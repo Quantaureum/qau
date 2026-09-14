@@ -11,7 +11,20 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/core"
+	"github.com/quantaureum/qau/params"
 )
+
+// networkBootnodes holds the canonical bootnode enode URLs for each named
+// network. These are the public, long-lived endpoints a fresh node dials
+// when no --bootnodes flag or config entry is provided (same role as
+// go-ethereum's params/bootnodes.go MainnetBootnodes). Entries MUST be
+// neutral host identifiers (dedicated seed endpoints), never internal
+// topology names.
+var networkBootnodes = map[string][]string{
+	NetworkMainnet: params.MainnetBootnodes,
+	NetworkTestnet: params.TestnetBootnodes,
+	NetworkDev:     nil,
+}
 
 // Network names
 const (
@@ -706,8 +719,9 @@ func TestnetConfig() *Config {
 	cfg.NetworkID = TestnetNetworkID
 	// TSS-/ (2026-07-16): Testnet allows trusted dealer DKG and
 	// local mode multi-share for testing (hard guards are mainnet-only).
-	cfg.TSSThreshold = 2
-	cfg.TSSTotalShares = 3
+	cfg.TSSThreshold = 3
+	cfg.TSSTotalShares = 4
+	cfg.TSSDistributedMode = false
 	return cfg
 }
 
@@ -806,6 +820,12 @@ func ResolveNetworkConfig(cfg *Config) {
 		if cfg.ExpectedGenesisHash == "" {
 			cfg.ExpectedGenesisHash = MainnetGenesisHash
 		}
+	}
+	// Fallback to the canonical network bootnodes when the operator did not
+	// supply any bootstrap peers (flag or config). Explicit peers always win;
+	// this only fills the zero value, mirroring go-ethereum's behaviour.
+	if len(cfg.BootstrapPeers) == 0 {
+		cfg.BootstrapPeers = networkBootnodes[string(cfg.Network)]
 	}
 }
 
