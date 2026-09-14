@@ -1,0 +1,198 @@
+// Quantaureum Rust SDK source, version 1.0.0.
+//! Address validation and formatting utilities.
+//!
+//! This module provides functions for validating and formatting Ethereum-style addresses.
+
+use crate::types::Address;
+
+/// Validates if a string is a valid Ethereum-style address.
+///
+/// A valid address is a 40-character hexadecimal string, optionally prefixed with "0x".
+///
+/// # Arguments
+///
+/// * `address` - The address string to validate
+///
+/// # Returns
+///
+/// `true` if the address is valid, `false` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// use quantaureum_sdk::utils::is_valid_address;
+///
+/// assert!(is_valid_address("0x1234567890123456789012345678901234567890"));
+/// assert!(is_valid_address("1234567890123456789012345678901234567890"));
+/// assert!(!is_valid_address("0x1234")); // too short
+/// assert!(!is_valid_address("0xGGGG567890123456789012345678901234567890")); // invalid chars
+/// ```
+pub fn is_valid_address(address: &str) -> bool {
+    let hex_str = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(address);
+
+    // Must be exactly 40 hex characters
+    if hex_str.len() != 40 {
+        return false;
+    }
+
+    // All characters must be valid hex digits
+    hex_str.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Converts an address to EIP-55 checksum format.
+///
+/// # Arguments
+///
+/// * `address` - The address string to convert
+///
+/// # Returns
+///
+/// The address in checksum format, or `None` if the input is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use quantaureum_sdk::utils::to_checksum_address;
+///
+/// let checksum = to_checksum_address("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap();
+/// assert_eq!(checksum, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+/// ```
+pub fn to_checksum_address(address: &str) -> Option<String> {
+    if !is_valid_address(address) {
+        return None;
+    }
+
+    // Parse the address and use the Address type's checksum method
+    Address::from_hex(address)
+        .ok()
+        .map(|addr| addr.to_checksum())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn test_is_valid_address_with_prefix() {
+        assert!(is_valid_address(
+            "0x1234567890123456789012345678901234567890"
+        ));
+        assert!(is_valid_address(
+            "0X1234567890123456789012345678901234567890"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_address_without_prefix() {
+        assert!(is_valid_address("1234567890123456789012345678901234567890"));
+    }
+
+    #[test]
+    fn test_is_valid_address_zero() {
+        assert!(is_valid_address(
+            "0x0000000000000000000000000000000000000000"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_address_mixed_case() {
+        assert!(is_valid_address(
+            "0xABCDEF1234567890abcdef1234567890ABCDEF12"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_address_too_short() {
+        assert!(!is_valid_address("0x1234"));
+        assert!(!is_valid_address("1234567890"));
+    }
+
+    #[test]
+    fn test_is_valid_address_too_long() {
+        assert!(!is_valid_address(
+            "0x12345678901234567890123456789012345678901234"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_address_invalid_chars() {
+        assert!(!is_valid_address(
+            "0xGGGG567890123456789012345678901234567890"
+        ));
+        assert!(!is_valid_address(
+            "0x123456789012345678901234567890123456789Z"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_address_empty() {
+        assert!(!is_valid_address(""));
+        assert!(!is_valid_address("0x"));
+    }
+
+    #[test]
+    fn test_to_checksum_address() {
+        // EIP-55 test vectors
+        let checksum = to_checksum_address("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap();
+        assert_eq!(checksum, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+    }
+
+    #[test]
+    fn test_to_checksum_address_all_caps() {
+        let checksum = to_checksum_address("0xFB6916095CA1DF60BB79CE92CE3EA74C37C5D359").unwrap();
+        assert_eq!(checksum, "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359");
+    }
+
+    #[test]
+    fn test_to_checksum_address_invalid() {
+        assert!(to_checksum_address("0x1234").is_none());
+        assert!(to_checksum_address("invalid").is_none());
+    }
+
+    #[test]
+    fn test_to_checksum_address_zero() {
+        let checksum = to_checksum_address("0x0000000000000000000000000000000000000000").unwrap();
+        assert_eq!(checksum, "0x0000000000000000000000000000000000000000");
+    }
+
+    // Strategy to generate valid 20-byte addresses
+    fn valid_address_bytes() -> impl Strategy<Value = [u8; 20]> {
+        proptest::array::uniform20(any::<u8>())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: quantaureum-rust-sdk, Property 7: Address Validation Correctness
+        // For any Address generated by the SDK (via from_bytes), is_valid_address() SHALL return true.
+        // Validates: Requirements 5.3
+        #[test]
+        fn prop_valid_address_from_bytes(bytes in valid_address_bytes()) {
+            let addr = Address::from_bytes(bytes);
+            let hex_str = addr.to_hex();
+            prop_assert!(is_valid_address(&hex_str));
+        }
+
+        // Feature: quantaureum-rust-sdk, Property 7: Address Validation Correctness
+        // For any string that is not a valid 40-character hex string, is_valid_address() SHALL return false.
+        // Validates: Requirements 5.3
+        #[test]
+        fn prop_invalid_address_wrong_length(s in "[0-9a-fA-F]{0,39}|[0-9a-fA-F]{41,80}") {
+            prop_assert!(!is_valid_address(&s), "Expected invalid address for: {}", s);
+            let with_prefix = format!("0x{}", s);
+            prop_assert!(!is_valid_address(&with_prefix), "Expected invalid address for: {}", with_prefix);
+        }
+
+        // Feature: quantaureum-rust-sdk, Property 7: Address Validation Correctness
+        // For any string containing non-hex characters, is_valid_address() SHALL return false.
+        // Validates: Requirements 5.3
+        #[test]
+        fn prop_invalid_address_non_hex_chars(s in "[g-zG-Z!@#$%^&*()]{40}") {
+            prop_assert!(!is_valid_address(&s));
+        }
+    }
+}

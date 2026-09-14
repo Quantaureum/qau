@@ -1,0 +1,44 @@
+# Build outputs
+/bin/
+/dist/
+/build/
+/out/
+/target/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeFiles/*
+!CMakeFiles/.gitkeep
+
+# Compiled artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.class
+*.jar
+*.whl
+
+# Local environments and editors
+.env
+.env.*
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Coverage and reports
+coverage/
+.coverage
+coverage.xml
+*.prof
+*.pprof

@@ -1,0 +1,120 @@
+# Quantaureum Python SDK source, version 1.0.0.
+[build-system]
+requires = ["setuptools>=61.0,<71.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantaureum"
+version = "1.0.0"
+description = "Python SDK for Quantaureum quantum-safe blockchain"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Quantaureum Team"}
+]
+keywords = ["blockchain", "quantaureum", "sdk", "web3", "crypto"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic==2.12.5",
+    "httpx==0.28.1",
+    "requests==2.32.5",
+    "aiohttp==3.13.3",
+    "eth-hash[pycryptodome]==0.7.1",
+    "eth-keys==0.7.0",
+    "eth-abi==5.2.0",
+    "mnemonic==0.21",
+    "rlp==4.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+    "hypothesis==6.148.8",
+    "mypy==1.19.1",
+    "ruff==0.14.10",
+    "coverage==7.13.1",
+    "types-requests==2.32.4.20250913",
+]
+
+[project.urls]
+Homepage = "https://github.com/quantaureum/qau"
+Documentation = "https://docs.quantaureum.io/sdk/python"
+Repository = "https://github.com/quantaureum/qau/tree/main/sdks/python-sdk"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quantaureum*"]
+
+[tool.setuptools.package-data]
+quantaureum = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py", "*_test.py", "*_property_test.py"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "silent"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "requests.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+]
+
+[tool.ruff.isort]
+known-first-party = ["quantaureum"]
+
+[tool.coverage.run]
+source = ["quantaureum"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]

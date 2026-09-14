@@ -1,0 +1,56 @@
+# Quantaureum Python SDK - Locked Dependencies
+# Generated: 2026-03-12
+# Python Version: 3.11+
+#
+# This file pins all dependencies to exact versions for reproducible builds.
+# To update dependencies:
+#   1. Update version ranges in pyproject.toml
+#   2. Install in clean environment: pip install -e .
+#   3. Regenerate this file: pip freeze > requirements.lock
+#   4. Test thoroughly before committing
+
+# Core Dependencies
+pydantic==2.12.5
+pydantic-core==2.41.5
+httpx==0.28.1
+requests==2.32.5
+aiohttp==3.13.3
+eth-hash==0.7.1
+eth-keys==0.7.0
+eth-abi==5.2.0
+mnemonic==0.21
+rlp==4.1.0
+
+# Cryptography
+pycryptodome==3.23.0
+
+# Transitive Dependencies (required by core packages)
+eth-utils==5.3.1
+eth-typing==5.2.1
+parsimonious==0.10.0
+cytoolz==1.0.0
+toolz==1.0.0
+regex==2025.11.3
+typing-extensions==4.15.0
+annotated-types==0.7.0
+
+# HTTP Client Dependencies
+certifi==2024.12.14
+charset-normalizer==3.4.1
+idna==3.10
+urllib3==2.3.0
+multidict==6.1.0
+yarl==1.18.3
+aiosignal==1.3.2
+frozenlist==1.5.0
+attrs==24.3.0
+async-timeout==5.0.1
+
+# Development Dependencies (optional)
+pytest==9.0.2
+pytest-asyncio==1.3.0
+hypothesis==6.148.8
+mypy==1.19.1
+ruff==0.14.10
+coverage==7.13.1
+types-requests==2.32.4.20250913
