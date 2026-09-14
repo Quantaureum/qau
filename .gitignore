@@ -1,9 +1,9 @@
 # Build outputs
-/bin/
-/dist/
-/build/
-/out/
-/target/
+bin/
+dist/
+build/
+out/
+target/
 *.egg-info/
 __pycache__/
 .pytest_cache/

@@ -96,9 +96,9 @@ Start a public-network node:
 ./bin/qaud --network testnet --datadir ./testnet-data
 ```
 
-Mainnet and testnet genesis configurations and the mainnet canonical bootnode
-records are built into the client. See the network guide for genesis-hash
-verification and connection checks.
+Mainnet and testnet genesis configurations and canonical bootnode records are
+built into the client. See the network guide for genesis-hash verification and
+connection checks.
 
 ## Network IDs
 

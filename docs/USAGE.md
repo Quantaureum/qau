@@ -25,12 +25,12 @@ qaud --config /etc/quantaureum/config.json
 Or start with a built-in public network preset:
 
 ```sh
-qaud --network mainnet --datadir /var/lib/quantaureum \
-  --bootnodes enode://65b6dcc0aeb5e0458996d3c6934a36c5213caf8074e4153c3f9e0f5f225789f7@163.192.142.82:9000
+qaud --network mainnet --datadir /var/lib/quantaureum
+qaud --network testnet --datadir /var/lib/quantaureum-testnet
 ```
 
-For mainnet, omit `--bootnodes` to use the canonical records built into the
-client. Supplying `--bootnodes` replaces that built-in list.
+For mainnet and testnet, omit `--bootnodes` to use the canonical records built
+into the client. Supplying `--bootnodes` replaces that built-in list.
 Mainnet and testnet do not require an external genesis JSON file. See
 [NETWORK.md](NETWORK.md) for genesis verification and connection checks.
 
@@ -115,7 +115,9 @@ qau-cli blockchain --help
 The node exposes Ethereum-compatible JSON-RPC methods. The examples use a
 local node; replace the URL with `https://rpc.quantaureum.com` to use the
 verified public mainnet endpoint. Verify any remote endpoint with
-`eth_chainId` before submitting transactions. Mainnet must return `0x684`.
+`eth_chainId` before submitting transactions. Mainnet must return `0x684`;
+the testnet endpoint `https://testnet-rpc.quantaureum.com` must return
+`0x685`.
 
 For example:
 

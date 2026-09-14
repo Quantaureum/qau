@@ -50,6 +50,9 @@ func TestTestnetGenesis(t *testing.T) {
 	if g.NetworkID != TestnetNetworkID {
 		t.Errorf("expected network ID %d, got %d", TestnetNetworkID, g.NetworkID)
 	}
+	if err := ValidateGenesisForNetwork(NetworkTestnet, g); err != nil {
+		t.Fatalf("testnet genesis does not match the canonical preset: %v", err)
+	}
 }
 
 func TestBuiltinNetworkGenesisValidation(t *testing.T) {

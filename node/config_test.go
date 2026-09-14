@@ -266,6 +266,24 @@ func TestResolveNetworkConfig_Testnet(t *testing.T) {
 	if cfg.DevMode {
 		t.Error("testnet must not enable dev mode")
 	}
+	want := []string{
+		"enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000",
+	}
+	if !sliceEqual(cfg.BootstrapPeers, want) {
+		t.Errorf("expected canonical testnet bootnodes %v, got %v", want, cfg.BootstrapPeers)
+	}
+}
+
+func TestResolveNetworkConfig_TestnetExplicitBootnodes(t *testing.T) {
+	cfg := &Config{
+		Network:        NetworkTestnet,
+		BootstrapPeers: []string{"enode://0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:9000"},
+	}
+	ResolveNetworkConfig(cfg)
+	want := []string{"enode://0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:9000"}
+	if !sliceEqual(cfg.BootstrapPeers, want) {
+		t.Errorf("expected explicit bootnodes %v, got %v", want, cfg.BootstrapPeers)
+	}
 }
 
 func TestResolveNetworkConfig_Mainnet(t *testing.T) {
@@ -949,11 +967,14 @@ func TestDevConfig_AllFields(t *testing.T) {
 // (trusted dealer DKG is allowed on testnet).
 func TestTestnetConfig_AllFields(t *testing.T) {
 	cfg := TestnetConfig()
-	if cfg.TSSThreshold != 2 {
-		t.Errorf("expected TestnetConfig TSSThreshold 2, got %d", cfg.TSSThreshold)
+	if cfg.TSSThreshold != 3 {
+		t.Errorf("expected TestnetConfig TSSThreshold 3, got %d", cfg.TSSThreshold)
 	}
-	if cfg.TSSTotalShares != 3 {
-		t.Errorf("expected TestnetConfig TSSTotalShares 3, got %d", cfg.TSSTotalShares)
+	if cfg.TSSTotalShares != 4 {
+		t.Errorf("expected TestnetConfig TSSTotalShares 4, got %d", cfg.TSSTotalShares)
+	}
+	if cfg.TSSDistributedMode {
+		t.Error("expected TestnetConfig TSSDistributedMode to remain disabled")
 	}
 }
 

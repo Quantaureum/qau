@@ -9,7 +9,7 @@ mainnet or testnet.
 | Network | Chain ID / Network ID | Genesis configuration hash | Validators |
 | --- | ---: | --- | ---: |
 | Mainnet | 1668 | `94e178e6faec5ed2c51e109b9d465c613620df245fee665fa77a28158b33e506` | 6 |
-| Testnet | 1669 | `7a3993d596afe2fe2d818299a69adff9ad838455c46958fc7c6b66c8c409f20b` | 4 |
+| Testnet | 1669 | `6e0fdada5beaaf93ed556b82a0daa405b28cb56e3eda2609b820e92683768384` | 4 |
 
 The hexadecimal JSON-RPC form of the chain ID is `0x684` for mainnet and
 `0x685` for testnet.
@@ -35,6 +35,19 @@ convenient for read-only queries and transaction submission, but operators and
 applications that require independent verification should run their own node
 and verify its genesis hash and peer connectivity as described below.
 
+The verified public testnet JSON-RPC endpoint is:
+
+```text
+https://testnet-rpc.quantaureum.com
+```
+
+It must return `"result":"0x685"` from the same `eth_chainId` request. The
+public testnet faucet is:
+
+```text
+https://faucet.quantaureum.com
+```
+
 Start a mainnet node:
 
 ```sh
@@ -48,8 +61,7 @@ Start a testnet node:
 ```sh
 qaud \
   --network testnet \
-  --datadir /var/lib/quantaureum-testnet \
-  --bootnodes enode://<node-id>@testnet-bootnode.example.invalid:9000
+  --datadir /var/lib/quantaureum-testnet
 ```
 
 The client verifies the built-in genesis configuration hash at startup. The
@@ -103,6 +115,19 @@ configured, `qaud` uses these records automatically:
     "enode://57879ea427537fd3690ed35353a32d1e87035f696995cd4da5126cb2fee05d3d@149.118.61.186:9000",
     "enode://ebf49fb21426f10430e48bf513f07750dc88dfa15c1d65d322b9f922ff1d61da@149.118.62.16:9000",
     "enode://949dcd8f80c032022d2bb7836afc1de9628c49d2f3325131d45d73d5908451e5@149.118.55.2:9000"
+  ]
+}
+```
+
+The testnet preset contains the following authenticated canonical bootstrap
+record. When `--network testnet` is selected and no bootstrap peers are
+configured, `qaud` uses this record automatically:
+
+```json
+{
+  "network": "testnet",
+  "bootstrapPeers": [
+    "enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000"
   ]
 }
 ```

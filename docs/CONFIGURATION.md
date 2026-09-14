@@ -116,8 +116,8 @@ mainnet and testnet, the external file must match the built-in chain identity
 and genesis hash. Use an empty `network` value for a custom network with its
 own genesis file.
 
-Mainnet uses the canonical bootstrap records built into the client. Testnet
-and custom networks require `bootstrapPeers` or `--bootnodes`; see
+Mainnet and testnet use the canonical bootstrap records built into the client.
+Custom networks require `bootstrapPeers` or `--bootnodes`; see
 [NETWORK.md](NETWORK.md).
 
 Do not enable development mode on mainnet. The node rejects that combination.

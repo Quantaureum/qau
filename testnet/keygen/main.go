@@ -23,7 +23,7 @@ import (
 	"github.com/quantaureum/qau/types"
 )
 
-const numValidators = 3
+const numValidators = 4
 
 func main() {
 	outputDir := flag.String("output", "", "secure output directory outside the source tree (required)")
@@ -119,7 +119,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("Next step: regenerate testnet/genesis.json with qauctl:")
 	fmt.Println("  qauctl genesis generate \\")
-	fmt.Println("    --validator-keys testnet/keys/validator1.key,testnet/keys/validator2.key,testnet/keys/validator3.key \\")
+	fmt.Printf("    --validator-keys %s/validator1.key,%s/validator2.key,%s/validator3.key,%s/validator4.key \\\n", keysDir, keysDir, keysDir, keysDir)
 	fmt.Println("    --output testnet/genesis.json \\")
 	fmt.Println("    --chain-id 1669 \\")
 	fmt.Println("    --network-id 1669")

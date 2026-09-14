@@ -11,7 +11,7 @@ import (
 
 const (
 	MainnetGenesisHash = "94e178e6faec5ed2c51e109b9d465c613620df245fee665fa77a28158b33e506"
-	TestnetGenesisHash = "7a3993d596afe2fe2d818299a69adff9ad838455c46958fc7c6b66c8c409f20b"
+	TestnetGenesisHash = "6e0fdada5beaaf93ed556b82a0daa405b28cb56e3eda2609b820e92683768384"
 )
 
 var mainnetBootnodes = []string{
@@ -21,6 +21,10 @@ var mainnetBootnodes = []string{
 	"enode://57879ea427537fd3690ed35353a32d1e87035f696995cd4da5126cb2fee05d3d@149.118.61.186:9000",
 	"enode://ebf49fb21426f10430e48bf513f07750dc88dfa15c1d65d322b9f922ff1d61da@149.118.62.16:9000",
 	"enode://949dcd8f80c032022d2bb7836afc1de9628c49d2f3325131d45d73d5908451e5@149.118.55.2:9000",
+}
+
+var testnetBootnodes = []string{
+	"enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000",
 }
 
 // NetworkPreset describes the client's built-in network identity.
@@ -52,6 +56,7 @@ func NetworkPresetByName(name string) (NetworkPreset, bool) {
 			ChainID:             TestnetNetworkID,
 			ExpectedGenesisHash: TestnetGenesisHash,
 			HasBuiltInGenesis:   true,
+			DefaultBootnodes:    testnetBootnodes,
 		}, true
 	case NetworkDev:
 		return NetworkPreset{

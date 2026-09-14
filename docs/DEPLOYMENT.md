@@ -53,7 +53,9 @@ sudo chown root:quantaureum /etc/quantaureum/config.json
 sudo chmod 0640 /etc/quantaureum/config.json
 ```
 
-Set `network` to `mainnet` or `testnet`, and provide authorized bootstrap peers.
+Set `network` to `mainnet` or `testnet`. Both presets use the canonical
+bootstrap records built into the client unless an operator explicitly supplies
+authorized peers.
 An external genesis file is optional and must match the selected preset. Never
 place private keys, passwords, certificates, or production peer lists in the
 source repository.
