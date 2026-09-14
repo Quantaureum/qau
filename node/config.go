@@ -11,7 +11,6 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/core"
-	"github.com/quantaureum/qau/params"
 )
 
 // networkBootnodes holds the canonical bootnode enode URLs for each named
@@ -20,9 +19,15 @@ import (
 // go-ethereum's params/bootnodes.go MainnetBootnodes). Entries MUST be
 // neutral host identifiers (dedicated seed endpoints), never internal
 // topology names.
+// networkBootnodes holds the canonical bootnode enode URLs for each named
+// network. These are the public, long-lived endpoints a fresh node dials
+// when no --bootnodes flag or config entry is provided (same role as
+// go-ethereum's params/bootnodes.go MainnetBootnodes). Entries MUST be
+// neutral host identifiers (dedicated seed endpoints), never internal
+// topology names.
 var networkBootnodes = map[string][]string{
-	NetworkMainnet: params.MainnetBootnodes,
-	NetworkTestnet: params.TestnetBootnodes,
+	NetworkMainnet: mainnetBootnodes,
+	NetworkTestnet: testnetBootnodes,
 	NetworkDev:     nil,
 }
 
