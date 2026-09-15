@@ -91,8 +91,28 @@ Windows 上如需显式可执行文件名，请为输出路径添加 `.exe` 后�
 ./bin/qaud --network testnet --datadir ./testnet-data
 ```
 
-主网和测试网创世配置以及主网 canonical bootnode 记录已内置在客户端中。创世哈希
+主网和测试网创世配置以及 canonical bootnode 记录已内置在客户端中。创世哈希
 校验与接入确认见网络指南。
+
+## 硬件与运行要求
+
+节点没有严格的硬件下限——任何能编译运行 Go 的机器都可以加入。下表列出
+经过验证的参考配置：
+
+| 角色 | CPU | 内存 | 磁盘 | 网络 |
+| --- | --- | --- | --- | --- |
+| 全节点（主网/测试网） | 4 核 | 8 GB | 200 GB SSD | 10 Mbps，建议静态公网 IP |
+| 验证节点（Validator） | 8 核 | 16 GB | 500 GB SSD | 100 Mbps，低延迟链路，必须静态 IP |
+| 开发网（本地） | 2 核 | 4 GB | 10 GB | 无 |
+
+说明：
+
+- Dilithium3 签名验证与 QTD 门限签名计算均为 CPU 密集型；验证者密钥
+  与签名状态必须保存在验证节点主机上。
+- 状态随链历史增长；建议使用 SSD 并监控数据目录剩余空间。
+- Go 工具链：使用 `go.mod` 中声明的版本。
+- 端口：P2P 监听地址默认 `0.0.0.0:9000`（`listenAddr`）；HTTP JSON-RPC、
+  WebSocket 与监控端点均可配置，详见[配置指南](docs/CONFIGURATION.md)。
 
 ## 网络 ID
 

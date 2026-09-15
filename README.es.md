@@ -95,6 +95,30 @@ Nodos de red pública:
 La configuración génesis de mainnet y testnet, así como los registros canonical
 bootnode de mainnet, están integrados en el cliente.
 
+## Requisitos de hardware y ejecución
+
+El nodo no tiene un mínimo estricto de hardware: cualquier máquina que
+pueda compilar y ejecutar Go puede unirse. La tabla siguiente lista
+configuraciones de referencia probadas:
+
+| Rol | CPU | Memoria | Disco | Red |
+| --- | --- | --- | --- | --- |
+| Nodo completo (mainnet/testnet) | 4 núcleos | 8 GB | 200 GB SSD | 10 Mbps, IP pública estática recomendada |
+| Validator | 8 núcleos | 16 GB | 500 GB SSD | 100 Mbps, enlace de baja latencia, IP estática obligatoria |
+| Devnet (local) | 2 núcleos | 4 GB | 10 GB | Ninguno |
+
+Notas:
+
+- La verificación de firmas Dilithium3 y la firma por umbral QTD son
+  intensivas en CPU; las claves y el estado de firma de los validators deben
+  permanecer en su host.
+- El estado crece con el historial de la cadena; se recomienda almacenamiento
+  SSD y monitorizar el espacio libre del directorio de datos.
+- Herramienta Go: la versión declarada en `go.mod`.
+- Puertos: la dirección de escucha P2P es por defecto `0.0.0.0:9000`
+  (`listenAddr`); los endpoints HTTP JSON-RPC, WebSocket y de métricas son
+  configurables — ver la [guía de configuración](docs/CONFIGURATION.md).
+
 ## Identificadores de red
 
 | Red | Chain ID / Network ID | Chain ID hexadecimal | Propósito |
