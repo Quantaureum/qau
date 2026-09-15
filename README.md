@@ -100,6 +100,29 @@ Mainnet and testnet genesis configurations and canonical bootnode records are
 built into the client. See the network guide for genesis-hash verification and
 connection checks.
 
+## Requirements
+
+The node has no strict hardware floor — any machine that compiles and runs
+Go can join. The table below lists tested reference configurations:
+
+| Role | CPU | Memory | Disk | Network |
+| --- | --- | --- | --- | --- |
+| Full node (mainnet/testnet) | 4 cores | 8 GB | 200 GB SSD | 10 Mbps, static public IP recommended |
+| Validator | 8 cores | 16 GB | 500 GB SSD | 100 Mbps, low-latency link, static IP required |
+| Devnet (local) | 2 cores | 4 GB | 10 GB | None |
+
+Notes:
+
+- Dilithium3 signature verification and QTD threshold signing are
+  CPU-bound; validator keys and signing state must stay on the validator
+  host.
+- State grows with chain history; prefer SSD storage and monitor free
+  space under the data directory.
+- Go toolchain: the version declared in `go.mod`.
+- Ports: P2P listen address defaults to `0.0.0.0:9000` (`listenAddr`);
+  HTTP JSON-RPC, WebSocket, and metrics endpoints are configurable — see
+  the [Configuration guide](docs/CONFIGURATION.md) for the exact keys.
+
 ## Network IDs
 
 | Network | Chain ID / Network ID | Hex chain ID | Purpose |
