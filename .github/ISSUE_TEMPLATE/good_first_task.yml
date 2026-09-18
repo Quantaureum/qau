@@ -1,0 +1,37 @@
+name: "Good first task"
+description: A bounded task suitable for a new contributor, with mentoring expected from a maintainer.
+title: "[Task]: "
+labels: ["good first issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Maintainers: do not file critical security, consensus, cryptography, or
+        reward-sensitive work as a first task. Most tasks are volunteer work with
+        no payment implied unless written funded-task terms were approved in advance.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Pointer to the relevant files and one-sentence background for a newcomer.
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+      description: Exactly what to change, in one paragraph.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checklist a reviewer will use.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How to verify
+      description: Exact commands or manual steps, e.g. go test ./path/... -run TestName
+    validations:
+      required: true

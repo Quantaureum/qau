@@ -99,7 +99,7 @@ bootnode de mainnet, están integrados en el cliente.
 
 El nodo no tiene un mínimo estricto de hardware: cualquier máquina que
 pueda compilar y ejecutar Go puede unirse. La tabla siguiente lista
-configuraciones de referencia probadas:
+**estimaciones provisionales (todavía no medidas)**:
 
 | Rol | CPU | Memoria | Disco | Red |
 | --- | --- | --- | --- | --- |

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible defect in a node binary, library, or SDK.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include private keys, passwords, mnemonics, real wallet-to-host
+        mappings, or production network topology in this report.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest command sequence that reproduces the issue.
+      placeholder: |
+        1. git checkout <commit>
+        2. go build ...
+        3. qaud --dev --network dev ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit hash, Go version, OS/architecture, and network (dev/testnet/mainnet context only).
+      placeholder: |
+        commit: a41e1f7
+        go: 1.26
+        os: linux/amd64
+        network: dev
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or terminal output
+      description: Sanitized excerpts only. Remove addresses tied to real operations and internal hostnames.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and did not find this report.
+          required: true
+        - label: This is not a security vulnerability (use GitHub private vulnerability reporting instead).
+          required: true

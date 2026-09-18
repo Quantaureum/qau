@@ -1,0 +1,41 @@
+name: Feature proposal
+description: Propose new behavior, an API change, or developer-experience improvement.
+title: "[Proposal]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Changes to consensus, cryptography, transaction formats, or storage
+        compatibility require a written design discussion before implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or developer problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the intended behavior and, if relevant, the interface change.
+    validations:
+      required: true
+  - type: textarea
+    id: nongoals
+    attributes:
+      label: Non-goals
+      description: What should this proposal explicitly not change?
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and risk
+      description: Impact on encoding, storage, consensus, existing APIs, or public networks.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will reviewers verify the proposal is complete? List concrete checks or test scenarios.
+    validations:
+      required: true

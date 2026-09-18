@@ -102,8 +102,10 @@ connection checks.
 
 ## Requirements
 
-The node has no strict hardware floor — any machine that compiles and runs
-Go can join. The table below lists tested reference configurations:
+The node has no strict hardware floor — Go-capable machines can join. The
+table below lists provisional sizing estimates for a comfortable first setup;
+these have not yet been independently measured and will be replaced by
+benchmarked figures as measurements are collected:
 
 | Role | CPU | Memory | Disk | Network |
 | --- | --- | --- | --- | --- |

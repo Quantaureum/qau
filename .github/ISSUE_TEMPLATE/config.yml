@@ -1,0 +1,9 @@
+# Contact: metadata pointers
+blank_issues_enabled: false
+contact_links:
+  - name: Private vulnerability report
+    url: https://github.com/Quantaureum/qau/security/advisories/new
+    about: Report security vulnerabilities privately — never in a public issue.
+  - name: General discussion
+    url: https://github.com/Quantaureum/qau/discussions
+    about: Questions, ideas, and design discussion that are not yet an actionable issue.
