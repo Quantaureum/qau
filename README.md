@@ -80,6 +80,8 @@ go build -trimpath -o bin/qauctl ./cmd/qauctl
 go build -trimpath -o bin/qau-visor ./cmd/qau-visor
 ```
 
+See [Contributing guide](CONTRIBUTING.md) for detailed build, test, and PR instructions.
+
 On Windows, add the `.exe` suffix to output paths when explicit executable
 names are needed.
 
