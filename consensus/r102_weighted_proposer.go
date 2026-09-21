@@ -176,8 +176,23 @@ func (q *QPOS) buildWeightedEpochTableLocked(epoch uint64) *weightedEpochTable {
 		if v == nil || v.Stake == nil || v.Stake.Sign() <= 0 {
 			continue
 		}
+		// R102 + effective-balance: weight is the validator's effective
+		// balance (floored to EffectiveBalanceIncrement, capped at
+		// MaxEffectiveBalance) once the cutover epoch is reached. The regime
+		// is gated on the SAME cutover as the weighted proposer itself
+		// (effectiveBalanceEnabled == weightedProposerEnabled), and this
+		// table is only ever built inside the weightedProposerEnabled branch,
+		// so consensusWeight here always returns the effective balance. Using
+		// the shared helper keeps the weight definition single-sourced across
+		// election, finality and fork-choice.
+		w := q.consensusWeight(v.Stake, epoch)
+		if w.Sign() <= 0 {
+			// A positive stake below one full increment rounds to 0 effective
+			// balance and carries no proposer weight (mirrors Ethereum).
+			continue
+		}
 		t.idx = append(t.idx, i)
-		running = running.Add(running, v.Stake)
+		running = running.Add(running, w)
 		c := new(big.Int).Set(running)
 		t.cum = append(t.cum, c)
 		t.total = new(big.Int).Set(running)

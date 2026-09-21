@@ -1806,6 +1806,23 @@ func (n *Node) computeGenesisStateRoot() (types.Hash, error) {
 		}
 	}
 
+	// AUDIT-FIX (effective-balance testnet, 2026-09): initState() adds the
+	// deterministic dev accounts to state when DevMode is enabled. This
+	// computation MUST mirror that, otherwise the genesis block header stores
+	// a stateRoot that omits the dev-account balances while the live stateDB
+	// includes them - a permanent genesis StateRoot mismatch that breaks
+	// block validation and prevents finality on any DevMode/testnet chain.
+	// Dev accounts use a fixed domain-separated seed so every node agrees.
+	if n.config.DevMode {
+		_, balances, derr := InitDevAccounts(n.config.DataDir, 3)
+		if derr != nil {
+			return types.Hash{}, fmt.Errorf("failed to init dev accounts for genesis root: %w", derr)
+		}
+		for addr, balance := range balances {
+			tmpDB.SetBalance(addr, balance)
+		}
+	}
+
 	stateRoot, err := tmpDB.Commit()
 	if err != nil {
 		return types.Hash{}, fmt.Errorf("failed to commit genesis state: %w", err)
