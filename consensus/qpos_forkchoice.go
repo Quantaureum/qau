@@ -84,7 +84,10 @@ func (q *QPOS) calculateBlockScoreLocked(blockRoot types.Hash, slot uint64) *big
 					if !validators[att.ValidatorIndex].Active {
 						continue
 					}
-					score.Add(score, validators[att.ValidatorIndex].Stake)
+					// Effective-balance regime (gated on the weighted-proposer
+					// cutover): fork-choice weight uses the capped effective
+					// balance, consistent with finality and proposer election.
+					score.Add(score, q.consensusWeight(validators[att.ValidatorIndex].Stake, epoch))
 				}
 			}
 		}

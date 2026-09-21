@@ -71,7 +71,11 @@ func (q *QPOS) tryUpdateFinality() {
 		if !v.Active {
 			continue
 		}
-		totalWeight.Add(totalWeight, v.Stake)
+		// Effective-balance regime (gated on the weighted-proposer cutover):
+		// finality weight uses the capped effective balance so a single large
+		// validator cannot dominate finality beyond MaxEffectiveBalance.
+		// prevEpoch is the epoch whose attestations are being finalized.
+		totalWeight.Add(totalWeight, q.consensusWeight(v.Stake, prevEpoch))
 		activeValidatorCount++
 	}
 
@@ -201,7 +205,9 @@ func (q *QPOS) tryUpdateFinality() {
 			}
 			if !attestedValidators[att.ValidatorIndex] {
 				attestedValidators[att.ValidatorIndex] = true
-				attestedWeight.Add(attestedWeight, validators[att.ValidatorIndex].Stake)
+				// Mirror totalWeight: attested weight must use the same
+				// effective-balance measure so the ratio stays consistent.
+				attestedWeight.Add(attestedWeight, q.consensusWeight(validators[att.ValidatorIndex].Stake, prevEpoch))
 			}
 		}
 	}
@@ -484,7 +490,7 @@ func (q *QPOS) calculateParticipatingStake(epoch uint64) *big.Int {
 	stake := big.NewInt(0)
 	for idx := range participated {
 		if idx < len(validators) && validators[idx].Active {
-			stake.Add(stake, validators[idx].Stake)
+			stake.Add(stake, q.consensusWeight(validators[idx].Stake, epoch))
 		}
 	}
 
@@ -498,12 +504,17 @@ func (q *QPOS) calculateTotalStake() *big.Int {
 	}
 	validators := q.validators.Validators()
 	total := big.NewInt(0)
+	// calculateTotalStake feeds finality participation ratios; use the same
+	// effective-balance measure as calculateParticipatingStake so numerator
+	// and denominator stay consistent. Derive the epoch from the latest known
+	// block time (consensus data), matching tryUpdateFinality's approach.
+	ebEpoch := q.currentFinalityEpoch()
 	for i, v := range validators {
 		if _, slashed := q.slashedValidators[i]; slashed {
 			continue
 		}
 		if v.Active {
-			total.Add(total, v.Stake)
+			total.Add(total, q.consensusWeight(v.Stake, ebEpoch))
 		}
 	}
 	return total
