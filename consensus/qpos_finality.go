@@ -2,6 +2,8 @@
 package consensus
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"math/big"
 
@@ -252,6 +254,7 @@ func (q *QPOS) tryUpdateFinality() {
 		if prevEpoch > q.justifiedEpoch {
 			q.justifiedEpoch = prevEpoch
 			q.justifiedRoot = q.getEpochBlockRootLocked(prevEpoch)
+			q.finalityPersistPending = true
 		}
 		// CONS-R9-L-REDO-01 (2026-07-19) FIX: Previously the guard was
 		// `oldJustified > 0`, which permanently excluded the genesis epoch
@@ -286,13 +289,16 @@ func (q *QPOS) tryUpdateFinality() {
 			if oldJustified > q.finalizedEpoch {
 				q.finalizedEpoch = oldJustified
 				q.finalizedRoot = oldJustifiedRoot
+				q.finalityPersistPending = true
 			} else if oldJustified == q.finalizedEpoch && q.finalizedRoot == (types.Hash{}) {
 				q.finalizedRoot = oldJustifiedRoot
+				q.finalityPersistPending = true
 			}
 		}
 		if q.votingManager != nil {
 			q.votingManager.syncFinalityFromQPOS(q.justifiedEpoch, q.finalizedEpoch, q.justifiedRoot, q.finalizedRoot)
 		}
+		q.persistFinalityLocked()
 	}
 }
 
@@ -436,6 +442,10 @@ func (q *QPOS) AdoptHeaderFinality(justifiedEpoch, finalizedEpoch uint64, header
 	// ProcessAttestation's defer).
 	justified, finalized := q.justifiedEpoch, q.finalizedEpoch
 	jRoot, fRoot := q.justifiedRoot, q.finalizedRoot
+	if adopted {
+		q.finalityPersistPending = true
+		q.persistFinalityLocked()
+	}
 	q.mu.Unlock()
 
 	if adopted && q.votingManager != nil {
@@ -457,6 +467,165 @@ func adoptCheckpointRoot(recorded types.Hash, epoch uint64, headerHash types.Has
 		return types.Hash{}
 	}
 	return headerHash
+}
+
+// SetFinalityPersistCallback registers the R107-FINALITY-PERSIST hook. The
+// callback is invoked synchronously while q.mu is held so disk state cannot
+// lag behind a committed finality transition. Passing nil disables persistence.
+func (q *QPOS) SetFinalityPersistCallback(
+	callback func(justifiedEpoch, finalizedEpoch uint64, justifiedRoot, finalizedRoot types.Hash) error,
+) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.finalityPersist = callback
+	if q.finalityPersist != nil {
+		if !q.hasCanonicalFinalityRootsLocked() {
+			q.finalityPersistPending = true
+		}
+		q.persistFinalityLocked()
+	}
+}
+
+// RestoreFinalityState restores a checkpoint captured by the durable callback
+// and registers both roots in epochBlockRoots. Registration is the critical
+// recovery step: without it, source attestations for the restored justified
+// epoch are rejected by the canonical-root binding check after restart.
+func (q *QPOS) RestoreFinalityState(
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	justifiedRoot types.Hash,
+	finalizedRoot types.Hash,
+) error {
+	if finalizedEpoch > justifiedEpoch {
+		return fmt.Errorf("restore finality state: finalized epoch %d exceeds justified epoch %d", finalizedEpoch, justifiedEpoch)
+	}
+	if finalizedEpoch == justifiedEpoch && justifiedEpoch > 0 && justifiedRoot != finalizedRoot {
+		return errors.New("restore finality state: equal checkpoints have different roots")
+	}
+	if justifiedEpoch > 0 && justifiedRoot == (types.Hash{}) {
+		return errors.New("restore finality state: justified root is zero")
+	}
+	if finalizedEpoch > 0 && finalizedRoot == (types.Hash{}) {
+		return errors.New("restore finality state: finalized root is zero")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if justifiedEpoch < q.justifiedEpoch || finalizedEpoch < q.finalizedEpoch {
+		return errors.New("restore finality state: checkpoint is older than local state")
+	}
+	if q.justifiedEpoch > 0 && justifiedEpoch == q.justifiedEpoch && justifiedRoot != q.justifiedRoot {
+		return errors.New("restore finality state: conflicting justified root")
+	}
+	if q.finalizedEpoch > 0 && finalizedEpoch == q.finalizedEpoch && finalizedRoot != q.finalizedRoot {
+		return errors.New("restore finality state: conflicting finalized root")
+	}
+	justifiedGenesisRoot, err := q.restoredGenesisRoot(justifiedEpoch, justifiedRoot)
+	if err != nil {
+		return err
+	}
+	finalizedGenesisRoot, err := q.restoredGenesisRoot(finalizedEpoch, finalizedRoot)
+	if err != nil {
+		return err
+	}
+	if justifiedEpoch == 0 && finalizedEpoch == 0 && justifiedRoot != (types.Hash{}) &&
+		finalizedRoot != (types.Hash{}) && justifiedRoot != finalizedRoot {
+		return errors.New("restore finality state: conflicting epoch-zero roots")
+	}
+
+	q.justifiedEpoch = justifiedEpoch
+	q.justifiedRoot = justifiedRoot
+	q.finalizedEpoch = finalizedEpoch
+	q.finalizedRoot = finalizedRoot
+	q.registerRestoredCheckpointRootsLocked()
+	if justifiedGenesisRoot != (types.Hash{}) {
+		q.epochBlockRoots[0] = justifiedGenesisRoot
+		q.slotBlockRoots[0] = justifiedGenesisRoot
+	}
+	if finalizedGenesisRoot != (types.Hash{}) {
+		if existing, exists := q.epochBlockRoots[0]; !exists || existing == (types.Hash{}) {
+			q.epochBlockRoots[0] = finalizedGenesisRoot
+			q.slotBlockRoots[0] = finalizedGenesisRoot
+		}
+	}
+	return nil
+}
+
+func (q *QPOS) restoredGenesisRoot(epoch uint64, root types.Hash) (types.Hash, error) {
+	if epoch != 0 || root == (types.Hash{}) {
+		return types.Hash{}, nil
+	}
+	genesisRoot, exists := q.epochBlockRoots[0]
+	if exists && genesisRoot != (types.Hash{}) && genesisRoot != root {
+		return types.Hash{}, errors.New("restore finality state: conflicting genesis root")
+	}
+	return root, nil
+}
+
+func (q *QPOS) registerRestoredCheckpointRootsLocked() {
+	if q.epochBlockRoots == nil {
+		q.epochBlockRoots = make(map[uint64]types.Hash)
+	}
+	if q.justifiedEpoch > 0 && q.justifiedRoot != (types.Hash{}) {
+		q.epochBlockRoots[q.justifiedEpoch] = q.justifiedRoot
+	}
+	if q.finalizedEpoch > 0 && q.finalizedRoot != (types.Hash{}) {
+		q.epochBlockRoots[q.finalizedEpoch] = q.finalizedRoot
+	}
+	if q.hasCanonicalFinalityRootsLocked() {
+		q.finalityPersistPending = false
+	}
+}
+
+// persistFinalityLocked snapshots the current checkpoint and invokes the
+// storage callback. Caller MUST hold q.mu. Non-genesis checkpoint roots must
+// already match epochBlockRoots; a header-hash fallback is never durable.
+// A failed durable write leaves finalityPersistPending set so a later
+// canonical-root update or backfill can retry it.
+func (q *QPOS) persistFinalityLocked() {
+	if q.finalityPersist == nil {
+		return
+	}
+	if !q.hasCanonicalFinalityRootsLocked() {
+		q.finalityPersistPending = true
+		return
+	}
+	if !q.finalityPersistPending {
+		return
+	}
+	if err := q.finalityPersist(
+		q.justifiedEpoch,
+		q.finalizedEpoch,
+		q.justifiedRoot,
+		q.finalizedRoot,
+	); err != nil {
+		// Keep the checkpoint pending so a later canonical-root update or
+		// backfill retries the durable write.
+		q.finalityPersistPending = true
+		log.Printf("[ERROR] QPOS: failed to persist finality checkpoint: %v", err)
+		return
+	}
+	q.finalityPersistPending = false
+}
+
+func (q *QPOS) hasCanonicalFinalityRootsLocked() bool {
+	checkpoints := [...]struct {
+		epoch uint64
+		root  types.Hash
+	}{
+		{epoch: q.justifiedEpoch, root: q.justifiedRoot},
+		{epoch: q.finalizedEpoch, root: q.finalizedRoot},
+	}
+	for _, checkpoint := range checkpoints {
+		if checkpoint.epoch == 0 {
+			continue
+		}
+		canonicalRoot, exists := q.epochBlockRoots[checkpoint.epoch]
+		if !exists || canonicalRoot == (types.Hash{}) || canonicalRoot != checkpoint.root {
+			return false
+		}
+	}
+	return true
 }
 
 func (q *QPOS) calculateParticipatingStake(epoch uint64) *big.Int {

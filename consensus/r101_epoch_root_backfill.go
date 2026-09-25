@@ -56,6 +56,7 @@ func (q *QPOS) BackfillEpochRoots(roots map[uint64]types.Hash) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	applied := 0
+	checkpointChanged := false
 	for e, r := range roots {
 		if r == (types.Hash{}) {
 			continue
@@ -69,8 +70,33 @@ func (q *QPOS) BackfillEpochRoots(roots map[uint64]types.Hash) int {
 				continue
 			}
 		}
+		existingRoot, hasExistingRoot := q.epochBlockRoots[e]
+		if e == q.finalizedEpoch && q.finalizedEpoch > 0 && hasExistingRoot &&
+			existingRoot != (types.Hash{}) && existingRoot != r {
+			// A canonical finalized checkpoint root is immutable. An adopted
+			// header may still carry a non-canonical fallback absent from
+			// epochBlockRoots; allow the first canonical root to reconcile it.
+			continue
+		}
 		q.epochBlockRoots[e] = r
+		if q.justifiedEpoch == e && q.justifiedRoot != r {
+			q.justifiedRoot = r
+			checkpointChanged = true
+		}
+		if q.finalizedEpoch == e && q.finalizedRoot != r {
+			q.finalizedRoot = r
+			checkpointChanged = true
+		}
 		applied++
+	}
+	if checkpointChanged || q.finalityPersistPending {
+		// The bulk path deliberately avoids setEpochBlockRootLocked because
+		// its pruning logic can remove entries inserted earlier in this loop.
+		// Reconcile and persist only after every root has been installed.
+		q.finalityPersistPending = true
+		if q.hasCanonicalFinalityRootsLocked() {
+			q.persistFinalityLocked()
+		}
 	}
 	return applied
 }

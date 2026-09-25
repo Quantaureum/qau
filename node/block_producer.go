@@ -745,6 +745,11 @@ func (bp *BlockProducer) initValidatorSet() {
 	// stored head was itself validated when it was imported, so this is
 	// consensus data, not an out-of-band hint.
 	if bp.node.blockStore != nil {
+		if err := configureQPOSFinalityPersistence(qpos, bp.node.blockStore); err != nil {
+			bpLog.Warn("R107-FINALITY-PERSIST: failed to restore durable finality checkpoint: %v", err)
+		} else {
+			bpLog.Info("R107-FINALITY-PERSIST: restored durable finality checkpoint and enabled persistence")
+		}
 		if stored, err := bp.node.blockStore.GetLatestBlock(); err == nil && stored != nil && stored.Header != nil {
 			storedHash := block.ComputeBlockHash(stored.Header)
 			qpos.AdoptHeaderFinality(stored.Header.JustifiedEpoch, stored.Header.FinalizedEpoch, storedHash)

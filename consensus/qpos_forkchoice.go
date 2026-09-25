@@ -477,7 +477,35 @@ func (q *QPOS) EnsureEpochBlockRoot(epoch uint64, blockRoot types.Hash) {
 // setEpochBlockRootLocked is the lock-free inner implementation of
 // SetEpochBlockRoot. Caller MUST hold q.mu.
 func (q *QPOS) setEpochBlockRootLocked(epoch uint64, blockRoot types.Hash) {
+	existingRoot, hasExistingRoot := q.epochBlockRoots[epoch]
+	if epoch == q.finalizedEpoch && q.finalizedEpoch > 0 && hasExistingRoot &&
+		existingRoot != (types.Hash{}) && existingRoot != blockRoot {
+		// A canonical finalized checkpoint root is immutable. An adopted
+		// header may still carry a non-canonical fallback that was never
+		// entered into epochBlockRoots; in that case this first canonical
+		// root is allowed to reconcile it.
+		return
+	}
 	q.epochBlockRoots[epoch] = blockRoot
+	// Header finality adoption may temporarily use the importing block hash
+	// until the canonical epoch boundary root is available. Reconcile the
+	// checkpoint roots as soon as that authoritative root is recorded so new
+	// attestations bind to the same source root that verification expects.
+	checkpointRootChanged := false
+	if q.justifiedEpoch == epoch && q.justifiedRoot != blockRoot {
+		q.justifiedRoot = blockRoot
+		checkpointRootChanged = true
+	}
+	if q.finalizedEpoch == epoch && q.finalizedRoot != blockRoot {
+		q.finalizedRoot = blockRoot
+		checkpointRootChanged = true
+	}
+	if checkpointRootChanged {
+		q.finalityPersistPending = true
+	}
+	if checkpointRootChanged || q.finalityPersistPending {
+		q.persistFinalityLocked()
+	}
 	// SECURITY: Invalidate the shuffle cache for epoch+1 to ensure the
 	// shuffle is recomputed with the latest state. (Note: as of R4-CORE-01,
 	// the shuffle seed now uses the VRF accumulator, not the epoch block

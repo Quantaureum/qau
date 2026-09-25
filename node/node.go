@@ -6308,13 +6308,22 @@ func (n *Node) startServices() error {
 			//
 			// The callback is only ever invoked under qpos's internal lock
 			// (SetEpochVRFAccumulator holds q.mu), so the debounce state below
-			// needs no extra synchronization. Debouncing identical
-			// (epoch, value) writes collapses the R52 replay's ~32k per-block
-			// calls into ~1 write per distinct value, keeping startup fast.
+			// needs no extra synchronization.
+			//
+			// R108-VRF-REPLAY-BATCH (2026-09-25): the debounce only collapses
+			// REPEATED (epoch, value) pairs, and every block inside an epoch
+			// carries a distinct running accumulator — so during the R52 replay
+			// it never fires and each of the O(chain height) blocks cost its own
+			// fsync, all of it on the synchronous startup path before the P2P
+			// listener is bound. On a slow-disk host that stall never finished
+			// (peers stayed 0). The replay therefore suppresses this callback and
+			// accumulates into an in-memory map flushed in one batch transaction;
+			// the live block-import path keeps the per-epoch debounced write.
 			var lastPersistEpoch uint64
 			var lastPersistAcc types.Hash
+			var replayingVRF atomic.Bool
 			qpos.SetVRFPersistCallback(func(epoch uint64, acc types.Hash) {
-				if n.blockStore == nil {
+				if n.blockStore == nil || replayingVRF.Load() {
 					return
 				}
 				if epoch == lastPersistEpoch && acc == lastPersistAcc {
@@ -6358,6 +6367,13 @@ func (n *Node) startServices() error {
 				count := 0
 				var lastEpoch uint64
 				var lastAcc types.Hash
+				// R108-VRF-REPLAY-BATCH: buffer what the replay observes and
+				// persist it in a single transaction afterwards (see the callback
+				// comment above). Later blocks of an epoch overwrite earlier ones,
+				// so the map ends up holding the last on-chain value per epoch —
+				// exactly what the per-block callback used to write.
+				replayAccs := make(map[uint64]types.Hash)
+				replayingVRF.Store(true)
 				for h := uint64(1); h <= continuousTip; h++ {
 					blk, err := n.blockStore.GetBlockByHeight(h)
 					if err != nil || blk == nil {
@@ -6368,11 +6384,16 @@ func (n *Node) startServices() error {
 					// the ON-CHAIN header value (deterministic across nodes), not
 					// by re-XOR-ing VRF outputs (path-asymmetric → fork).
 					qpos.SetEpochVRFAccumulator(blk.Header.Epoch, blk.Header.VRFAccumulator)
+					replayAccs[blk.Header.Epoch] = blk.Header.VRFAccumulator
 					if blk.Header.Epoch >= lastEpoch {
 						lastEpoch = blk.Header.Epoch
 						lastAcc = blk.Header.VRFAccumulator
 					}
 					count++
+				}
+				replayingVRF.Store(false)
+				if err := n.blockStore.PutVRFAccumulatorsBatch(replayAccs); err != nil {
+					nodeLog.Error("R108-VRF-REPLAY-BATCH: failed to persist %d replayed epoch accumulator(s): %v", len(replayAccs), err)
 				}
 				nodeLog.Info("R52 FIX: Rebuilt VRF accumulator from %d canonical blocks (height 1..%d, lastOnChainEpoch=%d)", count, continuousTip, lastEpoch)
 

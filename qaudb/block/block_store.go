@@ -28,6 +28,10 @@ var (
 	// downstream nodes to detect a false fork and stall forever).
 	// Legitimate reorgs must call DeleteBlocksFromHeight BEFORE PutBlock.
 	ErrBlockConflict = errors.New("conflicting block at same height")
+	// R107-FINALITY-PERSIST errors.
+	ErrInvalidFinalityState = errors.New("invalid finality state")
+	ErrFinalityRollback     = errors.New("finality state rollback rejected")
+	ErrFinalityConflict     = errors.New("conflicting finality state root")
 )
 
 // Key prefixes for database
@@ -80,6 +84,12 @@ var (
 	// schedule even if the R52 block replay is skipped or interrupted, so
 	// sealer proposer election never diverges from the canonical chain.
 	vrfAccPrefix = []byte("v") // epoch(8B BE) -> VRF accumulator hash
+
+	// R107-FINALITY-PERSIST: the latest durable Casper FFG checkpoint.
+	// Epochs are stored as big-endian uint64 values followed by justified
+	// and finalized roots. A value-side version byte makes future schema
+	// changes fail closed instead of being misdecoded by an older binary.
+	finalityPrefix = []byte("qpos-finality-v1")
 )
 
 // maxScanHeightRange limits how many heights scanLatestHeightUnlocked will
@@ -113,6 +123,10 @@ type BlockStore struct {
 	latestBlock     *encoding.Block
 	latestBlockHash types.Hash
 	syncMode        int32
+
+	// finalityMu serializes the read-compare-write transaction used to keep
+	// durable finality checkpoints monotonic across callbacks and restarts.
+	finalityMu sync.Mutex
 }
 
 // NewBlockStore creates a new block store
@@ -140,6 +154,28 @@ func (bs *BlockStore) PutVRFAccumulator(epoch uint64, acc types.Hash) error {
 	var epochKey [8]byte
 	binary.BigEndian.PutUint64(epochKey[:], epoch)
 	return bs.db.Put(append(vrfAccPrefix, epochKey[:]...), acc[:])
+}
+
+// PutVRFAccumulatorsBatch writes many per-epoch VRF accumulator checkpoints in
+// a single batch transaction. The R52 startup replay walks every canonical
+// block, so driving PutVRFAccumulator from that loop costs one fsync per block
+// — O(chain height) fsyncs on every restart. Batching collapses that to one
+// fsync while leaving the on-disk layout identical to the per-epoch API, so
+// LoadVRFAccumulators cannot tell which one wrote the entries.
+func (bs *BlockStore) PutVRFAccumulatorsBatch(accs map[uint64]types.Hash) error {
+	if len(accs) == 0 {
+		return nil
+	}
+	batch := bs.db.NewBatch()
+	for epoch, acc := range accs {
+		if acc == (types.Hash{}) {
+			continue
+		}
+		var epochKey [8]byte
+		binary.BigEndian.PutUint64(epochKey[:], epoch)
+		batch.Put(append(vrfAccPrefix, epochKey[:]...), acc[:])
+	}
+	return batch.Write()
 }
 
 // LoadVRFAccumulators reads every persisted per-epoch VRF accumulator
@@ -171,6 +207,140 @@ func (bs *BlockStore) LoadVRFAccumulators() (map[uint64]types.Hash, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+const (
+	finalityStateVersion byte = 1
+	finalityStateSize         = 1 + 8 + 8 + types.HashLength + types.HashLength
+)
+
+// PutFinalityState durably records the latest justified and finalized Casper
+// FFG checkpoints. The read-compare-write transaction prevents a stale caller
+// from moving either checkpoint backwards after a restart.
+func (bs *BlockStore) PutFinalityState(
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	justifiedRoot types.Hash,
+	finalizedRoot types.Hash,
+) error {
+	if err := validateFinalityState(justifiedEpoch, finalizedEpoch, justifiedRoot, finalizedRoot); err != nil {
+		return err
+	}
+
+	bs.finalityMu.Lock()
+	defer bs.finalityMu.Unlock()
+
+	storedJustified, storedFinalized, storedJustifiedRoot, storedFinalizedRoot, err := bs.loadFinalityState()
+	if err != nil && !errors.Is(err, ErrInvalidFinalityState) {
+		return err
+	}
+	// An invalid persisted record provides no trustworthy monotonic baseline.
+	// Allow a validated canonical checkpoint to replace it; transient database
+	// errors above still fail closed and are never treated as corruption.
+	if errors.Is(err, ErrInvalidFinalityState) {
+		storedJustified = 0
+		storedFinalized = 0
+		storedJustifiedRoot = types.Hash{}
+		storedFinalizedRoot = types.Hash{}
+	}
+	if justifiedEpoch < storedJustified || finalizedEpoch < storedFinalized {
+		return ErrFinalityRollback
+	}
+	// A finalized checkpoint is immutable. An unfinalized justified
+	// checkpoint may still be corrected when a canonical epoch root arrives
+	// after an earlier header-hash fallback was adopted.
+	justifiedRootImmutable := storedFinalized > 0 && storedJustified <= storedFinalized
+	if justifiedEpoch == storedJustified && storedJustified > 0 && justifiedRootImmutable && justifiedRoot != storedJustifiedRoot {
+		return ErrFinalityConflict
+	}
+	if finalizedEpoch == storedFinalized && storedFinalized > 0 && finalizedRoot != storedFinalizedRoot {
+		return ErrFinalityConflict
+	}
+
+	value := make([]byte, finalityStateSize)
+	value[0] = finalityStateVersion
+	offset := 1
+	binary.BigEndian.PutUint64(value[offset:], justifiedEpoch)
+	offset += 8
+	binary.BigEndian.PutUint64(value[offset:], finalizedEpoch)
+	offset += 8
+	copy(value[offset:], justifiedRoot[:])
+	offset += types.HashLength
+	copy(value[offset:], finalizedRoot[:])
+
+	if err := bs.db.Put(finalityPrefix, value); err != nil {
+		return fmt.Errorf("persisting finality state: %w", err)
+	}
+	return nil
+}
+
+// LoadFinalityState reads the latest durable Casper FFG checkpoint. A missing
+// key is the normal genesis/bootstrap case and returns the zero checkpoint.
+func (bs *BlockStore) LoadFinalityState() (
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	justifiedRoot types.Hash,
+	finalizedRoot types.Hash,
+	err error,
+) {
+	return bs.loadFinalityState()
+}
+
+func (bs *BlockStore) loadFinalityState() (
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	justifiedRoot types.Hash,
+	finalizedRoot types.Hash,
+	err error,
+) {
+	value, err := bs.db.Get(finalityPrefix)
+	if errors.Is(err, db.ErrKeyNotFound) {
+		return 0, 0, types.Hash{}, types.Hash{}, nil
+	}
+	if err != nil {
+		return 0, 0, types.Hash{}, types.Hash{}, fmt.Errorf("loading finality state: %w", err)
+	}
+	if len(value) != finalityStateSize {
+		return 0, 0, types.Hash{}, types.Hash{}, ErrInvalidFinalityState
+	}
+	if value[0] != finalityStateVersion {
+		return 0, 0, types.Hash{}, types.Hash{}, ErrInvalidFinalityState
+	}
+
+	offset := 1
+	justifiedEpoch = binary.BigEndian.Uint64(value[offset:])
+	offset += 8
+	finalizedEpoch = binary.BigEndian.Uint64(value[offset:])
+	offset += 8
+	copy(justifiedRoot[:], value[offset:])
+	offset += types.HashLength
+	copy(finalizedRoot[:], value[offset:])
+
+	if err := validateFinalityState(justifiedEpoch, finalizedEpoch, justifiedRoot, finalizedRoot); err != nil {
+		return 0, 0, types.Hash{}, types.Hash{}, err
+	}
+	return justifiedEpoch, finalizedEpoch, justifiedRoot, finalizedRoot, nil
+}
+
+func validateFinalityState(
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	justifiedRoot types.Hash,
+	finalizedRoot types.Hash,
+) error {
+	if finalizedEpoch > justifiedEpoch {
+		return ErrInvalidFinalityState
+	}
+	if finalizedEpoch == justifiedEpoch && justifiedRoot != finalizedRoot {
+		return ErrInvalidFinalityState
+	}
+	if justifiedEpoch > 0 && justifiedRoot == (types.Hash{}) {
+		return ErrInvalidFinalityState
+	}
+	if finalizedEpoch > 0 && finalizedRoot == (types.Hash{}) {
+		return ErrInvalidFinalityState
+	}
+	return nil
 }
 
 func (bs *BlockStore) SetSyncMode(enabled bool) {

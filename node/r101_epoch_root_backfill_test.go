@@ -157,8 +157,104 @@ func TestR101_CheckSyncBackfillsOncePerEpoch(t *testing.T) {
 	}
 }
 
-// TestR101_BackfillNoQPOS: without a wired QPOS the helper must be a safe
-// no-op (e.g. pure RPC node ordering before SetQPOS completes).
+func TestR101_BackfillOldestEpochCoversStalledCheckpoint(t *testing.T) {
+	tests := []struct {
+		name                 string
+		currentEpoch         uint64
+		justifiedEpoch       uint64
+		finalizedEpoch       uint64
+		checkpointRootsKnown bool
+		expectedOldest       uint64
+	}{
+		{
+			name:                 "healthy checkpoint uses small normal window",
+			currentEpoch:         100,
+			justifiedEpoch:       90,
+			finalizedEpoch:       89,
+			checkpointRootsKnown: true,
+			expectedOldest:       96,
+		},
+		{
+			name:                 "deep stalled checkpoint extends depth",
+			currentEpoch:         3589,
+			justifiedEpoch:       1465,
+			finalizedEpoch:       1464,
+			checkpointRootsKnown: false,
+			expectedOldest:       1464,
+		},
+		{
+			name:                 "missing justified root extends without finalized checkpoint",
+			currentEpoch:         3589,
+			justifiedEpoch:       1465,
+			finalizedEpoch:       0,
+			checkpointRootsKnown: false,
+			expectedOldest:       1465,
+		},
+		{
+			name:                 "known deep checkpoint roots keep healthy window",
+			currentEpoch:         3589,
+			justifiedEpoch:       1465,
+			finalizedEpoch:       1464,
+			checkpointRootsKnown: true,
+			expectedOldest:       3585,
+		},
+		{
+			name:                 "near-head checkpoint keeps healthy window",
+			currentEpoch:         4000,
+			justifiedEpoch:       3998,
+			finalizedEpoch:       3997,
+			checkpointRootsKnown: true,
+			expectedOldest:       3996,
+		},
+		{
+			name:                 "genesis checkpoints do not expand scan",
+			currentEpoch:         4000,
+			justifiedEpoch:       0,
+			finalizedEpoch:       0,
+			checkpointRootsKnown: true,
+			expectedOldest:       3996,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r101BackfillOldestEpoch(
+				tt.currentEpoch,
+				tt.justifiedEpoch,
+				tt.finalizedEpoch,
+				tt.checkpointRootsKnown,
+			); got != tt.expectedOldest {
+				t.Fatalf(
+					"r101BackfillOldestEpoch(%d, %d, %d, rootsKnown=%t) = %d, want %d",
+					tt.currentEpoch,
+					tt.justifiedEpoch,
+					tt.finalizedEpoch,
+					tt.checkpointRootsKnown,
+					got,
+					tt.expectedOldest,
+				)
+			}
+		})
+	}
+}
+
+func TestR101_BackfillMaxWalkCoversStalledCheckpoint(t *testing.T) {
+	// A checkpoint stalled 2,125 completed epochs behind the head needs a
+	// little more than 68,000 blocks. A fixed 65,536-block budget covers only
+	// 2,048 every-slot epochs and would stop before the source root.
+	const currentEpoch = uint64(5000)
+	const oldestEpoch = uint64(2875)
+	const expectedWalk = uint64(2126*consensus.SlotsPerEpoch + 1)
+
+	if got := r101BackfillMaxWalkFor(currentEpoch, oldestEpoch); got != expectedWalk {
+		t.Fatalf("r101BackfillMaxWalkFor(%d, %d) = %d, want %d",
+			currentEpoch, oldestEpoch, got, expectedWalk)
+	}
+	if got := r101BackfillMaxWalkFor(100, 96); got != r101BackfillMaxWalk {
+		t.Fatalf("r101BackfillMaxWalkFor(100, 96) = %d, want baseline %d", got, r101BackfillMaxWalk)
+	}
+}
+
 func TestR101_BackfillNoQPOS(t *testing.T) {
 	bs := block.NewBlockStore(db.NewMemDB())
 	s := NewSyncer(nil, bs, nil, nil, 1668)

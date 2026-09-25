@@ -403,6 +403,12 @@ type QPOS struct {
 	justifiedEpoch uint64
 	justifiedRoot  types.Hash
 
+	// R107-FINALITY-PERSIST: optional durable checkpoint callback. The
+	// consensus package stays storage-agnostic; node wiring persists the
+	// current checkpoint and restores it before live attestation processing.
+	finalityPersist        func(justifiedEpoch, finalizedEpoch uint64, justifiedRoot, finalizedRoot types.Hash) error
+	finalityPersistPending bool
+
 	// Epoch block roots for Casper FFG finality
 	epochBlockRoots map[uint64]types.Hash // epoch -> block root
 

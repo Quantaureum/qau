@@ -26,14 +26,18 @@ import (
 // walking backwards and keeping the earliest-seen block per epoch is exact.
 
 const (
-	// r101BackfillEpochDepth: how many COMPLETED epochs behind the head to
-	// reconstruct. 4 covers the ratchet's needs (justified source is within
-	// the last 2-3 epochs in any healthy or stuck scenario reachable today).
-	r101BackfillEpochDepth = 4
-	// r101BackfillMaxWalk bounds the backward scan (blocks). 8 epochs of
-	// every-slot blocks = 8*32; a partial walk still yields the deepest
-	// epochs first-incomplete, which is harmless (best-effort).
-	r101BackfillMaxWalk = 512
+	// r101BackfillHealthyEpochDepth is the normal completed-epoch window when
+	// the live checkpoint roots are already known. Keeping this small avoids
+	// repeatedly walking thousands of historical blocks on healthy nodes.
+	r101BackfillHealthyEpochDepth = 4
+	// r101BackfillEpochDepth is the emergency window when a checkpoint root is
+	// missing. r101BackfillOldestEpoch extends it to the persisted checkpoint
+	// when that checkpoint is older, so a long finality stall is recoverable.
+	r101BackfillEpochDepth = 2048
+	// r101BackfillMaxWalk is the normal backward block-scan budget. The
+	// effective budget is raised to cover any dynamically extended epoch
+	// window; a partial walk remains best-effort.
+	r101BackfillMaxWalk = 65536
 )
 
 // maybeBackfillEpochRootsLocked is the checkSync entry point. No-op when:
@@ -64,20 +68,29 @@ func (s *Syncer) maybeBackfillEpochRootsLocked() {
 }
 
 // reconstructEpochRoots walks backwards from head and derives the boundary
-// root of each completed epoch in [cur-depth, cur-1]. Best-effort: gaps or a
-// truncated walk simply return fewer entries.
+// root of each completed epoch in the dynamically selected recovery window.
+// Best-effort: gaps or a truncated walk simply return fewer entries.
 func (s *Syncer) reconstructEpochRoots(head *encoding.Block) map[uint64]types.Hash {
 	cur := head.Header.Epoch
-	oldest := uint64(0)
-	if cur >= r101BackfillEpochDepth {
-		oldest = cur - r101BackfillEpochDepth
+	justifiedEpoch := s.qpos.GetJustifiedEpoch()
+	finalizedEpoch := s.qpos.GetFinalizedEpoch()
+	checkpointRootsKnown := justifiedEpoch == 0 || s.qpos.HasEpochRoot(justifiedEpoch)
+	if finalizedEpoch > 0 && !s.qpos.HasEpochRoot(finalizedEpoch) {
+		checkpointRootsKnown = false
 	}
+	oldest := r101BackfillOldestEpoch(
+		cur,
+		justifiedEpoch,
+		finalizedEpoch,
+		checkpointRootsKnown,
+	)
 
 	// firstBlock[e] = the lowest-height block seen for epoch e (i.e. the
 	// epoch's first block) — walking downward, overwrite on every sighting.
 	firstBlock := make(map[uint64]*encoding.BlockHeader)
 	h := head.Header.Height
-	walked := 0
+	walked := uint64(0)
+	maxWalk := r101BackfillMaxWalkFor(cur, oldest)
 	for {
 		blk, err := s.blockStore.GetBlockByHeight(h)
 		if err != nil || blk == nil || blk.Header == nil {
@@ -89,7 +102,7 @@ func (s *Syncer) reconstructEpochRoots(head *encoding.Block) map[uint64]types.Ha
 		}
 		firstBlock[e] = blk.Header
 		walked++
-		if walked >= r101BackfillMaxWalk || h == 0 {
+		if walked >= maxWalk || h == 0 {
 			break
 		}
 		h--
@@ -107,4 +120,57 @@ func (s *Syncer) reconstructEpochRoots(head *encoding.Block) map[uint64]types.Ha
 		}
 	}
 	return roots
+}
+
+// r101BackfillOldestEpoch returns the oldest completed epoch the node must
+// reconstruct. The normal depth is a baseline, not a ceiling: a finality stall
+// can leave justifiedEpoch thousands of epochs behind the head, and source
+// attestations remain fail-closed until that epoch's canonical root is known.
+// The finalized checkpoint is included as well because the QPOS finality ratchet
+// may consult it while recovering.
+func r101BackfillOldestEpoch(
+	currentEpoch uint64,
+	justifiedEpoch uint64,
+	finalizedEpoch uint64,
+	checkpointRootsKnown bool,
+) uint64 {
+	oldest := uint64(0)
+	if checkpointRootsKnown {
+		if currentEpoch >= r101BackfillHealthyEpochDepth {
+			oldest = currentEpoch - r101BackfillHealthyEpochDepth
+		}
+		return oldest
+	}
+	if currentEpoch >= r101BackfillEpochDepth {
+		oldest = currentEpoch - r101BackfillEpochDepth
+	}
+
+	checkpointOldest := justifiedEpoch
+	if finalizedEpoch > 0 && finalizedEpoch < checkpointOldest {
+		checkpointOldest = finalizedEpoch
+	}
+	if checkpointOldest > 0 && checkpointOldest < oldest {
+		oldest = checkpointOldest
+	}
+	return oldest
+}
+
+// r101BackfillMaxWalkFor raises the walk cap when the computed epoch window is
+// wider than the normal baseline. It adds one epoch of cushion for a missed
+// boundary and one block for genesis. The multiplication is checked before use
+// so an untrusted or corrupt epoch value cannot wrap the limit downward.
+func r101BackfillMaxWalkFor(currentEpoch, oldestEpoch uint64) uint64 {
+	baseline := uint64(r101BackfillMaxWalk)
+	if currentEpoch <= oldestEpoch {
+		return baseline
+	}
+	spanEpochs := currentEpoch - oldestEpoch + 1
+	if spanEpochs > ^uint64(0)/consensus.SlotsPerEpoch {
+		return ^uint64(0)
+	}
+	required := spanEpochs*consensus.SlotsPerEpoch + 1
+	if required > baseline {
+		return required
+	}
+	return baseline
 }
