@@ -1,4 +1,7 @@
-* text=auto
+# Normalize text files to LF on every checkout, independently of the
+# contributor's core.autocrlf setting. Go tooling (gofmt) and CI assume LF;
+# a CRLF worktree makes gofmt report the whole tree as unformatted.
+* text=auto eol=lf
 
 *.wasm binary
 *.png binary
