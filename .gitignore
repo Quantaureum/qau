@@ -42,3 +42,9 @@ coverage/
 coverage.xml
 *.prof
 *.pprof
+
+# Local-only scratch and tooling (never commit)
+# .local-only/ holds local ops scripts, private notes and device-specific
+# artifacts; .pi-glla/ is a local agent tooling directory. Neither is source.
+.local-only/
+.pi-glla/
