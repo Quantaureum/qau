@@ -11,6 +11,7 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/core"
+	"github.com/quantaureum/qau/params"
 )
 
 // networkBootnodes holds the canonical bootnode enode URLs for each named
@@ -19,15 +20,9 @@ import (
 // go-ethereum's params/bootnodes.go MainnetBootnodes). Entries MUST be
 // neutral host identifiers (dedicated seed endpoints), never internal
 // topology names.
-// networkBootnodes holds the canonical bootnode enode URLs for each named
-// network. These are the public, long-lived endpoints a fresh node dials
-// when no --bootnodes flag or config entry is provided (same role as
-// go-ethereum's params/bootnodes.go MainnetBootnodes). Entries MUST be
-// neutral host identifiers (dedicated seed endpoints), never internal
-// topology names.
 var networkBootnodes = map[string][]string{
-	NetworkMainnet: mainnetBootnodes,
-	NetworkTestnet: testnetBootnodes,
+	NetworkMainnet: params.MainnetBootnodes,
+	NetworkTestnet: params.TestnetBootnodes,
 	NetworkDev:     nil,
 }
 
@@ -570,6 +565,13 @@ const (
 	MainnetNetworkID = 1668 // Quantaureum Mainnet
 	TestnetNetworkID = 1669 // Quantaureum Testnet
 	DevnetNetworkID  = 1333 // Development network
+
+	// devnetThresholdSharePassword is the deterministic development password
+	// used to encrypt threshold shares on devnet (networkId=1333) when no
+	// operator password is configured. Mirrors the DevMode deterministic seed
+	// convention (QUANTAUREUM-DEV-*): devnet secrets have no value.
+	// DEVNET ONLY — mainnet/testnet always require an explicit operator password.
+	devnetThresholdSharePassword = "QUANTAUREUM-DEV-THRESHOLD-SHARE-PASSWORD"
 )
 
 // DefaultConfig returns the default node configuration (Production mode)
@@ -724,9 +726,8 @@ func TestnetConfig() *Config {
 	cfg.NetworkID = TestnetNetworkID
 	// TSS-/ (2026-07-16): Testnet allows trusted dealer DKG and
 	// local mode multi-share for testing (hard guards are mainnet-only).
-	cfg.TSSThreshold = 3
-	cfg.TSSTotalShares = 4
-	cfg.TSSDistributedMode = false
+	cfg.TSSThreshold = 2
+	cfg.TSSTotalShares = 3
 	return cfg
 }
 
@@ -763,6 +764,17 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.ValidatorKeyPassword = envPass
 	}
 
+	// DevNet fallback: local development networks (networkId=1333) use a
+	// deterministic development password for threshold share encryption when
+	// no operator password is configured. Mirrors the DevMode deterministic
+	// seed convention (QUANTAUREUM-DEV-*): devnet secrets have no value and
+	// the convenience avoids blocking DKG on missing passwords. Mainnet and
+	// testnet always require an explicit operator password — this branch never
+	// fires there because DevnetNetworkID is the only devnet id.
+	if cfg.NetworkID == DevnetNetworkID && cfg.ValidatorKeyPassword == "" {
+		cfg.ValidatorKeyPassword = devnetThresholdSharePassword
+	}
+
 	// HIGH-012 FIX: QAU_VALIDATOR_KEY env var takes precedence for the key path itself.
 	if envKey := os.Getenv("QAU_VALIDATOR_KEY"); envKey != "" {
 		cfg.ValidatorKey = envKey
@@ -776,29 +788,17 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ResolveNetworkConfig resolves network-specific settings from the Network field.
-// Named public networks use their production settings, while the dev preset
-// enables local development behavior. Explicit genesis files still take precedence.
+// When Network is set to "dev", "testnet", or "mainnet", it automatically configures
+// genesisFile, devMode, and blockInterval. Explicit settings in config file take precedence.
 func ResolveNetworkConfig(cfg *Config) {
-	if cfg == nil {
-		return
-	}
-	if preset, ok := NetworkPresetByName(cfg.Network); ok {
-		cfg.Network = preset.Name
-		if len(cfg.BootstrapPeers) == 0 && len(preset.DefaultBootnodes) > 0 {
-			cfg.BootstrapPeers = append([]string(nil), preset.DefaultBootnodes...)
-		}
-	}
-	if cfg.GenesisFile == "" {
-		// An explicit file always wins. The environment variable is an operator
-		// override; named public networks do not require a runtime JSON file.
-		if path := os.Getenv("QAU_GENESIS_FILE"); path != "" {
-			cfg.GenesisFile = path
-		}
-	}
-
 	switch cfg.Network {
 	case NetworkDev:
-		applyPresetNetworkID(cfg, DevnetNetworkID)
+		if cfg.GenesisFile == "" {
+			// P3-NODE-03 FIX (R30, 2026-07-27): resolve genesis path from
+			// QAU_GENESIS_FILE env var so the node does not depend on CWD.
+			cfg.GenesisFile = resolvePathEnv("QAU_GENESIS_FILE", "genesis/dev.json")
+		}
+		cfg.NetworkID = 1333
 		cfg.DevMode = true
 		cfg.DevBlocks = true
 		if cfg.BlockInterval == 0 {
@@ -807,38 +807,47 @@ func ResolveNetworkConfig(cfg *Config) {
 		cfg.DevAutoUnlockAccounts = true
 		cfg.LogLevel = "debug"
 	case NetworkTestnet:
-		applyPresetNetworkID(cfg, TestnetNetworkID)
-		// Public testnet follows the same consensus path as mainnet. DevMode
-		// injects development accounts and bypasses signature verification,
-		// so it is reserved for the local dev preset only.
+		if cfg.GenesisFile == "" {
+			// P3-NODE-03 FIX (R30, 2026-07-27): resolve genesis path from env.
+			cfg.GenesisFile = resolvePathEnv("QAU_GENESIS_FILE", "genesis/testnet.json")
+		}
+		cfg.NetworkID = 1669
+		// SECURITY (audit 2026-06-14, M6): Testnet enables DevMode (fast
+		// blocks, reduced PoW) but must NOT auto-unlock accounts. The previous
+		// code set DevAutoUnlockAccounts=true unconditionally, which on a
+		// publicly reachable testnet would let anyone spend unlocked accounts
+		// (auto-unlock keeps keys in memory without a password). DevMode alone
+		// is sufficient for testnet semantics. Only NetworkDev (local, trusted)
+		// enables auto-unlock.
+		cfg.DevMode = true
+		cfg.DevBlocks = true
 		if cfg.BlockInterval == 0 {
-			cfg.BlockInterval = 12
+			cfg.BlockInterval = 5
 		}
 		if cfg.LogLevel == "" {
 			cfg.LogLevel = "debug"
 		}
-		if cfg.ExpectedGenesisHash == "" {
-			cfg.ExpectedGenesisHash = TestnetGenesisHash
-		}
+		fmt.Fprintln(os.Stderr, "[SECURITY-WARN] testnet network selected: DevMode enabled (fast blocks). "+
+			"DevAutoUnlockAccounts is intentionally NOT enabled; unlock accounts explicitly with a password.")
 	case NetworkMainnet:
-		applyPresetNetworkID(cfg, MainnetNetworkID)
-		if cfg.ExpectedGenesisHash == "" {
-			cfg.ExpectedGenesisHash = MainnetGenesisHash
+		if cfg.GenesisFile == "" {
+			// P3-NODE-03 FIX (R30, 2026-07-27): resolve genesis path from env.
+			cfg.GenesisFile = resolvePathEnv("QAU_GENESIS_FILE", "genesis/mainnet.json")
+			//  NOTE: In genesis/mainnet.json, each validator has a "stake"
+			// of 30000 QAU (30000 * 10^18) but the corresponding alloc "balance"
+			// is 32000 QAU (32000 * 10^18). The 2000 QAU difference per validator
+			// is an intentional gas fee buffer: validators need a non-staked
+			// balance to pay for transaction gas (consensus transactions,
+			// slashing evidence submission, etc.) since staked QAU is locked and
+			// cannot be used for gas. This discrepancy is by design, not a bug.
 		}
+		cfg.NetworkID = 1668
 	}
 	// Fallback to the canonical network bootnodes when the operator did not
 	// supply any bootstrap peers (flag or config). Explicit peers always win;
 	// this only fills the zero value, mirroring go-ethereum's behaviour.
 	if len(cfg.BootstrapPeers) == 0 {
 		cfg.BootstrapPeers = networkBootnodes[string(cfg.Network)]
-	}
-}
-
-func applyPresetNetworkID(cfg *Config, networkID uint64) {
-	// DefaultConfig starts with the mainnet ID. Preserve any other explicit ID
-	// so Config.Validate can report the disagreement instead of hiding it.
-	if cfg.NetworkID == 0 || cfg.NetworkID == MainnetNetworkID {
-		cfg.NetworkID = networkID
 	}
 }
 
@@ -860,23 +869,11 @@ func (c *Config) SaveConfig(path string) error {
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
-	if c.Network != "" {
-		preset, ok := NetworkPresetByName(c.Network)
-		if !ok {
-			return fmt.Errorf("unknown network %q (valid values: dev, testnet, mainnet)", c.Network)
-		}
-		if c.NetworkID != 0 && c.NetworkID != preset.NetworkID {
-			return fmt.Errorf("network %q requires networkId %d, got %d", preset.Name, preset.NetworkID, c.NetworkID)
-		}
-	}
-
-	if preset, ok := NetworkPresetByName(c.Network); ok && preset.HasBuiltInGenesis {
-		if c.DevMode {
-			return fmt.Errorf("devMode must not be enabled on %s (networkId=%d)", preset.Name, c.NetworkID)
-		}
-		if c.DevBlocks {
-			return fmt.Errorf("devBlocks must not be enabled on %s (networkId=%d)", preset.Name, c.NetworkID)
-		}
+	// audit-fix H-1: reject devMode on mainnet to prevent
+	// accidental deployment with development settings.
+	// Testnet allows devMode for local development/testing convenience.
+	if c.DevMode && c.NetworkID == MainnetNetworkID {
+		return fmt.Errorf("devMode must not be enabled on mainnet (networkId=%d)", c.NetworkID)
 	}
 
 	// AUDIT (2026) DA-FIX (CRITICAL): Mainnet hard guard for DA.
@@ -899,15 +896,20 @@ func (c *Config) Validate() error {
 	}
 
 	// Task 5 (TSSDistributedDKG): mainnet hard guard — runtime distributed
-	// DKG is permanently disabled on mainnet. Even multi-party DKG exchanges
-	// sensitive Shamir material over P2P; mainnet validators MUST import
-	// pre-generated encrypted shares (tssKeyShareFile) from an offline key
-	// ceremony. The switch defaults to OFF; enabling it on mainnet is a
-	// code-level fail-closed error, not just documentation.
-	if c.NetworkID == MainnetNetworkID && c.TSSDistributedDKG {
+	// DKG is disabled on mainnet unless the operator has explicitly
+	// acknowledged the Dilithium3 v1 mainnet activation. Even multi-party
+	// DKG exchanges threshold material over P2P; without the v1 path's
+	// roster-bound authenticated envelopes and genesis-anchored session
+	// derivation, mainnet validators MUST import pre-generated encrypted
+	// shares (tssKeyShareFile) from an offline key ceremony. The switch
+	// defaults to OFF; enabling it on mainnet is a code-level fail-closed
+	// error without QAU_ENABLE_TDILITHIUM3_V1_MAINNET=1.
+	if c.NetworkID == MainnetNetworkID && c.TSSDistributedDKG &&
+		!experimentalTDilithium3V1EnabledForNetwork(c.NetworkID) {
 		return fmt.Errorf("tssDistributedDKG must not be enabled on mainnet (networkId=%d): "+
-			"runtime distributed DKG is permanently disabled on mainnet; validators must import "+
-			"pre-generated encrypted shares (tssKeyShareFile) from an offline key ceremony",
+			"runtime distributed DKG is disabled on mainnet without the Dilithium3 v1 "+
+			"mainnet acknowledgement; validators must import pre-generated encrypted "+
+			"shares (tssKeyShareFile) from an offline key ceremony",
 			c.NetworkID)
 	}
 
@@ -969,26 +971,30 @@ func (c *Config) Validate() error {
 	// shares and can produce valid group signatures without threshold
 	// cooperation.
 	//
-	// On mainnet, multi-share threshold signing MUST use TSSDistributedMode=true
-	// (P2P multi-party signing). The single-share degenerate case
-	// (TotalShares == 1) is permitted because it is honest about being
-	// single-signer.
+	// On mainnet, this local all-shares mode is refused. The single-share
+	// degenerate case (TotalShares == 1) is permitted because it is honest about
+	// being single-signer.
+	//
+	// TSSDistributedMode=true is NOT offered as the way out: distributed P2P
+	// signing is permanently disabled (see distributedTSSEnabled in
+	// node/adapters.go), because the QTD aggregator would recover s1. Mainnet
+	// therefore has no supported multi-party sealing configuration yet; the
+	// honest options are tssTotalShares=1, or waiting for the protocol redesign.
 	//
 	// Test networks and dev nets may use local mode for development
 	// convenience by setting QAU_ALLOW_UNSAFE_LOCAL_TSS=1 in the environment.
-	// This mirrors the QAU_ENABLE_DISTRIBUTED_TSS / QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS
-	// two-key gate pattern used for the distributed TSS kill-switch.
 	if c.NetworkID == MainnetNetworkID &&
 		!c.TSSDistributedMode &&
 		c.TSSTotalShares > 1 {
 		// Allow explicit operator override ONLY when they acknowledge the risk.
 		// This is a defense-in-depth escape hatch, not a production setting.
 		if os.Getenv("QAU_ALLOW_UNSAFE_LOCAL_TSS") != "1" {
-			return fmt.Errorf("TSS- mainnet (networkId=%d) must not run TSS in local "+
+			return fmt.Errorf("TSS-R3-B-1 mainnet (networkId=%d) must not run TSS in local "+
 				"single-node-all-shares mode with tssTotalShares=%d > 1: this provides no "+
-				"threshold security (equivalent to single-key signing). Set tssDistributedMode=true "+
-				"in config for P2P multi-party threshold signing, or set tssTotalShares=1 if "+
-				"single-signer mode is intentional. For non-mainnet testing, set QAU_ALLOW_UNSAFE_LOCAL_TSS=1.",
+				"threshold security (equivalent to single-key signing). Set tssTotalShares=1 if "+
+				"single-signer mode is intentional; tssDistributedMode=true does not help, because "+
+				"distributed P2P signing is permanently disabled pending the QTD protocol redesign. "+
+				"For non-mainnet testing, set QAU_ALLOW_UNSAFE_LOCAL_TSS=1.",
 				c.NetworkID, c.TSSTotalShares)
 		}
 		// Operator explicitly acknowledged the risk — log at WARN level via

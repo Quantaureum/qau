@@ -57,7 +57,7 @@ This is the recommended way to set up validator keys after a chain reset,
 ensuring the validator address matches the genesis configuration.
 
 Example:
-  qauctl validator deploy /path/to/validator1.key validator.example.invalid \
+  qauctl validator deploy /path/to/validator1.key 203.0.113.1 \
     --ssh-key ~/.ssh/id_ed25519 \
     --remote-path /var/lib/quantaureum/validator.key \
     --restart`,

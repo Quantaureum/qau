@@ -2,7 +2,9 @@
 package tss
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 
 	"github.com/quantaureum/qau/wallet/tss/qtd"
@@ -34,10 +36,12 @@ type DKGTransport interface {
 	SendCommitment(peerID int, msg *qtd.Round1CommitmentMessage) error
 	// SendShare sends the Round1OpenMessage (containing the recipient's dedicated share) to peerID.
 	SendShare(peerID int, msg *qtd.Round1OpenMessage) error
-	// WaitCommitments blocks until all total-1 commitments from others have arrived.
-	WaitCommitments(total int) (map[int]*qtd.Round1CommitmentMessage, error)
-	// WaitShares blocks until all total-1 share messages from others have arrived.
-	WaitShares(total int) (map[int]*qtd.Round1OpenMessage, error)
+	// WaitCommitments blocks until all total-1 commitments from others have
+	// arrived, the wait times out, or ctx is cancelled (whichever comes first).
+	WaitCommitments(ctx context.Context, total int) (map[int]*qtd.Round1CommitmentMessage, error)
+	// WaitShares blocks until all total-1 share messages from others have
+	// arrived, the wait times out, or ctx is cancelled (whichever comes first).
+	WaitShares(ctx context.Context, total int) (map[int]*qtd.Round1OpenMessage, error)
 }
 
 // SetDKGTransport injects the cross-party DKG message transport (nil by default). In distributed-DKG mode
@@ -73,11 +77,30 @@ func (m *TSSManager) SetDKGTransport(t DKGTransport) {
 //	→ Finalize() produces the DKGResult
 //
 // REQUIRES dkgTransport to be injected; otherwise returns a clear error saying to inject a DKGTransport.
-func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+//
+// ctx bounds the network waits: when it is cancelled (e.g. the node layer's
+// per-attempt round-window deadline elapses), WaitCommitments/WaitShares return
+// promptly so this function returns and releases m.mu instead of leaking a
+// goroutine that holds the manager lock and wedges the next attempt (TSS-R7-12).
+// ErrDKGInProgress is returned when a distributed DKG round is already
+// running on this manager. A round does not hold m.mu while it waits on the
+// network, so this flag is what serializes overlapping rounds.
+var ErrDKGInProgress = errors.New("tss: a distributed DKG round is already in progress")
 
+func (m *TSSManager) generateKeySharesDistributed(ctx context.Context) ([]*KeyShare, error) {
+	// LOCK DISCIPLINE (2026-09): snapshot the round inputs under m.mu, then
+	// release the lock for the whole multi-round protocol. The rounds block on
+	// the network for up to a full round window and call back into the node
+	// layer (peer resolution, P2P sends). Holding m.mu across those calls
+	// inverted the lock order against consensus: QPOS.GetGroupPublicKey held
+	// qpos.mu while calling TSSManager.GroupPublicKey (m.mu), and this round
+	// held m.mu while resolving peers through QPOS.GetValidatorSet (qpos.mu).
+	// With a writer queued on qpos.mu the cycle closed and the node
+	// deadlocked: RPC, block validation and the TSS message loop all wait on
+	// one of the two locks. The lock is re-acquired only to install the result.
+	m.mu.Lock()
 	if m.config.Threshold < 2 {
+		m.mu.Unlock()
 		return nil, fmt.Errorf(
 			"TSS-R6-01: distributed DKG (the default path) requires threshold >= 2 "+
 				"for security (got %d). With threshold=1, a single share contains the "+
@@ -88,6 +111,7 @@ func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
 	}
 
 	if len(m.config.Seed) > 0 {
+		m.mu.Unlock()
 		return nil, fmt.Errorf(
 			"TSS-R6-01: distributed DKG (the default path) does not support " +
 				"deterministic seed input. The whole point of distributed DKG is that " +
@@ -97,6 +121,7 @@ func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
 	}
 
 	if m.dkgTransport == nil {
+		m.mu.Unlock()
 		return nil, fmt.Errorf(
 			"TSS-R7-07: a DistributedDKGRunner is injected but no DKGTransport is " +
 				"injected via SetDKGTransport. Distributed DKG requires BOTH a runner " +
@@ -105,75 +130,29 @@ func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
 				"before calling GenerateKeyShares.")
 	}
 
+	if m.dkgInProgress {
+		m.mu.Unlock()
+		return nil, ErrDKGInProgress
+	}
+	m.dkgInProgress = true
 	threshold := m.config.Threshold
 	total := m.config.TotalShares
-	myPid := m.dkgTransport.ParticipantID()
+	runner := m.dkgRunner
+	transport := m.dkgTransport
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.dkgInProgress = false
+		m.mu.Unlock()
+	}()
 
-	// Round 1: sample local secrets and broadcast the commitment (self-delivery follows the same path).
-	myCommitment, err := m.dkgRunner.InitiateRound1(myPid, threshold, total)
+	res, err := runDistributedDKGRounds(ctx, runner, transport, threshold, total)
 	if err != nil {
-		return nil, fmt.Errorf("distributed DKG round1: %w", err)
-	}
-	for peer := 1; peer <= total; peer++ {
-		if peer == myPid {
-			continue
-		}
-		if err := m.dkgTransport.SendCommitment(peer, myCommitment); err != nil {
-			return nil, fmt.Errorf("distributed DKG: send commitment to pid %d: %w", peer, err)
-		}
-	}
-	othersCommitments, err := m.dkgTransport.WaitCommitments(total)
-	if err != nil {
-		return nil, fmt.Errorf("distributed DKG round1: %w", err)
-	}
-	if err := m.dkgRunner.SubmitCommitment(myCommitment); err != nil {
-		return nil, fmt.Errorf("distributed DKG: submit self commitment: %w", err)
-	}
-	for pid, msg := range othersCommitments {
-		if err := m.dkgRunner.SubmitCommitment(msg); err != nil {
-			return nil, fmt.Errorf("distributed DKG: submit commitment from pid %d: %w", pid, err)
-		}
-		if err := m.dkgRunner.VerifyCommitment(msg); err != nil {
-			return nil, fmt.Errorf("distributed DKG: verify commitment from pid %d: %w", pid, err)
-		}
+		return nil, err
 	}
 
-	// Round 2: open the commitment and deliver each recipient's share via the transport.
-	opens, err := m.dkgRunner.InitiateRound2()
-	if err != nil {
-		return nil, fmt.Errorf("distributed DKG round2: %w", err)
-	}
-	for recipient, msg := range opens {
-		if recipient == myPid {
-			continue
-		}
-		if err := m.dkgTransport.SendShare(recipient, msg); err != nil {
-			return nil, fmt.Errorf("distributed DKG: send share to pid %d: %w", recipient, err)
-		}
-	}
-	othersShares, err := m.dkgTransport.WaitShares(total)
-	if err != nil {
-		return nil, fmt.Errorf("distributed DKG round2: %w", err)
-	}
-	if selfOpen, ok := opens[myPid]; ok {
-		if err := m.dkgRunner.SubmitShare(selfOpen); err != nil {
-			return nil, fmt.Errorf("distributed DKG: submit self share: %w", err)
-		}
-	}
-	for pid, msg := range othersShares {
-		if err := m.dkgRunner.SubmitShare(msg); err != nil {
-			return nil, fmt.Errorf("distributed DKG: submit share from pid %d: %w", pid, err)
-		}
-	}
-
-	// Finalize: aggregate shares into this party's global share and the group public key.
-	res, err := m.dkgRunner.Finalize()
-	if err != nil {
-		return nil, fmt.Errorf("distributed DKG finalize: %w", err)
-	}
-	if res == nil || res.GroupPublicKey == nil || res.MyShare == nil {
-		return nil, fmt.Errorf("distributed DKG finalize: nil result from runner")
-	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	m.qtdPubKey = res.GroupPublicKey
 	m.groupPubKey = make([]byte, len(res.GroupPublicKey.PubKey))
@@ -183,6 +162,10 @@ func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
 	pid := res.MyShare.ParticipantID
 	m.qtdShares = make(map[int]*qtd.QTDShare, 1)
 	m.qtdShares[pid] = res.MyShare
+	m.participantIDs = make([]int, total)
+	for i := range m.participantIDs {
+		m.participantIDs[i] = i + 1
+	}
 	h := sha256.Sum256(res.MyShare.S1ShareBytes)
 	m.shareCommitments = make(map[int][]byte, 1)
 	m.shareCommitments[pid] = h[:]
@@ -195,4 +178,78 @@ func (m *TSSManager) generateKeySharesDistributed() ([]*KeyShare, error) {
 		PublicKey:          m.groupPubKey,
 		VerificationVector: res.MyShare.VVector,
 	}}, nil
+}
+
+// runDistributedDKGRounds drives one complete distributed DKG instance over
+// the given runner and transport. It touches no TSSManager state, so the
+// caller can run it without holding the manager lock.
+func runDistributedDKGRounds(ctx context.Context, runner qtd.DistributedDKGRunner, transport DKGTransport, threshold, total int) (*qtd.DKGResult, error) {
+	myPid := transport.ParticipantID()
+
+	// Round 1: sample local secrets and broadcast the commitment (self-delivery follows the same path).
+	myCommitment, err := runner.InitiateRound1(myPid, threshold, total)
+	if err != nil {
+		return nil, fmt.Errorf("distributed DKG round1: %w", err)
+	}
+	for peer := 1; peer <= total; peer++ {
+		if peer == myPid {
+			continue
+		}
+		if err := transport.SendCommitment(peer, myCommitment); err != nil {
+			return nil, fmt.Errorf("distributed DKG: send commitment to pid %d: %w", peer, err)
+		}
+	}
+	othersCommitments, err := transport.WaitCommitments(ctx, total)
+	if err != nil {
+		return nil, fmt.Errorf("distributed DKG round1: %w", err)
+	}
+	if err := runner.SubmitCommitment(myCommitment); err != nil {
+		return nil, fmt.Errorf("distributed DKG: submit self commitment: %w", err)
+	}
+	for pid, msg := range othersCommitments {
+		if err := runner.SubmitCommitment(msg); err != nil {
+			return nil, fmt.Errorf("distributed DKG: submit commitment from pid %d: %w", pid, err)
+		}
+		if err := runner.VerifyCommitment(msg); err != nil {
+			return nil, fmt.Errorf("distributed DKG: verify commitment from pid %d: %w", pid, err)
+		}
+	}
+
+	// Round 2: open the commitment and deliver each recipient's share via the transport.
+	opens, err := runner.InitiateRound2()
+	if err != nil {
+		return nil, fmt.Errorf("distributed DKG round2: %w", err)
+	}
+	for recipient, msg := range opens {
+		if recipient == myPid {
+			continue
+		}
+		if err := transport.SendShare(recipient, msg); err != nil {
+			return nil, fmt.Errorf("distributed DKG: send share to pid %d: %w", recipient, err)
+		}
+	}
+	othersShares, err := transport.WaitShares(ctx, total)
+	if err != nil {
+		return nil, fmt.Errorf("distributed DKG round2: %w", err)
+	}
+	if selfOpen, ok := opens[myPid]; ok {
+		if err := runner.SubmitShare(selfOpen); err != nil {
+			return nil, fmt.Errorf("distributed DKG: submit self share: %w", err)
+		}
+	}
+	for pid, msg := range othersShares {
+		if err := runner.SubmitShare(msg); err != nil {
+			return nil, fmt.Errorf("distributed DKG: submit share from pid %d: %w", pid, err)
+		}
+	}
+
+	// Finalize: aggregate shares into this party's global share and the group public key.
+	res, err := runner.Finalize()
+	if err != nil {
+		return nil, fmt.Errorf("distributed DKG finalize: %w", err)
+	}
+	if res == nil || res.GroupPublicKey == nil || res.MyShare == nil {
+		return nil, fmt.Errorf("distributed DKG finalize: nil result from runner")
+	}
+	return res, nil
 }

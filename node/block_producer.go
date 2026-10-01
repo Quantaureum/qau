@@ -93,8 +93,9 @@ type BlockProducer struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	running bool
+	mu       sync.Mutex
+	attestMu sync.Mutex
+	running  bool
 
 	livenessMu         sync.RWMutex
 	lastProducedHeight map[types.Address]uint64
@@ -134,6 +135,78 @@ type BlockProducer struct {
 // QPOS returns the QPOS consensus engine
 func (bp *BlockProducer) QPOS() *consensus.QPOS {
 	return bp.qpos
+}
+
+func (bp *BlockProducer) onCanonicalBlockImported(header *encoding.BlockHeader) {
+	if bp == nil || bp.qpos == nil || header == nil {
+		return
+	}
+	root, known := bp.qpos.GetSlotBlockRoot(header.Slot)
+	if !known || root != block.ComputeBlockHash(header) {
+		return
+	}
+	if bp.threeChambersFlow != nil {
+		validators := bp.qpos.GetValidatorSet()
+		if validators == nil {
+			return
+		}
+		proposerIndex := validators.GetValidatorIndex(header.ProposerAddr)
+		if proposerIndex < 0 {
+			return
+		}
+		if bp.threeChambersFlow.GetLifecycle(header.Slot) == nil {
+			if err := bp.threeChambersFlow.ProposeBlock(header.Slot, root, proposerIndex); err != nil {
+				bpLog.Debug("Imported block review registration failed for slot %d: %v", header.Slot, err)
+				return
+			}
+		}
+	}
+	currentSlot := bp.qpos.GetCurrentSlot()
+	if header.Slot <= currentSlot && currentSlot-header.Slot <= 1 {
+		bp.tryAttest(header.Slot)
+	}
+}
+
+// ensureEpochStateForBlock backfills the epoch root and starts the executive
+// transition when the first canonical block of an epoch arrives after the
+// boundary slot was missed. Assigned committees make repeated blocks a no-op.
+func (bp *BlockProducer) ensureEpochStateForBlock(header *encoding.BlockHeader) {
+	if bp == nil || bp.qpos == nil || header == nil {
+		return
+	}
+
+	bp.qpos.EnsureEpochBlockRoot(header.Epoch, header.ParentHash)
+	coordinator := bp.qpos.GetChambersCoordinator()
+	if coordinator == nil {
+		return
+	}
+	executive := coordinator.GetExecutiveChamber()
+	if executive == nil {
+		return
+	}
+	executiveEpoch := executive.Epoch()
+	if executiveEpoch > header.Epoch || (executiveEpoch == header.Epoch && len(executive.Members()) > 0) {
+		return
+	}
+	validatorSet := bp.qpos.GetValidatorSet()
+	if validatorSet == nil {
+		return
+	}
+	// Dilithium3 v1 CNF-RSS: while the experimental gates are open on a
+	// non-mainnet network the v1 ceremony owns the executive-chamber activation
+	// for this epoch, so the legacy TSS group key must not be handed to the
+	// transition. Activating the chamber with it would satisfy
+	// CompleteDKGViaDistributedRunner's IsActive() early return and leave the v1
+	// ceremony unreachable (see tdilithium3V1OwnsExecutiveActivation). A nil key
+	// leaves the chamber in DKGRunning with its members selected, which is the
+	// state the v1 ceremony activates from.
+	groupPublicKey := bp.qpos.GetGroupPublicKey()
+	if bp.node != nil && bp.node.tdilithium3V1OwnsExecutiveActivation() {
+		groupPublicKey = nil
+	}
+	if err := coordinator.TransitionExecutiveForEpoch(header.Epoch, validatorSet, groupPublicKey); err != nil {
+		bpLog.Warn("Executive chamber transition failed for epoch %d: %v", header.Epoch, err)
+	}
 }
 
 // ThreeChambersFlow returns the persistent ThreeChambersFlow instance.
@@ -662,6 +735,7 @@ func (bp *BlockProducer) initValidatorSet() {
 	// raw-blockHash verification, preserving backward compatibility.
 	if qfs := qpos.GetQTDFinality(); qfs != nil {
 		qfs.SetChainID(bp.node.chainID)
+		qfs.SetSealAnnouncer(bp.node)
 		bpLog.Info("QTD domain separation: chainID injected (chainID=%d)", bp.node.chainID)
 	}
 
@@ -972,9 +1046,23 @@ func (bp *BlockProducer) produceLoop() {
 					// using the local TSSManager's group public key. This handles the
 					// common case where TSSManager finishes key generation slightly
 					// after the epoch transition.
-					if groupKey := bp.qpos.GetGroupPublicKey(); len(groupKey) > 0 {
-						if coordinator.TriggerDKG(groupKey) {
-							bpLog.Info("ThreeChambersFlow: DKG completed via local group key on slot %d", nextSlot)
+					// When the Dilithium3 v1 executor owns activation the epoch
+					// transition intentionally leaves the group key nil (design D8:
+					// no legacy fallback), so the legacy len(groupKey)>0 gate never
+					// fires and the v1 ceremony would be unreachable. In that mode we
+					// drive CompleteDKGViaDistributedRunner regardless of group-key
+					// length; it derives threshold/participants from the chamber and
+					// enters runTDilithium3DKGCeremony. The legacy TriggerDKG fallback
+					// stays gated on a non-empty key.
+					groupKey := bp.qpos.GetGroupPublicKey()
+					v1OwnsActivation := bp.node != nil && bp.node.tdilithium3V1OwnsExecutiveActivation()
+					if len(groupKey) > 0 || v1OwnsActivation {
+						completed := coordinator.CompleteDKGViaDistributedRunner(bp.qpos.GetCurrentEpoch())
+						if !completed && len(groupKey) > 0 && bp.node.config.NetworkID != MainnetNetworkID && !bp.node.config.TSSDistributedDKG {
+							completed = coordinator.TriggerDKG(groupKey)
+						}
+						if completed {
+							bpLog.Info("ThreeChambersFlow: DKG completed on slot %d", nextSlot)
 						}
 					}
 					// P1-9: Log a warning if DKG has been pending too long (5 minutes).
@@ -1610,23 +1698,8 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 		bp.qpos.SetEpochVRFAccumulator(newBlock.Header.Epoch, newBlock.Header.VRFAccumulator)
 		if newBlock.Header.RANDAOReveal != (types.Hash{}) && newBlock.Header.Slot%consensus.SlotsPerEpoch == 0 {
 			bp.qpos.SetEpochBlockRoot(newBlock.Header.Epoch, newBlockHash)
-			// P0-2 (2026-07-13): Transition executive chamber at epoch boundary.
-			coordinator := bp.qpos.GetChambersCoordinator()
-			if coordinator != nil {
-				vs := bp.qpos.GetValidatorSet()
-				if vs != nil {
-					groupPk := bp.qpos.GetGroupPublicKey()
-					if err := coordinator.TransitionExecutiveForEpoch(newBlock.Header.Epoch, vs, groupPk); err != nil {
-						bpLog.Warn("Executive chamber transition failed for epoch %d: %v", newBlock.Header.Epoch, err)
-					}
-				}
-			}
 		}
-		// R42-P3 FIX: Ensure epoch boundary root is set even when the first
-		// block of this epoch is NOT at the boundary slot (slot 32 skipped).
-		// Use the parent block's hash as the epoch boundary (chain tip at
-		// the start of the epoch).
-		bp.qpos.EnsureEpochBlockRoot(newBlock.Header.Epoch, newBlock.Header.ParentHash)
+		bp.ensureEpochStateForBlock(newBlock.Header)
 	}
 
 	// Update Prometheus metrics (under lock, fast)
@@ -1700,7 +1773,9 @@ func (bp *BlockProducer) MEVProtection() *miner.MEVProtection {
 // tryAttest attempts to create and broadcast an attestation for the slot
 // audit-fix R3-M3: guard against nil validatorKey to prevent silent signing failures.
 func (bp *BlockProducer) tryAttest(slot uint64) {
-	if bp.qpos == nil || bp.node.currentBlock == nil || bp.validatorKey == nil {
+	bp.attestMu.Lock()
+	defer bp.attestMu.Unlock()
+	if bp.qpos == nil || bp.node == nil || bp.validatorKey == nil {
 		return
 	}
 
@@ -1723,9 +1798,19 @@ func (bp *BlockProducer) tryAttest(slot uint64) {
 	if !bp.qpos.IsInCommittee(slot, bp.validatorAddr) {
 		return
 	}
+	if bp.qpos.HasChambers() && !bp.qpos.CanAttest(bp.validatorIdx, slot) {
+		return
+	}
 
-	// Create attestation for the current head block
-	blockHash := block.ComputeBlockHash(bp.node.currentBlock.Header)
+	// Attestations must bind to this slot's canonical block. The block is
+	// produced/imported after the slot tick begins, so attesting the previous
+	// head here would create valid-but-mismatched votes that review cannot
+	// classify as approvals.
+	blockHash, hasSlotRoot := bp.qpos.GetSlotBlockRoot(slot)
+	if !hasSlotRoot {
+		return
+	}
+
 	att := bp.qpos.CreateAttestation(slot, blockHash, bp.validatorIdx)
 	// R42-P4 FIX: CreateAttestation returns nil when the epoch boundary
 	// root isn't set yet. Skip attestation for this slot rather than
@@ -1996,9 +2081,7 @@ func (bp *BlockProducer) distributeMinistryRewards(epoch, slot uint64, rewards *
 	// Extract sealer indices from QTD finality if available.
 	var sealerIndices []int
 	if qfs := bp.qpos.GetQTDFinality(); qfs != nil {
-		if record := qfs.GetFinalityRecord(slot); record != nil {
-			sealerIndices = append(sealerIndices, record.Sealers...)
-		}
+		sealerIndices = qfs.GetEpochSealers(epoch)
 	}
 
 	// Use the deterministic epoch-based system caller (same as ProcessEpochAdvanced).
@@ -3302,6 +3385,9 @@ func (bp *BlockProducer) postCommitBlock(
 	// Sync staking data from this block (outside lock to prevent deadlock)
 	bp.node.syncStakingFromBlock(newBlock)
 	bp.node.syncValidatorKeysFromBlock(newBlock)
+	// Dilithium3 v1 CNF-RSS: record the finalized-epoch validator roster at
+	// epoch boundaries (no-op unless the experimental gates are open).
+	bp.node.captureTDilithium3DKGEpochRosterFromBlock(newBlock)
 
 	bp.RecordBlockProducer(bp.validatorAddr, newHeight)
 
@@ -3625,21 +3711,8 @@ func (bp *BlockProducer) produceBlock(slot uint64) {
 		bp.qpos.SetEpochVRFAccumulator(newBlock.Header.Epoch, newBlock.Header.VRFAccumulator)
 		if newBlock.Header.RANDAOReveal != (types.Hash{}) && newBlock.Header.Slot%consensus.SlotsPerEpoch == 0 {
 			bp.qpos.SetEpochBlockRoot(newBlock.Header.Epoch, newBlockHash)
-			// P0-2 (2026-07-13): Transition executive chamber at epoch boundary.
-			coordinator := bp.qpos.GetChambersCoordinator()
-			if coordinator != nil {
-				vs := bp.qpos.GetValidatorSet()
-				if vs != nil {
-					groupPk := bp.qpos.GetGroupPublicKey()
-					if err := coordinator.TransitionExecutiveForEpoch(newBlock.Header.Epoch, vs, groupPk); err != nil {
-						bpLog.Warn("Executive chamber transition failed for epoch %d: %v", newBlock.Header.Epoch, err)
-					}
-				}
-			}
 		}
-		// R42-P3 FIX: Ensure epoch boundary root is set even when the first
-		// block of this epoch is NOT at the boundary slot.
-		bp.qpos.EnsureEpochBlockRoot(newBlock.Header.Epoch, newBlock.Header.ParentHash)
+		bp.ensureEpochStateForBlock(newBlock.Header)
 	}
 
 	bp.postCommitBlock(newBlock, parentHash, consensus.SlotToEpoch(slot), txs)

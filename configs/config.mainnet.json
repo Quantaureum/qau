@@ -1,0 +1,86 @@
+{
+  "name": "qau-node",
+  "dataDir": "./data",
+  "network": "mainnet",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [],
+  "maxPeers": 50,
+  "rpcEnabled": true,
+  "rpcAddr": "127.0.0.1:8745",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8746",
+  "frontendEnabled": false,
+  "frontendAddr": "",
+  "healthEnabled": true,
+  "healthAddr": "127.0.0.1:8080",
+  "metricsEnabled": true,
+  "metricsAddr": "127.0.0.1:9090",
+  "validatorEnabled": false,
+  "validatorKey": "",
+  "cacheSize": 512,
+  "maxGasLimit": 30000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "devMode": false,
+  "blockInterval": 12,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 4,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 1024,
+    "l1MaxMemory": 67108864,
+    "l2MaxSize": 8192,
+    "l2MaxMemory": 268435456,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 1000,
+    "batchSize": 100
+  },
+  "expertConfig": {
+    "enabled": false
+  },
+  "computerUse": {
+    "enabled": false
+  },
+  "alerting": {
+    "enabled": true,
+    "configFile": "configs/alerting.json"
+  },
+  "bridge": {
+    "_comment": "Cross-chain bridge config (mainnet). QAU_ENABLE_BRIDGE=1 env var required to enable. Set ethereum nodeUrl + bridgeContractAddresses to enable cross-chain transfers.",
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8745",
+      "ethereum": ""
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "",
+      "ethereum": ""
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 20,
+    "messageExpiration": 86400,
+    "pollingInterval": 15,
+    "maxRetries": 5,
+    "initializerAddress": "",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  },
+  "allowedOrigins": [],
+  "danksharding": {
+    "enabled": false,
+    "experimental": false,
+    "committeeSize": 0,
+    "subnetCount": 0
+  },
+  "sharding": {
+    "maxCount": 64,
+    "blockSize": 1048576,
+    "interval": 12,
+    "minValidators": 3
+  }
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -186,6 +187,16 @@ func qtdSignedMessageOrLegacy(chainID, epoch, slot uint64, blockHash types.Hash)
 	return qtdSignedMessage(chainID, epoch, slot, blockHash)
 }
 
+// QTDSignedMessage is the exported form of the canonical seal message: the
+// exact bytes a QTD seal signature covers for one (chainID, epoch, slot,
+// blockHash) tuple. The node-side signing executor builds the message with it
+// so the layout has a single definition, and a caller that signs outside the
+// seal flow still signs what the verifier reconstructs. chainID == 0 keeps the
+// legacy raw-blockHash convention every pre-R39 record uses.
+func QTDSignedMessage(chainID, epoch, slot uint64, blockHash types.Hash) []byte {
+	return qtdSignedMessageOrLegacy(chainID, epoch, slot, blockHash)
+}
+
 // qtdVerifyMessageLocked is the verify-side mirror of qtdSignedMessageLocked.
 //
 // R40-P0-01 (2026-08-03) FIX: the prior implementation took an
@@ -288,14 +299,14 @@ type PendingSeal struct {
 	Epoch   uint64
 
 	// R30-IMPLEMENT (2026-07-27): P3-QTD-01 centralized weight-threshold fields.
-	// RequiredWeight is ceil(2/3 * totalExecutiveStake) — the minimum
-	// cumulative stake weight required from participating sealers for the
-	// seal to be considered weight-sufficient. MemberStakes maps each
-	// executive member's validator index to its stake at seal-request time
-	// (deep-copied to prevent race conditions with concurrent stake updates).
-	// Both fields are populated by snapshotExecutiveStakes (called from
-	// RequestSeal) and consumed by computeSealerWeight (called from
-	// ReceiveSealAnnouncement and completeSealLocked).
+	// RequiredWeight is ceil(2/3 * totalStake) — the minimum cumulative stake
+	// weight required from participating sealers for the seal to be considered
+	// weight-sufficient. MemberStakes maps each sealer's validator index to
+	// its stake at seal-request time (deep-copied to prevent race conditions
+	// with concurrent stake updates). Both fields are populated by
+	// snapshotSealerStakes (called from RequestSeal) and consumed by
+	// computeSealerWeight (called from ReceiveSealAnnouncement and
+	// completeSealLocked).
 	RequiredWeight *big.Int
 	MemberStakes   map[int]*big.Int
 
@@ -541,14 +552,29 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 	}
 
 	threshold := executive.Threshold()
+	// R47-QTD-QUORUM (2026-09-26): when a threshold signer is active, the seal
+	// quorum must ALSO satisfy the DKG group's t-of-n shape — an aggregated
+	// threshold signature only verifies when >= t partial signatures are
+	// combined, so a RequiredCount below t would produce pending seals that
+	// can never complete. max() keeps the chamber quorum as the floor; a
+	// signer that does not track a threshold shape (test mocks, single-node
+	// signers) returns 0 and leaves the chamber quorum unchanged.
+	if signer := qfs.qtdSigner; signer != nil {
+		if t := signer.Threshold(); t > threshold {
+			threshold = t
+		}
+	}
 
-	// R30-IMPLEMENT (2026-07-27): P3-QTD-01 — snapshot executive stakes and
-	// compute the required weight threshold (ceil(2/3 * totalExecutiveStake))
-	// via the shared helper. This ensures RequestSeal, ReceiveSealAnnouncement,
-	// and completeSealLocked all use the SAME weight threshold for the same
+	// R30-IMPLEMENT (2026-07-27): P3-QTD-01 — snapshot sealer stakes and
+	// compute the required weight threshold (ceil(2/3 * totalStake)) via the
+	// shared helper. This ensures RequestSeal, ReceiveSealAnnouncement, and
+	// completeSealLocked all use the SAME weight threshold for the same
 	// epoch, preventing divergence that could allow minority-stake finalization.
+	// R47-QTD-QUORUM (2026-09-26): the stake basis is the full validator set
+	// (see snapshotSealerStakesLocked) because the authorized sealer set is
+	// the DKG threshold-group holder set, which covers every validator.
 	epoch := SlotToEpoch(slot)
-	memberStakes, _, requiredWeight := qfs.snapshotExecutiveStakesLocked(epoch, coordinator)
+	memberStakes, _, requiredWeight := qfs.snapshotSealerStakesLocked(coordinator)
 
 	qfs.pendingSeals[slot] = &PendingSeal{
 		Slot:      slot,
@@ -558,7 +584,7 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 		PartialSigs:   make(map[int][]byte),
 		RequiredCount: threshold,
 		Completed:     false,
-		// P3-QTD-01: weight-threshold fields (populated by snapshotExecutiveStakes).
+		// P3-QTD-01: weight-threshold fields (populated by snapshotSealerStakes).
 		RequiredWeight: requiredWeight,
 		MemberStakes:   memberStakes,
 		// R31-P1-02 FIX (2026-07-27): QTD-P1-01 — initialize suspicion score
@@ -1329,59 +1355,37 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 	epoch := SlotToEpoch(slot)
 	qfs.qpos.mu.Lock()
 
-	// R4-CORE-04: Canonical chain binding — reject non-canonical block hashes.
-	// Check epoch root first (authoritative), then slot root (per-block).
-	if epochRoot, ok := qfs.qpos.epochBlockRoots[epoch]; ok {
-		if epochRoot != (types.Hash{}) && epochRoot != types.Hash(blockHash) {
-			qfs.qpos.mu.Unlock()
-			// P3-LOG-03 FIX (R30, 2026-07-27): Use structured qtdLogger.
-			qtdLogger.Warn("qtd_finality: R4-CORE-04: rejecting non-canonical QTD seal (epoch root mismatch)",
-				map[string]any{
-					"slot":               slot,
-					"epoch":              epoch,
-					"blockHash":          types.Hash(blockHash).String(),
-					"canonicalEpochRoot": epochRoot.String(),
-				})
-			return
-		}
-	} else if slotRoot, ok := qfs.qpos.slotBlockRoots[slot]; ok {
-		if slotRoot != (types.Hash{}) && slotRoot != types.Hash(blockHash) {
-			qfs.qpos.mu.Unlock()
-			// P3-LOG-03 FIX (R30, 2026-07-27): Use structured qtdLogger.
-			qtdLogger.Warn("qtd_finality: R4-CORE-04: rejecting non-canonical QTD seal (slot root mismatch)",
-				map[string]any{
-					"slot":              slot,
-					"blockHash":         types.Hash(blockHash).String(),
-					"canonicalSlotRoot": slotRoot.String(),
-				})
-			return
-		}
-	} else {
-		// QUANTUM-FIX (2026-07-17): Neither root is known — fail closed.
-		// Previously this accepted the seal with only a warning, allowing
-		// colluding executive members to finalize arbitrary blockHashes
-		// during early sync. Now we reject the seal entirely; the caller
-		// must establish a canonical root (e.g., via SetSlotBlockRoot on
-		// importing the genesis / canonical block) before QTD finalization
-		// can take effect.
+	checkpointRoot := blockHash
+	if epochRoot, ok := qfs.qpos.epochBlockRoots[epoch]; ok && epochRoot != (types.Hash{}) {
+		checkpointRoot = epochRoot
+	}
+	canonicalRoot, known := qfs.qpos.slotBlockRoots[slot]
+	if !known {
+		canonicalRoot, known = qfs.qpos.epochBlockRoots[epoch]
+	}
+	if !known || canonicalRoot == (types.Hash{}) || canonicalRoot != types.Hash(blockHash) {
 		qfs.qpos.mu.Unlock()
-		// P3-LOG-03 FIX (R30, 2026-07-27): Use structured qtdLogger.
-		qtdLogger.Error("qtd_finality: R4-CORE-04: rejecting QTD seal — no canonical root known (fail-closed per QUANTUM-)",
-			map[string]any{
-				"slot":      slot,
-				"epoch":     epoch,
-				"blockHash": types.Hash(blockHash).String(),
-			})
+		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root",
+			map[string]any{"slot": slot, "epoch": epoch})
 		return
 	}
 
+	changed := false
 	if epoch > qfs.qpos.finalizedEpoch {
 		qfs.qpos.finalizedEpoch = epoch
-		qfs.qpos.finalizedRoot = blockHash
+		qfs.qpos.finalizedRoot = checkpointRoot
+		changed = true
 	}
 	if epoch > qfs.qpos.justifiedEpoch {
 		qfs.qpos.justifiedEpoch = epoch
-		qfs.qpos.justifiedRoot = blockHash
+		qfs.qpos.justifiedRoot = checkpointRoot
+		changed = true
+	}
+	if changed {
+		qfs.qpos.finalityPersistPending = true
+	}
+	if changed || qfs.qpos.finalityPersistPending {
+		qfs.qpos.persistFinalityLocked()
 	}
 	qfs.qpos.mu.Unlock()
 
@@ -1493,6 +1497,40 @@ func (qfs *QTDFinalityState) IsSlotFinalized(slot uint64) bool {
 	// that consumers (fork chooser, RPC "finalized" block, sync
 	// sentinel) get a single consistent answer.
 	return record.Epoch <= qposFinalizedEpoch
+}
+
+func (qfs *QTDFinalityState) GetEpochSealers(epoch uint64) []int {
+	if qfs.qpos == nil || epoch > ^uint64(0)/uint64(SlotsPerEpoch) {
+		return nil
+	}
+	if epoch > qfs.qpos.GetFinalizedEpoch() {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	start := EpochStartSlot(epoch)
+	for offset := uint64(0); offset < uint64(SlotsPerEpoch); offset++ {
+		slot := start + offset
+		if !qfs.IsSlotFinalized(slot) {
+			continue
+		}
+		record := qfs.GetFinalityRecord(slot)
+		if record == nil {
+			continue
+		}
+		root, known := qfs.qpos.GetSlotBlockRoot(slot)
+		if !known || root != record.BlockHash {
+			continue
+		}
+		for _, sealer := range record.Sealers {
+			seen[sealer] = struct{}{}
+		}
+	}
+	sealers := make([]int, 0, len(seen))
+	for sealer := range seen {
+		sealers = append(sealers, sealer)
+	}
+	sort.Ints(sealers)
+	return sealers
 }
 
 func (qfs *QTDFinalityState) GetFinalityRecord(slot uint64) *InstantFinalityRecord {
@@ -1633,8 +1671,9 @@ func (qfs *QTDFinalityState) GetPendingSealCount() int {
 
 // GetPendingSeal returns a snapshot of the pending seal for a slot, or nil if
 // no seal is pending. P1-7: used by RPC qau_tss_getSealStatus to report
-// partial signature collection progress. Returns a copy so callers cannot
-// mutate internal state.
+// partial signature collection progress, and by the Dilithium3 v1 seal
+// executor to read the domain-separation tuple it must sign. Returns a copy so
+// callers cannot mutate internal state.
 func (qfs *QTDFinalityState) GetPendingSeal(slot uint64) *PendingSeal {
 	qfs.mu.RLock()
 	defer qfs.mu.RUnlock()
@@ -1649,6 +1688,12 @@ func (qfs *QTDFinalityState) GetPendingSeal(slot uint64) *PendingSeal {
 		PartialSigs:   p.PartialSigs, // read-only; map values are not mutated after creation
 		RequiredCount: p.RequiredCount,
 		Completed:     p.Completed,
+		// R39-P0-01: the domain-separation tuple travels with the snapshot.
+		// A copy that drops ChainID and Epoch reports zero, and the signing
+		// path treats a zero tuple as a legacy record with no canonical message
+		// to sign, so it refuses the seal instead of signing the wrong bytes.
+		ChainID: p.ChainID,
+		Epoch:   p.Epoch,
 	}
 }
 
@@ -1764,17 +1809,26 @@ const (
 	sealFailureAggregation
 )
 
-// snapshotExecutiveStakes returns a deep-copied map of executive member
-// stakes for the given epoch, the total executive stake, and the required
-// weight threshold (ceil(2/3 * total)). Returns (nil, nil, nil) when the
-// coordinator is unavailable or the executive chamber has no members —
-// callers use the nil return to skip the weight check gracefully.
+// snapshotSealerStakes returns a deep-copied map of sealer stakes, the total
+// stake, and the required weight threshold (ceil(2/3 * total)). Returns
+// (nil, nil, nil) when the coordinator is unavailable — callers use the nil
+// return to skip the weight check gracefully.
 //
 // R30-IMPLEMENT (2026-07-27): P3-QTD-01 fix. Centralizes the weight-
 // threshold computation so RequestSeal, ReceiveSealAnnouncement, and
 // completeSealLocked all use the SAME threshold for the same epoch.
 // Previously three inline copies had slightly divergent logic.
-func (qfs *QTDFinalityState) snapshotExecutiveStakes(epoch uint64) (memberStakes map[int]*big.Int, totalExecutiveStake, requiredWeight *big.Int) {
+//
+// R47-QTD-QUORUM (2026-09-26): the stake basis was previously the executive
+// chamber members for the epoch. QTD sealing is now driven by the DKG
+// threshold-group holder set (see node/qtd_seal.go), and the genesis DKG
+// distributes shares to EVERY validator, so the authorized sealer set is the
+// full validator set. The weight basis must cover every validator, otherwise
+// ReceiveSealAnnouncement's R35-P2-CONS-05 membership check would reject any
+// announcement whose sealers include non-executive holders, and the 2/3
+// economic bar would be computed against the wrong total. The ceil(2/3 *
+// total) formula is unchanged — only the basis is widened.
+func (qfs *QTDFinalityState) snapshotSealerStakes() (sealerStakes map[int]*big.Int, totalStake, requiredWeight *big.Int) {
 	qfs.mu.RLock()
 	defer qfs.mu.RUnlock()
 	if qfs.qpos == nil {
@@ -1784,51 +1838,51 @@ func (qfs *QTDFinalityState) snapshotExecutiveStakes(epoch uint64) (memberStakes
 	if coordinator == nil {
 		return nil, nil, nil
 	}
-	return qfs.snapshotExecutiveStakesLocked(epoch, coordinator)
+	return qfs.snapshotSealerStakesLocked(coordinator)
 }
 
-// snapshotExecutiveStakesLocked is the internal variant that assumes the
+// snapshotSealerStakesLocked is the internal variant that assumes the
 // caller already holds qfs.mu (at least RLock) and has a coordinator
-// reference. It reads the executive members for the epoch, looks up each
-// member's stake from the validator set, and computes the required weight
-// as ceil(2/3 * totalExecutiveStake).
+// reference. It snapshots every validator's stake and computes the required
+// weight as ceil(2/3 * totalStake).
 //
 // R30-IMPLEMENT (2026-07-27): P3-QTD-01. Caller must hold qfs.mu.
-func (qfs *QTDFinalityState) snapshotExecutiveStakesLocked(epoch uint64, coordinator *ThreeChambersCoordinator) (memberStakes map[int]*big.Int, totalExecutiveStake, requiredWeight *big.Int) {
+// R47-QTD-QUORUM (2026-09-26): basis switched from the executive members
+// for the epoch to the full validator set — see snapshotSealerStakes.
+func (qfs *QTDFinalityState) snapshotSealerStakesLocked(coordinator *ThreeChambersCoordinator) (sealerStakes map[int]*big.Int, totalStake, requiredWeight *big.Int) {
 	if coordinator == nil {
-		return nil, nil, nil
-	}
-	members := coordinator.GetExecutiveMembersForEpoch(epoch)
-	if len(members) == 0 {
 		return nil, nil, nil
 	}
 	validators := qfs.qpos.GetValidatorSet()
 	if validators == nil {
 		return nil, nil, nil
 	}
-	memberStakes = make(map[int]*big.Int, len(members))
-	totalExecutiveStake = new(big.Int)
-	for _, idx := range members {
-		v := validators.GetValidatorByIndex(idx)
+	all := validators.Validators()
+	if len(all) == 0 {
+		return nil, nil, nil
+	}
+	sealerStakes = make(map[int]*big.Int, len(all))
+	totalStake = new(big.Int)
+	for idx, v := range all {
 		if v == nil || v.Stake == nil {
 			continue
 		}
 		stakeCopy := new(big.Int).Set(v.Stake)
-		memberStakes[idx] = stakeCopy
-		totalExecutiveStake.Add(totalExecutiveStake, stakeCopy)
+		sealerStakes[idx] = stakeCopy
+		totalStake.Add(totalStake, stakeCopy)
 	}
-	if totalExecutiveStake.Sign() == 0 {
-		return memberStakes, totalExecutiveStake, nil
+	if totalStake.Sign() == 0 {
+		return sealerStakes, totalStake, nil
 	}
-	// requiredWeight = ceil(totalExecutiveStake * 2 / 3)
-	// = (totalExecutiveStake * 2 + 2) / 3  (integer ceil via (num + denom - 1) / denom)
-	num := new(big.Int).Mul(totalExecutiveStake, big.NewInt(2))
+	// requiredWeight = ceil(totalStake * 2 / 3)
+	// = (totalStake * 2 + 2) / 3  (integer ceil via (num + denom - 1) / denom)
+	num := new(big.Int).Mul(totalStake, big.NewInt(2))
 	rem := new(big.Int).Mod(num, big.NewInt(3))
 	requiredWeight = new(big.Int).Quo(num, big.NewInt(3))
 	if rem.Sign() > 0 {
 		requiredWeight.Add(requiredWeight, big.NewInt(1))
 	}
-	return memberStakes, totalExecutiveStake, requiredWeight
+	return sealerStakes, totalStake, requiredWeight
 }
 
 // computeSealerWeight sums the stakes of the given sealers from the
@@ -2055,7 +2109,7 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 //   - QTD-H04/H06: top-level defer recover() catches panics from
 //     VerifyBlock or any downstream qpos method, returning false instead
 //     of crashing the P2P message handler goroutine (liveness DoS).
-//   - P3-QTD-01: uses snapshotExecutiveStakes to compute the weight
+//   - P3-QTD-01: uses snapshotSealerStakes to compute the weight
 //     threshold, consistent with RequestSeal.
 //   - QTD-CRIT-03: does NOT participate in partial-sig collection, so
 //     the ConsecutiveAggFailures DoS bound does not apply here.
@@ -2102,7 +2156,7 @@ func (qfs *QTDFinalityState) ReceiveSealAnnouncement(slot uint64, blockHash type
 
 	// P3-QTD-01: compute weight threshold via the shared helper.
 	epoch := SlotToEpoch(slot)
-	memberStakes, _, requiredWeight := qfs.snapshotExecutiveStakes(epoch)
+	memberStakes, _, requiredWeight := qfs.snapshotSealerStakes()
 
 	// R35-P2-CONS-05 FIX (2026-07-29): Verify sealer membership BEFORE the
 	// weight check. The sealers slice arrives from an UNTRUSTED peer via P2P
@@ -2115,11 +2169,12 @@ func (qfs *QTDFinalityState) ReceiveSealAnnouncement(slot uint64, blockHash type
 	// sealer list without membership verification.
 	//
 	// Now we explicitly reject the announcement if ANY sealer index is not a
-	// known member of the executive chamber for this epoch. This closes both
-	// the "bogus index injection" and the "nil memberStakes bypass" attack
-	// vectors. Unknown indices in a threshold signature set indicate either
-	// a malformed message, a peer running different epoch state, or an active
-	// attack — all must be rejected.
+	// known validator (R47-QTD-QUORUM: memberStakes now covers the full
+	// validator set — the DKG holder basis — rather than the executive
+	// chamber). This closes both the "bogus index injection" and the "nil
+	// memberStakes bypass" attack vectors. Unknown indices in a threshold
+	// signature set indicate either a malformed message, a peer running
+	// different epoch state, or an active attack — all must be rejected.
 	if memberStakes != nil {
 		seen := make(map[int]bool, len(sealers))
 		for _, idx := range sealers {
@@ -2132,8 +2187,8 @@ func (qfs *QTDFinalityState) ReceiveSealAnnouncement(slot uint64, blockHash type
 			seen[idx] = true
 			stake, ok := memberStakes[idx]
 			if !ok || stake == nil {
-				// Sealer index is not a member of the executive chamber for
-				// this epoch — reject the announcement.
+				// Sealer index is not a known validator — reject the
+				// announcement.
 				return false
 			}
 		}

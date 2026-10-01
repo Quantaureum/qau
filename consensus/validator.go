@@ -490,10 +490,20 @@ func deepCopyAttestation(att *Attestation) *Attestation {
 // q.mu is always acquired FIRST. This ordering must be respected by any
 // future code path that acquires both locks.
 func (q *QPOS) CreateAttestation(slot uint64, blockRoot types.Hash, validatorIndex int) *Attestation {
-	q.mu.RLock()
+	q.mu.Lock()
 	justifiedEpoch := q.justifiedEpoch
 	justifiedRoot := q.justifiedRoot
 	currentEpoch := SlotToEpoch(slot)
+	if source, exists := q.attestationSources[currentEpoch]; exists {
+		justifiedEpoch, justifiedRoot = source.Epoch, source.Root
+	} else if currentEpoch > 0 && justifiedEpoch >= currentEpoch && q.finalizedEpoch >= currentEpoch {
+		justifiedEpoch = currentEpoch - 1
+		justifiedRoot = q.getEpochBlockRootLocked(justifiedEpoch)
+		if justifiedEpoch > 0 && justifiedRoot == (types.Hash{}) {
+			q.mu.Unlock()
+			return nil
+		}
+	}
 	// CRITICAL FIX: Target.Root must be the epoch boundary block root,
 	// NOT the current block root. In Casper FFG, all attestations within
 	// the same epoch must vote for the SAME target checkpoint (the block
@@ -502,10 +512,25 @@ func (q *QPOS) CreateAttestation(slot uint64, blockRoot types.Hash, validatorInd
 	// Target.Root within the same epoch, which triggers false "double
 	// vote" slashing detection in checkSurroundVote.
 	targetRoot := q.getEpochBlockRootLocked(currentEpoch)
+	if targetRoot != (types.Hash{}) && justifiedEpoch < currentEpoch {
+		if q.attestationSources == nil {
+			q.attestationSources = make(map[uint64]AttestationCheckpoint)
+		}
+		for epoch := range q.attestationSources {
+			if epoch < currentEpoch && currentEpoch-epoch > 2 {
+				delete(q.attestationSources, epoch)
+			}
+		}
+		if _, exists := q.attestationSources[currentEpoch]; !exists && len(q.attestationSources) >= 64 {
+			q.mu.Unlock()
+			return nil
+		}
+		q.attestationSources[currentEpoch] = AttestationCheckpoint{Epoch: justifiedEpoch, Root: justifiedRoot}
+	}
 	q.keyVersionMu.RLock()
 	currentKeyVersion := q.currentKeyVersion
 	q.keyVersionMu.RUnlock()
-	q.mu.RUnlock()
+	q.mu.Unlock()
 
 	// R42-P4 FIX (2026-08-07): If no epoch boundary block has been
 	// recorded yet, return an EMPTY attestation (nil) instead of falling

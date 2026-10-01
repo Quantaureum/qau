@@ -35,6 +35,10 @@ func (m *nonThresholdSigner) IsThresholdMode() bool {
 	// QTD-H01 trigger: signer is non-nil but NOT in threshold mode.
 	return false
 }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *nonThresholdSigner) Threshold() int { return 0 }
 func (m *nonThresholdSigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {

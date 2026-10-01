@@ -1,0 +1,673 @@
+openapi: 3.0.3
+info:
+  title: QuantaureumV2 JSON-RPC API
+  description: Quantum-safe blockchain JSON-RPC API with QPOS consensus, post-quantum cryptography, and Agent swarm integration.
+  version: 0.1.0
+  contact:
+    name: Quantaureum Team
+
+servers:
+  - url: http://localhost:8545
+    description: Local node
+  - url: http://localhost:8546
+    description: WebSocket endpoint
+
+paths:
+  /:
+    post:
+      summary: JSON-RPC endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonRpcRequest"
+      responses:
+        "200":
+          description: JSON-RPC response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonRpcResponse"
+
+components:
+  schemas:
+    JsonRpcRequest:
+      type: object
+      required: [jsonrpc, method, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+        params:
+          type: array
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+
+    JsonRpcResponse:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        result:
+          description: Result on success
+        error:
+          type: object
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
+            data:
+              description: Additional error data
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+
+    Block:
+      type: object
+      properties:
+        hash:
+          type: string
+          description: Block hash (hex)
+        parentHash:
+          type: string
+          description: Parent block hash
+        number:
+          type: string
+          description: Block number (hex)
+        timestamp:
+          type: string
+          description: Unix timestamp (hex)
+        transactions:
+          type: array
+          items:
+            oneOf:
+              - type: string
+                description: Transaction hash
+              - $ref: "#/components/schemas/Transaction"
+        gasLimit:
+          type: string
+          description: Gas limit (hex)
+        gasUsed:
+          type: string
+          description: Gas used (hex)
+
+    Transaction:
+      type: object
+      properties:
+        hash:
+          type: string
+        nonce:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        value:
+          type: string
+        gas:
+          type: string
+        gasPrice:
+          type: string
+        input:
+          type: string
+
+    TransactionReceipt:
+      type: object
+      properties:
+        transactionHash:
+          type: string
+        blockHash:
+          type: string
+        blockNumber:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        gasUsed:
+          type: string
+        status:
+          type: string
+          description: "0x1 = success, 0x0 = failure"
+
+    Filter:
+      type: object
+      properties:
+        fromBlock:
+          type: string
+        toBlock:
+          type: string
+        address:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        topics:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: array
+                items:
+                  type: string
+
+    QPOSStatus:
+      type: object
+      properties:
+        epoch:
+          type: string
+        slot:
+          type: string
+        justifiedEpoch:
+          type: string
+        finalizedEpoch:
+          type: string
+        validatorCount:
+          type: integer
+        activeValidators:
+          type: integer
+
+    StakingInfo:
+      type: object
+      properties:
+        validator:
+          type: string
+        stake:
+          type: string
+        rewards:
+          type: string
+        active:
+          type: boolean
+
+x-methods:
+  blockchain:
+    eth_chainId:
+      description: Returns the chain ID (0x684 = 1668 for mainnet, 0x535 = 1333 for devnet)
+      params: []
+      returns: string
+
+    net_version:
+      description: Returns the network ID
+      params: []
+      returns: string
+
+    eth_protocolVersion:
+      description: Returns the protocol version
+      params: []
+      returns: string
+
+    eth_blockNumber:
+      description: Returns the latest block number
+      params: []
+      returns: string
+
+    eth_gasPrice:
+      description: Returns current gas price
+      params: []
+      returns: string
+
+    eth_syncing:
+      description: Returns syncing status
+      params: []
+      returns: object | false
+
+  account:
+    eth_getBalance:
+      description: Returns account balance
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: blockTag
+          type: string
+          required: false
+      returns: string
+
+    eth_getTransactionCount:
+      description: Returns transaction count (nonce)
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: blockTag
+          type: string
+          required: false
+      returns: string
+
+    eth_getCode:
+      description: Returns contract code at address
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: blockTag
+          type: string
+          required: false
+      returns: string
+
+    eth_getStorageAt:
+      description: Returns storage value at position
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: position
+          type: string
+          required: true
+        - name: blockTag
+          type: string
+          required: false
+      returns: string
+
+  block:
+    eth_getBlockByHash:
+      description: Returns block by hash
+      params:
+        - name: hash
+          type: string
+          required: true
+        - name: fullTransactions
+          type: boolean
+          required: true
+      returns: Block | null
+
+    eth_getBlockByNumber:
+      description: Returns block by number/tag
+      params:
+        - name: blockTag
+          type: string
+          required: true
+        - name: fullTransactions
+          type: boolean
+          required: true
+      returns: Block | null
+
+    eth_getBlockTransactionCountByHash:
+      description: Returns transaction count in block by hash
+      params:
+        - name: hash
+          type: string
+          required: true
+      returns: string
+
+    eth_getBlockTransactionCountByNumber:
+      description: Returns transaction count in block by number
+      params:
+        - name: blockTag
+          type: string
+          required: true
+      returns: string
+
+  transaction:
+    eth_sendTransaction:
+      description: Sends a transaction
+      params:
+        - name: tx
+          type: object
+          required: true
+      returns: string
+
+    eth_sendRawTransaction:
+      description: Sends a signed raw transaction
+      params:
+        - name: rawTx
+          type: string
+          required: true
+      returns: string
+
+    eth_getTransactionByHash:
+      description: Returns transaction by hash
+      params:
+        - name: hash
+          type: string
+          required: true
+      returns: Transaction | null
+
+    eth_getTransactionReceipt:
+      description: Returns transaction receipt
+      params:
+        - name: hash
+          type: string
+          required: true
+      returns: TransactionReceipt | null
+
+    eth_estimateGas:
+      description: Estimates gas for a transaction
+      params:
+        - name: tx
+          type: object
+          required: true
+      returns: string
+
+    eth_call:
+      description: Executes a call without creating a transaction
+      params:
+        - name: tx
+          type: object
+          required: true
+        - name: blockTag
+          type: string
+          required: false
+      returns: string
+
+  filter:
+    eth_newFilter:
+      description: Creates a log filter
+      params:
+        - name: filter
+          type: Filter
+          required: true
+      returns: string
+
+    eth_newBlockFilter:
+      description: Creates a block filter
+      params: []
+      returns: string
+
+    eth_newPendingTransactionFilter:
+      description: Creates a pending transaction filter
+      params: []
+      returns: string
+
+    eth_uninstallFilter:
+      description: Uninstalls a filter
+      params:
+        - name: filterId
+          type: string
+          required: true
+      returns: boolean
+
+    eth_getFilterChanges:
+      description: Polls filter changes
+      params:
+        - name: filterId
+          type: string
+          required: true
+      returns: array
+
+    eth_getFilterLogs:
+      description: Returns logs matching filter
+      params:
+        - name: filterId
+          type: string
+          required: true
+      returns: array
+
+    eth_getLogs:
+      description: Returns logs matching filter criteria
+      params:
+        - name: filter
+          type: Filter
+          required: true
+      returns: array
+
+  network:
+    net_version:
+      description: Returns network version (maps to net_version)
+      params: []
+      returns: string
+
+    net_peerCount:
+      description: Returns peer count
+      params: []
+      returns: string
+
+    net_listening:
+      description: Returns whether node is listening
+      params: []
+      returns: boolean
+
+  txpool:
+    txpool_status:
+      description: Returns transaction pool status
+      params: []
+      returns: object
+
+    txpool_content:
+      description: Returns transaction pool content
+      params: []
+      returns: object
+
+    eth_pendingTransactions:
+      description: Returns pending transactions
+      params: []
+      returns: array
+
+  web3:
+    web3_clientVersion:
+      description: Returns client version
+      params: []
+      returns: string
+
+    web3_sha3:
+      description: Returns Keccak-256 hash
+      params:
+        - name: data
+          type: string
+          required: true
+      returns: string
+
+  consensus:
+    qau_qposStatus:
+      description: Returns QPOS consensus status (alias)
+      params: []
+      returns: QPOSStatus
+
+  staking:
+    qau_stake:
+      description: Stake QAU tokens as validator
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: amount
+          type: string
+          required: true
+      returns: string
+
+    qau_unstake:
+      description: Unstake QAU tokens
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: amount
+          type: string
+          required: true
+      returns: string
+
+    qau_getStake:
+      description: Get staking info for address
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: StakingInfo
+
+    qau_getStakingPools:
+      description: Returns all staking pools
+      params: []
+      returns: array
+
+    qau_getStakingStats:
+      description: Returns staking statistics
+      params: []
+      returns: object
+
+    qau_getUserStakes:
+      description: Returns user stakes
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: array
+
+    qau_claimRewards:
+      description: Claim staking rewards
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: string
+
+    qau_compoundRewards:
+      description: Compound staking rewards
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: string
+
+    qau_getStakingContracts:
+      description: Returns staking contract addresses
+      params: []
+      returns: array
+
+    qau_getPendingRewards:
+      description: Returns pending rewards
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: string
+
+    qau_getUnstakeStatus:
+      description: Returns unstake status
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: object
+
+    qau_getContractBalance:
+      description: Returns contract balance
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: string
+
+  quantum:
+    qau_signQuantumTransaction:
+      description: Sign transaction with post-quantum signature (Dilithium3)
+      params:
+        - name: tx
+          type: object
+          required: true
+      returns: string
+
+    qau_verifyQuantumTransaction:
+      description: Verify post-quantum transaction signature
+      params:
+        - name: signedTx
+          type: string
+          required: true
+      returns: boolean
+
+  privacy:
+    qau_sendPrivacyTransaction:
+      description: Send privacy transaction (stealth address)
+      params:
+        - name: tx
+          type: object
+          required: true
+      returns: string
+
+    qau_scanPrivacy:
+      description: Scan for privacy transactions
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: array
+
+    qau_getPrivacyBalance:
+      description: Get privacy balance
+      params:
+        - name: address
+          type: string
+          required: true
+      returns: string
+
+    qau_generateStealthAddress:
+      description: Generate stealth address (Kyber KEM)
+      params: []
+      returns: object
+
+  accountAbstraction:
+    qau_sendUserOperation:
+      description: Send EIP-4337 user operation
+      params:
+        - name: userOp
+          type: object
+          required: true
+        - name: entryPoint
+          type: string
+          required: true
+      returns: string
+
+    qau_estimateUserOperationGas:
+      description: Estimate gas for user operation
+      params:
+        - name: userOp
+          type: object
+          required: true
+        - name: entryPoint
+          type: string
+          required: true
+      returns: object
+
+    qau_getUserOperationByHash:
+      description: Get user operation by hash
+      params:
+        - name: hash
+          type: string
+          required: true
+      returns: object
+
+    qau_getUserOperationReceipt:
+      description: Get user operation receipt
+      params:
+        - name: hash
+          type: string
+          required: true
+      returns: object
+
+    qau_supportedEntryPoints:
+      description: Returns supported entry points
+      params: []
+      returns: array
+
+  admin:
+    admin_peers:
+      description: Returns connected peers (requires admin auth)
+      params: []
+      returns: array
+
+    admin_nodeInfo:
+      description: Returns node info (requires admin auth)
+      params: []
+      returns: object
+
+    admin_mint:
+      description: Mint QAU tokens (requires admin auth, devnet only)
+      params:
+        - name: address
+          type: string
+          required: true
+        - name: amount
+          type: string
+          required: true
+      returns: string
+
+  namingConvention:
+    note: "All RPC methods use the qau_ prefix exclusively. eth_* methods are not supported."

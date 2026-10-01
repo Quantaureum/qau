@@ -1,0 +1,28 @@
+{
+  "_comment": "Quantaureum Bridge — TESTNET configuration template (P3-5). Copy this file to configs/config.json and fill in the values. ChainID: 1669. Testnet uses independent validator keys, completely isolated from mainnet. SECURITY: Do NOT reuse mainnet keys on testnet.",
+  "_usage": "1) Copy to configs/config.json. 2) Set QAU_ENABLE_BRIDGE=1 env var. 3) Fill in bridgeContractAddresses and nodeUrls. 4) Set initializerAddress to the testnet governance address. 5) Set validatorPublicKeyHex and relayerPublicKeyHex from testnet validator keys. 6) Start the node.",
+  "_securityNotes": [
+    "Testnet validator keys MUST be independent from mainnet keys.",
+    "bootstrapMode may be set to true during initial testnet setup, but disable after registering signatures.",
+    "Old mainnet validator keys must be completely removed from testnet servers.",
+    "DevMode must be disabled to prevent signature verification bypass."
+  ],
+  "bridge": {
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8545",
+      "ethereum": "https://<external-evm-rpc-endpoint>"
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "0x0000000000000000000000000000000000000000",
+      "ethereum": "0x0000000000000000000000000000000000000000"
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 5,
+    "messageExpiration": 3600,
+    "pollingInterval": 10,
+    "maxRetries": 3,
+    "initializerAddress": "0x0000000000000000000000000000000000000000",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  }
+}

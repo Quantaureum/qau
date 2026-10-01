@@ -1,37 +1,47 @@
-# Pull request
+# Pull Request
 
-Do not include keys, mnemonics, internal hostnames, real wallet-to-host
-mappings, or production topology in this PR.
+Thanks for contributing to Quantaureum. Fill out the sections below so reviewers have full context.
 
-## What and why
+## Summary
+<!-- One short paragraph. What does this PR change and why? -->
 
-<!-- Behavior, bug, or docs change; link the issue. Note breaking changes. -->
+## Closes / Fixes
+<!-- Link issue(s) with `Closes #123` syntax. If none, say "n/a". -->
 
-## Implementation notes
+## Type of change
+- [ ] Bug fix (non-breaking behavior correction)
+- [ ] New feature (adds capability)
+- [ ] Breaking change (affects consensus, wire format, contract ABI, or public API)
+- [ ] Refactor (no behavior change)
+- [ ] Documentation only
+- [ ] CI / build change
 
-<!-- Key decisions. Call out consensus, crypto, storage-format,
-     wire-protocol, or public-API changes explicitly. -->
+## Affected components
+<!-- e.g. consensus, p2p, qvm, RPC, wallet, contracts/.., .github/... -->
 
-## Verification
+## Risks & mitigations
+<!-- Any mainnet impact? Contract behavior change? Backwards-compatibility break?
+     For each risk, list mitigation (test, runbook, feature flag...). -->
 
-<!-- Paste REAL results per CONTRIBUTING.md. Delete rows you did not run;
-     do not mark anything pass without running it. -->
+## Testing
+- [ ] `just ci` green locally
+- [ ] `go test -short ./...` green
+- [ ] `go test -race ./...` green on affected packages
+- [ ] New tests added for all new paths (list files below)
+- [ ] Manual smoke test on `localtest/` (6 validator) — describe result
+- [ ] Fuzz run on touched surface (`go test -fuzz=` ...) — list runs
 
-| Check | Result | Notes |
-|---|---|---|
-| `git diff --check` | ran / not run | |
-| `go vet ./...` | ran / not run | |
-| `go build ./...` | ran / not run | |
-| `go test ./... -count=1` | ran / not run | |
-| affected-package race tests (concurrency changes) | ran / not run | |
+## Mainnet readiness checklist
+<!-- Only for changes that can hit production binaries. Delete section if n/a. -->
+- [ ] No new hardcoded IPs / endpoints in tracked sources
+- [ ] No private keys, mnemonics, or keystore committed (`git log -p | grep -iE 'mnemonic|private_key|secret'`)
+- [ ] Sensitive configuration lives in `.local-only/`
+- [ ] Plan doc updated under `docs/plans/` if this introduces/extends a numbered milestone (e.g., R124 / R125...)
+- [ ] Runbook updated under `docs/` for field operators
 
-## Compatibility and security
+## Documentation
+- [ ] Public API surface documented in `docs/DEVELOPER_GUIDE.md` or affected module's doc
+- [ ] Breaking changes called out explicitly in PR description top
 
-- [ ] No consensus, crypto, storage-format, wire-protocol, or public-API change; OR I explained the impact and migration path above.
-- [ ] No secrets, real infrastructure details, or fabricated performance/security claims were added.
-- [ ] New comments and docs are in English.
-- [ ] I confirm this contribution is submitted under <LICENSE>, and I have the right to submit it.
-
-## Disclosure
-
-<!-- State any non-trivial AI-generated or third-party-derived content and how you verified it. -->
+## License
+By submitting this PR you agree your contribution will be distributed under the terms of the Apache-2.0 license (see `LICENSE`).

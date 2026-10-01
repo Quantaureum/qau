@@ -31,6 +31,10 @@ func (p *panickySigner) VerifyVote(pubKey []byte, message []byte, signature []by
 }
 func (p *panickySigner) GroupPublicKey() []byte { return p.groupKey }
 func (p *panickySigner) IsThresholdMode() bool  { return true }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (p *panickySigner) Threshold() int { return 0 }
 func (p *panickySigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {
@@ -190,6 +194,10 @@ func (a *alwaysValidSigner) VerifyVote(pubKey []byte, message []byte, signature 
 }
 func (a *alwaysValidSigner) GroupPublicKey() []byte { return a.groupKey }
 func (a *alwaysValidSigner) IsThresholdMode() bool  { return true }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (a *alwaysValidSigner) Threshold() int { return 0 }
 func (a *alwaysValidSigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {

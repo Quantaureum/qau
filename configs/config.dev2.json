@@ -1,0 +1,52 @@
+{
+  "name": "qau-node-finance",
+  "dataDir": "./data2",
+  "network": "dev",
+  "listenAddr": ":9001",
+  "bootstrapPeers": [
+    "127.0.0.1:9000"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAddr": "127.0.0.1:8555",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8556",
+  "frontendEnabled": false,
+  "frontendAddr": ":8089",
+  "healthEnabled": true,
+  "healthAddr": ":8081",
+  "validatorEnabled": false,
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": true,
+  "allowLegacySignatures": false,
+  "syncOnlyMode": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 512,
+    "l1MaxMemory": 33554432,
+    "l2MaxSize": 4096,
+    "l2MaxMemory": 134217728,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 5000,
+    "batchSize": 200
+  },
+  "memoryLimitMB": 4096,
+  "maxConcurrentRequests": 20,
+  "requestTimeout": 30,
+  "requestsPerSecond": 10,
+  "alerting": {
+    "enabled": false
+  },
+  "allowedOrigins": ["http://localhost:*", "chrome-extension://"]
+}

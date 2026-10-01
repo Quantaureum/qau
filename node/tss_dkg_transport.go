@@ -2,6 +2,7 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/quantaureum/qau/p2p"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
+	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 	"github.com/quantaureum/qau/wallet/tss/qtd"
 )
 
@@ -86,6 +89,12 @@ func NewP2PDKGTransport(host *p2p.Host, participantID int, sessionID []byte) *P2
 // ParticipantID returns this participant's ID in the DKG round (1..total).
 func (t *P2PDKGTransport) ParticipantID() int { return t.participantID }
 
+// SessionID returns the DKG session ID this transport is bound to. Used by the
+// node handlers (TSS-R7-11) to reject inbound DKG messages stamped with a
+// different session (i.e. from another round window), preventing cross-round
+// contamination of the commitment/share buffers.
+func (t *P2PDKGTransport) SessionID() []byte { return t.sessionID }
+
 // SetPeerResolver installs the participantID → P2P PeerID resolver used for
 // point-to-point share delivery. Wired by the node layer from the validator
 // set (validator index +1 = participant ID). Without it, SendShare fails
@@ -96,6 +105,125 @@ func (t *P2PDKGTransport) SetPeerResolver(resolve func(participantID int) (p2p.P
 	t.resolvePeer = resolve
 }
 
+// SetWaitTimeout overrides the per-round wait bound used by WaitCommitments /
+// WaitShares. The node layer sizes it from the round window so slow
+// post-quantum verification on a loaded validator does not abandon a round
+// that is still converging.
+func (t *P2PDKGTransport) SetWaitTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.waitTimeout = d
+}
+
+func (t *P2PDKGTransport) currentWaitTimeout() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.waitTimeout
+}
+
+func validateTDilithium3DKGInbound(messageType uint8, encoded []byte, session dilithium3v1.DKGSession, recipientPosition *uint8, verifier dilithium3v1.DKGIdentityVerifier) (protocol.ThresholdEnvelope, error) {
+	if messageType == p2p.MsgTypeTDilithium3DKGActivation || verifier == nil {
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG inbound requires an identity verifier")
+	}
+	envelope, err := validateTDilithium3DKGStructure(messageType, encoded, session, recipientPosition)
+	if err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	if len(envelope.IdentitySignature) != protocol.Dilithium3V1Profile().Algorithm.SignatureSize() {
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG identity signature has invalid size")
+	}
+	signingBytes, err := envelope.IdentitySigningBytes()
+	if err != nil || !verifier(envelope.SenderID, signingBytes, envelope.IdentitySignature) {
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG sender identity verification failed")
+	}
+	return envelope, nil
+}
+
+func validateTDilithium3DKGStructure(messageType uint8, encoded []byte, session dilithium3v1.DKGSession, recipientPosition *uint8) (protocol.ThresholdEnvelope, error) {
+	if err := session.Validate(); err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	if err := p2p.ValidateTDilithium3DKGEnvelope(messageType, encoded); err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	envelope, err := protocol.DecodeEnvelope(encoded)
+	if err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	sessionDigest, err := session.Digest()
+	if err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	committeeDigest, err := session.Committee.CanonicalDigest()
+	if err != nil {
+		return protocol.ThresholdEnvelope{}, err
+	}
+	if envelope.SessionID != sessionDigest || envelope.KeyGeneration != session.KeyGeneration || envelope.CommitteeVersion != session.Committee.Version {
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG envelope belongs to another session")
+	}
+	senderPosition, ok := tdilithium3DKGCommitteePosition(session.Committee, envelope.SenderID)
+	if !ok {
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG sender is outside committee")
+	}
+	switch messageType {
+	case p2p.MsgTypeTDilithium3DKGRandomness, p2p.MsgTypeTDilithium3DKGRandomnessCommitment:
+		if recipientPosition != nil {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("public Dilithium3 DKG message has private recipient context")
+		}
+	case p2p.MsgTypeTDilithium3DKGGroupSeed:
+		message, err := dilithium3v1.UnmarshalGroupSeedMessage(envelope.Payload)
+		if err != nil {
+			return protocol.ThresholdEnvelope{}, err
+		}
+		if message.CommitteeDigest != committeeDigest || senderPosition != message.LeaderPosition || recipientPosition == nil || *recipientPosition >= 6 || message.RecipientPosition != *recipientPosition {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG private seed identity mismatch")
+		}
+	case p2p.MsgTypeTDilithium3DKGAcknowledgement:
+		acknowledgement, err := dilithium3v1.UnmarshalContributionAcknowledgement(envelope.Payload)
+		if err != nil {
+			return protocol.ThresholdEnvelope{}, err
+		}
+		if acknowledgement.CommitteeDigest != committeeDigest || senderPosition != acknowledgement.ParticipantPosition || recipientPosition != nil {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG acknowledgement identity mismatch")
+		}
+	case p2p.MsgTypeTDilithium3DKGComplaint:
+		complaint, err := dilithium3v1.UnmarshalComplaint(envelope.Payload)
+		if err != nil {
+			return protocol.ThresholdEnvelope{}, err
+		}
+		if complaint.CommitteeDigest != committeeDigest || senderPosition != complaint.ComplainantPosition || recipientPosition != nil {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG complaint identity mismatch")
+		}
+	case p2p.MsgTypeTDilithium3DKGContribution:
+		contribution, err := dilithium3v1.UnmarshalPublicContribution(envelope.Payload)
+		if err != nil {
+			return protocol.ThresholdEnvelope{}, err
+		}
+		if senderPosition != contribution.DealerPosition || recipientPosition != nil {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG contribution identity mismatch")
+		}
+	case p2p.MsgTypeTDilithium3DKGActivation:
+		if recipientPosition != nil {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG activation cannot have a private recipient")
+		}
+	default:
+		return protocol.ThresholdEnvelope{}, fmt.Errorf("unsupported Dilithium3 DKG message type %d", messageType)
+	}
+	return envelope, nil
+}
+
+func tdilithium3DKGCommitteePosition(committee protocol.CommitteeID, participantID uint32) (uint8, bool) {
+	for position, candidate := range committee.Participants {
+		if candidate == participantID {
+			return uint8(position), true
+		}
+	}
+	return 0, false
+}
+
 // SendCommitment broadcasts the Round1 commitment to all participants.
 // Commitments are public (lattice-hard to invert), so gossip is safe and
 // avoids needing a full peer map for every participant.
@@ -103,7 +231,7 @@ func (t *P2PDKGTransport) SendCommitment(peerID int, msg *qtd.Round1CommitmentMe
 	if t.host == nil {
 		return fmt.Errorf("p2p dkg transport: no P2P host wired; cannot send commitment to participant %d", peerID)
 	}
-	data, err := marshalDKGMessage(msg)
+	data, err := marshalDKGEnvelope(t.sessionID, msg)
 	if err != nil {
 		return fmt.Errorf("p2p dkg transport: marshal commitment: %w", err)
 	}
@@ -131,7 +259,7 @@ func (t *P2PDKGTransport) SendShare(peerID int, msg *qtd.Round1OpenMessage) erro
 	if !ok {
 		return fmt.Errorf("p2p dkg transport: no P2P peer mapping for participant %d; refusing to deliver private share", peerID)
 	}
-	data, err := marshalDKGMessage(msg)
+	data, err := marshalDKGEnvelope(t.sessionID, msg)
 	if err != nil {
 		return fmt.Errorf("p2p dkg transport: marshal share: %w", err)
 	}
@@ -164,20 +292,22 @@ func (t *P2PDKGTransport) IngestShare(msg *qtd.Round1OpenMessage) {
 }
 
 // WaitCommitments blocks until the total-1 commitments from the other
-// participants have been ingested (excluding this participant's own ID), or
-// until the wait timeout expires. Returns a map keyed by participant ID.
-func (t *P2PDKGTransport) WaitCommitments(total int) (map[int]*qtd.Round1CommitmentMessage, error) {
-	return t.waitCommitments(total, t.waitTimeout)
+// participants have been ingested (excluding this participant's own ID), until
+// the wait timeout expires, or until ctx is cancelled. Returns a map keyed by
+// participant ID.
+func (t *P2PDKGTransport) WaitCommitments(ctx context.Context, total int) (map[int]*qtd.Round1CommitmentMessage, error) {
+	return t.waitCommitments(ctx, total, t.currentWaitTimeout())
 }
 
 // WaitShares blocks until the total-1 open+share messages from the other
-// participants have been ingested (excluding this participant's own ID), or
-// until the wait timeout expires. Returns a map keyed by participant ID.
-func (t *P2PDKGTransport) WaitShares(total int) (map[int]*qtd.Round1OpenMessage, error) {
-	return t.waitShares(total, t.waitTimeout)
+// participants have been ingested (excluding this participant's own ID), until
+// the wait timeout expires, or until ctx is cancelled. Returns a map keyed by
+// participant ID.
+func (t *P2PDKGTransport) WaitShares(ctx context.Context, total int) (map[int]*qtd.Round1OpenMessage, error) {
+	return t.waitShares(ctx, total, t.currentWaitTimeout())
 }
 
-func (t *P2PDKGTransport) waitCommitments(total int, timeout time.Duration) (map[int]*qtd.Round1CommitmentMessage, error) {
+func (t *P2PDKGTransport) waitCommitments(ctx context.Context, total int, timeout time.Duration) (map[int]*qtd.Round1CommitmentMessage, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -198,14 +328,22 @@ func (t *P2PDKGTransport) waitCommitments(total int, timeout time.Duration) (map
 			return out, nil
 		}
 		t.mu.Unlock()
+		// TSS-R7-12: honor ctx cancellation (per-attempt round-window deadline)
+		// so an abandoned round unwinds promptly and releases the manager lock.
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("p2p dkg transport: commitments wait cancelled (have %d/%d): %w", others, total-1, err)
+		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("p2p dkg transport: timed out waiting for %d commitments (have %d)", total-1, others)
 		}
-		time.Sleep(dkgWaitPollInterval)
+		select {
+		case <-ctx.Done():
+		case <-time.After(dkgWaitPollInterval):
+		}
 	}
 }
 
-func (t *P2PDKGTransport) waitShares(total int, timeout time.Duration) (map[int]*qtd.Round1OpenMessage, error) {
+func (t *P2PDKGTransport) waitShares(ctx context.Context, total int, timeout time.Duration) (map[int]*qtd.Round1OpenMessage, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -226,40 +364,73 @@ func (t *P2PDKGTransport) waitShares(total int, timeout time.Duration) (map[int]
 			return out, nil
 		}
 		t.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("p2p dkg transport: shares wait cancelled (have %d/%d): %w", others, total-1, err)
+		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("p2p dkg transport: timed out waiting for %d shares (have %d)", total-1, others)
 		}
-		time.Sleep(dkgWaitPollInterval)
+		select {
+		case <-ctx.Done():
+		case <-time.After(dkgWaitPollInterval):
+		}
 	}
 }
 
-// marshalDKGMessage serializes a DKG round payload to JSON for the wire.
-func marshalDKGMessage(v any) ([]byte, error) {
-	return json.Marshal(v)
+// dkgWireEnvelope wraps a DKG round message with the sessionID it belongs to.
+// TSS-R7-11 (2026-09): the raw qtd Round1 structs carry only a ParticipantID,
+// no round/session binding. When a node retries in a later round window, a
+// commitment/share from a DIFFERENT attempt (same ParticipantID) would be
+// ingested and fail VSS ("share does not match commitment set"), or a stale
+// message would poison a fresh coordinator. Stamping the sessionID on the wire
+// and rejecting mismatches at ingest makes each round window self-contained.
+type dkgWireEnvelope struct {
+	SessionID []byte          `json:"s"`
+	Payload   json.RawMessage `json:"p"`
+}
+
+// marshalDKGEnvelope wraps a marshaled DKG message with its sessionID.
+func marshalDKGEnvelope(sessionID []byte, msg any) ([]byte, error) {
+	inner, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(dkgWireEnvelope{SessionID: sessionID, Payload: inner})
 }
 
 // decodeDKGCommitmentPayload parses a qtd.Round1CommitmentMessage from a
-// received p2p.MsgTypeTSSDKGCommitment payload.
-func decodeDKGCommitmentPayload(payload []byte) (*qtd.Round1CommitmentMessage, error) {
+// received p2p.MsgTypeTSSDKGCommitment payload. It also returns the sessionID
+// stamped on the wire envelope (TSS-R7-11) so the handler can reject messages
+// from a different DKG round window.
+func decodeDKGCommitmentPayload(payload []byte) (*qtd.Round1CommitmentMessage, []byte, error) {
 	if len(payload) == 0 {
-		return nil, errors.New("empty DKG commitment payload")
+		return nil, nil, errors.New("empty DKG commitment payload")
+	}
+	var env dkgWireEnvelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil, nil, fmt.Errorf("decode DKG commitment envelope: %w", err)
 	}
 	var msg qtd.Round1CommitmentMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		return nil, fmt.Errorf("decode DKG commitment: %w", err)
+	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		return nil, nil, fmt.Errorf("decode DKG commitment: %w", err)
 	}
-	return &msg, nil
+	return &msg, env.SessionID, nil
 }
 
 // decodeDKGSharePayload parses a qtd.Round1OpenMessage from a received
-// p2p.MsgTypeTSSDKGAck payload.
-func decodeDKGSharePayload(payload []byte) (*qtd.Round1OpenMessage, error) {
+// p2p.MsgTypeTSSDKGAck payload. It also returns the sessionID stamped on the
+// wire envelope (TSS-R7-11).
+func decodeDKGSharePayload(payload []byte) (*qtd.Round1OpenMessage, []byte, error) {
 	if len(payload) == 0 {
-		return nil, errors.New("empty DKG share payload")
+		return nil, nil, errors.New("empty DKG share payload")
+	}
+	var env dkgWireEnvelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil, nil, fmt.Errorf("decode DKG share envelope: %w", err)
 	}
 	var msg qtd.Round1OpenMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		return nil, fmt.Errorf("decode DKG share: %w", err)
+	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		return nil, nil, fmt.Errorf("decode DKG share: %w", err)
 	}
-	return &msg, nil
+	return &msg, env.SessionID, nil
 }

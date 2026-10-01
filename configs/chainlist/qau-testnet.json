@@ -1,0 +1,32 @@
+{
+  "name": "Quantaureum Testnet",
+  "chain": "QAU",
+  "rpc": [
+    "https://testnet-rpc.quantaureum.com"
+  ],
+  "faucets": [
+    "https://faucet.quantaureum.com"
+  ],
+  "nativeCurrency": {
+    "name": "Quantaureum",
+    "symbol": "QAU",
+    "decimals": 18
+  },
+  "features": [
+    { "name": "EIP155" },
+    { "name": "EIP1559" }
+  ],
+  "infoURL": "https://quantaureum.com",
+  "shortName": "qau-testnet",
+  "chainId": 1669,
+  "networkId": 1669,
+  "icon": "quantaureum",
+  "explorers": [
+    {
+      "name": "Quantaureum Testnet Explorer",
+      "url": "https://testnet-explorer.quantaureum.com",
+      "icon": "quantaureum",
+      "standard": "EIP3091"
+    }
+  ]
+}

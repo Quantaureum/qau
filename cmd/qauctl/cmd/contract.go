@@ -27,12 +27,12 @@ Private keys are never handled directly — use account-remote import/unlock fir
 
 Example:
   # Deploy a LinearVesting contract
-  qauctl contract deploy ./contract.hex http://rpc.example.invalid:8545 \
+  qauctl contract deploy ./contract.hex http://203.0.113.1:8545 \
     --from 0x08036632ada4ff720fbb5e4b8e226358280954cb \
     --constructor "beneficiary=0xdF6F...,cliff=+3600,start=now,duration=7200,amount=1000qau"
 
   # Call a contract method (releasable())
-  qauctl contract call 0xContractAddress 0x86d1a69f http://rpc.example.invalid:8545 \
+  qauctl contract call 0xContractAddress 0x86d1a69f http://203.0.113.1:8545 \
     --from 0x08036632ada4ff720fbb5e4b8e226358280954cb`,
 	}
 
@@ -106,10 +106,10 @@ The calldata should include the function selector + encoded arguments.
 
 Example:
   # Call releasable()
-  qauctl contract call 0xContractAddr 0x86d1a69f http://rpc.example.invalid:8545 --from 0xMyAddr
+  qauctl contract call 0xContractAddr 0x86d1a69f http://203.0.113.1:8545 --from 0xMyAddr
 
   # Call release()
-  qauctl contract call 0xContractAddr 0x15e4167e http://rpc.example.invalid:8545 --from 0xMyAddr`,
+  qauctl contract call 0xContractAddr 0x15e4167e http://203.0.113.1:8545 --from 0xMyAddr`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return callContract(args[0], args[1], args[2], fromAddr)

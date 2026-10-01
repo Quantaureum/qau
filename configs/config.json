@@ -1,0 +1,98 @@
+{
+  "_comment": "SECURITY: This is a TESTNET / DEVELOPMENT config. For production deployments: (1) set rpcAddr/wsAddr to a specific internal IP or Unix socket, (2) remove localhost from allowedOrigins, (3) use TLS for RPC/WebSocket, (4) set validatorKey via environment variable QAU_VALIDATOR_KEY, (5) disable devMode.",
+  "name": "qau-node-master",
+  "dataDir": "./data1",
+  "network": "dev",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [
+    "127.0.0.1:9001",
+    "127.0.0.1:9002"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAuthEnabled": true,
+  "rpcAddr": "127.0.0.1:8545",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8546",
+  "frontendEnabled": false,
+  "frontendAddr": "127.0.0.1:8088",
+  "healthEnabled": true,
+  "healthAddr": "127.0.0.1:8080",
+  "validatorEnabled": true,
+  "validatorKey": "",
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": true,
+  "allowLegacySignatures": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 512,
+    "l1MaxMemory": 33554432,
+    "l2MaxSize": 4096,
+    "l2MaxMemory": 134217728,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 500,
+    "batchSize": 100
+  },
+  "memoryLimitMB": 4096,
+  "maxConcurrentRequests": 20,
+  "requestTimeout": 30,
+  "requestsPerSecond": 5,
+  "expertConfig": {
+    "enabled": false
+  },
+  "computerUse": {
+    "enabled": false
+  },
+  "alerting": {
+    "enabled": true,
+    "configFile": "configs/alerting.json"
+  },
+  "bridge": {
+    "_comment": "Cross-chain bridge config. QAU_ENABLE_BRIDGE=1 env var required to enable. nodeUrls maps chainID→RPC URL. Empty nodeUrls = bridge starts but registers 0 adapters (non-functional).",
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8545",
+      "ethereum": ""
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "",
+      "ethereum": ""
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 10,
+    "messageExpiration": 86400,
+    "pollingInterval": 15,
+    "maxRetries": 5,
+    "initializerAddress": "",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  },
+  "allowedOrigins": [
+    "http://localhost:3000",
+    "http://localhost:8088"
+  ],
+  "danksharding": {
+    "_comment": "DA committee / danksharding config. Set enabled=true to activate DA sampling, blob storage, and committee attestation. experimental=true prints warnings. committeeSize=0 uses default (512). subnetCount=0 uses default (32).",
+    "enabled": false,
+    "experimental": true,
+    "committeeSize": 0,
+    "subnetCount": 0
+  },
+  "_validatorKeyEnv": "QAU_VALIDATOR_KEY",
+  "sharding": {
+    "maxCount": 64,
+    "blockSize": 1048576,
+    "interval": 12,
+    "minValidators": 3
+  }
+}

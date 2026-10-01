@@ -27,9 +27,11 @@ package tss
 //
 // RESIDUAL RISK (High, not Critical): The aggregator can still recover s1
 // because c·(t0-s2) = c·(A·s1 - t1·2^d). However, the aggregator CANNOT
-// recover s2 or t0 individually, so it CANNOT forge signatures. Full closure
-// requires DH-based pairwise masking or distributed hint generation. Until
-// then, distributed TSS is HARD-BLOCKED in production (see distributedTSSEnabled()).
+// recover s2 or t0 individually, so it CANNOT forge signatures. Closure requires
+// distributed hint generation; pairwise masking does not help, because the masks
+// cancel in the aggregate. Distributed TSS is therefore permanently disabled —
+// see distributedTSSEnabled() in node/adapters.go, which returns false with no
+// runtime switch.
 //
 // These tests verify:
 //  1. End-to-end threshold signing still produces a valid signature (functional)

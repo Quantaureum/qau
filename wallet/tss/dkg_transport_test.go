@@ -3,6 +3,7 @@ package tss
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -90,7 +91,7 @@ func (b *memBus) SendShare(peerID int, msg *qtd.Round1OpenMessage) error {
 }
 
 // WaitCommitments blocks until all total-1 commitments from others arrive (deduplicated by pid).
-func (b *memBus) WaitCommitments(total int) (map[int]*qtd.Round1CommitmentMessage, error) {
+func (b *memBus) WaitCommitments(ctx context.Context, total int) (map[int]*qtd.Round1CommitmentMessage, error) {
 	got := make(map[int]*qtd.Round1CommitmentMessage)
 	timeout := time.After(30 * time.Second)
 	for len(got) < total-1 {
@@ -100,6 +101,8 @@ func (b *memBus) WaitCommitments(total int) (map[int]*qtd.Round1CommitmentMessag
 				continue
 			}
 			got[m.ParticipantID] = m
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-timeout:
 			return nil, fmt.Errorf("memBus: timeout waiting for %d commitments, got %d", total-1, len(got))
 		}
@@ -108,7 +111,7 @@ func (b *memBus) WaitCommitments(total int) (map[int]*qtd.Round1CommitmentMessag
 }
 
 // WaitShares blocks until all total-1 share messages from others arrive (deduplicated by pid).
-func (b *memBus) WaitShares(total int) (map[int]*qtd.Round1OpenMessage, error) {
+func (b *memBus) WaitShares(ctx context.Context, total int) (map[int]*qtd.Round1OpenMessage, error) {
 	got := make(map[int]*qtd.Round1OpenMessage)
 	timeout := time.After(30 * time.Second)
 	for len(got) < total-1 {
@@ -118,6 +121,8 @@ func (b *memBus) WaitShares(total int) (map[int]*qtd.Round1OpenMessage, error) {
 				continue
 			}
 			got[m.ParticipantID] = m
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-timeout:
 			return nil, fmt.Errorf("memBus: timeout waiting for %d shares, got %d", total-1, len(got))
 		}

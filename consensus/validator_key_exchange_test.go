@@ -213,6 +213,60 @@ func TestValidatorKeyExchange_BidirectionalSession(t *testing.T) {
 	}
 }
 
+func TestValidatorKeyExchange_ExportsDomainSeparatedPairwiseSecret(t *testing.T) {
+	addrA := generateTestAddress(0x31)
+	addrB := generateTestAddress(0x32)
+	vkeA, err := NewValidatorKeyExchange(addrA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vkeB, err := NewValidatorKeyExchange(addrB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubA, err := vkeA.LocalKyberPublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubB, err := vkeB.LocalKyberPublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vkeA.RegisterKyberKey(addrB, pubB); err != nil {
+		t.Fatal(err)
+	}
+	if err := vkeB.RegisterKyberKey(addrA, pubA); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := vkeA.InitiateSession(addrB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vkeB.CompleteSession(addrA, ciphertext); err != nil {
+		t.Fatal(err)
+	}
+
+	context := []byte("reshare/session/dealer/round/check")
+	secretA, err := vkeA.ExportPairwiseSecret(addrB, "QAU-TMLDSA65-V1-RESHARE-MASK", context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretB, err := vkeB.ExportPairwiseSecret(addrA, "QAU-TMLDSA65-V1-RESHARE-MASK", context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secretA != secretB || secretA == ([32]byte{}) {
+		t.Fatal("pairwise exporter mismatch or zero secret")
+	}
+	other, err := vkeA.ExportPairwiseSecret(addrB, "QAU-TMLDSA65-V1-RESHARE-MASK", []byte("other-check"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == secretA {
+		t.Fatal("pairwise exporter reused a secret across contexts")
+	}
+}
+
 func TestValidatorKeyExchange_SessionNotFound(t *testing.T) {
 	addr := generateTestAddress(0x01)
 	vke, _ := NewValidatorKeyExchange(addr)

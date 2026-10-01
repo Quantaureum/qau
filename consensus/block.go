@@ -400,8 +400,9 @@ type QPOS struct {
 	finalizedRoot  types.Hash
 
 	// Justified checkpoint (1 epoch before finalized)
-	justifiedEpoch uint64
-	justifiedRoot  types.Hash
+	justifiedEpoch     uint64
+	justifiedRoot      types.Hash
+	attestationSources map[uint64]AttestationCheckpoint
 
 	// R107-FINALITY-PERSIST: optional durable checkpoint callback. The
 	// consensus package stays storage-agnostic; node wiring persists the
@@ -939,10 +940,16 @@ func (q *QPOS) SetThresholdSigner(signer ThresholdKeySigner) {
 }
 
 // HasThresholdSigner returns true if a threshold signer is configured.
+//
+// LOCK ORDER: the signer is backed by wallet/tss and takes its own mutex.
+// Snapshot the pointer under q.mu and call it OUTSIDE the lock; calling into
+// the signer while holding q.mu made qpos.mu -> tss.mu an edge of the cycle
+// that deadlocked the 6-node testnet (see TSSManager.generateKeySharesDistributed).
 func (q *QPOS) HasThresholdSigner() bool {
 	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.tssSigner != nil && q.tssSigner.IsThresholdMode()
+	signer := q.tssSigner
+	q.mu.RUnlock()
+	return signer != nil && signer.IsThresholdMode()
 }
 
 // SetDAAvailabilityChecker registers a callback that checks whether a slot's
@@ -987,13 +994,16 @@ func (q *QPOS) CheckDAAvailability(slot uint64) error {
 // configured, or nil otherwise.
 // P0-2 (2026-07-13): Used at epoch boundaries to complete the executive
 // chamber DKG when a pre-established group key is available.
+//
+// LOCK ORDER: see HasThresholdSigner — never call the signer under q.mu.
 func (q *QPOS) GetGroupPublicKey() []byte {
 	q.mu.RLock()
-	defer q.mu.RUnlock()
-	if q.tssSigner == nil {
+	signer := q.tssSigner
+	q.mu.RUnlock()
+	if signer == nil {
 		return nil
 	}
-	return q.tssSigner.GroupPublicKey()
+	return signer.GroupPublicKey()
 }
 
 func (q *QPOS) SignBlock(validatorIndex int, data []byte) ([]byte, error) {

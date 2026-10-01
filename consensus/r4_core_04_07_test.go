@@ -155,7 +155,12 @@ func TestR4CORE04_RequestSeal_NoCanonicalRoot_AllowsSeal(t *testing.T) {
 // forked between RequestSeal and seal completion, or the canonical root
 // was recorded after RequestSeal but before completeSealLockedFinalize.
 func TestR4CORE04_CompleteSeal_RejectsNonCanonicalAtFinalize(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). The two partial seals below (from v0 and v1) must reach the
+	// weight bar to trigger completion. Use a 3-validator set so the
+	// executive members {0,1,2} ARE the full set: total 3000, required
+	// 2000, two signatures cover 2000 >= 2000.
+	vs := createTestValidatorSet(t, 3)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)

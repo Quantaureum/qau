@@ -31,9 +31,20 @@ type TSSManager struct {
 	mu     sync.RWMutex
 	config TSSConfig
 
-	qtdShares   map[int]*qtd.QTDShare
-	qtdPubKey   *qtd.QTDPublicKey
-	groupPubKey []byte
+	qtdShares      map[int]*qtd.QTDShare
+	qtdPubKey      *qtd.QTDPublicKey
+	groupPubKey    []byte
+	participantIDs []int
+	// retiredShares keeps the previous share generation after an epoch
+	// reshare moved this node out of the holder set or replaced its share.
+	// It is never used for signing. It exists so a rotation that fails on
+	// other nodes cannot destroy the only copy of the old generation before
+	// an acknowledged retirement protocol exists; see RetireResharedShare.
+	retiredShares map[int]*qtd.QTDShare
+	// dkgInProgress serializes distributed DKG rounds. A round releases m.mu
+	// while it waits on the network (see generateKeySharesDistributed), so
+	// the mutex alone cannot keep two rounds from overlapping.
+	dkgInProgress bool
 
 	activeSessions       map[string]*qtd.QTDSession
 	shareCommitments     map[int][]byte // SHA-256 of S1 only (legacy)
@@ -299,55 +310,12 @@ func (m *TSSManager) SetAllowPlaintextExport(allowed bool) {
 // SECURITY (audit P2-): Added allowPlaintextExport flag. Must call
 // SetAllowPlaintextExport(true) before calling this method. Default is false.
 func (m *TSSManager) ExportKeyShares() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if !m.allowPlaintextExport {
 		return nil, fmt.Errorf("plaintext export disabled: use ExportKeySharesEncrypted or call SetAllowPlaintextExport(true)")
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if len(m.qtdShares) == 0 {
-		return nil, fmt.Errorf("no key shares available")
-	}
-
-	var totalLen int
-	shareDatas := make([][]byte, 0, len(m.qtdShares))
-	for _, share := range m.qtdShares {
-		encoded := share.Encode()
-		totalLen += 4 + len(encoded)
-		shareDatas = append(shareDatas, encoded)
-	}
-
-	var gpKeyData []byte
-	if m.qtdPubKey != nil {
-		var err error
-		gpKeyData, err = m.exportGroupPublicKeyUnlocked()
-		if err != nil {
-			// AUDIT (2026) TSS B-8 FIX: Return the error instead of
-			// silently continuing with nil gpKeyData. Previously the export
-			// would succeed but produce data missing the group public key,
-			// causing silent data corruption.
-			return nil, fmt.Errorf("failed to export group public key during serialization: %w", err)
-		}
-	}
-
-	data := make([]byte, 2+totalLen+4+len(gpKeyData))
-	offset := 0
-
-	binary.BigEndian.PutUint16(data[offset:], uint16(len(shareDatas)))
-	offset += 2
-
-	for _, sd := range shareDatas {
-		binary.BigEndian.PutUint32(data[offset:], uint32(len(sd)))
-		offset += 4
-		copy(data[offset:], sd)
-		offset += len(sd)
-	}
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(gpKeyData)))
-	offset += 4
-	copy(data[offset:], gpKeyData)
-
-	return data, nil
+	return m.exportKeyStateLocked()
 }
 
 // exportKeyShares is the internal version of ExportKeyShares that acquires its
@@ -359,50 +327,7 @@ func (m *TSSManager) ExportKeyShares() ([]byte, error) {
 func (m *TSSManager) exportKeyShares() ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	if len(m.qtdShares) == 0 {
-		return nil, fmt.Errorf("no key shares available")
-	}
-
-	var totalLen int
-	shareDatas := make([][]byte, 0, len(m.qtdShares))
-	for _, share := range m.qtdShares {
-		encoded := share.Encode()
-		totalLen += 4 + len(encoded)
-		shareDatas = append(shareDatas, encoded)
-	}
-
-	var gpKeyData []byte
-	if m.qtdPubKey != nil {
-		var err error
-		gpKeyData, err = m.exportGroupPublicKeyUnlocked()
-		if err != nil {
-			// AUDIT (2026) TSS B-8 FIX: Return the error instead of
-			// silently continuing with nil gpKeyData. Previously the export
-			// would succeed but produce data missing the group public key,
-			// causing silent data corruption.
-			return nil, fmt.Errorf("failed to export group public key during serialization: %w", err)
-		}
-	}
-
-	data := make([]byte, 2+totalLen+4+len(gpKeyData))
-	offset := 0
-
-	binary.BigEndian.PutUint16(data[offset:], uint16(len(shareDatas)))
-	offset += 2
-
-	for _, sd := range shareDatas {
-		binary.BigEndian.PutUint32(data[offset:], uint32(len(sd)))
-		offset += 4
-		copy(data[offset:], sd)
-		offset += len(sd)
-	}
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(gpKeyData)))
-	offset += 4
-	copy(data[offset:], gpKeyData)
-
-	return data, nil
+	return m.exportKeyStateLocked()
 }
 
 // maxImportShareCountLimit returns the maximum number of key shares that
@@ -423,7 +348,7 @@ func maxImportShareCountLimit() int {
 	return 100
 }
 
-func (m *TSSManager) ImportKeyShares(data []byte) error {
+func (m *TSSManager) importLegacyKeyShares(data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -466,6 +391,7 @@ func (m *TSSManager) ImportKeyShares(data []byte) error {
 	}
 
 	m.qtdShares = make(map[int]*qtd.QTDShare, shareCount)
+	m.participantIDs = make([]int, 0, m.config.TotalShares)
 	m.shareCommitments = make(map[int][]byte, shareCount)
 	m.fullShareCommitments = make(map[int][]byte, shareCount)
 
@@ -475,10 +401,10 @@ func (m *TSSManager) ImportKeyShares(data []byte) error {
 		}
 		shareLen := int(binary.BigEndian.Uint32(data[offset:]))
 		offset += 4
-		// QP-03 FIX: Bound each share length to prevent memory exhaustion
-		// from a malicious oversized length field. Legitimate QTD shares are
-		// well under this limit; larger values indicate malformed input.
-		const maxImportShareSize = 16384
+		// Keep the import bound aligned with qtd.DecodeQTDShare. Current
+		// distributed-DKG shares can exceed 16 KiB once all verification
+		// vectors are present, while the decoder still caps allocations at 1 MiB.
+		const maxImportShareSize = 1 << 20
 		if shareLen > maxImportShareSize {
 			return fmt.Errorf("share %d: length exceeds maximum: %d (max %d)", i, shareLen, maxImportShareSize)
 		}
@@ -490,14 +416,28 @@ func (m *TSSManager) ImportKeyShares(data []byte) error {
 			return fmt.Errorf("share %d: %w", i, err)
 		}
 		offset += shareLen
+		if m.qtdShares[share.ParticipantID] != nil {
+			share.Zeroize()
+			return fmt.Errorf("duplicate share participant %d", share.ParticipantID)
+		}
 
 		m.qtdShares[share.ParticipantID] = share
+		m.participantIDs = append(m.participantIDs, share.ParticipantID)
 		h := sha256.Sum256(share.S1ShareBytes)
 		m.shareCommitments[share.ParticipantID] = h[:]
 		m.fullShareCommitments[share.ParticipantID] = computeFullShareCommitment(share)
 	}
+	if len(m.participantIDs) == 1 && m.config.TotalShares > 1 {
+		m.participantIDs = make([]int, m.config.TotalShares)
+		for i := range m.participantIDs {
+			m.participantIDs[i] = i + 1
+		}
+	}
 
-	if offset+4 <= len(data) {
+	if offset != len(data) {
+		if offset+4 > len(data) {
+			return fmt.Errorf("truncated group public key length")
+		}
 		gpKeyLen := int(binary.BigEndian.Uint32(data[offset:]))
 		offset += 4
 		// QP-01 FIX: Bound the group public key length to prevent memory
@@ -508,7 +448,10 @@ func (m *TSSManager) ImportKeyShares(data []byte) error {
 		if gpKeyLen > maxGroupPublicKeySize {
 			return fmt.Errorf("group public key length exceeds maximum: %d (max %d)", gpKeyLen, maxGroupPublicKeySize)
 		}
-		if gpKeyLen > 0 && offset+gpKeyLen <= len(data) {
+		if offset+gpKeyLen != len(data) {
+			return fmt.Errorf("truncated group public key or trailing data")
+		}
+		if gpKeyLen > 0 {
 			// R46-REENTRANT BUG FIX (2026-08-10): call the unlocked helper
 			// here — we already hold m.mu.Lock above. Calling ImportGroupPublicKey
 			// would re-enter m.mu.Lock on the same goroutine and deadlock.
@@ -716,6 +659,12 @@ func IsEncryptedKeyShareData(data []byte) bool {
 func (m *TSSManager) ZeroizeAllShares() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, share := range m.retiredShares {
+		if share != nil {
+			share.Zeroize()
+		}
+	}
+	m.retiredShares = make(map[int]*qtd.QTDShare)
 	for _, share := range m.qtdShares {
 		if share != nil {
 			share.Zeroize()
@@ -816,10 +765,8 @@ func (m *TSSManager) CreateParticipantSession(message []byte, participantIDs []i
 	if err != nil {
 		return "", fmt.Errorf("create GM-QTD session: %w", err)
 	}
-	if m.config.Threshold < m.config.TotalShares {
-		session.SetShamirMode(true)
-		session.SetLagrangeCoefficients(participantIDs)
-	}
+	session.SetShamirMode(true)
+	session.SetLagrangeCoefficients(participantIDs)
 
 	session.SetTimeout(5 * time.Minute)
 
@@ -1087,9 +1034,11 @@ func (m *TSSManager) CompleteSign(sessionKey string, participantID int) (*Partia
 //
 // RESIDUAL RISK (High): The aggregator can still recover s1 from the aggregated
 // Z0Share because c·(t0-s2) = c·(A·s1 - t1·2^d). However, the aggregator CANNOT
-// recover s2 or t0 individually, so it CANNOT forge signatures. Full closure
-// requires DH-based pairwise masking or distributed hint generation. Until then,
-// distributed TSS is HARD-BLOCKED in production (see distributedTSSEnabled()).
+// recover s2 or t0 individually, so it CANNOT forge signatures. Closure requires
+// distributed hint generation; pairwise masking does not help, because the masks
+// cancel in the aggregate the aggregator is entitled to compute. Distributed TSS
+// is therefore permanently disabled — see distributedTSSEnabled() in
+// node/adapters.go, which returns false with no runtime switch.
 //
 // SECURITY: Z0Share is signature-derived (a function of the challenge and key
 // shares), NOT a raw key share. The raw s2_i/t0_i shares are NEVER serialized.

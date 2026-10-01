@@ -1,0 +1,179 @@
+{
+  "_comment": "Quantaureum DA (Data Availability) Committee Configuration Example",
+  "_doc": "P3-4 (2026-07-15). This file documents the 'danksharding' section of the node config (node/config.go:DankshardingNodeConfig). Copy the 'danksharding' block below into your node's config.json and adjust values. Fields not listed here are not DA-related.",
+
+  "danksharding": {
+    "_comment": "DA committee / danksharding engine configuration (P1-5)",
+
+    "enabled": {
+      "_type": "bool",
+      "_default": "false (fail-closed; must explicitly opt in)",
+      "_mainnet": "true",
+      "_testnet": "false (set true once validator count >= committeeSize)",
+      "_devnet": "false",
+      "_desc": "Master switch for the DA subsystem. When false, initDanksharding() returns immediately — no blob processing, no committee participation, no DAS sampling. Mainnet MUST set true; testnet/devnet may set false during early operation when the validator count is below committeeSize (512 default)."
+    },
+
+    "experimental": {
+      "_type": "bool",
+      "_default": "true",
+      "_mainnet": "false (remove EXPERIMENTAL tag before production)",
+      "_testnet": "true",
+      "_devnet": "true",
+      "_desc": "When true, logs a warning at startup and once per block (warnOnce). Set to false for production mainnet once the DA subsystem has been audited and stabilized."
+    },
+
+    "warningMessage": {
+      "_type": "string",
+      "_default": "\"\" (uses built-in default warning)",
+      "_desc": "Custom warning message shown when experimental=true. If empty, the default 'Danksharding is EXPERIMENTAL - not production-ready, use at your own risk' is used. Set this to document your organization's testing status."
+    },
+
+    "committeeSize": {
+      "_type": "int",
+      "_default": "0 (uses consensus.DACommitteeSize = 512)",
+      "_mainnet": "0 (use default 512)",
+      "_testnet": "4 (set to your validator count, must be <= 512)",
+      "_devnet": "3",
+      "_desc": "Overrides the DA committee size. 0 = use the compile-time constant DACommitteeSize (512). For testnet/devnet with fewer validators, set this to your active validator count. The committee is shuffled from active validators each epoch using VRF beacon randomness (P1-12). Must be > 0 when enabled=true and validator count is below 512.",
+      "_constraint": "committeeSize <= len(activeValidators), otherwise GetCommittee returns 'insufficient active validators' error."
+    },
+
+    "subnetCount": {
+      "_type": "int",
+      "_default": "0 (uses consensus.DACommitteeSubnetCount = 32)",
+      "_mainnet": "0 (use default 32)",
+      "_desc": "Overrides the DA subnet count. 0 = use the compile-time constant DACommitteeSubnetCount (32). Subnets are used for distributed column-to-subnet assignment in DAS sampling. Rarely changed — leave at default 32."
+    }
+  },
+
+  "_compile_time_constants": {
+    "_comment": "These constants are NOT configurable via JSON. Changing them requires recompiling the node (and may break consensus compatibility). Listed here for operator awareness.",
+
+    "DACommitteeSize": {
+      "_value": 512,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Default DA committee size. Can be overridden per-node via committeeSize above, but the network-wide value should be consistent."
+    },
+
+    "DACommitteeSubnetCount": {
+      "_value": 32,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Number of DA subnets for distributed sampling."
+    },
+
+    "DACommitteeEpochLength": {
+      "_value": 256,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Slots per epoch. Committee is recomputed every 256 slots (~51min at 12s slot time)."
+    },
+
+    "DAAttestationThreshold": {
+      "_value": 0.6667,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Minimum attestation collection rate for DA availability (2/3 supermajority)."
+    },
+
+    "DAMaxAttestationsPerSlot": {
+      "_value": 512,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Hard cap on attestations accepted per slot. Equals DACommitteeSize. Prevents memory exhaustion from bogus ValidatorIndex flooding (P1-8)."
+    },
+
+    "DAMaxTransitionSignatures": {
+      "_value": 64,
+      "_location": "consensus/da_committee.go",
+      "_desc": "Max individual signatures in transition (multi-sig) mode when no QTD threshold signer is configured. Larger committees MUST use QTD threshold aggregation (P0-3)."
+    },
+
+    "MaxBlobsPerBlock": {
+      "_value": 6,
+      "_location": "encoding/blob_tx.go",
+      "_desc": "Maximum blobs per block. ProcessBlobsForBlock rejects blocks with more."
+    },
+
+    "BlobSize": {
+      "_value": 131072,
+      "_unit": "bytes (128 KB)",
+      "_location": "encoding/blob_tx.go",
+      "_desc": "Fixed blob size."
+    },
+
+    "MaxBlobStorageSize": {
+      "_value": 268435456,
+      "_unit": "bytes (256 MB)",
+      "_location": "encoding/blob_network.go",
+      "_desc": "In-memory blob storage LRU cache cap. When exceeded, oldest entries are evicted."
+    },
+
+    "BlobGCTickerInterval": {
+      "_value": "60s",
+      "_location": "encoding/blob_network.go",
+      "_desc": "Automatic GC ticker interval for blob storage cleanup."
+    }
+  },
+
+  "_retention_config": {
+    "_comment": "DASRetentionConfig (encoding/das_retention.go) — currently uses DefaultDASRetentionConfig() and is NOT exposed via JSON. Documented here for operator awareness. Future versions may expose these fields.",
+    "_fields": {
+      "BlobRetentionSlots": {
+        "_default": 128,
+        "_desc": "Blobs older than currentSlot - 128 are GC'd. 128 slots ≈ 25min at 12s slot time."
+      },
+      "SessionRetentionSlots": {
+        "_default": 256,
+        "_desc": "DAS sampling session retention (1 epoch)."
+      },
+      "AttestRetentionSlots": {
+        "_default": 128,
+        "_desc": "Attestation retention for aggregate building."
+      },
+      "ConfidenceDecaySlots": {
+        "_default": 64,
+        "_desc": "Slots before confidence starts decaying."
+      },
+      "MinConfidenceDecay": {
+        "_default": 0.5,
+        "_desc": "Floor for confidence decay — confidence never drops below 50% of original within the retention window."
+      },
+      "GCTickerInterval": {
+        "_default": "60s",
+        "_desc": "BlobGarbageCollector ticker interval."
+      }
+    }
+  },
+
+  "_how_to_disable": {
+    "_method_1_json": "Set danksharding.enabled = false in config.json (recommended). initDanksharding() returns immediately without initializing any DA components.",
+    "_method_2_runtime": "Call committeeMgr.SetConfig(DACommitteeConfig{Enabled: false}) at runtime to disable the committee without restarting the node. Cached committees are cleared and GetCommittee returns ErrDACommitteeDisabled.",
+    "_method_3_compile": "Remove the 'danksharding' section entirely from config.json — DefaultDankshardingNodeConfig() returns Enabled=false, Experimental=true (fail-closed)."
+  },
+
+  "_mainnet_example": {
+    "_comment": "Minimal mainnet config — copy this 'danksharding' block into your node's config.json",
+    "danksharding": {
+      "enabled": true,
+      "experimental": false,
+      "committeeSize": 0,
+      "subnetCount": 0
+    }
+  },
+
+  "_testnet_example": {
+    "_comment": "Testnet with 4 validators — DA committee size set to validator count",
+    "danksharding": {
+      "enabled": true,
+      "experimental": true,
+      "committeeSize": 4,
+      "subnetCount": 0
+    }
+  },
+
+  "_devnet_example": {
+    "_comment": "Devnet — DA disabled (single node, no committee)",
+    "danksharding": {
+      "enabled": false,
+      "experimental": true
+    }
+  }
+}

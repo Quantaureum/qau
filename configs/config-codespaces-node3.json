@@ -1,0 +1,37 @@
+{
+  "name": "qau-node-3",
+  "dataDir": "./data3",
+  "network": "dev",
+  "listenAddr": ":9002",
+  "bootstrapPeers": [
+    "127.0.0.1:9000",
+    "127.0.0.1:9001"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAuthEnabled": false,
+  "rpcForceDisableAuth": true,
+  "rpcAddr": "0.0.0.0:8549",
+  "wsEnabled": true,
+  "wsAddr": "0.0.0.0:8550",
+  "frontendEnabled": false,
+  "healthEnabled": true,
+  "healthAddr": "0.0.0.0:8082",
+  "validatorEnabled": true,
+  "validatorKey": "",
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": false,
+  "allowLegacySignatures": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "allowedOrigins": [
+    "*"
+  ]
+}

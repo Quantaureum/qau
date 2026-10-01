@@ -953,8 +953,7 @@ func (p *TxPool) BatchAdd(txs []*encoding.Transaction) []error {
 // Must be called while holding the pool lock (p.mu).
 // HIGH FIX: Added maximum cleanup iterations to prevent unbounded processing.
 //
-//	(P3): Transaction expiry policy. Transactions are tracked with an
-//
+//  (P3): Transaction expiry policy. Transactions are tracked with an
 // added-at timestamp (p.txTimestamps) and evicted once older than maxTxAge
 // (6 hours). This bounds memory usage from stale/abandoned transactions and
 // prevents a sender from permanently pinning pool slots. Eviction is amortized:

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="400" height="120" viewBox="0 0 400 120" xmlns="http://www.w3.org/2000/svg">
+  <!-- filter definitions -->
+  <defs>
+    <!-- gold glow -->
+    <filter id="goldGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feFlood flood-color="#ffcc00" result="glow"/>
+      <feComposite in="glow" in2="blur" operator="in" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- neon blue effect -->
+    <filter id="neonGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feFlood flood-color="#01c4ff" result="glow"/>
+      <feComposite in="glow" in2="blur" operator="in" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- quantum gradient -->
+    <linearGradient id="quantumGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#01c4ff" />
+      <stop offset="50%" stop-color="#8a2be2" />
+      <stop offset="100%" stop-color="#01c4ff" />
+    </linearGradient>
+    
+    <!-- breathing animation -->
+    <radialGradient id="breathingGold" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#ffcc00">
+        <animate attributeName="stop-opacity" values="1;0.7;1" dur="3s" repeatCount="indefinite" />
+      </stop>
+      <stop offset="100%" stop-color="#ff9900">
+        <animate attributeName="stop-opacity" values="0.8;0.5;0.8" dur="3s" repeatCount="indefinite" />
+      </stop>
+    </radialGradient>
+    
+    <!-- text gradient -->
+    <linearGradient id="textGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#01c4ff" />
+    </linearGradient>
+  </defs>
+  
+  <!-- logo icon section -->
+  <g transform="translate(60, 60)">
+    <!-- background circle -->
+    <circle cx="0" cy="0" r="50" fill="#121212" />
+    
+    <!-- quantum orbits - elliptical orbits for infinite possibility and multi-dimensional thinking -->
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumGradient)" stroke-width="1" transform="rotate(30 0 0)" filter="url(#neonGlow)" opacity="0.8" />
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumGradient)" stroke-width="1" transform="rotate(-30 0 0)" filter="url(#neonGlow)" opacity="0.8" />
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumGradient)" stroke-width="1" transform="rotate(90 0 0)" filter="url(#neonGlow)" opacity="0.8" />
+    
+    <!-- central gold core with a breathing-light effect -->
+    <circle cx="0" cy="0" r="15" fill="url(#breathingGold)" filter="url(#goldGlow)">
+      <!-- breathing effect animation -->
+      <animate attributeName="r" values="15;17;15" dur="3s" repeatCount="indefinite" />
+    </circle>
+    
+    <!-- four orbiting particles - quantum entanglement and global interconnection -->
+    <circle cx="0" cy="-35" r="5" fill="#01c4ff" filter="url(#neonGlow)" />
+    <circle cx="35" cy="0" r="5" fill="#01c4ff" filter="url(#neonGlow)" />
+    <circle cx="0" cy="35" r="5" fill="#01c4ff" filter="url(#neonGlow)" />
+    <circle cx="-35" cy="0" r="5" fill="#01c4ff" filter="url(#neonGlow)" />
+  </g>
+  
+  <!-- text section -->
+  <g transform="translate(130, 60)">
+    <!-- QUANTUM text -->
+    <text x="0" y="0" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="url(#textGradient)" filter="url(#neonGlow)">QUANTUM</text>
+    
+    <!-- AURUM text -->
+    <text x="0" y="40" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="url(#breathingGold)" filter="url(#goldGlow)">
+      AURUM
+      <!-- text breathing effect -->
+      <animate attributeName="fill-opacity" values="1;0.8;1" dur="3s" repeatCount="indefinite" />
+    </text>
+  </g>
+</svg>

@@ -1,6 +1,6 @@
-// Quantaureum Node source, version 1.0.0.
 //go:build linux || darwin
 
+// Quantaureum Node source, version 1.0.0.
 package visor
 
 import (

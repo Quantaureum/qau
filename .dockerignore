@@ -1,0 +1,67 @@
+# Quantaureum Docker build context exclusions
+# Mirrors .gitignore policy: only source enters the image. Sensitive /
+# operational / runtime data must NEVER be baked into a docker context.
+# 2026-09-08: the unfiltered context was 13.3 GB (.local-only alone = 12 GB).
+
+# Secrets & ops quarantine — ABSOLUTE
+.local-only/
+**/.local-only/
+.githooks/
+*.key
+*.pem
+*.p12
+keys/
+testnet/keys/
+devnet-work/
+.devnet-work/
+.devnet-work
+**/dev_accounts.json
+**/dev_accounts*.json
+validators/**/wallet.json
+.env
+.env.*
+*.local
+
+# VCS / AI tooling
+.git/
+.gitignore
+.gitattributes
+.github/
+.golangci.yml
+.vscode/
+.idea/
+.claude/
+.agents/
+.cursor/
+AGENTS.md
+
+# Build artifacts & runtime data
+build/
+data/
+data*/
+logs/
+*.log
+*.db
+*.lock
+certs/
+coverage*
+*.out
+*.test
+
+# Docs & non-runtime files (small but irrelevant to the image)
+docs/
+wiki/
+CHANGELOG.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+LICENSE
+README*.md
+*.md
+!cmd/**/*.md
+
+# Test heavy dirs (not needed in runtime image build)
+tests/
+.qrcode/
+scripts/
+Makefile

@@ -830,10 +830,21 @@ func warnShamirSideChannelRisk() {
 //	verification — out of P3 scope. Runtime warn + TEE attestation remain
 //	the mitigation; full CT closure tracked under N25-003.
 func shamirSplitPolyVec(vec PolyVec, threshold, total int) (map[int]PolyVec, error) {
+	if total <= 0 || threshold <= 0 || threshold > total {
+		return nil, ErrInvalidConfig
+	}
+	participants := make([]int, total)
+	for index := range participants {
+		participants[index] = index + 1
+	}
+	return shamirSplitPolyVecAt(vec, threshold, participants)
+}
+
+func shamirSplitPolyVecAt(vec PolyVec, threshold int, participants []int) (map[int]PolyVec, error) {
 	if len(vec) == 0 {
 		return nil, ErrInvalidConfig
 	}
-	if threshold <= 0 || total <= 0 || threshold > total {
+	if threshold <= 0 || len(participants) == 0 || threshold > len(participants) {
 		return nil, ErrInvalidConfig
 	}
 
@@ -846,14 +857,20 @@ func shamirSplitPolyVec(vec PolyVec, threshold, total int) (map[int]PolyVec, err
 	// risk visible to operators so they can remediate.
 	warnShamirSideChannelRisk()
 
-	shares := make(map[int]PolyVec, total)
-	for id := 1; id <= total; id++ {
+	shares := make(map[int]PolyVec, len(participants))
+	for _, id := range participants {
+		if id <= 0 || int64(id) >= Q {
+			return nil, ErrInvalidParticipant
+		}
+		if _, duplicate := shares[id]; duplicate {
+			return nil, ErrInvalidParticipant
+		}
 		shares[id] = make(PolyVec, len(vec))
 	}
 
 	for p := 0; p < len(vec); p++ {
 		for c := 0; c < N; c++ {
-			secret := uint32(vec[p][c]) % uint32(Q)
+			secret := uint32((int64(vec[p][c])%Q + Q) % Q)
 
 			coeffs := make([]uint32, threshold)
 			coeffs[0] = secret
@@ -867,7 +884,7 @@ func shamirSplitPolyVec(vec PolyVec, threshold, total int) (map[int]PolyVec, err
 				coeffs[j] = binary.LittleEndian.Uint32(buf[:]) % uint32(Q)
 			}
 
-			for id := 1; id <= total; id++ {
+			for _, id := range participants {
 				val := uint32(0)
 				x := uint32(id)
 				xPow := uint32(1)

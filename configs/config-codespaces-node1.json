@@ -1,0 +1,53 @@
+{
+  "name": "qau-node-master",
+  "dataDir": "./data1",
+  "network": "dev",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [
+    "127.0.0.1:9001",
+    "127.0.0.1:9002"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAuthEnabled": false,
+  "rpcForceDisableAuth": true,
+  "rpcAddr": "0.0.0.0:8545",
+  "wsEnabled": true,
+  "wsAddr": "0.0.0.0:8546",
+  "frontendEnabled": false,
+  "healthEnabled": true,
+  "healthAddr": "0.0.0.0:8080",
+  "validatorEnabled": true,
+  "validatorKey": "",
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": true,
+  "allowLegacySignatures": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 512,
+    "l1MaxMemory": 33554432,
+    "l2MaxSize": 4096,
+    "l2MaxMemory": 134217728,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 500,
+    "batchSize": 100
+  },
+  "memoryLimitMB": 4096,
+  "maxConcurrentRequests": 20,
+  "requestTimeout": 30,
+  "requestsPerSecond": 5,
+  "allowedOrigins": [
+    "*"
+  ]
+}

@@ -16,7 +16,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		{"MaxBlockMessageSize", MaxBlockMessageSize, 10 * 1024 * 1024},
 		{"MaxTransactionMessageSize", MaxTransactionMessageSize, 1 * 1024 * 1024},
 		{"MaxVoteMessageSize", MaxVoteMessageSize, 64 * 1024},
-		{"MaxStatusMessageSize", MaxStatusMessageSize, 1 * 1024},
+		{"MaxStatusMessageSize", MaxStatusMessageSize, 16 * 1024}, // TSS-R7-09: raised from 1KB to fit signed status (pubkey+sig ~5.4KB)
 		{"MaxPingPongMessageSize", MaxPingPongMessageSize, 256},
 		{"MaxBlockResponseSize", MaxBlockResponseSize, 10 * 1024 * 1024},
 	}

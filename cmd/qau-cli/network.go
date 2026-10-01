@@ -194,7 +194,7 @@ func newNetworkConnectCmd() *cobra.Command {
 		Long: `Connect to a specific Quantaureum network peer.
 
 Example:
-  qau-cli network connect enode://123456@peer.example.invalid:30303
+  qau-cli network connect enode://123456@198.51.100.10:30303
 
 This command initiates a connection to a specific peer node.
 The peer address should be in enode format.`,

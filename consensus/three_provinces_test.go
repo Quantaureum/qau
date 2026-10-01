@@ -152,7 +152,12 @@ func TestThreeChambersFlowExecutiveRefusesUnapproved(t *testing.T) {
 }
 
 func TestThreeChambersFlowFullApproval(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake), so executive {0,1,2} cannot reach it on a 10-validator set.
+	// Use a 4-validator set (total 4000, required 2667): three executive
+	// signatures cover 3000 >= 2667, and validator 3 (unassigned) serves as
+	// the proposer for ProposeBlock(1, hash, 3).
+	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)

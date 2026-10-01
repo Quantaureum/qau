@@ -2,9 +2,11 @@
 package consensus
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -195,7 +197,8 @@ var (
 )
 
 type ThreeChambersCoordinator struct {
-	mu sync.RWMutex
+	mu                sync.RWMutex
+	epochTransitionMu sync.Mutex
 
 	qpos *QPOS
 
@@ -263,6 +266,11 @@ type ThreeChambersCoordinator struct {
 	dkgTimeoutWarnEpoch uint64
 	dkgTimeoutWarnAt    time.Time
 	dkgTimeoutWarnSeen  bool
+
+	holderParticipantIDs []int
+	reshareEpoch         uint64
+	reshareInFlight      bool
+	reshareFailed        bool
 }
 
 // DistributedDKGRunner produces a group public key via real P2P distributed
@@ -284,6 +292,13 @@ type DistributedDKGRunner interface {
 	// RunDistributedDKG executes a distributed DKG round for the given
 	// epoch and participant count. Returns the group public key.
 	RunDistributedDKG(epoch uint64, threshold, totalParticipants int) ([]byte, error)
+}
+
+// DistributedReshareRunner rotates the holders of an existing group key at an
+// epoch boundary. The key itself is preserved; only the share holder set and
+// threshold change. It is optional so existing test/dev runners remain valid.
+type DistributedReshareRunner interface {
+	RunDistributedReshare(epoch uint64, oldParticipantIDs, newParticipantIDs []int, threshold int) ([]byte, error)
 }
 
 func NewThreeChambersCoordinator(qpos *QPOS) *ThreeChambersCoordinator {
@@ -417,6 +432,9 @@ func (tpc *ThreeChambersCoordinator) CompleteDKGViaDistributedRunner(epoch uint6
 	if executive == nil {
 		return false
 	}
+	if executive.Epoch() != epoch {
+		return false
+	}
 
 	// Already active — no need to run DKG.
 	if executive.IsActive() {
@@ -425,6 +443,16 @@ func (tpc *ThreeChambersCoordinator) CompleteDKGViaDistributedRunner(epoch uint6
 
 	// DKG not running — nothing to complete.
 	if executive.State() != ExecutiveDKGRunning {
+		return false
+	}
+
+	// A share rotation for this epoch is running or has failed: the
+	// committee does not (yet) hold shares for the key, so a slot tick must
+	// not activate the chamber with the pre-rotation holder set.
+	tpc.mu.RLock()
+	rotationBlocks := tpc.reshareInFlight || tpc.reshareFailed
+	tpc.mu.RUnlock()
+	if rotationBlocks {
 		return false
 	}
 
@@ -453,7 +481,15 @@ func (tpc *ThreeChambersCoordinator) CompleteDKGViaDistributedRunner(epoch uint6
 	// This bypasses the GOV- local-preset gate because the key was
 	// produced by the injected runner (real distributed DKG), not a local
 	// preset.
-	if err := executive.SetDKGComplete(groupPubKey); err != nil {
+	tpc.epochTransitionMu.Lock()
+	defer tpc.epochTransitionMu.Unlock()
+	tpc.mu.RLock()
+	rotationBlocks = tpc.reshareInFlight || tpc.reshareFailed
+	tpc.mu.RUnlock()
+	if rotationBlocks {
+		return false
+	}
+	if err := executive.setDKGCompleteForEpoch(epoch, members, groupPubKey); err != nil {
 		tpfLog.Warnf("GOV- distributed DKG returned malformed group public key for epoch %d: %v", epoch, err)
 		return false
 	}
@@ -829,8 +865,7 @@ func (tpc *ThreeChambersCoordinator) SelectExecutiveForEpoch(epoch uint64, valid
 		stake *big.Int
 	}
 
-	// Build eligible validator list (active, not slashed, positive stake,
-	// not already in Proposing or Review chamber).
+	// Build eligibility from validator state, independent of local slot roles.
 	eligible := make([]eligibleVal, 0, n)
 	vList := validators.Validators()
 	for i, v := range vList {
@@ -845,10 +880,6 @@ func (tpc *ThreeChambersCoordinator) SelectExecutiveForEpoch(epoch uint64, valid
 			continue
 		}
 		if v.Stake == nil || v.Stake.Sign() <= 0 {
-			continue
-		}
-		if tpc.assignment.IsInChamberForEpoch(i, ChamberProposing, epoch) ||
-			tpc.assignment.IsInChamberForEpoch(i, ChamberReview, epoch) {
 			continue
 		}
 		eligible = append(eligible, eligibleVal{index: i, stake: new(big.Int).Set(v.Stake)})
@@ -962,15 +993,21 @@ func (tpc *ThreeChambersCoordinator) SelectExecutiveForEpoch(epoch uint64, valid
 // The previous randaoMix was a locally-accumulated value that diverged across
 // nodes, causing Executive Chamber membership disagreements and chain forks.
 func (tpc *ThreeChambersCoordinator) TransitionExecutiveForEpoch(epoch uint64, validators *ValidatorSet, groupPublicKey []byte) error {
+	tpc.epochTransitionMu.Lock()
+	defer tpc.epochTransitionMu.Unlock()
 	executive := tpc.GetExecutiveChamber()
 	if executive == nil {
 		return fmt.Errorf("executive chamber not initialized")
 	}
-
-	// Idempotency guard: skip if already active for this epoch.
-	// Both block production and block import paths may call this at the same
-	// epoch boundary; without this guard, SetMembers would reset the state
-	// machine and potentially race with in-progress DKG.
+	if executive.Epoch() > epoch {
+		return nil
+	}
+	tpc.mu.RLock()
+	rotationBlocks := tpc.reshareInFlight || tpc.reshareFailed
+	tpc.mu.RUnlock()
+	if rotationBlocks {
+		return nil
+	}
 	if executive.Epoch() == epoch && executive.IsActive() {
 		return nil
 	}
@@ -979,43 +1016,195 @@ func (tpc *ThreeChambersCoordinator) TransitionExecutiveForEpoch(epoch uint64, v
 	if err != nil {
 		return fmt.Errorf("select executive for epoch %d: %w", epoch, err)
 	}
-
 	if err := executive.SetMembers(members, epoch); err != nil {
 		return fmt.Errorf("set executive members for epoch %d: %w", epoch, err)
 	}
 
-	if len(groupPublicKey) > 0 {
-		// GOV- (2026-07-17): Production gate. When requireDistributedDKG
-		// is enabled (mainnet), refuse to activate the executive chamber
-		// using a locally-preset group key. The local preset key is a
-		// placeholder that defeats threshold trust (a single operator
-		// controls the group key). Real P2P distributed DKG must produce
-		// the group key before activation is allowed.
-		tpc.mu.RLock()
-		requireDistributed := tpc.requireDistributedDKG
-		tpc.mu.RUnlock()
-		if requireDistributed {
-			tpfLog.Warnf("GOV- executive chamber for epoch %d NOT activated — requireDistributedDKG=true refuses local preset group key (placeholder DKG path); implement and wire P2P distributed DKG before mainnet activation",
-				epoch)
-		} else {
-			if err := executive.SetDKGComplete(groupPublicKey); err != nil {
-				tpfLog.Warnf("GOV- locally-preset group public key for epoch %d rejected: %v", epoch, err)
-			} else {
-				tpfLog.Infof("Executive chamber activated for epoch %d: %d members, threshold=%d",
-					epoch, len(members), executive.Threshold())
-			}
-		}
-	} else {
-		// P1-9 (2026-07-14): DKG pending — the group public key is not yet
-		// available. This happens when TSSManager has not generated key shares
-		// (e.g., first startup without a pre-existing key file). The DKG will
-		// be retried on the next epoch boundary via TriggerDKG, or when the
-		// node's TSSManager completes key generation.
-		tpfLog.Warnf("Executive chamber members selected for epoch %d: %d members (DKG pending — group public key not available, will retry)",
-			epoch, len(members))
+	if len(groupPublicKey) == 0 {
+		tpfLog.Warnf("Executive chamber members selected for epoch %d: %d members (DKG pending - group public key not available, will retry)", epoch, len(members))
+		return nil
 	}
 
+	tpc.mu.RLock()
+	runner := tpc.distributedDKGRunner
+	requireDistributed := tpc.requireDistributedDKG
+	oldIDs := append([]int(nil), tpc.holderParticipantIDs...)
+	tpc.mu.RUnlock()
+
+	if requireDistributed && runner == nil {
+		tpfLog.Warnf("GOV- executive chamber for epoch %d NOT activated: no distributed runner is wired", epoch)
+		return nil
+	}
+	resharer, canReshare := runner.(DistributedReshareRunner)
+	if requireDistributed && !canReshare {
+		tpfLog.Warnf("GOV- executive chamber for epoch %d NOT activated: distributed runner has no reshare capability", epoch)
+		return nil
+	}
+
+	// Holder set before this epoch. Empty means the genesis DKG set, i.e.
+	// every validator (participant IDs are 1-based validator indexes).
+	if len(oldIDs) == 0 {
+		oldIDs = make([]int, validators.ValidatorCount())
+		for i := range oldIDs {
+			oldIDs[i] = i + 1
+		}
+	}
+	// Executive membership uses zero-based validator indexes while the
+	// threshold-share protocol uses one-based participant IDs.
+	newIDs := make([]int, len(members))
+	for i, memberIndex := range members {
+		newIDs[i] = memberIndex + 1
+	}
+	newThreshold := executive.Threshold()
+	if newThreshold < 2 {
+		newThreshold = 2
+	}
+	if newThreshold > len(newIDs) {
+		newThreshold = len(newIDs)
+	}
+
+	// Rotate shares only when the committee can hold a threshold (at least
+	// two members) and actually differs from the current holder set. A
+	// one-member committee, the rule for small validator sets, keeps the
+	// existing t-of-n holder set and activates with the existing group key.
+	// The rotation itself runs in the background: this method is called from
+	// the block production and import paths (under the node lock), which
+	// must never wait on a network round.
+	if canReshare && len(newIDs) >= 2 && !sameParticipantSet(oldIDs, newIDs) {
+		if tpc.beginEpochReshare(epoch, newIDs) {
+			go tpc.runEpochReshare(resharer, epoch, oldIDs, newIDs, newThreshold, groupPublicKey)
+		}
+		return nil
+	}
+
+	if err := executive.SetDKGComplete(groupPublicKey); err != nil {
+		tpfLog.Warnf("group public key for epoch %d rejected: %v", epoch, err)
+		return nil
+	}
+	tpfLog.Infof("Executive chamber activated for epoch %d: %d members, threshold=%d", epoch, len(members), executive.Threshold())
 	return nil
+}
+
+func (tpc *ThreeChambersCoordinator) beginEpochReshare(epoch uint64, newIDs []int) bool {
+	tpc.mu.Lock()
+	defer tpc.mu.Unlock()
+	if tpc.reshareInFlight || tpc.reshareFailed || len(newIDs) < 2 {
+		tpfLog.Warnf("share rotation for epoch %d skipped: rotation for epoch %d is still running", epoch, tpc.reshareEpoch)
+		return false
+	}
+	tpc.reshareInFlight = true
+	tpc.reshareEpoch = epoch
+	tpc.reshareFailed = false
+	return true
+}
+
+// runEpochReshare drives one epoch-bound share rotation without holding any
+// coordinator lock, then activates the executive chamber if it is still
+// waiting for this epoch.
+func (tpc *ThreeChambersCoordinator) runEpochReshare(resharer DistributedReshareRunner, epoch uint64, oldIDs, newIDs []int, threshold int, currentKey []byte) {
+	tpfLog.Infof("share rotation for epoch %d started: %d -> %d holders, threshold=%d", epoch, len(oldIDs), len(newIDs), threshold)
+	resharedKey, err := resharer.RunDistributedReshare(epoch, oldIDs, newIDs, threshold)
+	if err == nil && (len(resharedKey) < minGroupPublicKeyLen || !bytes.Equal(resharedKey, currentKey)) {
+		err = fmt.Errorf("reshare did not preserve the existing group public key")
+	}
+
+	tpc.epochTransitionMu.Lock()
+	defer tpc.epochTransitionMu.Unlock()
+	tpc.mu.Lock()
+	if !tpc.reshareInFlight || tpc.reshareEpoch != epoch {
+		tpc.mu.Unlock()
+		return
+	}
+	defer tpc.mu.Unlock()
+	defer func() {
+		tpc.reshareInFlight = false
+		tpc.reshareFailed = err != nil
+		if err == nil {
+			tpc.holderParticipantIDs = append([]int(nil), newIDs...)
+			sort.Ints(tpc.holderParticipantIDs)
+		}
+	}()
+
+	executive := tpc.executive
+	if executive == nil {
+		err = fmt.Errorf("executive chamber is not initialized")
+		return
+	}
+	if err != nil {
+		tpfLog.Warnf("share rotation for epoch %d failed: %v (executive chamber stays in DKGRunning for this epoch)", epoch, err)
+		return
+	}
+	if executive.Epoch() != epoch || executive.State() != ExecutiveDKGRunning {
+		err = fmt.Errorf("executive chamber no longer awaits epoch %d", epoch)
+		tpfLog.Infof("share rotation for epoch %d finished after the chamber moved on (epoch=%d, state=%v); not activating", epoch, executive.Epoch(), executive.State())
+		return
+	}
+	members := make([]int, len(newIDs))
+	for index, participantID := range newIDs {
+		members[index] = participantID - 1
+	}
+	if err = executive.setDKGCompleteForEpoch(epoch, members, resharedKey); err != nil {
+		tpfLog.Warnf("group public key for epoch %d rejected after share rotation: %v", epoch, err)
+		return
+	}
+	tpfLog.Infof("Executive chamber activated for epoch %d after share rotation: %d holders, threshold=%d", epoch, len(newIDs), executive.Threshold())
+}
+
+// HolderParticipantIDs returns the share-holder set consensus currently
+// tracks (1-based participant IDs). Empty means the genesis DKG set.
+func (tpc *ThreeChambersCoordinator) HolderParticipantIDs() []int {
+	tpc.mu.RLock()
+	defer tpc.mu.RUnlock()
+	return append([]int(nil), tpc.holderParticipantIDs...)
+}
+
+// RestoreHolderParticipantIDs restores a committed holder generation from
+// authenticated local TSS state before epoch processing starts.
+func (tpc *ThreeChambersCoordinator) RestoreHolderParticipantIDs(ids []int) error {
+	restored := append([]int(nil), ids...)
+	sort.Ints(restored)
+	if len(restored) < 2 {
+		return fmt.Errorf("holder generation requires at least two participants")
+	}
+	for index, participantID := range restored {
+		if participantID <= 0 || (index > 0 && restored[index-1] == participantID) {
+			return fmt.Errorf("invalid holder participant ID %d", participantID)
+		}
+	}
+
+	tpc.epochTransitionMu.Lock()
+	defer tpc.epochTransitionMu.Unlock()
+	tpc.mu.Lock()
+	defer tpc.mu.Unlock()
+	if tpc.reshareInFlight || tpc.reshareFailed {
+		return fmt.Errorf("cannot restore holders while a reshare generation is unresolved")
+	}
+	tpc.holderParticipantIDs = restored
+	return nil
+}
+
+// ReshareInFlight reports whether an epoch share rotation is currently
+// running and, if so, for which epoch.
+func (tpc *ThreeChambersCoordinator) ReshareInFlight() (uint64, bool) {
+	tpc.mu.RLock()
+	defer tpc.mu.RUnlock()
+	return tpc.reshareEpoch, tpc.reshareInFlight
+}
+
+func sameParticipantSet(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	l := append([]int(nil), left...)
+	r := append([]int(nil), right...)
+	sort.Ints(l)
+	sort.Ints(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TriggerDKG attempts to complete the DKG flow for the executive chamber using
@@ -1032,6 +1221,8 @@ func (tpc *ThreeChambersCoordinator) TransitionExecutiveForEpoch(epoch uint64, v
 // Returns true if DKG was completed (executive transitioned to Active),
 // false if DKG is still pending or already complete.
 func (tpc *ThreeChambersCoordinator) TriggerDKG(groupPublicKey []byte) bool {
+	tpc.epochTransitionMu.Lock()
+	defer tpc.epochTransitionMu.Unlock()
 	executive := tpc.GetExecutiveChamber()
 	if executive == nil {
 		return false
@@ -1040,6 +1231,16 @@ func (tpc *ThreeChambersCoordinator) TriggerDKG(groupPublicKey []byte) bool {
 	// Already active — no need to trigger DKG.
 	if executive.IsActive() {
 		return true
+	}
+
+	// A share rotation for this epoch owns chamber activation. The local-key
+	// fallback must not activate the old key while new holders are still
+	// collecting contributions or after that rotation has failed.
+	tpc.mu.RLock()
+	rotationBlocks := tpc.reshareInFlight || tpc.reshareFailed
+	tpc.mu.RUnlock()
+	if rotationBlocks {
+		return false
 	}
 
 	// GOV- (2026-07-17): Production gate — refuse local preset key.

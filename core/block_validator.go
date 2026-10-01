@@ -2348,6 +2348,10 @@ func (v *BlockValidator) ValidateSignature(header *encoding.BlockHeader) error {
 	// might be a genuine individual signature, not a TSS signature).
 	if tssVerifier != nil && tssVerifier.HasGroupPublicKey() {
 		if err := tssVerifier.VerifyCombinedSignature(header.Signature, signingData); err != nil {
+			bound := consensus.ComputeTSSCanonicalBinding(header.ChainID, header.Epoch, header.Slot, header.ProposerAddr, "block", signingData)
+			if err := tssVerifier.VerifyCombinedSignature(header.Signature, bound[:]); err == nil {
+				return nil
+			}
 			if sigLen == crypto.GMQTDCombinedSignatureSize {
 				// 4064-byte signatures are exclusively TSS — no fallback
 				return ErrInvalidSignature

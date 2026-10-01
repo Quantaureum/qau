@@ -1160,7 +1160,7 @@ const playgroundHTML = `<!DOCTYPE html>
     async function executeQuery() {
       const query = document.getElementById('query').value;
       const response = document.getElementById('response');
-
+      
       try {
         const res = await fetch(window.location.href, {
           method: 'POST',
@@ -1169,7 +1169,7 @@ const playgroundHTML = `<!DOCTYPE html>
           },
           body: JSON.stringify({ query }),
         });
-
+        
         const data = await res.json();
         response.textContent = JSON.stringify(data, null, 2);
       } catch (err) {

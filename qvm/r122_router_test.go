@@ -430,7 +430,7 @@ func TestR122RouterAddLiquidityRefundFail(t *testing.T) {
 		0x79,       // CODECOPY (QVM opcode 0x79)
 		0x10, 0x05, // PUSH1 size
 		0x10, 0x00, // PUSH1 offset
-		0x06, // RETURN
+		0x06,       // RETURN
 	}
 	runtime := []byte{0x10, 0x00, 0x10, 0x00, 0x07} // PUSH1 0 PUSH1 0 REVERT
 	f.db.SetNonce(f.owner, 5)

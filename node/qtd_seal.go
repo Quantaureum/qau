@@ -312,6 +312,8 @@ func (n *Node) handleQTDSealMessage(msg p2p.PeerMessage) {
 		n.handleQTDSealRequest(msg)
 	case p2p.MsgTypeQTDPartialSeal:
 		n.handleQTDPartialSeal(msg)
+	case p2p.MsgTypeQTDSealAnnouncement:
+		n.handleQTDSealAnnouncement(msg)
 	}
 }
 
@@ -419,6 +421,19 @@ func (n *Node) handleQTDSealRequest(msg p2p.PeerMessage) {
 		}
 	}
 
+	// Slice 4 decision C: with the executor gate open this notification is the
+	// attempt announcement of the four fixed signers. The trailing ordinal is
+	// present only on a retry; the sender check above already binds the
+	// announcement to the slot's proposer, the only ordinal authority. The
+	// legacy executive-member notification below stays unchanged while the gate
+	// is closed.
+	if tdilithium3SealExecutorEnabled(n) {
+		if n.tdilithium3SealSigningStart(slot, blockHash, tdilithium3SealSigningOrdinal(data)) {
+			nodeLog.Debug("Dilithium3 v1 seal executor: slot %d attempt announced by the proposer", slot)
+		}
+		return
+	}
+
 	// R7 P0-1 FIX: Executive members no longer produce partial signatures
 	// via validatorKey.Sign. The proposer computes the full QTD threshold
 	// signature asynchronously via qfs.AggregateAndCompleteSeal. This
@@ -426,6 +441,16 @@ func (n *Node) handleQTDSealRequest(msg p2p.PeerMessage) {
 	// log that a seal is in progress and prepare for incoming TSS protocol
 	// messages (Round1/Round2) in distributed mode.
 	if executive.IsMember(n.blockProducer.validatorIdx) {
+		if n.tssManager == nil {
+			return
+		}
+		participantID := n.getMyParticipantID()
+		if _, err := n.tssManager.GetQTDShare(participantID); err != nil {
+			nodeLog.Warn("QTD seal request: Executive validator %d has no active TSS share for slot %d: %v",
+				n.blockProducer.validatorIdx, slot, err)
+			return
+		}
+		go n.computeAndCompleteQTDSeal(slot, blockHash)
 		nodeLog.Debug("QTD seal request received from proposer for slot %d (blockHash=%s) — awaiting TSS protocol messages",
 			slot, blockHash.String())
 	}
@@ -570,7 +595,50 @@ func (n *Node) requestQTDSeal(slot uint64, blockHash types.Hash) {
 	// Asynchronously compute the QTD threshold signature and complete the seal.
 	// This is the production path — the broken partial-seal collection in
 	// handleQTDPartialSeal is deprecated.
-	go n.computeAndCompleteQTDSeal(slot, blockHash)
+	if n.tssManager != nil {
+		participantID := n.getMyParticipantID()
+		if _, err := n.tssManager.GetQTDShare(participantID); err == nil {
+			go n.computeAndCompleteQTDSeal(slot, blockHash)
+		}
+	}
+}
+
+// qtdSealerCandidates derives the sealer candidate set for a QTD seal from
+// the DKG threshold-group holder set tracked by the TSS manager.
+//
+// R47-QTD-QUORUM (2026-09-26): the previous code passed executive.Members()
+// as the sealer list, but the executive chamber (1-3 members per epoch) only
+// AUTHORIZES sealing — the aggregated threshold signature is only valid when
+// >= t partial signatures from the DKG holder set are combined. On a
+// 6-validator network the executive chamber has a single member, so sealing
+// against executive members could never satisfy the 4-of-6 group shape.
+//
+// Holder ParticipantIDs are 1-based (validatorIndex + 1): convert to
+// 0-based validator indices and drop any pid that does not map into the
+// current validator set (a stale share can contribute neither stake weight
+// nor an aggregatable partial signature). Falls back to the provided
+// executive members when no DKG holder generation is established (legacy
+// single-process configurations and tests without a TSS generation),
+// preserving the previous behavior.
+func (n *Node) qtdSealerCandidates(validatorCount int, fallback []int) []int {
+	if n.tssManager == nil {
+		return fallback
+	}
+	pids, ok := n.tssManager.ActiveParticipantIDs()
+	if !ok || len(pids) == 0 {
+		return fallback
+	}
+	sealers := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		if pid < 1 || pid > validatorCount {
+			continue
+		}
+		sealers = append(sealers, pid-1)
+	}
+	if len(sealers) == 0 {
+		return fallback
+	}
+	return sealers
 }
 
 // computeAndCompleteQTDSeal computes the QTD threshold signature for the given
@@ -617,12 +685,30 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 	// retry on the next iteration; if the seal is permanently missed, the
 	// block will not be finalized and the next proposer will skip this
 	// slot (consistent with consensus rules for unfinalized slots).
+	if n.distributedSigner != nil && !n.isDesignatedQTDSealer(slot) {
+		return
+	}
 	if !n.acquireQTDSealSlot() {
 		nodeLog.Warn("NODE-R12-H01: QTD seal semaphore full (cap=%d), giving up on slot %d (blockHash=%s) — slot tick will retry",
 			MaxConcurrentQTDSeals, slot, blockHash.String())
 		return
 	}
 	defer n.releaseQTDSealSlot()
+	n.qtdPeerRtMu.Lock()
+	if n.qtdSealInFlight == nil {
+		n.qtdSealInFlight = make(map[uint64]struct{})
+	}
+	if _, exists := n.qtdSealInFlight[slot]; exists {
+		n.qtdPeerRtMu.Unlock()
+		return
+	}
+	n.qtdSealInFlight[slot] = struct{}{}
+	n.qtdPeerRtMu.Unlock()
+	defer func() {
+		n.qtdPeerRtMu.Lock()
+		delete(n.qtdSealInFlight, slot)
+		n.qtdPeerRtMu.Unlock()
+	}()
 
 	if n.blockProducer == nil || n.blockProducer.QPOS() == nil {
 		return
@@ -631,6 +717,27 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 	qpos := n.blockProducer.QPOS()
 	qfs := qpos.GetQTDFinality()
 	if qfs == nil {
+		return
+	}
+	if qfs.GetFinalityRecord(slot) != nil {
+		return
+	}
+	if pending := qfs.GetPendingSeal(slot); pending == nil {
+		if err := qfs.RequestSeal(slot, blockHash); err != nil {
+			return
+		}
+	} else if pending.BlockHash != blockHash {
+		return
+	}
+
+	// Slice 4 decision C: with the executor gate open, sealing runs as one
+	// interactive four-signer session instead of the legacy per-node
+	// aggregation. This node runs its own first attempt when it is one of the
+	// four fixed signers; a node outside the four only announced the seal
+	// request above and waits for the seal announcement. The legacy path below
+	// stays byte-for-byte unchanged while the gate is closed.
+	if tdilithium3SealExecutorEnabled(n) {
+		n.tdilithium3SealSigningStart(slot, blockHash, 0)
 		return
 	}
 
@@ -643,10 +750,16 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 		return
 	}
 
-	// Get the executive chamber members as sealers.
-	members := executive.Members()
+	// R47-QTD-QUORUM: derive the sealer list from the DKG holder set; the
+	// executive chamber only authorizes sealing. Fall back to the executive
+	// members when no holder generation is established.
+	validatorCount := 0
+	if vs := qpos.GetValidatorSet(); vs != nil {
+		validatorCount = vs.Size()
+	}
+	members := n.qtdSealerCandidates(validatorCount, executive.Members())
 	if len(members) == 0 {
-		nodeLog.Warn("QTD seal: executive chamber has no members for slot %d", slot)
+		nodeLog.Warn("QTD seal: no sealers available for slot %d", slot)
 		return
 	}
 
@@ -666,9 +779,9 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 					attempt, slot)
 				return
 			}
-			members = executive.Members()
+			members = n.qtdSealerCandidates(validatorCount, executive.Members())
 			if len(members) == 0 {
-				nodeLog.Warn("QTD seal: executive chamber has no members on retry %d for slot %d",
+				nodeLog.Warn("QTD seal: no sealers available on retry %d for slot %d",
 					attempt, slot)
 				return
 			}

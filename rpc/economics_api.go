@@ -71,8 +71,7 @@ func (api *EconomicsAPI) SetChainID(id uint64) {
 	api.chainID = id
 }
 
-//	This method uses a non-standard name. The convention across
-//
+//  This method uses a non-standard name. The convention across
 // other API structs (API, DebugAPI, ProofAPI, etc.) is RegisterHandlers.
 // The original name is retained for backward compatibility; a
 // RegisterHandlers alias is defined below.

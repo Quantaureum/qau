@@ -1,0 +1,21 @@
+{
+  "name": "qau-docker-testnet",
+  "networkId": 1669,
+  "genesisFile": "/app/genesis/testnet.json",
+  "dataDir": "/app/data",
+  "listenAddr": "0.0.0.0:9000",
+  "externalIP": "CHANGE_ME_PUBLIC_IP",
+  "bootstrapPeers": ["CHANGE_ME_BOOTSTRAP_ENODE"],
+  "maxPeers": 50,
+  "rpcEnabled": true,
+  "rpcAddr": "0.0.0.0:8545",
+  "wsEnabled": true,
+  "wsAddr": "0.0.0.0:8546",
+  "healthEnabled": true,
+  "healthAddr": "0.0.0.0:8080",
+  "validatorEnabled": false,
+  "cacheSize": 512,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json"
+}

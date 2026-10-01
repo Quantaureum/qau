@@ -2,6 +2,8 @@
 package tss
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -83,8 +85,9 @@ type DistributedSession struct {
 	round1Done        bool
 
 	// Round 2 state
-	round2Reveals map[int]*qtd.Round2Reveal // participantID → reveal
-	round2Done    bool
+	round2Reveals  map[int]*qtd.Round2Reveal // participantID → reveal
+	pendingPrivate map[int]*qtd.Round2Reveal
+	round2Done     bool
 
 	// The underlying QTD session (created by the aggregator for local computation)
 	qtdSession *qtd.QTDSession
@@ -146,6 +149,10 @@ func (ds *DistributedSigner) InitiateSession(message []byte, participantIDs []in
 	// aggregator share) instead of the deprecated CreateSigningSession
 	// (which loaded ALL shares, defeating t-of-n threshold security).
 	initiatedAt := time.Now().UnixNano()
+	var attemptNonce [32]byte
+	if _, err := rand.Read(attemptNonce[:]); err != nil {
+		return [32]byte{}, err
+	}
 	sessionKey, err := ds.manager.CreateParticipantSession(message, participantIDs, myParticipantID, initiatedAt)
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("create participant session: %w", err)
@@ -166,6 +173,7 @@ func (ds *DistributedSigner) InitiateSession(message []byte, participantIDs []in
 	// caller's backing array.
 	h := sha256.New()
 	h.Write(message)
+	h.Write(attemptNonce[:])
 	var idBuf [4]byte
 	binary.BigEndian.PutUint32(idBuf[:], uint32(len(participantIDs)))
 	h.Write(idBuf[:])
@@ -457,20 +465,16 @@ func (ds *DistributedSigner) SubmitRound2Reveal(sessionID [32]byte, reveal *qtd.
 	if !isParticipantInList(reveal.ParticipantID, session.ParticipantIDs) {
 		return fmt.Errorf("participant %d is not part of this session", reveal.ParticipantID)
 	}
-	// QP-07 FIX: If a reveal already exists for this participant (e.g. a
-	// retransmitted or duplicate submission), zeroize the previous z0
-	// contribution (Z0Share) — secret-derived private material —
-	// before it is replaced. Otherwise the old backing arrays would linger
-	// unreferenced in memory, defeating the zeroization done in
-	// zeroSessionSecrets/CleanSession.
-	// AUDIT (2026) TSS-FIX: Replaced Cs2Share/Ct0Share zeroization
-	// with Z0Share zeroization (the struct field changed).
 	if old, exists := session.round2Reveals[reveal.ParticipantID]; exists && old != nil {
-		if old.Z0Share != nil {
-			for i := range old.Z0Share {
-				old.Z0Share[i] = 0
-			}
+		if !bytes.Equal(old.WShare, reveal.WShare) || !bytes.Equal(old.Nonce, reveal.Nonce) {
+			return fmt.Errorf("conflicting public reveal for participant %d", reveal.ParticipantID)
 		}
+		return nil
+	}
+	if pending := session.pendingPrivate[reveal.ParticipantID]; pending != nil {
+		reveal.ZShare = pending.ZShare
+		reveal.Z0Share = pending.Z0Share
+		delete(session.pendingPrivate, reveal.ParticipantID)
 	}
 	session.round2Reveals[reveal.ParticipantID] = reveal
 
@@ -492,7 +496,19 @@ func (ds *DistributedSigner) IsRound2Complete(sessionID [32]byte) bool {
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.round2Done
+	return session.round2ReadyForAggregation()
+}
+
+func (session *DistributedSession) round2ReadyForAggregation() bool {
+	if !session.round2Done || len(session.round2Reveals) < session.Threshold {
+		return false
+	}
+	for _, reveal := range session.round2Reveals {
+		if reveal == nil || len(reveal.ZShare) == 0 || len(reveal.Z0Share) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // AttachZ0Contribution attaches the combined z0 contribution (Z0Share) and
@@ -528,7 +544,20 @@ func (ds *DistributedSigner) AttachZ0Contribution(sessionID [32]byte, participan
 
 	reveal, exists := session.round2Reveals[participantID]
 	if !exists {
-		return fmt.Errorf("no public reveal for participant %d", participantID)
+		if !isParticipantInList(participantID, session.ParticipantIDs) {
+			return fmt.Errorf("participant %d is not part of this session", participantID)
+		}
+		if session.pendingPrivate == nil {
+			session.pendingPrivate = make(map[int]*qtd.Round2Reveal)
+		}
+		if old := session.pendingPrivate[participantID]; old != nil {
+			if !bytes.Equal(old.ZShare, zShare) || !bytes.Equal(old.Z0Share, z0Share) {
+				return fmt.Errorf("conflicting private contribution")
+			}
+			return nil
+		}
+		session.pendingPrivate[participantID] = &qtd.Round2Reveal{ParticipantID: participantID, ZShare: bytes.Clone(zShare), Z0Share: bytes.Clone(z0Share)}
+		return nil
 	}
 
 	// AUDIT (2026) TSS-FIX: Attach the combined z0 contribution
@@ -579,7 +608,7 @@ func (ds *DistributedSigner) AggregateSignature(sessionID [32]byte) ([]byte, err
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	if !session.round2Done {
+	if !session.round2ReadyForAggregation() {
 		return nil, ErrInsufficientReveals
 	}
 
@@ -634,6 +663,11 @@ func (ds *DistributedSigner) CleanSession(sessionID [32]byte) {
 func zeroSessionSecrets(session *DistributedSession) {
 	if session == nil {
 		return
+	}
+	for participant, reveal := range session.pendingPrivate {
+		qtd.SecurelyZeroMemory(reveal.ZShare)
+		qtd.SecurelyZeroMemory(reveal.Z0Share)
+		delete(session.pendingPrivate, participant)
 	}
 	// Zero commitments
 	for _, c := range session.round1Commitments {

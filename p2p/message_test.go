@@ -80,6 +80,30 @@ func TestEncodeDecodeStatusMessage(t *testing.T) {
 	}
 }
 
+func TestStatusMessageV3ForkIDRoundTrip(t *testing.T) {
+	status := &StatusMessage{
+		Version:            3,
+		NetworkID:          1333,
+		BestHeight:         1075,
+		Timestamp:          1790136692,
+		SessionNonce:       [16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+		ValidatorPublicKey: []byte{0x01},
+		ValidatorSignature: []byte{0x02},
+	}
+	for i := range status.ForkID {
+		status.ForkID[i] = byte(i + 1)
+	}
+
+	encoded := EncodeStatusMessage(status)
+	decoded, err := DecodeStatusMessage(encoded)
+	if err != nil {
+		t.Fatalf("DecodeStatusMessage failed: %v", err)
+	}
+	if decoded.ForkID != status.ForkID {
+		t.Fatalf("ForkID did not round-trip: got %x, want %x", decoded.ForkID, status.ForkID)
+	}
+}
+
 func TestDecodeStatusMessageTooShort(t *testing.T) {
 	_, err := DecodeStatusMessage([]byte{1, 2, 3})
 	if err != ErrMalformedMessage {

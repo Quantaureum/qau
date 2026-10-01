@@ -1,50 +1,404 @@
-# Build outputs
-bin/
-dist/
-build/
-out/
-target/
-*.egg-info/
-__pycache__/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-node_modules/
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-CMakeFiles/*
-!CMakeFiles/.gitkeep
+# ============================================================
+# QUANTAUREUM .gitignore - Production-grade security
+# Updated: 2026-04-27
+# ============================================================
 
-# Compiled artifacts
-*.exe
-*.dll
-*.so
-*.dylib
-*.a
-*.lib
-*.class
-*.jar
-*.whl
+# ----- .local-only/: quarantine for non-source, sensitive, or dev-only files
+# Anything in this directory is excluded from version control and will never
+# reach the open-source repository. Use it for: scratch/coverage/debug data,
+# private key snapshots, IP/server-bearing configs, internal audit/blog/VC
+# docs, ops runbooks, and any temporary scripts. See project rules for policy.
+/.local-only/
 
-# Local environments and editors
+# ----- .githooks/: local pre-commit hooks containing secret-detection patterns
+# Uses environment-specific regex patterns that reference real production
+# identifiers. Keep hooks local; do NOT commit to the open-source repository.
+/.githooks/
+
+# ----- vendored secp256k1 (moved out of the open-source tree)
+# Download libsecp256k1 from https://github.com/bitcoin-core/secp256k1 and
+# place it under sdks/cpp-sdk/third_party/secp256k1/ if you need ECDSA in the
+# C++ SDK. The CMakeLists.txt falls back to a system install of libsecp256k1.
+/sdks/cpp-sdk/third_party/secp256k1/
+
+# ----- Sensitive key material - NEVER commit private keys -----
+keys/validator*.key
+keys/genesis_wallets/*/wallet.json
+testnet/keys/*.key
+testnet/keys/
+testnet/dev_key.txt
+testnet/dev_addr.txt
+CREDENTIALS.md
+*.pem
+*.p12
+*.key
+
+# ----- audit-fix MEDIUM: temporary private key files must never be committed -----
+# These files (e.g., tmp_s5_priv.txt) contain Dilithium3 private key material
+# generated during testing/deployment and must never be version-controlled.
+tmp_*_priv.txt
+*_priv.txt
+*_privkey*.txt
+tmp_*.hex
+tmp_*.sh
+
+# ----- Environment files - NEVER commit real secrets -----
 .env
-.env.*
-.venv/
-venv/
+.env.local
+.env.*.local
+.env.production
+.env.production.local
+
+# ----- audit-fix: Validator wallet files contain encrypted private keys -----
+# Even though encrypted, they should NEVER be committed to version control
+validators/*/wallet.json
+validators/*/public.json
+
+# ----- audit-fix: Dev account files contain plaintext private keys -----
+# These are generated at runtime and must NEVER be committed
+**/dev_accounts.json
+
+# ----- audit-fix C-1/C-2: Account data with public keys/addresses must not be committed -----
+accounts/quantum-accounts.json
+accounts/*.json
+
+# ----- Any file containing sensitive validator or account data -----
+**/secrets/
+**/credentials/
+
+# ----- Database files - NEVER commit data files -----
+*.db
+*.db-wal
+*.db-shm
+
+# ----- Backup and failed test files -----
+*.bak
+*.fail
+*.zip
+backup/
+
+# ----- Temporary diagnostic scripts (contain real server IPs/credentials) -----
+_*.py
+_*.sh
+tmp_*.sh
+tmp_*.py
+tmp_*.txt
+tmp_*.hex
+_probe*.py
+_diag*.py
+_broadcast*.py
+
+# ----- Server audit documents (contain operational IPs/details) -----
+SERVERS_AUDIT*.md
+
+# ----- Root-level compiled binaries (regenerate with go build) -----
+/qaud
+/qauctl
+/qaud-*
+/qaud_*
+*.exe
+/qaucold
+/qaucold-gui
+/qasm
+/qsign
+/faucet
+/qau-cli
+/keystore_to_plainkey
+/scripts
+
+# ----- Coverage and test artifacts -----
+*.out
+coverage*
+*_cover*
+*_cov*.txt
+consccov_*
+node_cover*
+rpc_cover*
+test_result.txt
+node_test_output.txt
+audit-report*.json
+
+# ----- Build artifacts -----
+build/
+dist/
+*.exe
+# Cross-compiled / experimental Go binaries (regenerate with `go build` / `make`)
+*-linux-arm64
+*-arm64
+*_arm64
+*_linux_arm64
+*_fastcascade*
+*.test
+
+# ----- Data directories -----
+data/
+data1/
+data2/
+data3/
+testnet/node*/data/
+
+# ----- Logs -----
+*.log
+crash_*.log
+
+# ----- IDE -----
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# ----- OS -----
 .DS_Store
+Thumbs.db
 
-# Coverage and reports
-coverage/
-.coverage
-coverage.xml
-*.prof
-*.pprof
+# ----- Node modules (frontend) -----
+node_modules/
 
-# Local-only scratch and tooling (never commit)
-# .local-only/ holds local ops scripts, private notes and device-specific
-# artifacts; .pi-glla/ is a local agent tooling directory. Neither is source.
-.local-only/
-.pi-glla/
+# ----- Go -----
+vendor/
+pkg/mod/
+
+# ----- PID files -----
+pids.json
+
+# ----- Additional security: database, keystore, and seed files -----
+*.dat
+*.bbolt
+keystore/
+**/keystore/*
+genesis_wallets/
+*_seed*.txt
+*.mnemonic
+*.seed
+*.keystore
+coverage.out
+coverage.html
+
+# Old git backup
+.git_old/
+
+# ============================================================
+# OPEN-SOURCE CLEANUP - Only source code, nothing else
+# ============================================================
+
+# ----- Entire directories to exclude (operational/deployment) -----
+# deploy/ was excluded wholesale during open-source cleanup because the old
+# directory carried real deployment configs. The sanitized templates now live
+# in deploy/ (config.example.json etc.) and ARE tracked; secrets stay out
+# via deploy/keys/ and .env below.
+deploy/*
+!deploy/
+!deploy/config.example.json
+!deploy/config.testnet.json
+!deploy/config.validator.json
+!deploy/prometheus.yml
+!contracts/solidity/deploy/
+monitoring/
+nginx/
+admin-backend/
+frontend-apps/
+migrations/
+mainnet/
+tmp/
+bin/
+data/
+data-dev/
+data1/
+data2/
+data3/
+data_prod/
+logs/
+backup/
+devdata/
+testnet-data/
+testnet-data2/
+certs/
+fix/
+ops/
+dev/
+validators/
+
+# ----- Audit reports (root and docs) -----
+/AUDIT*.md
+/DEP_AUDIT*.md
+/SECURITY_AUDIT*.md
+/security-audit*.md
+/docs/AUDIT*.md
+/docs/DEEP_AUDIT*.md
+/docs/AUDIT_REMEDIATION*.md
+/docs/AUDIT_REPORT*.md
+/docs/SECURITY_AUDIT*.md
+audit/findings*.md
+audit/tracking/
+
+# ----- Operational/deployment docs (root) -----
+/CODE_WIKI.md
+/DEPLOYMENT_READINESS.md
+/EMERGENCY.md
+/GENESIS_PUBLIC.md
+/RUNBOOK.md
+/TROUBLESHOOTING.md
+
+# ----- Root-level deployment/diagnostic scripts -----
+/deploy-cloudshell.sh
+/go.sum.verify.sh
+/prepare-upload.sh
+/verify_node.sh
+/reset-devnet.bat
+
+# ----- Docker compose (operational, not build) -----
+# docker-compose.yml (sanitized, ports bound to 127.0.0.1, no secrets) is
+# tracked; operator-specific overrides keep matching the ignore below.
+docker-compose.override.yml
+docker-compose*.local.yml
+
+# ----- Coverage reports -----
+conscov*.txt
+*.coverprofile
+
+# ----- Package lock files (node/npm not part of Go project) -----
+/package-lock.json
+package-lock.json
+
+# ----- Compiled hex bytecode (can be regenerated from .sol/.qasm) -----
+contracts/*.hex
+
+# ----- Solidity build artifacts -----
+contracts/solidity/artifacts/
+contracts/solidity/cache/
+contracts/solidity/package-lock.json
+contracts/solidity/node_modules/
+
+# ----- testnet: exclude all operational scripts/configs, keep Go source -----
+testnet/*.sh
+testnet/*.bat
+testnet/*.cmd
+testnet/*.ps1
+testnet/*.py
+testnet/*.json
+testnet/node*/
+!testnet/keygen/
+!testnet/derive_addrs/
+!testnet/genesis/
+
+# ----- devnet node configs -----
+devnet/node*/
+
+# ----- tools: exclude all JS/PowerShell/Shell/Bat scripts, keep Go source -----
+tools/*.js
+tools/*.bat
+tools/*.ps1
+tools/*.sh
+tools/*.py
+tools/scripts/*.ps1
+tools/scripts/*.sh
+tools/scripts/*.js
+tools/scripts/*.md
+
+# ----- wallet TSS: exclude papers/PDFs/LaTeX -----
+wallet/tss/*.pdf
+wallet/tss/*.tex
+wallet/tss/*.aux
+wallet/tss/*.toc
+wallet/tss/*.py
+
+# ----- docs: exclude marketing/legal/social/ops -----
+/docs/BENCHMARK*.md
+/docs/DEPLOYMENT*.md
+/docs/DEPLOY_*.md
+/docs/OPERATIONS*.md
+/docs/INCIDENT*.md
+/docs/LEGAL*.md
+/docs/SAFT*.md
+/docs/LISTING*.md
+/docs/Fundraising*.md
+/docs/Founder*.md
+/docs/TWITTER*.md
+/docs/SERVER_DEPLOYMENT*.md
+/docs/SECURITY_AUDIT_LOG*.md
+/docs/Quantaureum_Pitch_Deck*.pdf
+/docs/*.html
+/docs/discord/
+/docs/reddit/
+/docs/social/
+/docs/twitter/
+/docs/medium/
+/docs/operations/
+/docs/architecture.png
+/docs/transaction-flow.png
+/docs/qtd_paper.pdf
+
+# ----- Office documents / binary blobs (never source code) -----
+*.pptx
+*.ppt
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.pdf
+*.bin
+
+# ----- Logos are kept in docs/logos/ for branding, but exclude large assets -----
+# docs/logos/*.png are kept (small branding assets)
+
+# ----- SDKs are in separate repositories (not part of the node repo) -----
+# Go SDK:    github.com/quantaureum/go-sdk
+# JS/TS SDK: github.com/quantaureum/sdk-js
+# Rust SDK:  github.com/quantaureum/sdk-rs
+# C++ SDK:   github.com/quantaureum/sdk-cpp
+# Java SDK:  github.com/quantaureum/sdk-java
+# Python SDK: github.com/quantaureum/sdk-py
+/sdks/
+
+# ----- Root-level compiled binaries (build artifacts, not source) -----
+/sign_call
+/sign_deploy
+/sign_transfer
+/qaud
+/qauctl
+
+# ----- testnet-site is a separate repository, not part of node -----
+/testnet-site/
+
+# ----- Python bytecode / caches (build artifacts) -----
+__pycache__/
+*.pyc
+*.pyo
+
+# ----- Genesis deployment artifacts (contain real validator public keys/alloc).
+# Regenerate with cmd/genvalidators / genesis tools; keep the real ones local. -----
+/genesis/*.json
+
+# Local isolated worktrees used for reviewed feature/security work
+.worktrees/
+
+# ----- AGENTS.md: project rules carrying server IPs / SSH creds / private-key paths -----
+# Never commit it (sensitive internal rules file).
+/AGENTS.md
+
+# ---- localtest/ scratch dir (scripts/configs are per-dev, never commit) ----
+localtest/
+
+# ----- build artifacts / IDE dumps (R122 housekeeping) -----
+contracts/solidity-reference/artifacts/
+contracts/solidity-reference/cache/
+DockerDesktopWSL/
+
+# ----- Shell artifact guards -----
+# SSH client artifacts and misnamed known_hosts variants
+.ssh/
+known_hosts*
+*.sshknown_hosts*
+
+# operator key material & local overrides, never committed
+deploy/keys/
+deploy/genesis/
+deploy/config.json
+docker-compose.override.yml
+.env
+
+# ----- pi agent session artifacts (local only)
+/.pi-glla/
+
+# ----- Yan agent session artifacts (local only)
+/.yanagent/

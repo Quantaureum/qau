@@ -1,0 +1,160 @@
+# Quantaureum Node — Docker Compose stack
+#
+# Profiles:
+#   default    : single dev/test node (qau-node service)
+#   testnet    : testnet node + faucet
+#   validator  : validator node (requires key material, see notes)
+#   monitoring : Prometheus + Grafana (local only, ports bound to 127.0.0.1)
+#
+# SECURITY NOTES
+#   * No secrets are baked into the image or compose file. Validator keys and
+#     passwords are injected via env (.env file, gitignored) or read-only mounts
+#     from an operator-managed directory.
+#   * All published ports bind to 127.0.0.1 so nothing is exposed to the public
+#     internet by default. Change bindings consciously when deploying.
+#   * Prometheus and Grafana run with default credentials ONLY for local
+#     monitoring profile; set GF_SECURITY_ADMIN_PASSWORD before any remote use.
+
+services:
+  qau-node:
+    image: quantaureum/qau-node:1.0.0
+    build: .
+    container_name: qau-node
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8545:8545"   # JSON-RPC
+      - "127.0.0.1:8546:8546"   # WebSocket
+      - "127.0.0.1:9000:9000"   # P2P
+      - "127.0.0.1:8080:8080"   # health
+    volumes:
+      - qau-data:/app/data
+      # Defaults to the tracked sanitized devnet template so a fresh clone works
+      # out of the box. To customize: cp deploy/config.example.json
+      # deploy/config.json, edit, and override the volume in
+      # docker-compose.override.yml (gitignored).
+      - ./deploy/config.example.json:/app/config-custom.json:ro
+    command: ["--config", "/app/config-custom.json"]
+    environment:
+      QAU_LOG_LEVEL: ${QAU_LOG_LEVEL:-info}
+      QAU_LOG_FORMAT: ${QAU_LOG_FORMAT:-json}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  qau-testnet:
+    image: quantaureum/qau-node:1.0.0
+    profiles: ["testnet"]
+    container_name: qau-testnet
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:8080:8080"
+      # Faucet sidecar shares this network namespace; publish its port here.
+      - "127.0.0.1:18088:18088"
+    volumes:
+      - qau-testnet-data:/app/data
+      - ./deploy/config.testnet.json:/app/config-custom.json:ro
+      # Operator-provided genesis (gitignored via deploy/* whitelist):
+      - ./deploy/genesis/testnet.json:/app/genesis/testnet.json:ro
+    command: ["--config", "/app/config-custom.json"]
+    environment:
+      QAU_LOG_LEVEL: ${QAU_LOG_LEVEL:-info}
+
+  qau-faucet:
+    image: quantaureum/qau-node:1.0.0
+    profiles: ["testnet"]
+    container_name: qau-faucet
+    restart: unless-stopped
+    # Sidecar pattern: the faucet binary hardcodes rpcURL=http://localhost:8545,
+    # so it shares the testnet node's network namespace.
+    network_mode: "service:qau-testnet"
+    depends_on:
+      - qau-testnet
+    volumes:
+      # Operator-managed faucet key file (gitignored, never committed).
+      - ./deploy/keys/faucet.key:/app/keys/faucet.key:ro
+      - faucet-ratelimit:/app/data/faucet
+    command: ["qau-faucet"]
+    environment:
+      QUANTAUREUM_FAUCET_LISTEN: 0.0.0.0:18088
+      QUANTAUREUM_FAUCET_KEY_FILE: /app/keys/faucet.key
+      QUANTAUREUM_FAUCET_RATELIMIT_FILE: /app/data/faucet/ratelimits.json
+      # Optional API key for the fund endpoint (recommended):
+      QUANTAUREUM_FAUCET_API_KEY: ${QUANTAUREUM_FAUCET_API_KEY:-}
+
+  # Validator profile: keys are NEVER baked into the image. Mount the keystore
+  # read-only from an operator-managed directory and pass the password via env
+  # (docker secret / .env, gitignored). The session-key sovereignty design
+  # (R131) recommends: base key signs only on-chain identity events; per-block
+  # signing uses session keys injected via QAU_SESSION_KEY_FILE.
+  qau-validator:
+    image: quantaureum/qau-node:1.0.0
+    profiles: ["validator"]
+    container_name: qau-validator
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - qau-validator-data:/app/data
+      - ./deploy/config.validator.json:/app/config-custom.json:ro
+      # Operator-provided genesis (gitignored via deploy/* whitelist):
+      - ./deploy/genesis/mainnet.json:/app/genesis/mainnet.json:ro
+      - ./deploy/keys:/app/keys:ro
+    command: ["--config", "/app/config-custom.json"]
+    environment:
+      QAU_LOG_LEVEL: ${QAU_LOG_LEVEL:-info}
+      # Password must come from .env or docker secrets, never committed.
+      # (Empty default keeps `docker compose config` working without secrets;
+      # the node itself refuses to start as validator without a real password.)
+      QAU_VALIDATOR_KEY_PASSWORD: ${QAU_VALIDATOR_KEY_PASSWORD:-}
+      # R131 session-key hot signing (optional, recommended):
+      QAU_SESSION_KEY_FILE: /app/keys/session.key
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
+    container_name: qau-prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["monitoring"]
+    container_name: qau-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3030:3000"
+    environment:
+      # Default credentials are for LOCAL monitoring only. Override for any
+      # non-local deployment: GF_SECURITY_ADMIN_USER / GF_SECURITY_ADMIN_PASSWORD.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?Set GF_SECURITY_ADMIN_PASSWORD for the monitoring profile}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  qau-data:
+  qau-testnet-data:
+  qau-validator-data:
+  faucet-ratelimit:
+  prometheus-data:
+  grafana-data:

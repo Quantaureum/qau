@@ -12,15 +12,9 @@ import (
 	"github.com/quantaureum/qau/types"
 )
 
-const numValidators = 4
-
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: go run ./testnet/derive_addrs <secure-output-directory>")
-		os.Exit(1)
-	}
-	baseDir := os.Args[1]
-	for i := 1; i <= numValidators; i++ {
+	baseDir := "./testnet/keys"
+	for i := 1; i <= 3; i++ {
 		pubKeyFile := filepath.Join(baseDir, fmt.Sprintf("validator%d.pub", i))
 		data, err := os.ReadFile(pubKeyFile)
 		if err != nil {

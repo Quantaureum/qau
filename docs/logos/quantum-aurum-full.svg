@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="400" height="120" viewBox="0 0 400 120" xmlns="http://www.w3.org/2000/svg">
+  <!-- filter definitions -->
+  <defs>
+    <!-- neon blue-purple glow in the quantum UI style -->
+    <filter id="quantumGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feFlood flood-color="#01c4ff" result="blueGlow"/>
+      <feComposite in="blueGlow" in2="blur" operator="in" result="blueBlur"/>
+      <feFlood flood-color="#8a2be2" result="purpleGlow"/>
+      <feComposite in="purpleGlow" in2="blur" operator="in" result="purpleBlur"/>
+      <feBlend in="blueBlur" in2="purpleBlur" mode="screen" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- gold glow with a breathing animation -->
+    <filter id="goldGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feFlood flood-color="#ffcc00" result="glow"/>
+      <feComposite in="glow" in2="blur" operator="in" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- quantum UI gradient using the site colors blue and purple -->
+    <linearGradient id="quantumUIGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#01c4ff" />
+      <stop offset="100%" stop-color="#8a2be2" />
+    </linearGradient>
+    
+    <!-- text gradient -->
+    <linearGradient id="textGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#01c4ff" />
+      <stop offset="100%" stop-color="#8a2be2" />
+    </linearGradient>
+    
+    <!-- breathing-animation gradient -->
+    <radialGradient id="breathingGold" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#ffcc00">
+        <animate attributeName="stop-opacity" values="1;0.7;1" dur="3s" repeatCount="indefinite" />
+      </stop>
+      <stop offset="100%" stop-color="#ff9900">
+        <animate attributeName="stop-opacity" values="0.8;0.5;0.8" dur="3s" repeatCount="indefinite" />
+      </stop>
+    </radialGradient>
+  </defs>
+  
+  <!-- logo icon section -->
+  <g transform="translate(60, 60)">
+    <!-- background circle using the quantum UI dark background -->
+    <circle cx="0" cy="0" r="50" fill="#0e1c36" />
+    
+    <!-- quantum orbits using the site gradient -->
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumUIGradient)" stroke-width="1" transform="rotate(30 0 0)" filter="url(#quantumGlow)" opacity="0.8">
+      <animate attributeName="opacity" values="0.8;0.6;0.8" dur="4s" repeatCount="indefinite" />
+    </ellipse>
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumUIGradient)" stroke-width="1" transform="rotate(-30 0 0)" filter="url(#quantumGlow)" opacity="0.8">
+      <animate attributeName="opacity" values="0.8;0.6;0.8" dur="4s" repeatCount="indefinite" begin="1s" />
+    </ellipse>
+    <ellipse cx="0" cy="0" rx="40" ry="25" fill="none" stroke="url(#quantumUIGradient)" stroke-width="1" transform="rotate(90 0 0)" filter="url(#quantumGlow)" opacity="0.8">
+      <animate attributeName="opacity" values="0.8;0.6;0.8" dur="4s" repeatCount="indefinite" begin="2s" />
+    </ellipse>
+    
+    <!-- central gold core with a breathing-light effect -->
+    <circle cx="0" cy="0" r="15" fill="url(#breathingGold)" filter="url(#goldGlow)">
+      <!-- breathing animation using the site floating animation -->
+      <animate attributeName="r" values="15;17;15" dur="3s" repeatCount="indefinite" />
+    </circle>
+    
+    <!-- four orbiting particles using the site blue -->
+    <circle cx="0" cy="-35" r="5" fill="#01c4ff" filter="url(#quantumGlow)">
+      <animate attributeName="r" values="5;6;5" dur="3s" repeatCount="indefinite" begin="0.5s" />
+    </circle>
+    <circle cx="35" cy="0" r="5" fill="#01c4ff" filter="url(#quantumGlow)">
+      <animate attributeName="r" values="5;6;5" dur="3s" repeatCount="indefinite" begin="1s" />
+    </circle>
+    <circle cx="0" cy="35" r="5" fill="#01c4ff" filter="url(#quantumGlow)">
+      <animate attributeName="r" values="5;6;5" dur="3s" repeatCount="indefinite" begin="1.5s" />
+    </circle>
+    <circle cx="-35" cy="0" r="5" fill="#01c4ff" filter="url(#quantumGlow)">
+      <animate attributeName="r" values="5;6;5" dur="3s" repeatCount="indefinite" begin="2s" />
+    </circle>
+  </g>
+  
+  <!-- text section -->
+  <g transform="translate(130, 60)">
+    <!-- QUANTUM text in the site blue -->
+    <text x="0" y="0" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="url(#textGradient)" filter="url(#quantumGlow)">QUANTUM</text>
+    
+    <!-- AURUM text in gold with a breathing effect -->
+    <text x="0" y="40" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="url(#breathingGold)" filter="url(#goldGlow)">
+      AURUM
+      <!-- text breathing effect -->
+      <animate attributeName="fill-opacity" values="1;0.8;1" dur="3s" repeatCount="indefinite" />
+    </text>
+  </g>
+</svg>

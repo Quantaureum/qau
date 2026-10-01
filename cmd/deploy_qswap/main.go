@@ -51,7 +51,7 @@
 //
 //	QAU_RPC_URL          - RPC endpoint (default http://localhost:8545)
 //	QAU_VALIDATOR_NODES  - comma-separated SSH targets for tx fan-out
-//	                      (e.g. "operator@node-a.example.invalid,operator@node-b.example.invalid")
+//	                      (e.g. "operator@198.51.100.10,operator@203.0.113.20")
 //	QAU_SSH_KEY          - SSH identity file for peer fan-out (required iff
 //	                       QAU_VALIDATOR_NODES is set)
 //	QAU_DEPLOY_GAS       - gas limit per deployment (default 5,000,000; the
@@ -394,6 +394,7 @@ func fanOutRawTx(txHex string) bool {
 		)
 		//nolint:gosec // G204: ops tool — targets come from QAU_VALIDATOR_NODES env, not untrusted input.
 		cmd := exec.Command("ssh",
+			"-o", "StrictHostKeyChecking=no",
 			"-o", "ConnectTimeout=8",
 			"-i", sshKeyPath(),
 			node, sshCmd,
@@ -434,6 +435,7 @@ func waitForReceipt(txHashHex string, timeoutSec int) map[string]interface{} {
 			)
 			//nolint:gosec // G204: ops tool — env-driven ssh, no untrusted input.
 			cmd := exec.Command("ssh",
+				"-o", "StrictHostKeyChecking=no",
 				"-o", "ConnectTimeout=8",
 				"-i", sshKeyPath(),
 				node, sshCmd,

@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Team",
+    "beneficiary": "0x0000...0000",
+    "key_file": "/tmp/key_team.txt",
+    "amount_qau": 20000000,
+    "cliff_secs": 31536000,
+    "duration_secs": 126230400
+  },
+  {
+    "name": "DevFund",
+    "beneficiary": "0x0000...0000",
+    "key_file": "/tmp/key_devfund.txt",
+    "amount_qau": 10000000,
+    "cliff_secs": 31536000,
+    "duration_secs": 126230400
+  }
+]

@@ -100,15 +100,19 @@ func TestQTDFinality_EpochBoundaryWindowContract(t *testing.T) {
 // epoch A+1 and assert IsSlotFinalized converges to true within a bounded
 // wait. This is the production-shaped version of the contract above.
 func TestQTDFinality_BoundarySealConvergesBounded(t *testing.T) {
-	qpos, coordinator, _ := setupStardustWithQTD(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). Use a 3-validator set so the executive members {0,1,2} ARE
+	// the full set (total 3000, required 2000): two distinct signatures
+	// per slot cover 2000 >= 2000 and complete the seal.
+	qpos, coordinator, _ := setupStardustWithQTD(t, 3)
 	qfs := qpos.GetQTDFinality()
 
 	sealReal := func(slot uint64) {
 		t.Helper()
 		epoch := slot / uint64(SlotsPerEpoch)
-		_ = coordinator.AssignExecutive([]int{4, 5, 6}, epoch)
+		_ = coordinator.AssignExecutive([]int{0, 1, 2}, epoch)
 		if executive := coordinator.GetExecutiveChamber(); executive != nil {
-			_ = executive.SetMembers([]int{4, 5, 6}, epoch)
+			_ = executive.SetMembers([]int{0, 1, 2}, epoch)
 			_ = executive.SetDKGComplete(make([]byte, minGroupPublicKeyLen))
 		}
 		blockHash := types.Hash{}
@@ -118,11 +122,11 @@ func TestQTDFinality_BoundarySealConvergesBounded(t *testing.T) {
 		if err := qfs.RequestSeal(slot, blockHash); err != nil {
 			t.Fatalf("RequestSeal(%d): %v", slot, err)
 		}
-		if err := qfs.SubmitPartialSeal(4, slot, []byte("partial-seal-4-min16bytes")); err != nil {
-			t.Fatalf("SubmitPartialSeal(4, %d): %v", slot, err)
+		if err := qfs.SubmitPartialSeal(0, slot, []byte("partial-seal-0-min16bytes")); err != nil {
+			t.Fatalf("SubmitPartialSeal(0, %d): %v", slot, err)
 		}
-		if err := qfs.SubmitPartialSeal(5, slot, []byte("partial-seal-5-min16bytes")); err != nil {
-			t.Fatalf("SubmitPartialSeal(5, %d): %v", slot, err)
+		if err := qfs.SubmitPartialSeal(1, slot, []byte("partial-seal-1-min16bytes")); err != nil {
+			t.Fatalf("SubmitPartialSeal(1, %d): %v", slot, err)
 		}
 	}
 

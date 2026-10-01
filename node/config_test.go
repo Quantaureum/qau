@@ -70,7 +70,6 @@ func TestNetworkIDs(t *testing.T) {
 func TestConfigValidate_DevModeOnMainnet(t *testing.T) {
 	cfg := &Config{
 		DevMode:   true,
-		Network:   NetworkMainnet,
 		NetworkID: MainnetNetworkID,
 	}
 	err := cfg.Validate()
@@ -263,26 +262,8 @@ func TestResolveNetworkConfig_Testnet(t *testing.T) {
 	if cfg.NetworkID != TestnetNetworkID {
 		t.Errorf("expected testnet ID %d, got %d", TestnetNetworkID, cfg.NetworkID)
 	}
-	if cfg.DevMode {
-		t.Error("testnet must not enable dev mode")
-	}
-	want := []string{
-		"enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000",
-	}
-	if !sliceEqual(cfg.BootstrapPeers, want) {
-		t.Errorf("expected canonical testnet bootnodes %v, got %v", want, cfg.BootstrapPeers)
-	}
-}
-
-func TestResolveNetworkConfig_TestnetExplicitBootnodes(t *testing.T) {
-	cfg := &Config{
-		Network:        NetworkTestnet,
-		BootstrapPeers: []string{"enode://0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:9000"},
-	}
-	ResolveNetworkConfig(cfg)
-	want := []string{"enode://0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:9000"}
-	if !sliceEqual(cfg.BootstrapPeers, want) {
-		t.Errorf("expected explicit bootnodes %v, got %v", want, cfg.BootstrapPeers)
+	if !cfg.DevMode {
+		t.Error("expected dev mode for testnet")
 	}
 }
 
@@ -641,24 +622,24 @@ func TestConfigValidate_TLSCertRotationDefaults(t *testing.T) {
 func TestResolveNetworkConfig_DevGenesisFile(t *testing.T) {
 	cfg := &Config{Network: NetworkDev}
 	ResolveNetworkConfig(cfg)
-	if cfg.GenesisFile != "" {
-		t.Errorf("expected built-in dev genesis, got '%s'", cfg.GenesisFile)
+	if cfg.GenesisFile != "genesis/dev.json" {
+		t.Errorf("expected dev genesis file, got '%s'", cfg.GenesisFile)
 	}
 }
 
 func TestResolveNetworkConfig_TestnetGenesisFile(t *testing.T) {
 	cfg := &Config{Network: NetworkTestnet}
 	ResolveNetworkConfig(cfg)
-	if cfg.GenesisFile != "" {
-		t.Errorf("expected built-in testnet genesis, got '%s'", cfg.GenesisFile)
+	if cfg.GenesisFile != "genesis/testnet.json" {
+		t.Errorf("expected testnet genesis file, got '%s'", cfg.GenesisFile)
 	}
 }
 
 func TestResolveNetworkConfig_MainnetGenesisFile(t *testing.T) {
 	cfg := &Config{Network: NetworkMainnet}
 	ResolveNetworkConfig(cfg)
-	if cfg.GenesisFile != "" {
-		t.Errorf("expected built-in mainnet genesis, got '%s'", cfg.GenesisFile)
+	if cfg.GenesisFile != "genesis/mainnet.json" {
+		t.Errorf("expected mainnet genesis file, got '%s'", cfg.GenesisFile)
 	}
 }
 
@@ -673,8 +654,8 @@ func TestResolveNetworkConfig_DevPreservesExistingGenesisFile(t *testing.T) {
 func TestResolveNetworkConfig_TestnetBlockInterval(t *testing.T) {
 	cfg := &Config{Network: NetworkTestnet}
 	ResolveNetworkConfig(cfg)
-	if cfg.BlockInterval != 12 {
-		t.Errorf("expected testnet block interval 12, got %d", cfg.BlockInterval)
+	if cfg.BlockInterval != 5 {
+		t.Errorf("expected testnet block interval 5, got %d", cfg.BlockInterval)
 	}
 }
 
@@ -690,14 +671,14 @@ func TestResolveNetworkConfig_TestnetAutoUnlock(t *testing.T) {
 	// SECURITY (audit 2026-06-14, M6): testnet must NOT enable
 	// DevAutoUnlockAccounts. Auto-unlock keeps keys in memory without a
 	// password, which is unsafe on a publicly reachable testnet. DevMode
-	// is also disabled; only NetworkDev enables development behavior.
+	// (fast blocks) is still enabled; only NetworkDev enables auto-unlock.
 	cfg := &Config{Network: NetworkTestnet}
 	ResolveNetworkConfig(cfg)
 	if cfg.DevAutoUnlockAccounts {
 		t.Error("DevAutoUnlockAccounts must be false for testnet (M6 security fix)")
 	}
-	if cfg.DevMode {
-		t.Error("DevMode must be false for testnet")
+	if !cfg.DevMode {
+		t.Error("expected DevMode to be true for testnet")
 	}
 
 	// Only the local dev network enables auto-unlock.
@@ -967,14 +948,11 @@ func TestDevConfig_AllFields(t *testing.T) {
 // (trusted dealer DKG is allowed on testnet).
 func TestTestnetConfig_AllFields(t *testing.T) {
 	cfg := TestnetConfig()
-	if cfg.TSSThreshold != 3 {
-		t.Errorf("expected TestnetConfig TSSThreshold 3, got %d", cfg.TSSThreshold)
+	if cfg.TSSThreshold != 2 {
+		t.Errorf("expected TestnetConfig TSSThreshold 2, got %d", cfg.TSSThreshold)
 	}
-	if cfg.TSSTotalShares != 4 {
-		t.Errorf("expected TestnetConfig TSSTotalShares 4, got %d", cfg.TSSTotalShares)
-	}
-	if cfg.TSSDistributedMode {
-		t.Error("expected TestnetConfig TSSDistributedMode to remain disabled")
+	if cfg.TSSTotalShares != 3 {
+		t.Errorf("expected TestnetConfig TSSTotalShares 3, got %d", cfg.TSSTotalShares)
 	}
 }
 

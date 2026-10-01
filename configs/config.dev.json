@@ -1,0 +1,94 @@
+{
+  "name": "qau-node-master",
+  "dataDir": "./data1",
+  "network": "dev",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [
+    "127.0.0.1:9001",
+    "127.0.0.1:9002"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAddr": "127.0.0.1:8545",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8546",
+  "frontendEnabled": false,
+  "frontendAddr": ":8088",
+  "healthEnabled": true,
+  "healthAddr": ":8080",
+  "validatorEnabled": false,
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": true,
+  "allowLegacySignatures": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 512,
+    "l1MaxMemory": 33554432,
+    "l2MaxSize": 4096,
+    "l2MaxMemory": 134217728,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 5000,
+    "batchSize": 200
+  },
+  "memoryLimitMB": 4096,
+  "maxConcurrentRequests": 20,
+  "requestTimeout": 30,
+  "requestsPerSecond": 10,
+  "alerting": {
+    "enabled": false
+  },
+  "bridge": {
+    "_comment": "Cross-chain bridge config (dev). QAU_ENABLE_BRIDGE=1 env var required to enable. Empty ethereum URL = only quantaureum adapter registers.",
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8545",
+      "ethereum": ""
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "",
+      "ethereum": ""
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 3,
+    "messageExpiration": 3600,
+    "pollingInterval": 5,
+    "maxRetries": 3,
+    "initializerAddress": "",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  },
+  "allowedOrigins": [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8080",
+    "http://localhost:8545",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8545",
+    "chrome-extension://*"
+  ],
+  "_comment_allowedOrigins": "FIX: Replaced wildcard 'http://localhost:*' with explicit dev ports (3000=frontend, 5173=Vite, 8080=health, 8545=RPC) to limit CORS exposure. Add ports as needed for your dev setup.",
+  "danksharding": {
+    "enabled": false,
+    "experimental": true,
+    "committeeSize": 0,
+    "subnetCount": 0
+  },
+  "sharding": {
+    "maxCount": 64,
+    "blockSize": 1048576,
+    "interval": 12,
+    "minValidators": 3
+  }
+}

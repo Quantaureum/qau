@@ -35,7 +35,23 @@ func setupStardustWithQTD(t *testing.T, validatorCount int) (*QPOS, *ThreeChambe
 
 func setupFullProvinces(t *testing.T) (*QPOS, *ThreeChambersCoordinator, *ThreeChambersFlow) {
 	t.Helper()
-	qpos, coordinator, flow := setupStardustWithQTD(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake), so executive {4,5,6} on an equal-stake 10-node set can never
+	// reach the bar (3/10 of stake < 2/3). Skew the stakes: executive
+	// members hold 6000 each, everyone else 500 (total 21500, required
+	// 14334). Three executive signatures cover 18000 >= 14334, so seals
+	// complete once all three members sign. Power-separation tests that use
+	// this helper are unaffected — chamber membership checks do not read
+	// stake.
+	vs := createSkewedValidatorSet(t, 10, map[int]int64{4: 6000, 5: 6000, 6: 6000}, 500)
+	qpos, err := NewQPOS(vs)
+	if err != nil {
+		t.Fatalf("NewQPOS failed: %v", err)
+	}
+	qpos.InitChambers()
+	coordinator := qpos.GetChambersCoordinator()
+	qpos.GetQTDFinality().SetQTDSigner(&mockThresholdSigner{})
+	flow := NewThreeChambersFlow(qpos, coordinator)
 
 	_ = coordinator.AssignProposing(0, 1)
 	_ = coordinator.AssignReview([]int{1, 2, 3}, 1)
@@ -335,6 +351,9 @@ func TestStardustV2_Unit_QTDFinality_AlreadyFinalizedSlot(t *testing.T) {
 
 	_ = qfs.SubmitPartialSeal(4, 11, []byte("sig-4-min16bytes-padding"))
 	_ = qfs.SubmitPartialSeal(5, 11, []byte("sig-5-min16bytes-padding"))
+	// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight (14334) on the
+	// skewed set; the third executive member must sign to complete.
+	_ = qfs.SubmitPartialSeal(6, 11, []byte("sig-6-min16bytes-padding"))
 
 	if !qfs.IsSlotFinalized(11) {
 		t.Fatal("Slot 11 should be finalized")
@@ -366,6 +385,9 @@ func TestStardustV2_Unit_QTDFinality_VerifyInstantFinality(t *testing.T) {
 
 	_ = qfs.SubmitPartialSeal(4, 12, []byte("sig-4-min16bytes-padding"))
 	_ = qfs.SubmitPartialSeal(5, 12, []byte("sig-5-min16bytes-padding"))
+	// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight (14334) on the
+	// skewed set; the third executive member must sign to complete.
+	_ = qfs.SubmitPartialSeal(6, 12, []byte("sig-6-min16bytes-padding"))
 
 	record := qfs.GetFinalityRecord(12)
 	if record == nil {
@@ -698,6 +720,9 @@ func TestStardustV2_Integration_BlockStructureExtension(t *testing.T) {
 	}
 	_ = qfs.SubmitPartialSeal(4, slot, []byte("sig-4-min16bytes-padding"))
 	_ = qfs.SubmitPartialSeal(5, slot, []byte("sig-5-min16bytes-padding"))
+	// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight (14334) on the
+	// skewed set; the third executive member must sign to complete.
+	_ = qfs.SubmitPartialSeal(6, slot, []byte("sig-6-min16bytes-padding"))
 
 	header := &encoding.BlockHeader{
 		Slot:       slot,
@@ -870,6 +895,10 @@ func TestStardustV2_Performance_ConcurrentFinality(t *testing.T) {
 
 			_ = qfs.SubmitPartialSeal(4, slot, []byte("sig-4-min16bytes-padding"))
 			_ = qfs.SubmitPartialSeal(5, slot, []byte("sig-5-min16bytes-padding"))
+			// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight
+			// (14334) on the skewed set; the third executive member must
+			// sign to complete.
+			_ = qfs.SubmitPartialSeal(6, slot, []byte("sig-6-min16bytes-padding"))
 		}(i)
 	}
 
@@ -1013,6 +1042,9 @@ func TestStardustV2_Security_UnauthorizedSealRejected(t *testing.T) {
 
 	_ = qfs.SubmitPartialSeal(4, sealSlot, []byte("authorized-sig-4"))
 	_ = qfs.SubmitPartialSeal(5, sealSlot, []byte("authorized-sig-5"))
+	// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight (14334) on the
+	// skewed set; the third executive member must sign to complete.
+	_ = qfs.SubmitPartialSeal(6, sealSlot, []byte("authorized-sig-6"))
 
 	if !qfs.IsSlotFinalized(sealSlot) {
 		t.Error("Slot should be finalized after 2 authorized seals (threshold=2)")

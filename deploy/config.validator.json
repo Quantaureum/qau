@@ -1,0 +1,21 @@
+{
+  "name": "qau-docker-validator",
+  "networkId": 1668,
+  "genesisFile": "/app/genesis/mainnet.json",
+  "dataDir": "/app/data",
+  "listenAddr": "0.0.0.0:9000",
+  "externalIP": "CHANGE_ME_PUBLIC_IP",
+  "bootstrapPeers": ["CHANGE_ME_BOOTSTRAP_ENODE"],
+  "maxPeers": 50,
+  "rpcEnabled": false,
+  "rpcAddr": "127.0.0.1:8545",
+  "wsEnabled": false,
+  "healthEnabled": true,
+  "healthAddr": "0.0.0.0:8080",
+  "validatorEnabled": true,
+  "validatorKey": "/app/keys/validator.key",
+  "cacheSize": 512,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json"
+}

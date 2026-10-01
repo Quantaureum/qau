@@ -152,7 +152,7 @@ func buildSignAndMaybeSend(cf *commonFlags, signerKeyPath string, data []byte) {
 	registry := economics.ValidatorKeyRegistryAddress
 
 	tx := &encoding.Transaction{
-		From:     addrArr,
+		From: addrArr,
 		To:       (*types.Address)(&registry),
 		Type:     encoding.TxTypeValidatorKey,
 		Nonce:    nonce,

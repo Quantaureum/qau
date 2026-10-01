@@ -41,6 +41,7 @@ const (
 //	60-69:   Protocol negotiation response + sync extensions (qau_proto): ReceiptReq/ReceiptResp
 //	70-79:   TSS protocol (qau_tss): SessionInit, Round1, Round2, Signature, DKG
 //	80-89:   Shard protocol (qau_shard): ShardBlock, ShardBlockReq/Resp, ShardAttestation, CrossShardMsg/Receipt
+//	90-95:   Dilithium3 v1 DKG extension (qau_tss): randomness, group rounds, contribution, activation
 //
 // R4-H4 FIX (2026-07-06): MsgTypeProtocolNegotiateResp moved from 61 to 60.
 // Previously at 61 (was 50, conflicted with DASSampleReq), which was in an
@@ -159,6 +160,7 @@ const (
 	// qtd.Round1OpenMessage.
 	MsgTypeTSSDKGCommitment uint8 = 77 // Distributed DKG Round1 commitment (broadcast)
 	MsgTypeTSSDKGAck        uint8 = 78 // Distributed DKG Round1 open / share delivery (P2P)
+	MsgTypeTSSDKGReshare    uint8 = 79 // Epoch-bound share resharing (P2P)
 
 	// Shard protocol (qau_shard) — 80-89 range
 	// P1-1 (2026-07-14): P2P message channel for shard block propagation,
@@ -171,6 +173,35 @@ const (
 	MsgTypeShardAttestation  uint8 = 83 // Shard block finalization attestation (validator → proposer)
 	MsgTypeCrossShardMsg     uint8 = 84 // Cross-shard message propagation (source → dest shard nodes)
 	MsgTypeCrossShardReceipt uint8 = 85 // Cross-shard receipt propagation (relay confirmation)
+
+	// Dilithium3 v1 DKG uses versioned threshold envelopes. Private group
+	// seeds are point-to-point only; the remaining messages are public within
+	// the fixed committee.
+	MsgTypeTDilithium3DKGRandomness           uint8 = 90
+	MsgTypeTDilithium3DKGGroupSeed            uint8 = 91
+	MsgTypeTDilithium3DKGAcknowledgement      uint8 = 92
+	MsgTypeTDilithium3DKGComplaint            uint8 = 93
+	MsgTypeTDilithium3DKGContribution         uint8 = 94
+	MsgTypeTDilithium3DKGActivation           uint8 = 95
+	MsgTypeTDilithium3DKGRandomnessCommitment uint8 = 96
+
+	// Dilithium3 v1 signing executor (qau_tss): the four public round messages
+	// of the threshold signing construction, each a canonical fixed-width
+	// payload inside the shared threshold envelope. They are broadcast inside
+	// the four-signer active set, are exempt from content-hash dedup for the
+	// same retransmission reason as the DKG kinds, and are only interpreted by
+	// the signing executor of the wallet-side protocol layer.
+	MsgTypeTDilithium3SigningCommit     uint8 = 97
+	MsgTypeTDilithium3SigningReveal     uint8 = 98
+	MsgTypeTDilithium3SigningAcceptance uint8 = 99
+	MsgTypeTDilithium3SigningResponse   uint8 = 100
+
+	// Dilithium3 v1 DKG activation certificate broadcast. Once a participant
+	// assembles the unanimous activation certificate it gossips the full
+	// serialized certificate (magic "QTD3ACT1", JSON, <=128KB) so same-session
+	// peers that did not finish their own collection can adopt the identical
+	// group key instead of deriving a fresh divergent session next epoch.
+	MsgTypeTDilithium3DKGActivationCertificate uint8 = 101
 )
 
 // Message flags
@@ -840,11 +871,11 @@ func EncodeStatusMessage(status *StatusMessage) []byte {
 	if hasV2Ext || hasForkID {
 		// V3 extension block (2026-08-13): length-prefixed trailer carrying
 		// Timestamp(8) + SessionNonce(16) [+ ForkID(32)]. extLen==24 is the
-		// legacy V2 form; extLen==36 is the V3 form with fork id. Legacy
+		// legacy V2 form; extLen==56 is the V3 form with fork id. Legacy
 		// decoders stop at the signature and ignore this block entirely.
 		extLen := 24
 		if hasForkID {
-			extLen = 36
+			extLen = 56
 		}
 		extLenBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(extLenBuf, uint32(extLen))
@@ -914,7 +945,7 @@ func DecodeStatusMessage(data []byte) (*StatusMessage, error) {
 				// extension fields may extend the block; we read the first 24
 				// bytes which is the V2 spec Timestamp+Nonce).
 				//
-				// V3 (2026-08-13): extLen==36 additionally carries ForkID(32B)
+				// V3 (2026-08-13): extLen==56 additionally carries ForkID(32B)
 				// after the nonce.
 				if len(data) >= offset+4 {
 					extLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
@@ -922,8 +953,8 @@ func DecodeStatusMessage(data []byte) (*StatusMessage, error) {
 					if extLen >= 24 && len(data) >= offset+24 {
 						status.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
 						copy(status.SessionNonce[:], data[offset+8:offset+24])
-						if extLen >= 36 && len(data) >= offset+36 {
-							copy(status.ForkID[:], data[offset+24:offset+36])
+						if extLen >= 56 && len(data) >= offset+56 {
+							copy(status.ForkID[:], data[offset+24:offset+56])
 						}
 					}
 				}
@@ -1170,11 +1201,43 @@ func ValidateMessage(msg *Message) error {
 		if len(msg.Payload) < 64 || len(msg.Payload) > 50*1024 {
 			return ErrMalformedMessage
 		}
+	case MsgTypeTSSKeyExchange:
+		if len(msg.Payload) < 36 || len(msg.Payload) > 20*1024 {
+			return ErrMalformedMessage
+		}
 	case MsgTypeTSSDKGCommitment, MsgTypeTSSDKGAck:
 		// Task 5 (node-layer distributed DKG): JSON-encoded round messages
 		// (qtd.Round1CommitmentMessage / qtd.Round1OpenMessage). Reject empty
 		// payloads; upper bound prevents unbounded memory from base64-encoded
 		// polynomial vectors (a full open+share JSON stays well below 128KB).
+		if len(msg.Payload) < 16 || len(msg.Payload) > 128*1024 {
+			return ErrMalformedMessage
+		}
+	case MsgTypeTSSDKGReshare:
+		if len(msg.Payload) < 32 || len(msg.Payload) > 2*1024*1024 {
+			return ErrMalformedMessage
+		}
+	case MsgTypeTDilithium3DKGRandomness,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement,
+		MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution,
+		MsgTypeTDilithium3DKGActivation:
+		if err := ValidateTDilithium3DKGEnvelope(msg.Type, msg.Payload); err != nil {
+			return ErrMalformedMessage
+		}
+	case MsgTypeTDilithium3SigningCommit,
+		MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance,
+		MsgTypeTDilithium3SigningResponse:
+		if err := ValidateTDilithium3SigningEnvelope(msg.Type, msg.Payload); err != nil {
+			return ErrMalformedMessage
+		}
+	case MsgTypeTDilithium3DKGActivationCertificate:
+		// Serialized activation certificate (magic "QTD3ACT1", JSON). Reject
+		// empty payloads; upper bound matches the thresholdActivationMaxSize
+		// 128KB cap enforced by decodeThresholdActivationCertificate.
 		if len(msg.Payload) < 16 || len(msg.Payload) > 128*1024 {
 			return ErrMalformedMessage
 		}

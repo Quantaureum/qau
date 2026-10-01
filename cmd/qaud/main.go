@@ -12,9 +12,17 @@ import (
 	"time"
 
 	"github.com/quantaureum/qau/cmd/qaud/config"
-	"github.com/quantaureum/qau/internal/version"
 	"github.com/quantaureum/qau/node"
 	"github.com/quantaureum/qau/profiling"
+)
+
+var (
+	// Version is set by ldflags during build.
+	Version = "0.1.0"
+	// GitCommit is set by ldflags during build.
+	GitCommit = "unknown"
+	// BuildTime is set by ldflags during build.
+	BuildTime = "unknown"
 )
 
 func main() {
@@ -29,9 +37,9 @@ func main() {
 
 	if *cli.ShowVersion {
 		fmt.Printf("Quantaureum Node\n")
-		fmt.Printf("Version: %s\n", version.Version)
-		fmt.Printf("Git Commit: %s\n", version.GitCommit)
-		fmt.Printf("Build Time: %s\n", version.BuildTime)
+		fmt.Printf("Version: %s\n", Version)
+		fmt.Printf("Git Commit: %s\n", GitCommit)
+		fmt.Printf("Build Time: %s\n", BuildTime)
 		fmt.Printf("Go Version: %s\n", runtime.Version())
 		fmt.Printf("OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		return
@@ -94,7 +102,7 @@ func main() {
 func printBanner(cfg *node.Config) {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════╗")
-	fmt.Printf("║        Quantaureum v%s - Quantum Blockchain         ║\n", version.Version)
+	fmt.Println("║        Quantaureum v1.0 - Quantum Blockchain         ║")
 	fmt.Println("║        Post-Quantum Secure | QPOS Consensus          ║")
 	fmt.Println("╚══════════════════════════════════════════════════════╝")
 	fmt.Println()

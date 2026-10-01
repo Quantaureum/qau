@@ -50,9 +50,7 @@ type EnhancedPoolStats struct {
 }
 
 // EnhancedPoolConfig holds all tunable parameters for the enhanced tx pool.
-//
-//	All size/memory limits are configurable struct fields (not
-//
+//  All size/memory limits are configurable struct fields (not
 // hardcoded). Defaults are provided by DefaultEnhancedPoolConfig() which
 // references the Default* constants above.
 type EnhancedPoolConfig struct {

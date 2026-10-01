@@ -182,12 +182,24 @@ func (sc *ExecutiveChamber) SetMembers(members []int, epoch uint64) error {
 const minGroupPublicKeyLen = crypto.Dilithium3PublicKeySize // 1952 bytes
 
 func (sc *ExecutiveChamber) SetDKGComplete(publicKey []byte) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.setDKGCompleteLocked(publicKey)
+}
+
+func (sc *ExecutiveChamber) setDKGCompleteForEpoch(epoch uint64, members []int, publicKey []byte) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.epoch != epoch || sc.state != ExecutiveDKGRunning || !sameParticipantSet(sc.members, members) {
+		return fmt.Errorf("DKG completion does not match the pending executive committee")
+	}
+	return sc.setDKGCompleteLocked(publicKey)
+}
+
+func (sc *ExecutiveChamber) setDKGCompleteLocked(publicKey []byte) error {
 	if len(publicKey) < minGroupPublicKeyLen {
 		return fmt.Errorf("group public key too short: %d (minimum %d = Dilithium3 PublicKeySize)", len(publicKey), minGroupPublicKeyLen)
 	}
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
 
 	sc.state = ExecutiveActive
 	sc.publicKey = make([]byte, len(publicKey))

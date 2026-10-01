@@ -1,0 +1,30 @@
+{
+  "name": "Quantaureum Mainnet",
+  "chain": "QAU",
+  "rpc": [
+    "https://rpc.quantaureum.com"
+  ],
+  "faucets": [],
+  "nativeCurrency": {
+    "name": "Quantaureum",
+    "symbol": "QAU",
+    "decimals": 18
+  },
+  "features": [
+    { "name": "EIP155" },
+    { "name": "EIP1559" }
+  ],
+  "infoURL": "https://quantaureum.com",
+  "shortName": "qau",
+  "chainId": 1668,
+  "networkId": 1668,
+  "icon": "quantaureum",
+  "explorers": [
+    {
+      "name": "Quantaureum Explorer",
+      "url": "https://explorer.quantaureum.com",
+      "icon": "quantaureum",
+      "standard": "EIP3091"
+    }
+  ]
+}

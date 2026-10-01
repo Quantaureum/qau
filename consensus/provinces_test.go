@@ -550,3 +550,38 @@ func createTestValidatorSet(t *testing.T, count int) *ValidatorSet {
 	}
 	return vs
 }
+
+// createSkewedValidatorSet creates a validator set where the validators in
+// highStake hold the given stake and everyone else holds lowStake.
+//
+// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+// stake), so an executive chamber that is a strict subset of the validator
+// set can only reach the weight bar if its members hold a disproportionate
+// share of the stake. Tests that seal with executive {4,5,6} on a 10-node
+// set use this helper with high stakes so three executive signatures meet
+// ceil(2/3 * total).
+func createSkewedValidatorSet(t *testing.T, count int, highStake map[int]int64, lowStake int64) *ValidatorSet {
+	t.Helper()
+	validators := make([]*Validator, count)
+	for i := 0; i < count; i++ {
+		var addr types.Address
+		addr[0] = byte(i + 1)
+		addr[1] = byte(i >> 8)
+		stake := lowStake
+		if s, ok := highStake[i]; ok {
+			stake = s
+		}
+		validators[i] = &Validator{
+			Address:        addr,
+			Stake:          big.NewInt(stake),
+			Active:         true,
+			Commission:     0,
+			PublicKeyBytes: make([]byte, 1952),
+		}
+	}
+	vs, err := NewValidatorSet(validators)
+	if err != nil {
+		t.Fatalf("createSkewedValidatorSet failed: %v", err)
+	}
+	return vs
+}

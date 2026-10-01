@@ -45,6 +45,10 @@ func (p *poisonedThresholdSigner) IsThresholdMode() bool {
 	return true
 }
 
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (p *poisonedThresholdSigner) Threshold() int { return 0 }
+
 // AggregatePartialSignatures fails if the poison signature is present in
 // the map, simulating an invalid signature that causes TSS aggregation
 // to fail. Succeeds otherwise.
@@ -79,7 +83,20 @@ func (p *poisonedThresholdSigner) AggregatePartialSignatures(sealers []int, part
 //     (including the poison one), and the counter resets.
 //   - Subsequent legitimate sigs can then complete the seal normally.
 func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
-	qpos, coordinator, _ := setupFullProvinces(t)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake), and aggregation only runs once the weight bar is reached.
+	// This test needs aggregation to fire on the SECOND signature, so the
+	// executive members {0,1,2} must BE the full validator set: use a
+	// 3-validator set (total 3000, required 2000, two sigs cover 2000).
+	// setupFullProvinces cannot express this (it keeps executive
+	// {4,5,6} a strict subset), so the topology is inlined here.
+	vs := createTestValidatorSet(t, 3)
+	qpos, err := NewQPOS(vs)
+	if err != nil {
+		t.Fatalf("NewQPOS failed: %v", err)
+	}
+	qpos.InitChambers()
+	coordinator := qpos.GetChambersCoordinator()
 	qfs := qpos.GetQTDFinality()
 
 	// Replace the default mock signer with a poisoned one. The poison sig
@@ -88,19 +105,19 @@ func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
 	poisonSig := []byte("poison-sig-min16bytes") // 20 bytes
 	qfs.SetQTDSigner(&poisonedThresholdSigner{poisonSig: poisonSig})
 
-	// Executive members are [4, 5, 6] with threshold=2 (set by setupFullProvinces
-	// for epoch 0 only). CHAMBER-H03 FIX (R31, 2026-07-27): CanSeal fail-closes
-	// for epochs without an explicit executive assignment, so we must assign
-	// executive for epoch 1 (slot 50 / SlotsPerEpoch=32 = epoch 1).
+	// Executive members are [0, 1, 2] with threshold=2. CHAMBER-H03 FIX
+	// (R31, 2026-07-27): CanSeal fail-closes for epochs without an explicit
+	// executive assignment, so we must assign executive for epoch 1
+	// (slot 50 / SlotsPerEpoch=32 = epoch 1).
 	const slot = 50
 	approveSlot(coordinator, slot)
 
 	// CHAMBER-H03: assign executive for slot's epoch.
 	epoch := SlotToEpoch(slot)
 	if !coordinator.HasExecutiveAssignment(epoch) {
-		_ = coordinator.AssignExecutive([]int{4, 5, 6}, epoch)
+		_ = coordinator.AssignExecutive([]int{0, 1, 2}, epoch)
 		executive := coordinator.GetExecutiveChamber()
-		_ = executive.SetMembers([]int{4, 5, 6}, epoch)
+		_ = executive.SetMembers([]int{0, 1, 2}, epoch)
 		_ = executive.SetDKGComplete(make([]byte, minGroupPublicKeyLen))
 	}
 
@@ -117,10 +134,10 @@ func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
 	// Legitimate signature (also >= 16 bytes, != 3293, accepted in non-prod).
 	legitSig := []byte("legit-sig-min16bytes-padding") // 26 bytes
 
-	// Step 1: Attacker (validator 4) submits poison sig. Count=1 < threshold=2,
+	// Step 1: Attacker (validator 0) submits poison sig. Count=1 < threshold=2,
 	// so no aggregation attempt yet. Poison sig is stored.
-	if err := qfs.SubmitPartialSeal(4, slot, poisonSig); err != nil {
-		t.Fatalf("Step 1: SubmitPartialSeal(poison, v4) failed: %v", err)
+	if err := qfs.SubmitPartialSeal(0, slot, poisonSig); err != nil {
+		t.Fatalf("Step 1: SubmitPartialSeal(poison, v0) failed: %v", err)
 	}
 	qfs.mu.RLock()
 	pending := qfs.pendingSeals[slot]
@@ -135,35 +152,35 @@ func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
 	}
 	qfs.mu.RUnlock()
 
-	// Step 2: Legitimate sig from validator 5 triggers aggregation (count=2 >= threshold=2),
+	// Step 2: Legitimate sig from validator 1 triggers aggregation (count=2 >= threshold=2),
 	// but aggregation fails because poison sig is present.
 	//
 	// R31-P1-02 FIX (2026-07-27): The rotation deletion strategy evicts the
-	// MOST SUSPICIOUS sig (v4's poison, suspicion score 1) rather than the
-	// newly-submitted sig (v5's legit, suspicion score 0). This means the
+	// MOST SUSPICIOUS sig (v0's poison, suspicion score 1) rather than the
+	// newly-submitted sig (v1's legit, suspicion score 0). This means the
 	// poison is evicted on the FIRST failure — even faster than the old
 	// maxConsecutiveAggFailures reset. The maxConsecutiveAggFailures reset
 	// still exists as a backstop for the multi-poison scenario (multiple
 	// validators submit poison sigs, so no single sig is identifiable as
 	// most suspicious).
-	if err := qfs.SubmitPartialSeal(5, slot, legitSig); err != nil {
-		t.Fatalf("Step 2: SubmitPartialSeal(legit, v5) failed: %v", err)
+	if err := qfs.SubmitPartialSeal(1, slot, legitSig); err != nil {
+		t.Fatalf("Step 2: SubmitPartialSeal(legit, v1) failed: %v", err)
 	}
 	qfs.mu.RLock()
 	pending = qfs.pendingSeals[slot]
 	if pending == nil {
 		t.Fatalf("Step 2: pending seal missing (should not be completed yet)")
 	}
-	// R31-P1-02: poison sig (v4) EVICTED (highest suspicion score), legit sig (v5) retained.
+	// R31-P1-02: poison sig (v0) EVICTED (highest suspicion score), legit sig (v1) retained.
 	if len(pending.PartialSigs) != 1 {
 		t.Fatalf("Step 2: expected 1 sig (poison evicted, legit retained), got %d",
 			len(pending.PartialSigs))
 	}
-	if _, hasV4 := pending.PartialSigs[4]; hasV4 {
-		t.Fatalf("Step 2: poison sig from v4 should be EVICTED (R31-P1-02 rotation strategy, highest suspicion score)")
+	if _, hasV0 := pending.PartialSigs[0]; hasV0 {
+		t.Fatalf("Step 2: poison sig from v0 should be EVICTED (R31-P1-02 rotation strategy, highest suspicion score)")
 	}
-	if _, hasV5 := pending.PartialSigs[5]; !hasV5 {
-		t.Fatalf("Step 2: legit sig from v5 should be retained (R31-P1-02: newly-submitted has score 0)")
+	if _, hasV1 := pending.PartialSigs[1]; !hasV1 {
+		t.Fatalf("Step 2: legit sig from v1 should be retained (R31-P1-02: newly-submitted has score 0)")
 	}
 	if pending.ConsecutiveAggFailures != 1 {
 		t.Fatalf("Step 2: expected ConsecutiveAggFailures=1, got %d",
@@ -173,14 +190,14 @@ func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
 
 	t.Log("✅ QTD-CRIT-03: Poison sig evicted on first failure (R31-P1-02 rotation strategy)")
 
-	// Step 5: Now that the poison sig is evicted, a legit sig from v4 should
+	// Step 5: Now that the poison sig is evicted, a legit sig from v0 should
 	// be accepted. Count=2 >= threshold=2, aggregation succeeds (no poison).
-	if err := qfs.SubmitPartialSeal(4, slot, legitSig); err != nil {
-		t.Fatalf("Step 5: SubmitPartialSeal(legit, v4) failed: %v", err)
+	if err := qfs.SubmitPartialSeal(0, slot, legitSig); err != nil {
+		t.Fatalf("Step 5: SubmitPartialSeal(legit, v0) failed: %v", err)
 	}
 
 	// Step 6: The seal should be completed: pendingSeals[slot] deleted, instantFinalizedSlots[slot] set.
-	// (v4's legit sig + v5's retained legit sig → count=2 >= threshold=2 → aggregation succeeds)
+	// (v0's legit sig + v1's retained legit sig → count=2 >= threshold=2 → aggregation succeeds)
 	qfs.mu.RLock()
 	_, pendingExists := qfs.pendingSeals[slot]
 	finalized := qfs.instantFinalizedSlots[slot] != nil

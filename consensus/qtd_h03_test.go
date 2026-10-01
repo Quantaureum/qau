@@ -27,6 +27,10 @@ func (m *epochKeySigner) VerifyVote(pubKey []byte, message []byte, signature []b
 }
 func (m *epochKeySigner) GroupPublicKey() []byte { return m.groupKey }
 func (m *epochKeySigner) IsThresholdMode() bool  { return true }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *epochKeySigner) Threshold() int { return 0 }
 func (m *epochKeySigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {
@@ -200,7 +204,13 @@ func TestQTD_H03_getGroupPublicKeyForEpoch_EmptyKeyFailClosed(t *testing.T) {
 // NOT a "group public key empty" error) — proving it found the historical
 // key and proceeded to VerifyBlock with it.
 func TestQTD_H03_SubmitCompletedSeal_UsesEpochKeyNotCurrent(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: the weight check (ceil(2/3 of the FULL validator set
+	// stake)) runs before signature verification. With 10 validators the
+	// sealers {0,1,2} cover only 3000 of 6667, so the test would fail with a
+	// weight error instead of reaching the signature-verification step this
+	// test is designed to exercise. A 3-validator set makes the sealers
+	// cover the full 3000 stake (>= 2000 required).
+	vs := createTestValidatorSet(t, 3)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)

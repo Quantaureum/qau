@@ -2,6 +2,7 @@
 package tss
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
@@ -124,6 +125,16 @@ func (m *TSSManager) VerifyQTDShare(share *qtd.QTDShare) error {
 // import pre-generated shares from TSSKeyShareFile instead. The mainnet hard
 // guard in node/config.go Validate() enforces this at startup.
 func (m *TSSManager) GenerateKeyShares() ([]*KeyShare, error) {
+	return m.GenerateKeySharesCtx(context.Background())
+}
+
+// GenerateKeySharesCtx is GenerateKeyShares with a caller-supplied context that
+// bounds the distributed-DKG network waits. The node layer passes a per-attempt
+// context whose deadline is the round-window boundary, so an abandoned round
+// unwinds and releases the manager lock instead of leaking a goroutine that
+// wedges the next attempt (TSS-R7-12). The simulated/trusted-dealer fallback
+// path ignores ctx (it does no network I/O).
+func (m *TSSManager) GenerateKeySharesCtx(ctx context.Context) ([]*KeyShare, error) {
 	// TSS-R7-07: Runtime existence check for DistributedDKGRunner.
 	// When no real P2P runner is injected, fall back to the simulated
 	// trusted-dealer path with a LOUD warning so operators know the
@@ -172,7 +183,7 @@ func (m *TSSManager) GenerateKeyShares() ([]*KeyShare, error) {
 	// DKGTransport (SetDKGTransport); otherwise generateKeySharesDistributed returns
 	// a clear error.
 	if m.HasDistributedDKGRunner() {
-		return m.generateKeySharesDistributed()
+		return m.generateKeySharesDistributed(ctx)
 	}
 
 	m.mu.Lock()
@@ -207,8 +218,10 @@ func (m *TSSManager) GenerateKeyShares() ([]*KeyShare, error) {
 	copy(m.groupPubKey, qtdPubKey.PubKey)
 
 	m.qtdShares = make(map[int]*qtd.QTDShare, len(qtdShares))
+	m.participantIDs = make([]int, 0, m.config.TotalShares)
 	for _, s := range qtdShares {
 		m.qtdShares[s.ParticipantID] = s
+		m.participantIDs = append(m.participantIDs, s.ParticipantID)
 		h := sha256.Sum256(s.S1ShareBytes)
 		m.shareCommitments[s.ParticipantID] = h[:]
 		m.fullShareCommitments[s.ParticipantID] = computeFullShareCommitment(s)
@@ -310,8 +323,10 @@ func (m *TSSManager) GenerateKeySharesTrustedDealer() ([]*KeyShare, error) {
 	copy(m.groupPubKey, qtdPubKey.PubKey)
 
 	m.qtdShares = make(map[int]*qtd.QTDShare, len(qtdShares))
+	m.participantIDs = make([]int, 0, m.config.TotalShares)
 	for _, s := range qtdShares {
 		m.qtdShares[s.ParticipantID] = s
+		m.participantIDs = append(m.participantIDs, s.ParticipantID)
 		h := sha256.Sum256(s.S1ShareBytes)
 		m.shareCommitments[s.ParticipantID] = h[:]
 		m.fullShareCommitments[s.ParticipantID] = computeFullShareCommitment(s)

@@ -2,6 +2,7 @@
 package node
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestP2PDKGTransport_IngestAndWaitCommitments(t *testing.T) {
 		PubContribution: []byte("pubcontrib-3"),
 	})
 
-	got, err := tr.WaitCommitments(3) // total=3, wait for 2 others (self pid=1 excluded)
+	got, err := tr.WaitCommitments(context.Background(), 3) // total=3, wait for 2 others (self pid=1 excluded)
 	if err != nil {
 		t.Fatalf("WaitCommitments failed: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestP2PDKGTransport_IngestAndWaitShares(t *testing.T) {
 		T0ShareShares: map[int][]byte{1: []byte("t0-3")},
 	})
 
-	got, err := tr.WaitShares(3) // total=3, wait for 2 others (self pid=1 excluded)
+	got, err := tr.WaitShares(context.Background(), 3) // total=3, wait for 2 others (self pid=1 excluded)
 	if err != nil {
 		t.Fatalf("WaitShares failed: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestP2PDKGTransport_WaitCommitments_Timeout(t *testing.T) {
 
 	// Only one of the two required commitments arrives → timeout.
 	tr.IngestCommitment(&qtd.Round1CommitmentMessage{ParticipantID: 2})
-	_, err := tr.WaitCommitments(3)
+	_, err := tr.WaitCommitments(context.Background(), 3)
 	if err == nil {
 		t.Fatal("expected timeout error when commitments incomplete")
 	}
@@ -100,7 +101,7 @@ func TestP2PDKGTransport_WaitShares_Timeout(t *testing.T) {
 	tr.waitTimeout = 50 * time.Millisecond
 
 	tr.IngestShare(&qtd.Round1OpenMessage{ParticipantID: 2})
-	_, err := tr.WaitShares(3)
+	_, err := tr.WaitShares(context.Background(), 3)
 	if err == nil {
 		t.Fatal("expected timeout error when shares incomplete")
 	}
@@ -131,13 +132,16 @@ func TestP2PDKGTransport_DecodeRoundTrip(t *testing.T) {
 		Commitment:      []byte{0x01, 0x02, 0x03},
 		PubContribution: []byte{0xaa, 0xbb},
 	}
-	commitData, err := marshalDKGMessage(commit)
+	commitData, err := marshalDKGEnvelope([]byte("sess-1"), commit)
 	if err != nil {
 		t.Fatalf("marshal commitment failed: %v", err)
 	}
-	decodedCommit, err := decodeDKGCommitmentPayload(commitData)
+	decodedCommit, sess, err := decodeDKGCommitmentPayload(commitData)
 	if err != nil {
 		t.Fatalf("decode commitment failed: %v", err)
+	}
+	if string(sess) != "sess-1" {
+		t.Errorf("commitment session round-trip mismatch: %q", sess)
 	}
 	if decodedCommit.ParticipantID != 1 || len(decodedCommit.Commitment) != 3 || len(decodedCommit.PubContribution) != 2 {
 		t.Errorf("commitment round-trip mismatch: %+v", decodedCommit)
@@ -149,13 +153,16 @@ func TestP2PDKGTransport_DecodeRoundTrip(t *testing.T) {
 		S2ShareShares: map[int][]byte{1: {0x22}},
 		T0ShareShares: map[int][]byte{1: {0x33}},
 	}
-	shareData, err := marshalDKGMessage(share)
+	shareData, err := marshalDKGEnvelope([]byte("sess-2"), share)
 	if err != nil {
 		t.Fatalf("marshal share failed: %v", err)
 	}
-	decodedShare, err := decodeDKGSharePayload(shareData)
+	decodedShare, sess2, err := decodeDKGSharePayload(shareData)
 	if err != nil {
 		t.Fatalf("decode share failed: %v", err)
+	}
+	if string(sess2) != "sess-2" {
+		t.Errorf("share session round-trip mismatch: %q", sess2)
 	}
 	if decodedShare.ParticipantID != 2 || len(decodedShare.S1ShareShares) != 1 {
 		t.Errorf("share round-trip mismatch: %+v", decodedShare)
@@ -166,13 +173,13 @@ func TestP2PDKGTransport_DecodeRoundTrip(t *testing.T) {
 }
 
 func TestP2PDKGTransport_DecodeMalformed(t *testing.T) {
-	if _, err := decodeDKGCommitmentPayload([]byte("not-json")); err == nil {
+	if _, _, err := decodeDKGCommitmentPayload([]byte("not-json")); err == nil {
 		t.Error("decodeDKGCommitmentPayload should reject malformed JSON")
 	}
-	if _, err := decodeDKGSharePayload([]byte("not-json")); err == nil {
+	if _, _, err := decodeDKGSharePayload([]byte("not-json")); err == nil {
 		t.Error("decodeDKGSharePayload should reject malformed JSON")
 	}
-	if _, err := decodeDKGCommitmentPayload(nil); err == nil {
+	if _, _, err := decodeDKGCommitmentPayload(nil); err == nil {
 		t.Error("decodeDKGCommitmentPayload should reject nil payload")
 	}
 }

@@ -151,7 +151,13 @@ func TestQPOS_CanPropose_NoDAChecker(t *testing.T) {
 // REFUSES to finalize when the DA availability check fails. P1-4 (2026-07-14).
 // This is the HARD check — blocks with unavailable DA must not be finalized.
 func TestThreeChambersFlow_FinalizeBlock_DARefused(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). The executive members {0,1,2} must reach that bar with their
+	// own signatures. Use a 4-validator set (total 4000, required 2667):
+	// three executive signatures cover 3000 >= 2667, and validator 3 (not
+	// assigned to any chamber) remains available as the proposer for
+	// ProposeBlock(1, hash, 3).
+	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
@@ -228,7 +234,8 @@ func TestThreeChambersFlow_FinalizeBlock_DARefused(t *testing.T) {
 // TestThreeChambersFlow_FinalizeBlock_DAAvailable verifies that FinalizeBlock
 // SUCCEEDS when the DA availability check passes. P1-4 (2026-07-14).
 func TestThreeChambersFlow_FinalizeBlock_DAAvailable(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: same 4-validator topology as DARefused (see above).
+	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
@@ -302,7 +309,8 @@ func TestThreeChambersFlow_FinalizeBlock_DAAvailable(t *testing.T) {
 // SUCCEEDS when no DA checker is configured (DA verification is opt-in).
 // P1-4 (2026-07-14).
 func TestThreeChambersFlow_FinalizeBlock_NoChecker(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: same 4-validator topology as DARefused (see above).
+	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)

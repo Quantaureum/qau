@@ -156,28 +156,6 @@ func (bs *BlockStore) PutVRFAccumulator(epoch uint64, acc types.Hash) error {
 	return bs.db.Put(append(vrfAccPrefix, epochKey[:]...), acc[:])
 }
 
-// PutVRFAccumulatorsBatch writes many per-epoch VRF accumulator checkpoints in
-// a single batch transaction. The R52 startup replay walks every canonical
-// block, so driving PutVRFAccumulator from that loop costs one fsync per block
-// — O(chain height) fsyncs on every restart. Batching collapses that to one
-// fsync while leaving the on-disk layout identical to the per-epoch API, so
-// LoadVRFAccumulators cannot tell which one wrote the entries.
-func (bs *BlockStore) PutVRFAccumulatorsBatch(accs map[uint64]types.Hash) error {
-	if len(accs) == 0 {
-		return nil
-	}
-	batch := bs.db.NewBatch()
-	for epoch, acc := range accs {
-		if acc == (types.Hash{}) {
-			continue
-		}
-		var epochKey [8]byte
-		binary.BigEndian.PutUint64(epochKey[:], epoch)
-		batch.Put(append(vrfAccPrefix, epochKey[:]...), acc[:])
-	}
-	return batch.Write()
-}
-
 // LoadVRFAccumulators reads every persisted per-epoch VRF accumulator
 // checkpoint (R58-VRF-PERSIST). The node injects them into a freshly created
 // QPOS at startup, BEFORE the R52 block replay overwrites them with the

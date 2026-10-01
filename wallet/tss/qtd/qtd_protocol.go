@@ -1104,8 +1104,9 @@ func (s *QTDSession) Round2Aggregate(reveals []*Round2Reveal) (*QTDSignature, er
 	// QUANTUM- (audit 2026-07-17, Low): reaffirmed as documented
 	// limitation. s1 recovery from aggregated c·(t0-s2) is theoretical
 	// (requires W-agg + H-agg collusion, cannot forge signatures alone).
-	// Production hard-blocks via QAU_ENABLE_DISTRIBUTED_TSS. Distributed
-	// hint generation (SPDZ-style MPC / FROST migration) tracked as
+	// Distributed TSS is permanently disabled in the node (see
+	// distributedTSSEnabled in node/adapters.go): there is no env switch.
+	// Distributed hint generation (SPDZ-style MPC / FROST migration) tracked as
 	// research-level future work — out of P3 scope.
 	z0Contribution := make(PolyVec, Dilithium3K)
 	// FIX: Zero z0Contribution after use.

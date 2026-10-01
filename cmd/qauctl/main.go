@@ -7,11 +7,15 @@ import (
 	"os"
 
 	"github.com/quantaureum/qau/cmd/qauctl/cmd"
-	"github.com/quantaureum/qau/internal/version"
+)
+
+var (
+	version = "1.0.0"
+	commit  = "unknown"
 )
 
 func main() {
-	rootCmd := cmd.NewRootCmd(version.Version, version.GitCommit, version.BuildTime)
+	rootCmd := cmd.NewRootCmd(version, commit)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

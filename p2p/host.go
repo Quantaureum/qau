@@ -2175,23 +2175,9 @@ func (h *Host) ConnectedPeerCount() int {
 	return count
 }
 
-// Connect connects to a peer without pinning its authenticated identity.
+// Connect connects to a peer
 // SECURITY FIX Q-B-003: Outbound connections now perform encrypted handshake.
 func (h *Host) Connect(ctx context.Context, addr string) error {
-	return h.dial(ctx, addr, "")
-}
-
-// ConnectVerified connects to a peer and requires its authenticated PeerID to
-// match expectedID. It is used for bootstrap records whose identity is pinned
-// by the enode node ID.
-func (h *Host) ConnectVerified(ctx context.Context, addr string, expectedID PeerID) error {
-	if expectedID == "" {
-		return errors.New("expected peer ID is empty")
-	}
-	return h.dial(ctx, addr, expectedID)
-}
-
-func (h *Host) dial(ctx context.Context, addr string, expectedID PeerID) error {
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -2233,7 +2219,7 @@ func (h *Host) dial(ctx context.Context, addr string, expectedID PeerID) error {
 	}
 
 	// Perform encrypted handshake before adding to peer list
-	encConn, err := performClientHandshake(conn, h.nodeKeyPair, h.id, expectedID, h.powNonce)
+	encConn, err := performClientHandshake(conn, h.nodeKeyPair, h.id, "", h.powNonce)
 	if err != nil {
 		if conn != nil {
 			conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
@@ -4099,14 +4085,28 @@ func (h *Host) registerProtocols() {
 		Name:    ProtocolTSS,
 		Version: ProtocolTSSVersion,
 		MsgTypes: map[uint8]bool{
-			MsgTypeTSSSessionInit:   true,
-			MsgTypeTSSRound1Commit:  true,
-			MsgTypeTSSRound2Reveal:  true,
-			MsgTypeTSSRound2Private: true,
-			MsgTypeTSSSignature:     true,
-			MsgTypeTSSDKGShare:      true,
-			MsgTypeTSSDKGCommitment: true,
-			MsgTypeTSSDKGAck:        true,
+			MsgTypeTSSSessionInit:                     true,
+			MsgTypeTSSRound1Commit:                    true,
+			MsgTypeTSSRound2Reveal:                    true,
+			MsgTypeTSSRound2Private:                   true,
+			MsgTypeTSSSignature:                       true,
+			MsgTypeTSSDKGShare:                        true,
+			MsgTypeTSSKeyExchange:                     true,
+			MsgTypeTSSDKGCommitment:                   true,
+			MsgTypeTSSDKGAck:                          true,
+			MsgTypeTSSDKGReshare:                      true,
+			MsgTypeTDilithium3DKGRandomness:           true,
+			MsgTypeTDilithium3DKGRandomnessCommitment: true,
+			MsgTypeTDilithium3DKGGroupSeed:            true,
+			MsgTypeTDilithium3DKGAcknowledgement:      true,
+			MsgTypeTDilithium3DKGComplaint:            true,
+			MsgTypeTDilithium3DKGContribution:         true,
+			MsgTypeTDilithium3DKGActivation:           true,
+			MsgTypeTDilithium3SigningCommit:           true,
+			MsgTypeTDilithium3SigningReveal:           true,
+			MsgTypeTDilithium3SigningAcceptance:       true,
+			MsgTypeTDilithium3SigningResponse:         true,
+			MsgTypeTDilithium3DKGActivationCertificate: true,
 		},
 		Handler: h.handleTSSProtocol,
 	})
@@ -5196,11 +5196,9 @@ func (h *Host) connectBootstrapPeers() {
 	// Phase 1: Connect to configured bootstrap peers
 	for _, addr := range h.config.BootstrapPeers {
 		address := addr
-		expectedID := PeerID("")
 		if strings.HasPrefix(addr, "enode://") {
 			if node, err := enode.ParseV4(addr); err == nil {
 				address = fmt.Sprintf("%s:%d", node.IP().String(), node.TCP())
-				expectedID = h.enodeIDToPeerID(node.ID())
 				logging.Global().Info("Connecting to bootstrap peer", map[string]any{
 					"enode": addr,
 					"dial":  address,
@@ -5213,13 +5211,7 @@ func (h *Host) connectBootstrapPeers() {
 			}
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 30*time.Second)
-		var err error
-		if expectedID != "" {
-			err = h.ConnectVerified(ctx, address, expectedID)
-		} else {
-			err = h.Connect(ctx, address)
-		}
-		if err != nil {
+		if err := h.Connect(ctx, address); err != nil {
 			logging.Global().Warn("Failed to connect to bootstrap peer", map[string]any{
 				"address": address,
 				"error":   err.Error(),
@@ -5503,11 +5495,9 @@ func (h *Host) tryReconnectBootstrapPeers() error {
 	var lastErr error
 	for _, addr := range addrsToConnect {
 		dialAddr := addr
-		expectedID := PeerID("")
 		if strings.HasPrefix(addr, "enode://") {
 			if node, err := enode.ParseV4(addr); err == nil {
 				dialAddr = fmt.Sprintf("%s:%d", node.IP().String(), node.TCP())
-				expectedID = h.enodeIDToPeerID(node.ID())
 			} else {
 				logging.Global().Warn("Failed to parse bootstrap peer enode URL for reconnection", map[string]any{
 					"address": addr,
@@ -5518,12 +5508,7 @@ func (h *Host) tryReconnectBootstrapPeers() error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
-		var err error
-		if expectedID != "" {
-			err = h.ConnectVerified(ctx, dialAddr, expectedID)
-		} else {
-			err = h.Connect(ctx, dialAddr)
-		}
+		err := h.Connect(ctx, dialAddr)
 		if err != nil {
 			logging.Global().Warn("Failed to reconnect to bootstrap peer", map[string]any{
 				"address": addr,
@@ -6505,6 +6490,18 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 	// invisible to operators.
 	if msgType == MsgTypeCommit {
 		hostLog.Infof("broadcast(MsgTypeCommit): sent=%d skipped=%d total_peers=%d", sent, skipped, len(h.peers))
+	}
+	// The signing executor is the one path that cannot observe its own wire
+	// delivery: a round message that is never sent looks exactly like a peer
+	// that stayed silent. Under the seal trace switch only, record what the
+	// broadcast actually pushed out.
+	switch msgType {
+	case MsgTypeTDilithium3SigningCommit, MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance, MsgTypeTDilithium3SigningResponse:
+		if os.Getenv("QAU_TRACE_TDILITHIUM3_V1_SEAL") == "1" {
+			hostLog.Infof("broadcast(signing type=%d bytes=%d): sent=%d skipped=%d total_peers=%d",
+				msgType, len(data), sent, skipped, len(h.peers))
+		}
 	}
 
 	return nil

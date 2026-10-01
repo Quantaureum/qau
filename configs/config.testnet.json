@@ -1,0 +1,99 @@
+{
+  "name": "qau-testnet-node",
+  "nodeId": "testnet-node-1",
+  "dataDir": "/var/lib/quantaureum",
+  "network": "testnet",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [
+    "/dns4/testnet-boot1.quantaureum.io/tcp/9000/p2p/QmTestBootstrap1",
+    "/dns4/testnet-boot2.quantaureum.io/tcp/9000/p2p/QmTestBootstrap2"
+  ],
+  "_comment_bootstrapPeers": "PLACEHOLDER: Replace QmTestBootstrap1/2 with real PeerIDs after deploying validator nodes. Run 'qaud node-info' on each bootnode to get its PeerID.",
+  "maxPeers": 50,
+  "rpcEnabled": true,
+  "rpcAddr": "127.0.0.1:8645",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8646",
+  "metricsEnabled": true,
+  "metricsAddr": "127.0.0.1:9090",
+  "metricsPath": "/metrics",
+  "frontendEnabled": true,
+  "frontendAddr": "127.0.0.1:3000",
+  "healthEnabled": true,
+  "healthAddr": "127.0.0.1:8080",
+  "validatorEnabled": false,
+  "validatorKey": "",
+  "cacheSize": 1024,
+  "maxGasLimit": 30000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "devMode": false,
+  "blockInterval": 6,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 4,
+    "maxRetries": 5
+  },
+  "cacheConfig": {
+    "l1MaxSize": 1024,
+    "l1MaxMemory": 67108864,
+    "l2MaxSize": 8192,
+    "l2MaxMemory": 268435456,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 5000,
+    "batchSize": 200
+  },
+  "keyRotation": {
+    "enabled": true,
+    "keyDir": "/var/lib/quantaureum/keys",
+    "rotationInterval": 7,
+    "maxKeyAge": 30,
+    "backupEnabled": true,
+    "backupDir": "/var/lib/quantaureum/keys/backup"
+  },
+  "tlsCertRotation": {
+    "enabled": true,
+    "certDir": "/var/lib/quantaureum/certs",
+    "organization": "Quantaureum Testnet",
+    "commonName": "testnet.quantaureum.io",
+    "validityDuration": 90,
+    "renewalThreshold": 14,
+    "backupEnabled": true,
+    "backupDir": "/var/lib/quantaureum/certs/backup"
+  },
+  "economics": {
+    "initialSupply": "20000000000000000000000000",
+    "validatorMinStake": "1000000000000000000000",
+    "blockReward": "2000000000000000000",
+    "stakingAPY": 0.05,
+    "eip1559": {
+      "baseFeeChangeDenominator": 8,
+      "elasticityMultiplier": 2,
+      "initialBaseFee": "1000000000"
+    }
+  },
+  "faucet": {
+    "enabled": true,
+    "maxAmountPerRequest": "100000000000000000000",
+    "cooldownSeconds": 3600,
+    "dailyLimit": "10000000000000000000000",
+    "faucetAddress": "0xFaucetAddress0000000000000000000000000001",
+    "_comment_faucetAddress": "PLACEHOLDER: Replace with the real faucet account address after generating the faucet Dilithium3 keypair"
+  },
+  "danksharding": {
+    "enabled": false,
+    "experimental": true,
+    "committeeSize": 0,
+    "subnetCount": 0
+  },
+  "sharding": {
+    "maxCount": 64,
+    "blockSize": 1048576,
+    "interval": 12,
+    "minValidators": 3
+  }
+}

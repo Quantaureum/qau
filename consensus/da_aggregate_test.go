@@ -38,6 +38,10 @@ func (m *mockDAAttestationSigner) VerifyVote(pubKey []byte, message []byte, sign
 }
 func (m *mockDAAttestationSigner) GroupPublicKey() []byte { return m.groupPublicKey }
 func (m *mockDAAttestationSigner) IsThresholdMode() bool  { return m.thresholdMode }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *mockDAAttestationSigner) Threshold() int { return 0 }
 func (m *mockDAAttestationSigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {

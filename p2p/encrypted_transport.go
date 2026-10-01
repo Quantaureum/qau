@@ -330,6 +330,18 @@ func (c *encryptedConn) Write(p []byte) (int, error) {
 // can dump memory could read the plaintext. zeroize() is a no-op on nil
 // slices, so this is safe even if readBuf was already nil.
 func (c *encryptedConn) Close() error {
+	// R42-CLOSE-DEADLOCK FIX (2026-09-26): Close the raw connection BEFORE
+	// taking the mutexes. A goroutine parked in Read holds readMu for the whole
+	// blocking io.ReadFull on c.Conn, and a goroutine parked in Write holds
+	// writeMu while blocked on c.Conn.Write. On a connected but idle peer
+	// nothing ever satisfies those syscalls, so acquiring the locks first made
+	// Close — and therefore Host.Stop — hang forever. Closing the socket makes
+	// both syscalls return immediately, so the owners release their locks and
+	// the zeroization below can proceed. Key material is still wiped before
+	// Close returns; only the order of socket teardown relative to zeroization
+	// changed.
+	err := c.Conn.Close()
+
 	c.writeMu.Lock()
 	c.readMu.Lock()
 	zeroize(c.sendKey)
@@ -342,7 +354,7 @@ func (c *encryptedConn) Close() error {
 	c.readBuf = nil
 	c.readMu.Unlock()
 	c.writeMu.Unlock()
-	return c.Conn.Close()
+	return err
 }
 
 func makeNonce(counter uint64) []byte {

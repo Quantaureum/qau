@@ -1,0 +1,38 @@
+{
+  "_comment": "Node 3 config",
+  "name": "qau-node-3",
+  "dataDir": "./data3",
+  "network": "dev",
+  "listenAddr": ":9002",
+  "bootstrapPeers": [
+    "127.0.0.1:9000",
+    "127.0.0.1:9001"
+  ],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAuthEnabled": true,
+  "rpcAddr": "127.0.0.1:8549",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8550",
+  "frontendEnabled": false,
+  "healthEnabled": true,
+  "healthAddr": "127.0.0.1:8082",
+  "validatorEnabled": true,
+  "validatorKey": "",
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": false,
+  "allowLegacySignatures": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "allowedOrigins": [
+    "http://localhost:3000"
+  ],
+  "_validatorKeyEnv": "QAU_VALIDATOR_KEY"
+}

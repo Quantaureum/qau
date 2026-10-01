@@ -1,0 +1,37 @@
+{
+  "name": "@quantaureum/contracts",
+  "version": "1.0.0",
+  "description": "Quantaureum cross-chain bridge Solidity contracts",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:local": "hardhat deploy --network localhost",
+    "deploy:quantaureum": "hardhat deploy --network quantaureum",
+    "verify:quantaureum": "hardhat verify --network quantaureum",
+    "clean": "hardhat clean",
+    "lint": "solhint 'contracts/**/*.sol'"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "@typechain/ethers-v6": "^0.5.0",
+    "@typechain/hardhat": "^9.0.0",
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^10.0.0",
+    "@types/node": "^20.0.0",
+    "chai": "^4.3.0",
+    "ethers": "^6.9.0",
+    "hardhat": "^2.19.0",
+    "hardhat-gas-reporter": "^1.0.9",
+    "solhint": "^4.1.0",
+    "solidity-coverage": "^0.8.5",
+    "ts-node": "^10.9.0",
+    "typechain": "^8.3.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.0"
+  }
+}

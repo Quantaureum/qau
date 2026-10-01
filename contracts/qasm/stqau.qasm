@@ -876,10 +876,10 @@ fn_withdrawal_of:
     // shares -> mem[0x40] (slot6 mapping)
     //   the hash area reuses mem[0x20..0x60]: but 0x20 already holds the unlock return value (it would be clobbered;
     //   RETURN reads mem[0x00..0x60] only at the end — the unlock value must be moved to safety first!)
-    //   rearrangement: move the unlock value from mem[0x20] -> mem[0x120] as a staging area?
+    //   rearrangement: move the unlock value from mem[0x20] -> mem[0x120] as a staging area? 
     //   simplification: keep the RETURN layout owed(0x00) unlock(0x20) shares(0x40) untouched,
     //   and compute the shares keccak in a dedicated hash area mem[0x40..0x80]: addr@0x40, slot6@0x60,
-    //   size=0x40 offset=0x40; after hashing, write the shares value back to mem[0x40] —
+    //   size=0x40 offset=0x40; after hashing, write the shares value back to mem[0x40] — 
     //   but the hash inputs at mem[0x40/0x60] are then overwritten by MSTORE 0x40 — hash first, write after
     PUSH1 0x80
     MLOAD

@@ -177,9 +177,58 @@ func (mr *ReviewChamber) ProcessReviewAttestation(att *Attestation) error {
 	result := mr.getOrCreateSlotResultLocked(att.Slot)
 	result.Attestations = append(result.Attestations, att)
 
-	if att.ValidatorIndex >= 0 && att.ValidatorIndex < len(validators) {
+	// Canonical roots may arrive after attestations (block production and
+	// import happen later in the slot tick). Store the signed attestations,
+	// then recount whenever a canonical root is available. This prevents
+	// attestations from being permanently misclassified as rejects while the
+	// slot root is still unknown.
+	mr.recountPendingResultLocked(result)
+
+	return nil
+}
+
+// getKnownSlotBlockRoot returns the exact canonical root for a slot. Unlike
+// getExpectedBlockRoot, it does not fall back to the epoch boundary root:
+// review votes are for a specific slot, and an unrelated epoch root must not
+// be treated as that slot's known root during delayed classification.
+func (mr *ReviewChamber) getKnownSlotBlockRoot(slot uint64) (types.Hash, bool) {
+	if mr.qpos == nil {
+		return types.Hash{}, false
+	}
+	mr.qpos.mu.RLock()
+	defer mr.qpos.mu.RUnlock()
+	root, ok := mr.qpos.slotBlockRoots[slot]
+	return root, ok
+}
+
+// recountPendingResultLocked recomputes approve/reject accounting from the
+// retained attestations. It only runs while the verdict is Pending, so a
+// finalized verdict can never be rewritten.
+func (mr *ReviewChamber) recountPendingResultLocked(result *ReviewSlotResult) {
+	if result == nil || result.Verdict != VerdictPending || mr.qpos == nil {
+		return
+	}
+	expectedRoot, known := mr.getKnownSlotBlockRoot(result.Slot)
+	if !known {
+		return
+	}
+
+	result.ApproveCount = 0
+	result.RejectCount = 0
+	result.ApproveStake = big.NewInt(0)
+	result.RejectStake = big.NewInt(0)
+	result.TotalStake = big.NewInt(0)
+
+	validators := mr.qpos.validators.Validators()
+	for _, att := range result.Attestations {
+		if att == nil || att.ValidatorIndex < 0 || att.ValidatorIndex >= len(validators) {
+			continue
+		}
 		v := validators[att.ValidatorIndex]
-		if att.BeaconBlockRoot == mr.getExpectedBlockRoot(att.Slot) {
+		if v == nil || v.Stake == nil {
+			continue
+		}
+		if att.BeaconBlockRoot == expectedRoot {
 			result.ApproveCount++
 			result.ApproveStake.Add(result.ApproveStake, v.Stake)
 		} else {
@@ -190,8 +239,6 @@ func (mr *ReviewChamber) ProcessReviewAttestation(att *Attestation) error {
 	}
 
 	mr.evaluateVerdictLocked(result)
-
-	return nil
 }
 
 // getExpectedBlockRoot returns the canonical block root that an attestation
@@ -369,6 +416,10 @@ func (mr *ReviewChamber) CheckTimeout(slot uint64) {
 	if !ok || result.Verdict != VerdictPending {
 		return
 	}
+	mr.recountPendingResultLocked(result)
+	if result.Verdict != VerdictPending {
+		return
+	}
 
 	slotStart := GetSlotStartTime(slot)
 	if time.Since(slotStart) > mr.attestationTimeout {
@@ -378,20 +429,22 @@ func (mr *ReviewChamber) CheckTimeout(slot uint64) {
 }
 
 func (mr *ReviewChamber) GetSlotVerdict(slot uint64) AttestationVerdict {
-	mr.mu.RLock()
-	defer mr.mu.RUnlock()
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
 
 	if result, ok := mr.slotResults[slot]; ok {
+		mr.recountPendingResultLocked(result)
 		return result.Verdict
 	}
 	return VerdictPending
 }
 
 func (mr *ReviewChamber) GetSlotResult(slot uint64) *ReviewSlotResult {
-	mr.mu.RLock()
-	defer mr.mu.RUnlock()
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
 
 	if result, ok := mr.slotResults[slot]; ok {
+		mr.recountPendingResultLocked(result)
 		// AUDIT R4-GOV-01 (2026-07-15): CommitteeTotalStake may be nil for
 		// slot results created before this field was added (e.g., by tests
 		// that construct ReviewSlotResult directly). Guard against nil to
@@ -413,6 +466,7 @@ func (mr *ReviewChamber) GetSlotResult(slot uint64) *ReviewSlotResult {
 			CommitteeTotalStake: ctsCopy,
 			Verdict:             result.Verdict,
 			VerdictTime:         result.VerdictTime,
+			Attestations:        result.Attestations,
 		}
 		return copy
 	}

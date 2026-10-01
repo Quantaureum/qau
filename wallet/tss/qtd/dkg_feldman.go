@@ -134,6 +134,38 @@ func validateFeldmanCommitmentSet(data []byte, expectedSessionID []byte, expecte
 	return nil
 }
 
+// fullPoly / fullPolyVec hold un-reduced Feldman evaluations P(id) = Σ a_j·id^j
+// over the integers, i.e. the value Pedersen VSS verifies before the mod-Q
+// reduction Dilithium works with. int32 is NOT wide enough for them: with
+// coefficients in [0, Q) the magnitude reaches Q·Σ id^j, which already
+// exceeds 2^31 for participant 6 at threshold 4 and grows without bound for
+// larger committees. The 2026-09 six-node testnet failed exactly this way —
+// every participant ≤ 5 verified, participant 6 rejected one wrapped
+// coefficient — and a nine-node committee could not complete Round2 at all.
+// int64 covers committees up to about 15 members at two-thirds thresholds;
+// feldmanEvaluationFits rejects larger configurations up front instead of
+// corrupting shares.
+type fullPoly [N]int64
+
+type fullPolyVec []fullPoly
+
+// feldmanEvaluationFits reports whether Q·Σ_{j<threshold} total^j, the bound
+// on |P(id)| for id ≤ total with coefficients in [0, Q), fits in int64.
+func feldmanEvaluationFits(threshold, total int) bool {
+	if threshold < 1 || total < 1 {
+		return false
+	}
+	bound := new(big.Int)
+	power := big.NewInt(1)
+	x := big.NewInt(int64(total))
+	for j := 0; j < threshold; j++ {
+		bound.Add(bound, power)
+		power.Mul(power, x)
+	}
+	bound.Mul(bound, big.NewInt(Q))
+	return bound.IsInt64()
+}
+
 // feldmanSplitPolyVec performs Shamir splitting using the polynomial coefficients stored in feldmanStore,
 // ensuring the shares and commitments use the same polynomial (fixes the VSS verification failure bug).
 // polyStore is either store.s1Polys or store.s2Polys.
@@ -141,13 +173,19 @@ func validateFeldmanCommitmentSet(data []byte, expectedSessionID []byte, expecte
 // Key point: this computes the full integer evaluation (no mod Q), because Pedersen VSS verification needs
 // the complete P(id) = sum(coeff_j * id^j) value (scalar multiplication on the BLS12-381 curve),
 // not the mod-Q value Dilithium uses. Callers reduce mod Q themselves after VSS verification.
-func feldmanSplitPolyVec(polyStore []feldmanRingPoly, polyCount, threshold, total int) (map[int]PolyVec, error) {
+// The evaluation is carried as int64 end to end (see fullPolyVec); the int32
+// truncation that used to happen here silently corrupted shares for
+// participant IDs ≥ 6.
+func feldmanSplitPolyVec(polyStore []feldmanRingPoly, polyCount, threshold, total int) (map[int]fullPolyVec, error) {
 	if polyStore == nil {
 		return nil, errors.New("dkg: feldmanRingPoly store is nil")
 	}
-	shares := make(map[int]PolyVec, total)
+	if !feldmanEvaluationFits(threshold, total) {
+		return nil, fmt.Errorf("%w: threshold %d with %d participants exceeds the int64 Feldman evaluation range", ErrDKGInvalidThreshold, threshold, total)
+	}
+	shares := make(map[int]fullPolyVec, total)
 	for id := 1; id <= total; id++ {
-		shares[id] = make(PolyVec, polyCount)
+		shares[id] = make(fullPolyVec, polyCount)
 	}
 	for pi := 0; pi < polyCount; pi++ {
 		for ci := 0; ci < N; ci++ {
@@ -167,7 +205,7 @@ func feldmanSplitPolyVec(polyStore []feldmanRingPoly, polyCount, threshold, tota
 					val = val + int64(coeff)*xPow
 					xPow = xPow * x
 				}
-				shares[id][pi][ci] = int32(val)
+				shares[id][pi][ci] = val
 			}
 		}
 	}
@@ -222,7 +260,7 @@ func verifyFeldmanShare(commitmentSet []byte, shareBytes []byte, blindShareBytes
 		coeffOffset = s1PolyCount * N
 	}
 
-	expectedShareLen := polyCount * N * 4
+	expectedShareLen := polyCount * N * 8
 	expectedBlindLen := polyCount * N * 32
 	if len(shareBytes) != expectedShareLen {
 		return fmt.Errorf("%w: share length %d, want %d", ErrDKGVSSVerification, len(shareBytes), expectedShareLen)
@@ -245,8 +283,8 @@ func verifyFeldmanShare(commitmentSet []byte, shareBytes []byte, blindShareBytes
 	for ri := 0; ri < polyCount*N; ri++ {
 		globalIdx := coeffOffset + ri
 
-		shareVal := int32(binary.LittleEndian.Uint32(shareBytes[ri*4 : ri*4+4]))
-		shareBig := new(big.Int).SetInt64(int64(shareVal))
+		shareVal := int64(binary.LittleEndian.Uint64(shareBytes[ri*8 : ri*8+8]))
+		shareBig := new(big.Int).SetInt64(shareVal)
 		shareBig.Mod(shareBig, curveOrder)
 
 		blindBig := new(big.Int).SetBytes(blindShareBytes[ri*32 : (ri+1)*32])
@@ -318,42 +356,41 @@ func randCoeffQ() (int32, error) {
 	return int32(binary.LittleEndian.Uint32(buf[:]) % uint32(Q)), nil
 }
 
-// vecToBytesFull serializes a PolyVec with 4 bytes per coefficient (signed int32 LE).
-// Used for VSS shares that carry full integer evaluation (not modulo Q).
-func vecToBytesFull(v PolyVec) []byte {
-	out := make([]byte, len(v)*N*4)
+// vecToBytesFull serializes a fullPolyVec with 8 bytes per coefficient (signed int64 LE).
+// Used for VSS shares that carry the full integer evaluation (not modulo Q).
+func vecToBytesFull(v fullPolyVec) []byte {
+	out := make([]byte, len(v)*N*8)
 	for pi := range v {
 		for ci := 0; ci < N; ci++ {
-			off := (pi*N + ci) * 4
-			val := uint32(v[pi][ci])
-			binary.LittleEndian.PutUint32(out[off:off+4], val)
+			off := (pi*N + ci) * 8
+			binary.LittleEndian.PutUint64(out[off:off+8], uint64(v[pi][ci]))
 		}
 	}
 	return out
 }
 
-// vecFromBytesFull deserializes a PolyVec from 4 bytes per coefficient (signed int32 LE).
-func vecFromBytesFull(b []byte, numPolys int) (PolyVec, error) {
-	if len(b) != numPolys*N*4 {
+// vecFromBytesFull deserializes a fullPolyVec from 8 bytes per coefficient (signed int64 LE).
+func vecFromBytesFull(b []byte, numPolys int) (fullPolyVec, error) {
+	if len(b) != numPolys*N*8 {
 		return nil, ErrInvalidPolyBytes
 	}
-	vec := make(PolyVec, numPolys)
+	vec := make(fullPolyVec, numPolys)
 	for pi := 0; pi < numPolys; pi++ {
 		for ci := 0; ci < N; ci++ {
-			off := (pi*N + ci) * 4
-			vec[pi][ci] = int32(binary.LittleEndian.Uint32(b[off : off+4]))
+			off := (pi*N + ci) * 8
+			vec[pi][ci] = int64(binary.LittleEndian.Uint64(b[off : off+8]))
 		}
 	}
 	return vec, nil
 }
 
-// reduceFullShareToQ reduces each coefficient of a full-integer PolyVec modulo Q,
+// reduceFullShareToQ reduces each coefficient of a full-integer evaluation modulo Q,
 // producing a standard PolyVec with coefficients in [0, Q-1].
-func reduceFullShareToQ(v PolyVec) PolyVec {
+func reduceFullShareToQ(v fullPolyVec) PolyVec {
 	out := make(PolyVec, len(v))
 	for pi := range v {
 		for ci := 0; ci < N; ci++ {
-			out[pi][ci] = int32(((int64(v[pi][ci]) % Q) + Q) % Q)
+			out[pi][ci] = int32(((v[pi][ci] % Q) + Q) % Q)
 		}
 	}
 	return out

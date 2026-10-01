@@ -2,6 +2,7 @@
 package p2p
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -223,7 +224,9 @@ func TestMessageValidatorGetMaxSizeForType(t *testing.T) {
 func TestMessageValidatorGetMaxSizeForInvalidType(t *testing.T) {
 	mv := NewMessageValidator()
 
-	_, err := mv.GetMaxSizeForType(99)
+	// 102 is unassigned: types 90-101 are the threshold Dilithium3 v1
+	// protocol block (DKG 90-96, signing 97-100, activation certificate 101).
+	_, err := mv.GetMaxSizeForType(102)
 	if err == nil {
 		t.Error("expected error for invalid message type")
 	}
@@ -280,6 +283,11 @@ func TestValidateMessageType(t *testing.T) {
 		MsgTypeExpert,
 		MsgTypeSnapStateReq, MsgTypeSnapStateResp,
 		MsgTypeSnapRangeReq, MsgTypeSnapRangeResp,
+		// Dilithium3 v1 signing executor round messages (97-100)
+		MsgTypeTDilithium3SigningCommit, MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance, MsgTypeTDilithium3SigningResponse,
+		// Dilithium3 v1 DKG activation certificate broadcast (101)
+		MsgTypeTDilithium3DKGActivationCertificate,
 	}
 
 	for _, mt := range validTypes {
@@ -288,8 +296,9 @@ func TestValidateMessageType(t *testing.T) {
 		}
 	}
 
-	if ValidateMessageType(99) {
-		t.Error("ValidateMessageType(99) should be false")
+	// 102 is unassigned and must stay rejected.
+	if ValidateMessageType(102) {
+		t.Error("ValidateMessageType(102) should be false")
 	}
 }
 
@@ -469,5 +478,48 @@ func TestMessageValidatorValidateAndParseInvalid(t *testing.T) {
 	result, _ := mv.ValidateAndParse(msg)
 	if result.Valid {
 		t.Error("result should be invalid for unknown message type")
+	}
+}
+
+// TestMessageValidatorRetransmittedDKGNotDuplicate is a regression test for
+// R42-DKG-RETRANSMIT. The Dilithium3 v1 DKG phase drivers re-send the identical
+// signed envelope every second until a phase completes, but content-hash dedup
+// rejected every retransmission as ErrDuplicateMessage, so a message lost to a
+// full inbound queue could not be recovered until the 30s dedup TTL expired.
+func TestMessageValidatorRetransmittedDKGNotDuplicate(t *testing.T) {
+	mv := NewMessageValidator()
+
+	for _, messageType := range []uint8{
+		MsgTypeTDilithium3DKGRandomness,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement,
+		MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution,
+		MsgTypeTDilithium3DKGActivation,
+	} {
+		payload := testTDilithium3Envelope(t, messageType, testTDilithium3Payload(t, messageType))
+		// A fresh timestamp per retransmission mirrors the production send path;
+		// the dedup hash covers type and payload only, so the payload is what the
+		// retransmission repeats verbatim.
+		message := &Message{
+			Type:      messageType,
+			From:      PeerID("validator-101"),
+			Payload:   payload,
+			Timestamp: time.Now(),
+		}
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := mv.ValidateMessage(message); err != nil {
+				t.Fatalf("DKG type %d retransmission %d rejected: %v", messageType, attempt, err)
+			}
+		}
+	}
+
+	// Non-DKG types must still be deduplicated: the second identical message is
+	// reported as a duplicate before format validation runs.
+	nonDKG := &Message{Type: MsgTypeTransaction, From: PeerID("peer-1"), Payload: make([]byte, 64)}
+	_ = mv.ValidateMessage(nonDKG)
+	if err := mv.ValidateMessage(nonDKG); !errors.Is(err, ErrDuplicateMessage) {
+		t.Fatalf("identical non-DKG retransmission: got %v, want ErrDuplicateMessage", err)
 	}
 }

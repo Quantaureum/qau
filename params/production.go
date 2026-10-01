@@ -11,7 +11,7 @@ import "os"
 // QAU_PRODUCTION=1 silently disabled EVERY production-only guard at once —
 // parallel-QVM consensus-divergence blocking, JIT blocking, DA hard-rejects,
 // TSS legacy-share blocking, plaintext-dial refusal, insecure-unlock refusal,
-// etc. See audit finding HIGH-1.
+// etc. See .local-only/audit/R31_FULL_AUDIT_REPORT.md HIGH-1.
 //
 // The centralized API inverts the default for the guards that protect against
 // KNOWN unfixed consensus/security holes (parallel QVM CRIT-1/CRIT-2, JIT):

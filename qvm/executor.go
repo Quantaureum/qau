@@ -17,9 +17,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/quantaureum/qau/params"
 	"github.com/quantaureum/qau/qvm/jit"
 	"github.com/quantaureum/qau/qvm/precompiled"
+	"github.com/quantaureum/qau/params"
 	"github.com/quantaureum/qau/types"
 	"golang.org/x/crypto/sha3"
 )

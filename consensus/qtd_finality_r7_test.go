@@ -13,7 +13,12 @@ import (
 // QTD threshold signature can be submitted directly to complete a pending seal,
 // bypassing the broken partial-seal collection in node/qtd_seal.go.
 func TestR7SubmitCompletedSeal(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). With 10 validators the sealers {0,1,2} only cover 3000 of the
+	// required 6667. Use a 3-validator set so the executive members {0,1,2}
+	// ARE the full validator set (total 3000, required 2000) and the seal
+	// legitimately meets both the count and the weight quorum.
+	vs := createTestValidatorSet(t, 3)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
@@ -128,7 +133,10 @@ func TestR7SubmitCompletedSealRejectsNonCanonical(t *testing.T) {
 
 // TestR7AggregateAndCompleteSeal verifies the R7 P0-1 production path.
 func TestR7AggregateAndCompleteSeal(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: same topology fix as TestR7SubmitCompletedSeal — with
+	// 10 validators the sealers {0,1,2} cover 3000 of the required 6667
+	// weight; on a 3-validator set they cover the full 3000 stake.
+	vs := createTestValidatorSet(t, 3)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
@@ -302,6 +310,10 @@ func (f *failingR7ThresholdSigner) GroupPublicKey() []byte {
 func (f *failingR7ThresholdSigner) IsThresholdMode() bool {
 	return true
 }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (f *failingR7ThresholdSigner) Threshold() int { return 0 }
 func (f *failingR7ThresholdSigner) AggregatePartialSignatures(sealers []int, partialSigs map[int][]byte, message []byte) ([]byte, error) {
 	return nil, fmt.Errorf("failing signer: AggregatePartialSignatures always fails (simulating distributed signing timeout)")
 }

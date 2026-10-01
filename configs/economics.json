@@ -1,0 +1,157 @@
+{
+  "tokenInfo": {
+    "name": "Quantaureum",
+    "symbol": "QAU",
+    "decimals": 18,
+    "initialSupply": "20000000000000000000000000",
+    "initialSupplyHuman": "20,000,000 QAU"
+  },
+  "distribution": {
+    "genesisAllocation": {
+      "total": "20000000000000000000000000",
+      "totalHuman": "20,000,000 QAU",
+      "breakdown": {
+        "communityContribution": {
+          "amount": "4961600000000000000000000",
+          "amountHuman": "4,961,600 QAU",
+          "share": 24.808,
+          "vesting": "None (free circulation)"
+        },
+        "team": {
+          "amount": "4000000000000000000000000",
+          "amountHuman": "4,000,000 QAU",
+          "share": 20.0,
+          "vestingMonths": 48,
+          "cliffMonths": 12
+        },
+        "stakingIncentivePool": {
+          "amount": "4000000000000000000000000",
+          "amountHuman": "4,000,000 QAU",
+          "share": 20.0,
+          "releaseMonths": 60,
+          "monthlyRelease": "66666666666666666666666",
+          "monthlyReleaseHuman": "66,666.67 QAU/month"
+        },
+        "developmentFund": {
+          "amount": "2000000000000000000000000",
+          "amountHuman": "2,000,000 QAU",
+          "share": 10.0,
+          "vestingMonths": 48,
+          "cliffMonths": 12
+        },
+        "ecosystemFund": {
+          "amount": "2000000000000000000000000",
+          "amountHuman": "2,000,000 QAU",
+          "share": 10.0,
+          "vestingMonths": 48
+        },
+        "foundationReserve": {
+          "amount": "2000000000000000000000000",
+          "amountHuman": "2,000,000 QAU",
+          "share": 10.0,
+          "vestingMonths": 48,
+          "cliffMonths": 12,
+          "maxYearlyRelease": 20
+        },
+        "securityAndCompliance": {
+          "amount": "1000000000000000000000000",
+          "amountHuman": "1,000,000 QAU",
+          "share": 5.0,
+          "vestingMonths": 36
+        },
+        "validatorStaking": {
+          "amount": "38400000000000000000000",
+          "amountHuman": "38,400 QAU",
+          "share": 0.192,
+          "breakdown": {
+            "staked": {
+              "amount": "36000000000000000000000",
+              "amountHuman": "36,000 QAU",
+              "detail": "6 \u00d7 6,000 QAU staked in consensus"
+            },
+            "accountBalance": {
+              "amount": "2400000000000000000000",
+              "amountHuman": "2,400 QAU",
+              "detail": "6 \u00d7 400 QAU account balance"
+            }
+          }
+        }
+      }
+    }
+  },
+  "staking": {
+    "validatorMinStake": "32000000000000000000",
+    "validatorMinStakeHuman": "32 QAU",
+    "delegatorMinStake": "1000000000000000000",
+    "delegatorMinStakeHuman": "1 QAU",
+    "unbondingPeriodDays": 7,
+    "targetAPY": {
+      "low": 0.04,
+      "high": 0.05
+    },
+    "dynamicIssuance": {
+      "stakingRateLow": 0.50,
+      "stakingRateMid": 0.75,
+      "issuanceRateLow": 0.05,
+      "issuanceRateMid": 0.045,
+      "issuanceRateHigh": 0.04
+    }
+  },
+  "slashing": {
+    "doubleSigning": {
+      "penalty": 1.0,
+      "description": "100% of staked QAU"
+    },
+    "downtime": {
+      "penaltyPerHour": 0.001,
+      "maxPenalty": 0.05,
+      "description": "0.1% per hour, max 5%"
+    },
+    "maliciousBehavior": {
+      "minPenalty": 0.10,
+      "maxPenalty": 1.0,
+      "description": "10-100% based on severity"
+    }
+  },
+  "fees": {
+    "eip1559": {
+      "baseFeeChangeDenominator": 8,
+      "elasticityMultiplier": 2,
+      "initialBaseFee": "1000000000",
+      "initialBaseFeeHuman": "1 Gwei"
+    },
+    "baseFeeDestination": "burn",
+    "priorityFeeDestination": "validator"
+  },
+  "blockRewards": {
+    "baseReward": "2000000000000000000",
+    "baseRewardHuman": "2 QAU per block",
+    "blockTime": 12,
+    "blocksPerDay": 7200,
+    "dailyReward": "14400000000000000000000",
+    "dailyRewardHuman": "14,400 QAU/day",
+    "yearlyReward": "5256000000000000000000000",
+    "yearlyRewardHuman": "5,256,000 QAU/year"
+  },
+  "governance": {
+    "proposalThreshold": "100000000000000000000000",
+    "proposalThresholdHuman": "100,000 QAU",
+    "votingPeriodBlocks": 40320,
+    "votingPeriodDays": 7,
+    "quorumPercentage": 10,
+    "passThreshold": 50
+  },
+  "faucet": {
+    "testnet": {
+      "enabled": true,
+      "maxPerRequest": "100000000000000000000",
+      "maxPerRequestHuman": "100 QAU",
+      "cooldownSeconds": 3600,
+      "dailyLimit": "10000000000000000000000",
+      "dailyLimitHuman": "10,000 QAU"
+    },
+    "mainnet": {
+      "enabled": false
+    }
+  }
+}

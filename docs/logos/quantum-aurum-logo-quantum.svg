@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- filter definitions -->
+  <defs>
+    <!-- gold glow -->
+    <filter id="goldGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feFlood flood-color="#ffcc00" result="glow"/>
+      <feComposite in="glow" in2="blur" operator="in" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- neon blue effect -->
+    <filter id="neonGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feFlood flood-color="#01c4ff" result="glow"/>
+      <feComposite in="glow" in2="blur" operator="in" result="coloredBlur"/>
+      <feBlend in="SourceGraphic" in2="coloredBlur" mode="normal"/>
+    </filter>
+    
+    <!-- quantum gradient -->
+    <linearGradient id="quantumGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#01c4ff" />
+      <stop offset="50%" stop-color="#8a2be2" />
+      <stop offset="100%" stop-color="#01c4ff" />
+    </linearGradient>
+  </defs>
+  
+  <!-- background circle -->
+  <circle cx="100" cy="100" r="90" fill="#121212" />
+  
+  <!-- quantum orbits - elliptical orbits for infinite possibility and multi-dimensional thinking -->
+  <ellipse cx="100" cy="100" rx="75" ry="45" fill="none" stroke="url(#quantumGradient)" stroke-width="1.5" transform="rotate(30 100 100)" filter="url(#neonGlow)" opacity="0.8" />
+  <ellipse cx="100" cy="100" rx="75" ry="45" fill="none" stroke="url(#quantumGradient)" stroke-width="1.5" transform="rotate(-30 100 100)" filter="url(#neonGlow)" opacity="0.8" />
+  <ellipse cx="100" cy="100" rx="75" ry="45" fill="none" stroke="url(#quantumGradient)" stroke-width="1.5" transform="rotate(90 100 100)" filter="url(#neonGlow)" opacity="0.8" />
+  
+  <!-- central gold core - the stable value of "Aurum" (gold) -->
+  <circle cx="100" cy="100" r="25" fill="#ffcc00" filter="url(#goldGlow)" />
+  
+  <!-- four orbiting particles - quantum entanglement and global interconnection -->
+  <circle cx="100" cy="35" r="8" fill="#01c4ff" filter="url(#neonGlow)" />
+  <circle cx="165" cy="100" r="8" fill="#01c4ff" filter="url(#neonGlow)" />
+  <circle cx="100" cy="165" r="8" fill="#01c4ff" filter="url(#neonGlow)" />
+  <circle cx="35" cy="100" r="8" fill="#01c4ff" filter="url(#neonGlow)" />
+  
+  <!-- quantum fluctuation effect - a touch of quantum physics -->
+  <path d="M 70,100 Q 85,85 100,100 Q 115,115 130,100" fill="none" stroke="#01c4ff" stroke-width="1.5" opacity="0.6" filter="url(#neonGlow)" />
+  <path d="M 100,70 Q 115,85 100,100 Q 85,115 100,130" fill="none" stroke="#01c4ff" stroke-width="1.5" opacity="0.6" filter="url(#neonGlow)" />
+</svg>

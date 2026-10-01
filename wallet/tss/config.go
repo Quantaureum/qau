@@ -57,8 +57,9 @@ const TrustedDealerModeEnabled = false
 // and may be overridden via SetAllowTrustedDealerCeremonyForTest() in tests.
 //
 // The two-level gate (env var here + mainnet hard guard in node/config.go)
-// mirrors the QAU_ENABLE_DISTRIBUTED_TSS / QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS
-// pattern used for the distributed TSS kill-switch (adapters.go:59).
+// is the model for ceremony-only capabilities. Note that the distributed TSS
+// path has no equivalent gate any more: it is permanently disabled (see
+// distributedTSSEnabled in node/adapters.go) rather than switchable.
 var (
 	trustedDealerCeremonyOnce    sync.Once
 	trustedDealerCeremonyAllowed bool

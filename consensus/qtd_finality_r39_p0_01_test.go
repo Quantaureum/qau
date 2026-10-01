@@ -73,6 +73,10 @@ func (m *r39P001MockSigner) VerifyVote(pubKey []byte, message []byte, signature 
 }
 func (m *r39P001MockSigner) GroupPublicKey() []byte { return append([]byte(nil), m.groupKey...) }
 func (m *r39P001MockSigner) IsThresholdMode() bool  { return true }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *r39P001MockSigner) Threshold() int { return 0 }
 func (m *r39P001MockSigner) AggregatePartialSignatures(sealers []int, partialSigs map[int][]byte, message []byte) ([]byte, error) {
 	return append([]byte(nil), message...), nil
 }

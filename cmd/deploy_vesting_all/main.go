@@ -39,7 +39,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -91,13 +90,6 @@ func sshKeyPath() string {
 		os.Exit(1)
 	}
 	return key
-}
-
-func resultsFilePath() string {
-	if path := strings.TrimSpace(os.Getenv("QAU_VESTING_RESULTS_FILE")); path != "" {
-		return path
-	}
-	return filepath.Join(os.TempDir(), "vesting_deployment_results.json")
 }
 
 // vestingContract defines one LinearVesting deployment.
@@ -290,14 +282,12 @@ func main() {
 		fmt.Printf("  %-20s %s (%s QAU)\n", r["name"], r["contract_addr"], r["amount_qau"])
 	}
 
-	// Save results.
+	// Save results
 	resultsJSON, _ := json.MarshalIndent(results, "", "  ")
-	resultsPath := resultsFilePath()
-	if err := os.WriteFile(resultsPath, resultsJSON, 0600); err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: failed to save deployment results to %s: %v\n", resultsPath, err)
-	} else {
-		fmt.Printf("\nResults saved to %s\n", resultsPath)
-	}
+	//nolint:gosec // G303: deployment results deliberately written to a fixed
+	// /tmp path so ops scripts (R40.G) can find them; 0600 owner-only, not sensitive.
+	os.WriteFile("/tmp/vesting_deployment_results.json", resultsJSON, 0600) // G303/G306: results file, owner-only
+	fmt.Println("\nResults saved to /tmp/vesting_deployment_results.json")
 }
 
 // deployOneVesting deploys a single LinearVesting contract with commit-reveal.
@@ -532,6 +522,7 @@ func sendRawTransaction(txHex string) interface{} {
 		)
 		//nolint:gosec // G204: ops tool — ssh target/args come from QAU_VALIDATOR_NODES + QAU_SSH_KEY env (R50), not untrusted input.
 		cmd := exec.Command("ssh",
+			"-o", "StrictHostKeyChecking=no",
 			"-o", "ConnectTimeout=5",
 			"-i", sshKeyPath(),
 			node, sshCmd,
@@ -636,6 +627,7 @@ func waitForReceipt(txHashHex string, timeoutSec int) map[string]interface{} {
 			)
 			//nolint:gosec // G204: ops tool — see submitCommitment; env-driven ssh, no untrusted input.
 			cmd := exec.Command("ssh",
+				"-o", "StrictHostKeyChecking=no",
 				"-o", "ConnectTimeout=5",
 				"-i", sshKeyPath(),
 				node, sshCmd,

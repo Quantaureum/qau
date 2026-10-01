@@ -1,0 +1,9 @@
+go 1.26.6
+
+use (
+	.
+	./crypto
+	./encoding
+	./tools/tests/integration/testutil
+	./types
+)

@@ -422,3 +422,90 @@ func TestHandshakeInvalidLength(t *testing.T) {
 		t.Error("expected error for invalid handshake length, got nil")
 	}
 }
+
+// TestEncryptedConnCloseUnblocksPendingRead is a regression test for the
+// Host.Stop deadlock (R42-CLOSE-DEADLOCK). Close used to acquire readMu before
+// touching the socket, while a goroutine parked in Read holds readMu for the
+// entire blocking io.ReadFull on the raw connection. On a connected but idle
+// peer nothing ever satisfies that read, so Close — and therefore Host.Stop —
+// hung forever.
+//
+// The test builds a real handshake over TCP, parks a reader exactly the way a
+// peer read loop does, and requires Close to return promptly and to unblock
+// that reader.
+func TestEncryptedConnCloseUnblocksPendingRead(t *testing.T) {
+	clientKey, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate client key: %v", err)
+	}
+	serverKey, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate server key: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	var wg sync.WaitGroup
+	var serverConn net.Conn
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		raw, err := listener.Accept()
+		if err != nil {
+			t.Errorf("accept failed: %v", err)
+			return
+		}
+		serverConn, err = performServerHandshake(raw, serverKey, false)
+		if err != nil {
+			t.Errorf("server handshake failed: %v", err)
+		}
+	}()
+
+	raw, err := net.DialTimeout("tcp", listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	clientConn, err := performClientHandshake(raw, clientKey, derivePeerIDFromKeyPair(clientKey), "", computeTestPoWNonce(t, clientKey))
+	if err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+	wg.Wait()
+	defer clientConn.Close()
+	if serverConn == nil {
+		t.Fatal("server handshake did not produce a connection")
+	}
+
+	enc, ok := serverConn.(*encryptedConn)
+	if !ok {
+		t.Fatalf("server handshake returned %T, want *encryptedConn", serverConn)
+	}
+
+	// Park a reader the way Host's read loop does. It acquires readMu and then
+	// blocks in io.ReadFull because the client stays silent.
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 64)
+		_, _ = enc.Read(buf)
+	}()
+	// Let the reader acquire readMu and reach the blocking read before closing.
+	time.Sleep(200 * time.Millisecond)
+
+	closed := make(chan error, 1)
+	go func() { closed <- enc.Close() }()
+
+	select {
+	case <-closed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("encryptedConn.Close deadlocked with a pending Read, so Host.Stop would hang forever")
+	}
+	select {
+	case <-readDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("pending Read was not unblocked by Close")
+	}
+}

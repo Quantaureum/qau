@@ -83,8 +83,7 @@ type QRNGConfig struct {
 
 // DefaultQRNGConfig returns the default QRNG configuration.
 //
-//	CLARIFICATION: SourceHybrid (the default Source) does NOT use a
-//
+//  CLARIFICATION: SourceHybrid (the default Source) does NOT use a
 // real quantum random number generator. It mixes crypto/rand output with
 // "extended entropy" produced by generateExtendedEntropy — but
 // generateExtendedEntropy is itself seeded from crypto/rand. Therefore

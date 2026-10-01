@@ -152,6 +152,12 @@ func TestM3_FinalityGuarantee(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SubmitPartialSeal failed: %v", err)
 		}
+		// R47-QTD-QUORUM: two signatures (12000) < RequiredWeight (14334) on
+		// the skewed set; the third executive member must sign to complete.
+		err = qfs.SubmitPartialSeal(6, slot, []byte("partial-sig-6-min16bytes"))
+		if err != nil {
+			t.Fatalf("SubmitPartialSeal failed: %v", err)
+		}
 
 		if !qfs.IsSlotFinalized(slot) {
 			t.Error("slot should be finalized after 2-of-3 partial seals")

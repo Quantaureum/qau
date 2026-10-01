@@ -39,8 +39,7 @@ type EconomicsConfig struct {
 
 // DefaultEconomicsConfig returns the default economics configuration.
 //
-//	NOTE (P3): testnet vs mainnet configuration differences.
-//
+//  NOTE (P3): testnet vs mainnet configuration differences.
 // This returns the SHARED defaults used by all networks. Network-specific
 // overrides are applied by the node bootstrap (see node/ package) based on
 // ChainID:

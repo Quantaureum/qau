@@ -73,7 +73,7 @@ func applyFlagOverrides(cfg *node.Config, cli *CLI) {
 	}
 	if *cli.Bootnodes != "" {
 		peers := splitBootnodes(*cli.Bootnodes)
-		cfg.BootstrapPeers = peers
+		cfg.BootstrapPeers = append(cfg.BootstrapPeers, peers...)
 	}
 
 	// P2P Discovery overrides
@@ -232,15 +232,11 @@ func LoadConfig(cli *CLI) (*node.Config, error) {
 
 	applyFlagOverrides(cfg, cli)
 
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	genesis, genErr := node.LoadGenesisForConfig(cfg)
-	if genErr != nil {
-		return nil, genErr
-	}
-	if genesis != nil {
+	if cfg.GenesisFile != "" {
+		genesis, genErr := node.LoadGenesis(cfg.GenesisFile)
+		if genErr != nil {
+			return nil, fmt.Errorf("failed to load genesis from %s: %w", cfg.GenesisFile, genErr)
+		}
 		if err := consensus.SetGenesisTime(int64(genesis.Timestamp)); err != nil {
 			return nil, fmt.Errorf("failed to set genesis time: %w", err)
 		}

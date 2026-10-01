@@ -110,7 +110,10 @@ func TestQTDFinalityRequestSeal(t *testing.T) {
 }
 
 func TestQTDFinalitySubmitPartialSeal(t *testing.T) {
-	vs := createTestValidatorSet(t, 10)
+	// R47-QTD-QUORUM: the weight quorum basis is the full validator set.
+	// Use a 3-validator set so the executive members {0,1,2} cover the
+	// entire stake — 2-of-3 partial seals reach 2000 >= ceil(2/3*3000).
+	vs := createTestValidatorSet(t, 3)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
@@ -313,6 +316,10 @@ func (m *mockThresholdSigner) GroupPublicKey() []byte {
 func (m *mockThresholdSigner) IsThresholdMode() bool {
 	return true
 }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *mockThresholdSigner) Threshold() int { return 0 }
 
 // FIX: Implement AggregatePartialSignatures for the mock
 // threshold signer. This combines the submitted partial signatures into a

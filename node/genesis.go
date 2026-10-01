@@ -79,7 +79,15 @@ type GenesisValidator struct {
 
 // DefaultGenesis returns the default genesis configuration (Production/Mainnet)
 func DefaultGenesis() *Genesis {
-	return mainnetGenesis()
+	return &Genesis{
+		ChainID:    MainnetNetworkID, // 1668 - Quantaureum Mainnet
+		NetworkID:  MainnetNetworkID,
+		Timestamp:  MainnetGenesisTimestamp, // audit-fix M-2: deterministic timestamp
+		GasLimit:   30000000,
+		ExtraData:  "Quantaureum Genesis Block - Mainnet",
+		Alloc:      make(map[string]GenesisAccount),
+		Validators: []GenesisValidator{},
+	}
 }
 
 // DevGenesis returns the development genesis configuration
@@ -98,7 +106,15 @@ func DevGenesis() *Genesis {
 
 // TestnetGenesis returns the testnet genesis configuration
 func TestnetGenesis() *Genesis {
-	return testnetGenesis()
+	return &Genesis{
+		ChainID:    TestnetNetworkID, // 1669 - Testnet
+		NetworkID:  TestnetNetworkID,
+		Timestamp:  TestnetGenesisTimestamp, // audit-fix M-2: deterministic timestamp
+		GasLimit:   30000000,
+		ExtraData:  "Quantaureum Genesis Block - Testnet",
+		Alloc:      make(map[string]GenesisAccount),
+		Validators: []GenesisValidator{},
+	}
 }
 
 // LoadGenesis loads genesis configuration from a file

@@ -404,7 +404,6 @@ func TestNode_ValidateProductionConfig_DevModeOnMainnet(t *testing.T) {
 	cfg := &Config{
 		Name:      "test",
 		DataDir:   t.TempDir(),
-		Network:   NetworkMainnet,
 		NetworkID: MainnetNetworkID,
 		DevMode:   true,
 	}
@@ -418,12 +417,18 @@ func TestNode_ValidateProductionConfig_DevModeOnTestnet(t *testing.T) {
 	cfg := &Config{
 		Name:      "test",
 		DataDir:   t.TempDir(),
-		Network:   NetworkTestnet,
 		NetworkID: TestnetNetworkID,
 		DevMode:   true,
 	}
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error for dev mode on testnet")
+	n, err := NewNode(cfg)
+	if err != nil {
+		t.Fatalf("NewNode failed: %v", err)
+	}
+	defer closeNodeDB(n)
+
+	err = n.validateProductionConfig()
+	if err != nil {
+		t.Errorf("dev mode on testnet should be allowed, got: %v", err)
 	}
 }
 

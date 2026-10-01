@@ -47,6 +47,15 @@ type ThresholdKeySigner interface {
 	VerifyVote(pubKey []byte, message []byte, signature []byte) bool
 	GroupPublicKey() []byte
 	IsThresholdMode() bool
+	// Threshold returns the t of the threshold group's t-of-n shape. The
+	// QTD finality quorum (RequiredCount) must be derived from this value
+	// when a threshold signer is active, because the aggregated signature
+	// is only valid when at least t partial signatures are combined.
+	//
+	// Implementations that do not track a threshold shape (e.g. test mocks
+	// or single-node signers) MUST return 0 so callers fall back to the
+	// chamber quorum unchanged.
+	Threshold() int
 	// AggregatePartialSignatures combines collected partial signatures from
 	// multiple validators into a single threshold signature. This is the
 	// correct way to produce a QTD signature — using SignBlock with a single

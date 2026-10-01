@@ -735,7 +735,7 @@ func TestSetTrustedRelayerPublicKeyBytes_ExternalAdapter(t *testing.T) {
 	}
 }
 
-// TestR4BRDG_ExternalAdapter_SubmitMessage_NoKey_NoPanic verifies the
+// TestR4BRDG_ExternalAdapter_SubmitMessage_NoKey_NoPanic verifies the 
 // regression fix: SubmitMessage must NOT panic when relayer keys are not
 // configured. Previously it dereferenced *e.relayerPrivateKey before checking
 // hasPrivKey, causing a nil pointer panic. The symmetric fix was already

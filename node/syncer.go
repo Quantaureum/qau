@@ -16,6 +16,7 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/core"
+	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/privacy"
@@ -168,6 +169,14 @@ type Syncer struct {
 	// When set, it's included in broadcast status messages so other peers
 	// can auto-register the validator address → PeerID mapping.
 	validatorAddress types.Address
+	// TSS-R7-09 (2026-09): validator signing key + public key for SIGNED
+	// status messages. The host only registers the validator↔PeerID mapping
+	// when the status carries a valid ValidatorPublicKey + ValidatorSignature
+	// (host.go verification gate). Without a signed status the mapping stays
+	// empty, so TSS/DKG sender validation (validateDKGMessageSender) rejects
+	// every message. When these are set, buildStatusMessage signs the status.
+	validatorSignKey *crypto.PrivateKey
+	validatorPubKey  []byte
 
 	snapSyncing       bool
 	snapSyncCompleted bool // R??-SNAP-REGUARD (2026-08-17): prevents re-triggering snap sync after completion
@@ -441,6 +450,15 @@ func (s *Syncer) SetOnStateDBVerified(fn func(height uint64)) {
 // enabling automatic Address→PeerID mapping for directed TSS message routing.
 func (s *Syncer) SetValidatorAddress(addr types.Address) {
 	s.validatorAddress = addr
+}
+
+// SetValidatorSigner provides the validator private key + public key so the
+// syncer can broadcast SIGNED status messages. TSS-R7-09 (2026-09): required
+// for the host to register the validator↔PeerID mapping; without it, TSS/DKG
+// sender validation rejects all messages from this node.
+func (s *Syncer) SetValidatorSigner(key *crypto.PrivateKey, pubKey []byte) {
+	s.validatorSignKey = key
+	s.validatorPubKey = pubKey
 }
 
 // ETHEREUM-PARITY SYNC (2026-08-13): --sync.mode=full support.
@@ -2681,6 +2699,28 @@ func (s *Syncer) queryPeerStatus() {
 		GenesisHash:      genesisHash,
 		ValidatorAddress: s.validatorAddress,
 		ForkID:           forkID,
+	}
+
+	// TSS-R7-09 (2026-09): sign the status so peers register the
+	// validator↔PeerID mapping (host.go only trusts a status carrying a valid
+	// ValidatorPublicKey + ValidatorSignature). Without this the mapping stays
+	// empty and TSS/DKG sender validation rejects every message. Sign over the
+	// 104-byte base payload (base[:104]); we intentionally omit the V2
+	// Timestamp/SessionNonce extension so the host verifies against the base
+	// payload directly (see host.go signed-domain handling). Best-effort: if
+	// signing fails, fall back to an unsigned status (mapping just won't
+	// populate from this node, same as before the fix).
+	if s.validatorSignKey != nil && len(s.validatorPubKey) > 0 &&
+		s.validatorAddress != (types.Address{}) {
+		status.ValidatorPublicKey = s.validatorPubKey
+		base := p2p.EncodeStatusMessage(status) // no sig yet
+		if len(base) >= 104 {
+			if sig, serr := s.validatorSignKey.Sign(base[:104]); serr == nil {
+				status.ValidatorSignature = sig
+			} else {
+				status.ValidatorPublicKey = nil // revert to unsigned on failure
+			}
+		}
 	}
 
 	// Encode and broadcast status

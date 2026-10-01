@@ -352,3 +352,88 @@ func TestR4GOV01_OneVoteLockRegression(t *testing.T) {
 	}
 	t.Log("=== R4-GOV-01 Phase 5: 7 reject votes (>= 2/3) → Rejected (PASS) ===")
 }
+
+func TestReviewRecountsAfterSlotRootArrives(t *testing.T) {
+	SetAttestationNetworkID(1668)
+	qpos, keys := setupQPOSWithKeys(9)
+	review := NewReviewChamber(qpos)
+
+	slot := uint64(1)
+	blockRoot := types.Hash{0x51}
+	qpos.SetEpochBlockRoot(SlotToEpoch(slot), blockRoot)
+	for i := 0; i < 6; i++ {
+		vIdx := findValidatorIndex(qpos, keys[i].Public.Address())
+		if vIdx < 0 {
+			t.Fatalf("validator key %d not found in validator set", i)
+		}
+		att := qpos.CreateAttestation(slot, blockRoot, vIdx)
+		if att == nil {
+			t.Fatal("CreateAttestation returned nil")
+		}
+		if err := qpos.SignAttestation(att, keys[i].Private); err != nil {
+			t.Fatalf("SignAttestation(%d) failed: %v", i, err)
+		}
+		if err := review.ProcessReviewAttestation(att); err != nil {
+			t.Fatalf("ProcessReviewAttestation(%d) failed: %v", i, err)
+		}
+	}
+
+	result := review.GetSlotResult(slot)
+	if result == nil {
+		t.Fatal("slot result was not created")
+	}
+	if result.Verdict != VerdictPending {
+		t.Fatalf("unknown root verdict = %s, want Pending", result.Verdict)
+	}
+	if result.ApproveCount != 0 || result.RejectCount != 0 {
+		t.Fatalf("unknown root must not classify attestations: approve=%d reject=%d",
+			result.ApproveCount, result.RejectCount)
+	}
+
+	qpos.SetSlotBlockRoot(slot, blockRoot)
+	if verdict := review.GetSlotVerdict(slot); verdict != VerdictApproved {
+		t.Fatalf("post-root verdict = %s, want Approved", verdict)
+	}
+
+	result = review.GetSlotResult(slot)
+	if result.ApproveCount != 6 || result.RejectCount != 0 {
+		t.Fatalf("post-root counts = approve %d, reject 0; want approve 6", result.ApproveCount)
+	}
+	if result.ApproveStake.Cmp(result.RejectStake) <= 0 {
+		t.Fatalf("approve stake %s must exceed reject stake %s",
+			result.ApproveStake, result.RejectStake)
+	}
+}
+
+func TestReviewTimeoutRecountsBeforeTimingOut(t *testing.T) {
+	SetAttestationNetworkID(1668)
+	qpos, keys := setupQPOSWithKeys(9)
+	review := NewReviewChamber(qpos)
+
+	slot := uint64(1)
+	blockRoot := types.Hash{0x52}
+	qpos.SetEpochBlockRoot(SlotToEpoch(slot), blockRoot)
+	for i := 0; i < 6; i++ {
+		vIdx := findValidatorIndex(qpos, keys[i].Public.Address())
+		if vIdx < 0 {
+			t.Fatalf("validator key %d not found in validator set", i)
+		}
+		att := qpos.CreateAttestation(slot, blockRoot, vIdx)
+		if att == nil {
+			t.Fatal("CreateAttestation returned nil")
+		}
+		if err := qpos.SignAttestation(att, keys[i].Private); err != nil {
+			t.Fatalf("SignAttestation(%d) failed: %v", i, err)
+		}
+		if err := review.ProcessReviewAttestation(att); err != nil {
+			t.Fatalf("ProcessReviewAttestation(%d) failed: %v", i, err)
+		}
+	}
+
+	qpos.SetSlotBlockRoot(slot, blockRoot)
+	review.CheckTimeout(slot)
+
+	if verdict := review.GetSlotVerdict(slot); verdict != VerdictApproved {
+		t.Fatalf("CheckTimeout verdict = %s, want Approved after root arrives", verdict)
+	}
+}

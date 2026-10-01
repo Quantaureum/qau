@@ -1,0 +1,29 @@
+{
+  "_comment": "Quantaureum Bridge — MAINNET configuration template (P3-5). Copy this file to configs/config.json and fill in the values. ChainID: 1668. All fields are required unless marked optional. SECURITY: Never commit filled-in configs with real private keys or governance addresses.",
+  "_usage": "1) Copy to configs/config.json. 2) Set QAU_ENABLE_BRIDGE=1 env var. 3) Fill in bridgeContractAddresses and nodeUrls. 4) Set initializerAddress to the governance multisig/contract address. 5) Set validatorPublicKeyHex and relayerPublicKeyHex from trusted sources. 6) Start the node.",
+  "_securityNotes": [
+    "bootstrapMode must remain false in production (fail-closed).",
+    "initializerAddress should be a multisig or governance contract, not an EOA.",
+    "validatorPublicKeyHex and relayerPublicKeyHex must come from trusted QPOS validator set or governance.",
+    "nodeUrls for external chains should use HTTPS endpoints with API keys.",
+    "confirmationsRequired >= 10 prevents reorg-based double-spend attacks."
+  ],
+  "bridge": {
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8545",
+      "ethereum": "https://<external-evm-rpc-endpoint>"
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "0x0000000000000000000000000000000000000000",
+      "ethereum": "0x0000000000000000000000000000000000000000"
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 10,
+    "messageExpiration": 86400,
+    "pollingInterval": 15,
+    "maxRetries": 5,
+    "initializerAddress": "0x0000000000000000000000000000000000000000",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  }
+}

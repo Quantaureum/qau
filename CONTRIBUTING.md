@@ -1,106 +1,261 @@
 # Contributing to Quantaureum
 
-Contributions to code, tests, documentation, and developer tooling are welcome.
-Start with a small, independently reviewable change. A merged contribution does
-not automatically qualify for a payment or grant repository permissions.
+Thank you for your interest in contributing to Quantaureum! This document outlines the process for contributing to the world's first quantum-resistant Layer 1 blockchain.
 
-## Before starting
+## Table of Contents
 
-- Read the [roadmap](ROADMAP.md) and [governance](GOVERNANCE.md).
-- Follow the [code of conduct](CODE_OF_CONDUCT.md).
-- Report suspected vulnerabilities privately using [SECURITY.md](SECURITY.md),
-  not a public issue or pull request.
-- For changes to consensus, cryptography, transaction encoding, storage formats,
-  or economic rules, discuss a design before implementing it.
-- Confirm scope and acceptance criteria with a maintainer before starting a
-  substantial task. An issue assignment is coordination, not a payment promise.
+- [Code of Conduct](#code-of-conduct)
+- [Getting Started](#getting-started)
+- [Development Workflow](#development-workflow)
+- [Coding Standards](#coding-standards)
+- [Testing Requirements](#testing-requirements)
+- [Pull Request Process](#pull-request-process)
+- [Security Vulnerability Reporting](#security-vulnerability-reporting)
+- [Architecture Overview](#architecture-overview)
 
-## Set up a development checkout
+## Code of Conduct
 
-Install Git and the Go version declared in `go.mod`. Fork the repository on
-GitHub, clone your fork, and create a branch for your change. Run these commands
-from the repository root:
+Participation in this project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Please be respectful and inclusive.
 
-```sh
-go version
-go mod download
-go build ./...
-go test ./... -count=1
+## Getting Started
+
+### Prerequisites
+
+- **Go 1.26+** (latest stable)
+- **Git 2.30+**
+- **Make** (for build scripts)
+- Basic understanding of blockchain concepts and post-quantum cryptography
+
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/Quantaureum/qau.git
+cd qau
+
+# Build the node
+make build
+
+# Run tests
+make test
+
+# Start a local dev node
+make dev
 ```
 
-Some packages may require platform-specific dependencies. If setup fails, report
-which command failed, the commit, Go version, and operating system. Do not
-silently skip failures or describe an untested platform as supported.
+## Development Workflow
 
-To build the daemon for a local experiment:
+### 1. Fork and Branch
 
-```sh
-go build -trimpath -o .local-only/bin/qaud ./cmd/qaud
-./.local-only/bin/qaud --help
-./.local-only/bin/qaud --dev --network dev --datadir ./.local-only/dev-data
+```bash
+# Fork the repo on GitHub, then:
+git remote add origin https://github.com/<your-username>/quantaureum.git
+git checkout -b feature/your-feature-name
 ```
 
-On Windows, use `qaud.exe` for the output and executable name. Development mode
-uses intentionally public deterministic seeds: **DEVNET ONLY**. Never fund these
-accounts with real assets or expose a development node to the public network.
-Stop the foreground daemon with `Ctrl+C`. See the [usage guide](docs/USAGE.md)
-and [configuration guide](docs/CONFIGURATION.md) before changing endpoints.
+Use descriptive branch names:
+- `feature/add-vesting-contract` — new features
+- `fix/txpool-nonce-gap` — bug fixes
+- `refactor/consensus-state-machine` — refactors
+- `docs/api-reference` — documentation
 
-Keep generated binaries, runtime state, logs, credentials, and one-off scripts
-under the ignored `.local-only/` directory or outside the checkout. Do not
-commit them. Never include real keys, wallet-to-host mappings, or deployment
-topology in examples, tests, screenshots, or logs.
+### 2. Write Code
 
-## Choose a task
+Follow the [Coding Standards](#coding-standards) below. Every change must:
+- Pass `golangci-lint run` with zero warnings
+- Include tests (see [Testing Requirements](#testing-requirements))
+- Not introduce `panic()` in production code paths
+- Not ignore errors without justification (`//nolint:errcheck` with comment)
 
-Useful starting points include documentation corrections, CLI help improvements,
-unit tests for existing behavior, and SDK example validation. Look for issues
-with explicit scope, non-goals, and acceptance criteria; ask for clarification
-when these are missing. Do not turn a single task into multiple cosmetic PRs.
+### 3. Commit
 
-A good issue describes:
+We use [Conventional Commits](https://www.conventionalcommits.org/):
 
-1. The problem and user-visible impact.
-2. Relevant packages or documentation.
-3. Expected behavior and non-goals.
-4. Evidence required for acceptance.
-5. Commands or manual steps that validate the result.
-
-## Prepare a pull request
-
-- Keep changes focused and explain why they are needed.
-- Format changed Go files with `gofmt` and add tests for changed behavior.
-- Use English for new code comments, commit messages, and technical documentation.
-- Document compatibility changes and migrations explicitly.
-- Cite the conditions and evidence behind performance and security claims.
-- Disclose relevant generated or AI-assisted work. You remain responsible for
-  correctness, licensing, understanding the change, and checking generated code.
-- Identify third-party material and its license. Only submit work you have the
-  right to contribute under this repository's [license](LICENSE).
-
-Run the applicable checks and record exact results in the PR:
-
-```sh
-git diff --check
-go vet ./...
-go build ./...
-go test ./... -count=1
+```
+feat(consensus): add QTD finality gadget v2
+fix(txpool): resolve nonce gap on state rebuild
+refactor(p2p): consolidate compact block broadcasting
+docs(rpc): update JSON-RPC API reference
+test(crypto): add Dilithium3 signature fuzzing
+chore(deps): bump circl to v1.6.3
 ```
 
-For concurrency changes, also run race-enabled tests for affected packages on a
-supported platform. If a check cannot run or fails, report that honestly with a
-sanitized error summary. Do not claim that CI passes merely because a workflow
-file exists. SDK changes need checks appropriate to the affected SDK as well.
+### 4. Push and PR
 
-Open a PR using the template and respond to review. Maintainers may request
-changes or decline a contribution that conflicts with project scope. Do not
-send private keys, production access, or payments to obtain a review.
+```bash
+git push origin feature/your-feature-name
+```
 
-## Recognition and rewards
+Open a Pull Request against `main`. Fill out the PR template completely.
 
-The project is designing a tiered contributor reward process. There is no
-active general reward schedule established by this document. Do not assume
-that opening an issue, submitting a PR, or obtaining a merge creates a payment
-entitlement. Any funded task must state its budget, reward asset, acceptance
-criteria, approver, and payment terms in writing before work starts. Security
-reports follow the separate disclosure process; no bug bounty is promised here.
+## Coding Standards
+
+### Go Style
+
+- Run `gofmt -s` and `goimports` before committing
+- Follow [Effective Go](https://go.dev/doc/effective_go) and the [Go Code Review Comments](https://github.com/golang/go/wiki/CodeReviewComments)
+- Use `golangci-lint` (config in `.golangci.yml`)
+
+### Error Handling
+
+**Never ignore errors silently.** If you must ignore an error, add a comment explaining why:
+
+```go
+// Good: explicit handling
+if err := db.Put(key, value); err != nil {
+    return fmt.Errorf("failed to persist state: %w", err)
+}
+
+// Acceptable: best-effort with justification
+_ = conn.Close() //nolint:errcheck // best-effort cleanup on error path
+
+// Bad: silent ignore
+_ = db.Put(key, value)
+```
+
+### Concurrency
+
+- Always protect shared state with `sync.Mutex` or `sync.RWMutex`
+- Prefer channels for goroutine communication
+- Never start a goroutine without a clear lifecycle (context cancellation or done channel)
+- Use `go vet -race` and `-race` flag in tests
+
+### Logging
+
+- Use `zerolog` (structured logging) via the project's logger setup
+- Never use `fmt.Println` in production code (use `log.Printf` if zerolog is unavailable)
+- Log levels: `Error` (failures), `Warn` (recoverable issues), `Info` (lifecycle), `Debug` (diagnostics)
+- Include relevant context (height, hash, peer ID) in log messages
+
+### Cryptography
+
+- **Never** hardcode private keys, seeds, or test vectors with real key material
+- Use `memguard` for sensitive key material in memory
+- Always `defer crypto.ZeroBytesSecure(keyMaterial)` after use
+- Use Dilithium3 for signatures, Kyber768 for key encapsulation
+
+## Testing Requirements
+
+### Minimum Coverage
+
+| Package | Minimum Coverage |
+|---------|-----------------|
+| `crypto/` | 90% |
+| `consensus/` | 85% |
+| `qaudb/` | 85% |
+| `encoding/` | 85% |
+| `node/` | 75% |
+| `p2p/` | 75% |
+| `rpc/` | 75% |
+| `qvm/` | 80% |
+| Overall | 80% |
+
+### Test Types
+
+1. **Unit tests** (`*_test.go`) — every public function must have tests
+2. **Integration tests** (`node/integration_test.go`) — cross-module flows
+3. **Fuzz tests** (`fuzz_test.go`) — cryptographic and parsing functions
+4. **Benchmark tests** (`*_bench_test.go`) — hot paths (consensus, state DB, P2P)
+
+### Running Tests
+
+```bash
+# All tests
+make test
+
+# With race detector
+make test-race
+
+# Coverage report
+make test-coverage
+
+# Specific package
+go test -v -race ./crypto/...
+
+# Benchmarks
+go test -bench=. -benchmem ./qaudb/state/...
+```
+
+## Pull Request Process
+
+### PR Checklist
+
+Before submitting a PR, ensure:
+
+- [ ] Code compiles: `make build`
+- [ ] Tests pass: `make test`
+- [ ] Lint passes: `golangci-lint run`
+- [ ] Race detector passes: `make test-race`
+- [ ] Coverage meets minimum for changed packages
+- [ ] No `panic()` in production code
+- [ ] No hardcoded secrets or IP addresses
+- [ ] Commit messages follow Conventional Commits
+- [ ] PR description explains the change and motivation
+- [ ] Breaking changes are documented
+
+### Review Process
+
+1. Automated CI must pass (build, test, lint, coverage)
+2. At least 2 maintainer approvals required for `main`
+3. Security-sensitive changes (consensus, crypto, P2P) require review by a security team member
+4. Breaking changes require a Quantaureum Improvement Proposal (QIP)
+
+### Review Criteria
+
+Reviewers will check:
+- **Correctness**: Does the code do what it claims?
+- **Security**: Are there vulnerabilities (reentrancy, overflow, timing attacks)?
+- **Performance**: Is this on the hot path? Does it add latency?
+- **Testability**: Are the tests meaningful (not just coverage padding)?
+- **Maintainability**: Will this be understandable in 6 months?
+
+## Security Vulnerability Reporting
+
+**Do NOT open a public issue for security vulnerabilities.**
+
+Instead, email security@quantaureum.com with:
+1. Description of the vulnerability
+2. Steps to reproduce
+3. Potential impact
+4. Suggested fix (if any)
+
+We will acknowledge within 48 hours and provide a fix timeline. See [SECURITY.md](SECURITY.md) for the severity-based bounty table.
+
+## Contributor Rewards
+
+Following the Ethereum ecosystem's open-source model, Quantaureum does not run a public token airdrop. Instead, contributors are rewarded through a discretionary **contribution grant**:
+
+- **Code**: merged pull requests that meaningfully improve the protocol
+- **Security**: valid vulnerability reports (see the bounty table in [SECURITY.md](SECURITY.md))
+- **Community**: significant, sustained contributions to the ecosystem
+
+Rewards are denominated in **QAU** and paid from a **fixed, capped bug-bounty fund drawn from the on-chain Ecosystem Fund** (see the bounty table in [SECURITY.md](SECURITY.md)) and, for non-security contributions, through a governance-reviewed grant — never from user funds. Specific weights and criteria are announced separately; there is no fixed open airdrop schedule.
+
+## Architecture Overview
+
+Quantaureum uses a 7-layer architecture:
+
+```
+L7  Service Layer    — JSON-RPC, WebSocket, GraphQL, REST API
+L6  Integration Layer — Node orchestration, Syncer, Snapshot, Adapters
+L5  Consensus Layer   — QPOS, QTD Finality, Election, Slashing, Voting
+L4  Execution Layer   — QVM (opcodes, JIT, parallel execution, precompiled)
+L3  Network Layer     — P2P (GossipSub, RLPx, Discovery), Bridge, DeFi
+L2  Storage Layer     — QauDB (bbolt), Verkle Trie, State DB, Block Store
+L1  Cryptography Layer — Dilithium3, Kyber768, GM-QTD, Keystore
+```
+
+Key design principles:
+- **Layer isolation**: lower layers never import from higher layers
+- **Interface boundaries**: modules communicate through well-defined Go interfaces
+- **Fail-safe defaults**: cryptographic verification fails closed
+- **Post-quantum first**: all signature and key exchange operations use NIST-standardized PQ algorithms
+
+## Questions?
+
+- **GitHub Issues** — bugs and feature requests
+- **GitHub Discussions** — questions and design discussions
+- **Discord** — real-time community chat at https://discord.gg/MSctkBT5j
+- **Email** — maintainers@quantaureum.com
+
+Thank you for contributing to making blockchain quantum-safe!

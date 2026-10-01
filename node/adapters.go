@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"os"
 	"strings"
 	"time"
 
@@ -16,8 +15,6 @@ import (
 	"github.com/quantaureum/qau/economics"
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/graphql"
-	"github.com/quantaureum/qau/internal/version"
-	"github.com/quantaureum/qau/params"
 	"github.com/quantaureum/qau/qaudb/block"
 	"github.com/quantaureum/qau/qaudb/state"
 	"github.com/quantaureum/qau/qaudb/trie"
@@ -29,77 +26,43 @@ import (
 	"github.com/quantaureum/qau/wallet/tss"
 )
 
-// distributedTSSEnabled controls whether distributed P2P threshold signing
-// is used.
+// distributedTSSEnabled permanently reports false.
 //
-// AUDIT (2026) TSS-FIX (CRITICAL): The previous comment claimed
-// that masked contributions (c·s2, c·t0) are "signature-derived and leak
-// nothing about the private key." THIS IS CRYPTOGRAPHICALLY FALSE.
+// Distributed P2P threshold signing is hard-disabled and has no runtime
+// switch: no environment variable, config flag, or network mode turns it on.
+// The sole remaining caller-visible effect is that every distributed branch in
+// this file stays unreachable.
 //
-// In the NTT ring Z_q[X]/(X^256+1) (q=8380417), the challenge polynomial c
-// (τ=49 ±1 coefficients) is invertible with overwhelming probability. An
-// aggregator holding c and the summed c·t0 can recover t0 via NTT inversion:
+// REASON (TSS-R3-B-1, unresolved). The QTD aggregator is the block proposer.
+// From the aggregated Z0Share contributions it learns c·(t0-s2). In the NTT
+// ring Z_q[X]/(X^256+1) (q=8380417) the challenge polynomial c (τ=49 ±1
+// coefficients) is invertible with overwhelming probability, so the aggregator
+// recovers (t0-s2) by NTT inversion and then s1 from the overdetermined system
 //
-//	t0 = InvNTT( NTT(c·t0) ⊘ NTT(c) )
+//	A·s1 = t1·2^d + (t0-s2)
 //
-// Combined with public t1, this gives t = t1·2^d + t0. Similarly, c·s2 → s2.
-// Then s1 is recovered by solving A·s1 = t - s2 (overdetermined linear system
-// in the NTT domain). The FULL private key (s1, s2, t0) is reconstructed.
+// since A and t1 are both public. A proposer running the aggregation therefore
+// ends up holding s1 — precisely the secret a 4-of-6 threshold scheme exists to
+// keep distributed.
 //
-// The Round5 protocol change (Z0Share = λ_i·c·(t0_i - s2_i)) prevents the
-// aggregator from obtaining c·s2 and c·t0 SEPARATELY — only their difference
-// c·(t0-s2) is available, which leaks s1 (via A·s1 = t1·2^d + (t0-s2)) but
-// NOT s2 or t0 individually. This reduces the vulnerability from Critical
-// (full key recovery) to High (s1 recovery only).
+// The Round5 change (Z0Share = λ_i·c·(t0_i - s2_i)) removed the *separate*
+// c·s2 and c·t0 transmissions, so the aggregator can no longer recover s2 or
+// t0 and cannot forge on its own. That lowers the exposure from full-key
+// recovery to s1 recovery; it does not close it.
 //
-// FULL CLOSURE requires either:
+// Closure needs a protocol redesign in which the aggregator only ever combines
+// partial signatures — distributed hint generation under MPC, or an equivalent
+// construction. It is not a masking tweak: a pairwise zero-sum mask cancels in
+// the sum the aggregator is entitled to compute, so it hides individual
+// contributions from peers but not the aggregate from the aggregator.
 //
-//	(a) DH-based pairwise zero-sum masking (aggregator cannot remove masks),
-//	(b) Distributed hint generation via MPC (no single party sees z0), or
-//	(c) A threshold Dilithium scheme with distributed hint protocol.
-//
-// Until one of these is implemented, distributed TSS MUST NOT be used in
-// production.
-//
-// ENFORCEMENT: The kill-switch is OFF by default. In production mode
-// (QAU_PRODUCTION=1), distributed TSS is HARD-BLOCKED unless the operator
-// explicitly sets QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS=1, acknowledging the
-// residual s1-leakage risk. This two-key gate prevents accidental enablement.
-//
-// TSS-C1 (R8 2026-07-19 FIX): Previously the testnet path (QAU_PRODUCTION != 1)
-// bypassed the unsafe acknowledgment gate entirely — operators could set
-// QAU_ENABLE_DISTRIBUTED_TSS=1 on testnet and immediately get distributed
-// signing with full s1-leakage risk. The leakage is a CRYPTOGRAPHIC issue
-// (independent of network mode), so testnet deployments also MUST explicitly
-// acknowledge the risk. Now both paths require QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS=1.
-// This is especially important for public testnets where multiple parties
-// participate and the W+H aggregator collusion is realistic.
+// The former two-key gate (QAU_ENABLE_DISTRIBUTED_TSS +
+// QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS) was removed deliberately. It let a
+// deployment self-attest a residual s1 leak as acceptable, and it framed an
+// unfinished protocol as a pending acknowledgement. Neither is a posture this
+// project can support, so the switches are gone rather than defaulted off.
 func distributedTSSEnabled() bool {
-	if os.Getenv("QAU_ENABLE_DISTRIBUTED_TSS") != "1" {
-		return false
-	}
-	// TSS-C1 FIX: require unsafe acknowledgment on ALL networks.
-	// The previous code only enforced this on production. The s1 leakage
-	// is a property of the QTD protocol itself, not the deployment mode.
-	if os.Getenv("QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS") != "1" {
-		log.Printf("[SECURITY] [BLOCKED] Distributed TSS is disabled. " +
-			"QAU_ENABLE_DISTRIBUTED_TSS=1 was set, but you must ALSO set " +
-			"QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS=1 to acknowledge the s1-leakage risk (TSS- / TSS-C1). " +
-			"This requirement is enforced on BOTH mainnet and testnet because the " +
-			"vulnerability is cryptographic, not deployment-specific. " +
-			"Falling back to local in-process aggregation.")
-		return false
-	}
-	// Both gates passed: log warning with network context.
-	networkMode := "testnet/devnet"
-	if params.IsProductionEnv() {
-		networkMode = "PRODUCTION"
-	}
-	log.Printf("[SECURITY] [WARNING] Distributed TSS enabled in %s mode with UNSAFE acknowledgment. "+
-		"TSS- RESIDUAL RISK: the aggregator (block proposer) can recover s1 "+
-		"from the aggregated Z0Share contributions. Do NOT use in production until "+
-		"DH-based pairwise masking or distributed hint generation is implemented.", networkMode)
-	return true
+	return false
 }
 
 // Helper function to parse stake string
@@ -1052,7 +1015,7 @@ func (a *chainInfoAdapter) NetworkID() uint64 {
 }
 
 func (a *chainInfoAdapter) ProtocolVersion() string {
-	return version.ProtocolVersion
+	return "1.0.0"
 }
 
 func (a *chainInfoAdapter) IsSyncing() bool {
@@ -1083,7 +1046,7 @@ func (a *chainInfoAdapter) GetPeers() []rpc.PeerInfo {
 	for _, p := range peers {
 		peerInfo := rpc.PeerInfo{
 			ID:   string(p.ID),
-			Name: fmt.Sprintf("Quantaureum/v%s", version.Version),
+			Name: "Quantaureum/v1.0.0",
 			Caps: []string{"qau/1"},
 			Network: rpc.Network{
 				LocalAddress:  a.node.config.ListenAddr,
@@ -1384,26 +1347,22 @@ func (a *tssSignerAdapter) SignBlock(validatorIndex int, message []byte) ([]byte
 	if len(participants) < a.tss.Threshold() {
 		return nil, fmt.Errorf("insufficient participants for threshold signing: have %d, need %d", len(participants), a.tss.Threshold())
 	}
-	// AUDIT (2026) TSS-FIX (CRITICAL): Distributed TSS signing is
-	// NOT fully safe yet. The previous design transmitted SEPARATE masked
-	// contributions Cs2Share (λ_i·c·s2_i) and Ct0Share (λ_i·c·t0_i), which
-	// allowed the aggregator to invert the challenge polynomial c in the NTT
-	// ring Z_q[X]/(X^256+1) and recover s2 and t0 separately, then s1 via
-	// A·s1 = t - s2, reconstructing the FULL Dilithium3 private key.
+	// Distributed signing is hard-disabled: distributedTSSEnabled() returns
+	// false unconditionally (see its comment for the s1-recovery argument), so
+	// this branch is unreachable and every call signs through the local share
+	// path below. The branch is kept as the documented insertion point for the
+	// protocol redesign, not as a configuration option.
 	//
-	// The Round5 fix COMBINES the two contributions into a single Z0Share =
-	// λ_i·c·(t0_i - s2_i) which the aggregator CANNOT decompose. This reduces
-	// the vulnerability from Critical (full key recovery) to High (s1 recovery
-	// only) — the aggregator can recover s1 but CANNOT recover s2 or t0
-	// individually, so it CANNOT forge signatures.
-	//
-	// RESIDUAL RISK (High): Full closure requires DH-based pairwise masking or
-	// distributed hint generation. Until then, distributed TSS is HARD-BLOCKED
-	// in production via the distributedTSSEnabled() two-key gate
-	// (QAU_PRODUCTION=1 requires QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS=1).
+	// Historical note on the Round5 change: the earlier design transmitted
+	// SEPARATE masked contributions Cs2Share (λ_i·c·s2_i) and Ct0Share
+	// (λ_i·c·t0_i), which let the aggregator invert the challenge polynomial c
+	// in the NTT ring Z_q[X]/(X^256+1), recover s2 and t0 separately, and then
+	// s1 via A·s1 = t - s2 — the FULL Dilithium3 private key. Combining them
+	// into Z0Share = λ_i·c·(t0_i - s2_i) removed the separate transmissions and
+	// lowered the exposure to s1 recovery only.
 	// Raw s2_i/t0_i shares NEVER traverse the wire in either design.
 	if a.node != nil && a.node.distributedSigner != nil && distributedTSSEnabled() {
-		// R7 P0-3 FIX (TSS-, 2026-07-17): Use distributeTSSSignNoFallback
+		// R7 P0-3 (TSS-R2-B-2, 2026-07-17): Use distributeTSSSignNoFallback
 		// instead of DistributeTSSSign (allowFallback=true). Previously, a
 		// distributed signing failure (e.g., DoS-induced timeout) silently fell
 		// back to local SignWithRetry, downgrading t-of-n threshold security to
@@ -1419,9 +1378,9 @@ func (a *tssSignerAdapter) SignVote(validatorIndex int, message []byte) ([]byte,
 	if len(participants) < a.tss.Threshold() {
 		return nil, fmt.Errorf("insufficient participants for threshold signing: have %d, need %d", len(participants), a.tss.Threshold())
 	}
-	// AUDIT (2026) TSS-FIX: Same as SignBlock — distributed TSS
-	// now transmits only masked contributions and is safe to enable.
-	// R7 P0-3 FIX (TSS-): Use no-fallback path to preserve threshold.
+	// Same permanent hard-disable as SignBlock: distributedTSSEnabled() is
+	// false unconditionally, so votes always use the local share path.
+	// R7 P0-3 (TSS-R2-B-2): the no-fallback path preserves the threshold.
 	if a.node != nil && a.node.distributedSigner != nil && distributedTSSEnabled() {
 		return a.node.distributeTSSSignNoFallback(message, participants)
 	}
@@ -1432,11 +1391,7 @@ func (a *tssSignerAdapter) allParticipantIDs() []int {
 	if a.tss == nil {
 		return nil
 	}
-	ids := make([]int, 0, a.tss.TotalShares())
-	for i := 1; i <= a.tss.TotalShares(); i++ {
-		ids = append(ids, i)
-	}
-	return ids
+	return a.tss.ParticipantIDs()
 }
 
 func (a *tssSignerAdapter) VerifyBlock(pubKey []byte, message []byte, signature []byte) bool {
@@ -1469,48 +1424,69 @@ func (a *tssSignerAdapter) GroupPublicKey() []byte {
 	return a.tss.GroupPublicKey()
 }
 
+// IsThresholdMode reports whether this signer can produce threshold seals.
+// In local mode the manager must hold at least threshold shares itself. In
+// distributed P2P mode every validator holds exactly ONE share by design, so
+// HasThreshold is always false there; what makes signing possible is a group
+// key plus the local share, with the remaining partial signatures collected
+// over the network. QTD-H01 (qtd_finality.setQTDSignerLocked) rejects
+// signers that report false here, so the distributed case must be answered
+// truthfully or the executive chamber can never seal (2026-09 six-node run:
+// "qtdSigner not configured" on every seal while five holders were online).
 func (a *tssSignerAdapter) IsThresholdMode() bool {
 	if a.tss == nil {
 		return false
 	}
-	return a.tss.HasThreshold()
+	if a.tss.HasThreshold() {
+		return true
+	}
+	distributed := a.node != nil && a.node.distributedSigner != nil
+	return distributed && a.tss.HasGroupPublicKey() && a.tss.ShareCount() > 0
+}
+
+// Threshold returns the t of the DKG group's t-of-n shape, mirroring the
+// consensus.ThresholdKeySigner contract: 0 means "no threshold shape
+// tracked" and callers fall back to the chamber quorum. Returns 0 when the
+// TSS manager is absent so QTD finality keeps the chamber-based quorum.
+func (a *tssSignerAdapter) Threshold() int {
+	if a.tss == nil {
+		return 0
+	}
+	return a.tss.Threshold()
 }
 
 // AggregatePartialSignatures combines collected partial signatures from
 // multiple validators into a single threshold signature.
 //
-// P0-1 FIX (2026-07-13): The previous implementation ignored the partialSigs
+// P0-1 (2026-07-13): The previous implementation ignored the partialSigs
 // parameter entirely and used SignWithRetry to produce ALL partial signatures
 // locally. This allowed any single node holding >= threshold key shares to
 // forge a "threshold" signature, defeating the t-of-n security guarantee.
 //
-// New behavior:
-//   - Distributed mode (TSSDistributedMode=true): uses distributeTSSSignNoFallback
-//     which enforces strict P2P multi-party signing. Failure does NOT fall back
-//     to local SignWithRetry — the seal remains pending for retry.
+// Behavior:
+//   - Distributed mode (TSSDistributedMode=true): fail-closed. The distributed
+//     aggregation path is permanently disabled, so a node configured this way
+//     cannot seal rather than silently degrade.
 //   - Local mode + external partialSigs: fail-closed (cannot safely aggregate
 //     external partial signatures without a distributed signer to verify provenance).
 //   - Local mode + no external partialSigs: SignWithRetry for test/development
 //     only. Logs a warning that this is not production-safe.
 //
-// AggregatePartialSignatures combines collected partial signatures from
-// distributed P2P signers into the final threshold signature.
+// SECURITY (audit R3 TSS-B-1): the distributed signing path hands the
+// aggregator (= block proposer) material from which it recovers s1, so any
+// single validator who becomes proposer ends up holding the group signing
+// secret. This is the SAME vulnerability as SignBlock/SignVote (R2-CRIT-01).
 //
-// SECURITY (audit R3 TSS- B-1): The distributed signing path transmits
-// raw S2/T0 secret-key shares to the aggregator (= block proposer), allowing
-// any single validator who becomes proposer to reconstruct the full group
-// signing key. This is the SAME vulnerability as SignBlock/SignVote (R2-CRIT-01).
+// R2-CRIT-01 added an env kill-switch (QAU_ENABLE_DISTRIBUTED_TSS) to
+// SignBlock/SignVote but MISSED this sealing path: AggregatePartialSignatures
+// only checked `distributedSigner != nil`, so TSSDistributedMode=true alone
+// routed sealing through the leaking protocol.
 //
-// The previous fix (R2-CRIT-01) added an env kill-switch (QAU_ENABLE_DISTRIBUTED_TSS)
-// to SignBlock/SignVote, but MISSED this sealing path — AggregatePartialSignatures
-// only checked `distributedSigner != nil`, not `distributedTSSEnabled()`. This
-// meant that setting TSSDistributedMode=true alone (without the env var) would
-// route sealing through the share-leaking protocol.
-//
-// Now this path is also gated by distributedTSSEnabled(). Until the protocol
-// is redesigned to never transmit raw shares, distributed sealing is disabled
-// by default. Production MUST NOT enable QAU_ENABLE_DISTRIBUTED_TSS until the
-// TSS- protocol redesign is complete.
+// Both gates are now gone. distributedTSSEnabled() returns false
+// unconditionally (see its comment), so distributed sealing is impossible in
+// every build and on every network — there is no switch to set, in either
+// direction. Node configs that still request distributed mode fail closed here
+// until the protocol redesign removes the s1 leak.
 func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs map[int][]byte, message []byte) ([]byte, error) {
 	if a.tss == nil {
 		return nil, fmt.Errorf("tss: TSSManager is nil")
@@ -1519,19 +1495,19 @@ func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs
 		return nil, fmt.Errorf("insufficient sealers for threshold: have %d, need %d", len(sealers), a.tss.Threshold())
 	}
 
-	// SECURITY (audit R3 TSS- B-1): Distributed sealing path MUST be
-	// gated by the same env kill-switch as SignBlock/SignVote. Without this
-	// check, TSSDistributedMode=true alone routes sealing through the
-	// share-leaking protocol, bypassing the R2-CRIT-01 mitigation.
-	if a.node != nil && a.node.distributedSigner != nil && distributedTSSEnabled() {
-		sig, err := a.node.distributeTSSSignNoFallback(message, sealers)
-		if err != nil {
-			// Do NOT fall back to local SignWithRetry. The seal remains
-			// pending so participants can re-submit. This preserves the
-			// t-of-n threshold security guarantee.
-			return nil, fmt.Errorf("strict distributed TSS signing failed (no fallback): %w", err)
-		}
-		return sig, nil
+	// Distributed sealing is permanently disabled (TSS-R3-B-1). Report it
+	// explicitly so an operator who configured TSSDistributedMode=true gets the
+	// real reason instead of a generic aggregation failure.
+	//
+	// The former distributeTSSSignNoFallback call is gone from this path: it
+	// could only ever run behind the removed env gate, and restoring it without
+	// the protocol redesign would re-introduce the s1 leak.
+	if a.node != nil && a.node.distributedSigner != nil {
+		return nil, fmt.Errorf("distributed TSS sealing is permanently disabled (TSS-R3-B-1): " +
+			"the QTD aggregator, which is the block proposer, recovers s1 from the aggregated Z0Share " +
+			"contributions, so distributed threshold sealing would hand it the group signing secret. " +
+			"No runtime switch enables this path. Use tssDistributedMode=false with imported shares, " +
+			"or a single-signer configuration")
 	}
 
 	// Local mode (no distributed signer): cannot safely aggregate external
@@ -1539,15 +1515,28 @@ func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs
 	// but without a distributed signer we cannot verify their provenance or
 	// aggregate them via the QTD protocol.
 	if len(partialSigs) > 0 {
-		return nil, fmt.Errorf("cannot aggregate %d external partial signatures in local TSS mode: enable TSSDistributedMode=true for threshold signing", len(partialSigs))
+		return nil, fmt.Errorf("cannot aggregate %d external partial signatures without a distributed signer: distributed TSS is permanently disabled (TSS-R3-B-1)", len(partialSigs))
 	}
 
 	// Local mode with no external partialSigs: test/development only.
 	// SignWithRetry uses locally stored qtdShares to produce all partial
 	// signatures — this is NOT threshold security and must not be used
-	// in production. In production, TSSDistributedMode must be enabled.
+	// in production. Distributed mode is not an alternative: it is
+	// permanently disabled (TSS-R3-B-1), so no configuration provides
+	// P2P threshold sealing today.
+	//
+	// FIX (off-by-one): `sealers` are 0-based validator indices, but
+	// SignWithRetry takes 1-based ParticipantIDs (wallet/tss/qtd stores
+	// shares with pid = i + 1).
 	nodeLog.Warn("AggregatePartialSignatures: using local SignWithRetry (test/development mode only, not for production)")
-	return a.tss.SignWithRetry(message, sealers)
+	participantIDs := make([]int, len(sealers))
+	for i, sealer := range sealers {
+		if sealer < 0 {
+			return nil, fmt.Errorf("invalid sealer validator index %d", sealer)
+		}
+		participantIDs[i] = sealer + 1
+	}
+	return a.tss.SignWithRetry(message, participantIDs)
 }
 
 // snapshotManagerAdapter adapts Node to rpc.SnapshotManager
@@ -1601,32 +1590,40 @@ func (a *snapshotManagerAdapter) RestoreSnapshot(blockHeight uint64) (map[string
 	return result, nil
 }
 
-// consensusStakeUpdaterAdapter bridges RPC staking operations to the consensus
-// ValidatorManager AND the QPOS ValidatorSet cache. When qau_stake updates the
-// economics StakingManager, this adapter propagates the change to both:
-//  1. ValidatorManager (for persistence and ValidatorInfo)
-//  2. QPOS.validators (for proposer selection and finality voting)
+// errConsensusStakeMutationNotBlockDerived refuses every attempt to mutate the
+// consensus validator set from outside block processing.
 //
-// Without updating QPOS.validators, QPOS still sees stake=0 and participation
-// rate stays low, preventing finality.
+// INVARIANT (Dilithium3 v1 CNF-RSS design, "Finalized-Epoch Validator Snapshot",
+// option 2): every validator-set mutation must be block-derived, because the
+// finalized-epoch roster snapshot is captured from that set at epoch
+// boundaries and is only deterministic when the set is a pure function of the
+// applied blocks. Proposer election and finality already read that set, so an
+// off-block mutation also makes nodes elect different proposers for the same
+// slot.
+var errConsensusStakeMutationNotBlockDerived = errors.New(
+	"consensus validator set mutations must be block-derived; the RPC stake updater is disabled")
+
+// consensusStakeUpdaterAdapter bridges RPC staking operations to the consensus
+// ValidatorManager AND the QPOS ValidatorSet cache.
+//
+// It is a refusing stub on purpose. The original implementation applied an RPC
+// stake update straight to ValidatorManager and QPOS (adding the address to the
+// QPOS set when it was unknown). That is off-block state: the mutation carries
+// no block or epoch tag, so two nodes that processed the same blocks could hold
+// different validator sets, and the epoch-boundary roster snapshot would then
+// differ between them without any error. Stake changes reach consensus through
+// the block-driven path instead (node.syncStakingFromBlock ->
+// ValidatorManager/QPOS, driven by TxTypeStake / TxTypeUnstake).
 type consensusStakeUpdaterAdapter struct {
 	vm   *consensus.ValidatorManager
 	qpos *consensus.QPOS
 }
 
+// UpdateValidatorStake fails closed. It deliberately does not touch the
+// ValidatorManager or the QPOS validator set; callers must route validator-set
+// changes through block processing.
 func (a *consensusStakeUpdaterAdapter) UpdateValidatorStake(addr types.Address, stake *big.Int, commission uint32, blockHeight uint64) error {
-	if a.vm != nil && a.vm.IsValidator(addr) {
-		if err := a.vm.UpdateStake(addr, addr, stake); err != nil {
-			return err
-		}
-	}
-	// Update QPOS ValidatorSet cache so proposer selection sees the new stake.
-	// AddStakingValidator handles both new and existing validators (updates stake
-	// if already present, adds if new).
-	if a.qpos != nil {
-		a.qpos.AddStakingValidator(addr, stake)
-	}
-	return nil
+	return fmt.Errorf("%w (addr=%s height=%d)", errConsensusStakeMutationNotBlockDerived, addr.String(), blockHeight)
 }
 
 func (a *consensusStakeUpdaterAdapter) IsKnownValidator(addr types.Address) bool {

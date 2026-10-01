@@ -1,0 +1,589 @@
+openapi: 3.1.0
+info:
+  title: Quantaureum Blockchain API
+  description: |
+    JSON-RPC 2.0 API for the Quantaureum Native Blockchain (QAU).
+    
+    This API provides access to blockchain data, account information, and transaction submission.
+    All methods follow the JSON-RPC 2.0 specification.
+    
+    ## Authentication
+    Currently, the API does not require authentication. Rate limiting is applied per IP address.
+    
+    ## Base URL
+    - HTTP: `http://localhost:8545`
+    - WebSocket: `ws://localhost:8546`
+    
+    ## Request Format
+    All requests must be POST with Content-Type: application/json
+    
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "method_name",
+      "params": [...],
+      "id": 1
+    }
+    ```
+    
+    ## Response Format
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "result": ...,
+      "id": 1
+    }
+    ```
+    
+    ## Error Response
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "error": {
+        "code": -32600,
+        "message": "Invalid Request",
+        "data": "additional info"
+      },
+      "id": 1
+    }
+    ```
+  version: 1.0.0
+  contact:
+    name: Quantaureum Team
+    url: https://quantaureum.com
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8545
+    description: Local development node (HTTP)
+  - url: ws://localhost:8546
+    description: Local development node (WebSocket)
+
+tags:
+  - name: Chain
+    description: Chain information methods
+  - name: Account
+    description: Account state methods
+  - name: Block
+    description: Block retrieval methods
+  - name: Transaction
+    description: Transaction methods
+  - name: Subscription
+    description: WebSocket subscription methods
+  - name: LightClient
+    description: |
+      Light client API methods optimized for bandwidth-constrained environments.
+      These endpoints provide efficient access to blockchain data with compression
+      and delta encoding support.
+
+paths:
+  /:
+    post:
+      summary: JSON-RPC Endpoint
+      description: All JSON-RPC methods are accessed through this endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonRpcRequest'
+      responses:
+        '200':
+          description: JSON-RPC response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+
+components:
+  schemas:
+    JsonRpcRequest:
+      type: object
+      required:
+        - jsonrpc
+        - method
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+          description: JSON-RPC version
+        method:
+          type: string
+          description: Method name
+        params:
+          type: array
+          description: Method parameters
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+          description: Request identifier
+
+    JsonRpcResponse:
+      type: object
+      required:
+        - jsonrpc
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        result:
+          description: Method result (present on success)
+        error:
+          $ref: '#/components/schemas/JsonRpcError'
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+            - type: "null"
+
+    JsonRpcError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          description: Error code
+        message:
+          type: string
+          description: Error message
+        data:
+          description: Additional error data
+
+    Address:
+      type: string
+      pattern: "^0x[a-fA-F0-9]{40}$"
+      description: 20-byte address in hex format
+      example: "0x742d35Cc6634C0532925a3b844Bc9e7595f8fE00"
+
+    Hash:
+      type: string
+      pattern: "^0x[a-fA-F0-9]{64}$"
+      description: 32-byte hash in hex format
+      example: "0x88df016429689c079f3b2f6ad39fa052532c56795b733da78a91ebe6a713944b"
+
+    HexQuantity:
+      type: string
+      pattern: "^0x[a-fA-F0-9]+$"
+      description: Hex-encoded quantity
+      example: "0x1a4"
+
+    HexData:
+      type: string
+      pattern: "^0x[a-fA-F0-9]*$"
+      description: Hex-encoded data
+      example: "0x68656c6c6f"
+
+    Block:
+      type: object
+      properties:
+        version:
+          type: integer
+          description: Protocol version
+        height:
+          $ref: '#/components/schemas/HexQuantity'
+        timestamp:
+          $ref: '#/components/schemas/HexQuantity'
+        parentHash:
+          $ref: '#/components/schemas/Hash'
+        stateRoot:
+          $ref: '#/components/schemas/Hash'
+        txRoot:
+          $ref: '#/components/schemas/Hash'
+        receiptRoot:
+          $ref: '#/components/schemas/Hash'
+        proposerAddr:
+          $ref: '#/components/schemas/Address'
+        vrfProof:
+          $ref: '#/components/schemas/HexData'
+        vrfValue:
+          $ref: '#/components/schemas/Hash'
+        signature:
+          $ref: '#/components/schemas/HexData'
+        transactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+
+    Transaction:
+      type: object
+      properties:
+        version:
+          type: integer
+          description: Transaction version
+        type:
+          type: integer
+          description: |
+            Transaction type:
+            - 0: Transfer
+            - 1: Contract call
+            - 2: Contract creation
+            - 3: Stake
+            - 4: Unstake
+        nonce:
+          $ref: '#/components/schemas/HexQuantity'
+        from:
+          $ref: '#/components/schemas/Address'
+        to:
+          $ref: '#/components/schemas/Address'
+        value:
+          $ref: '#/components/schemas/HexQuantity'
+        gasLimit:
+          $ref: '#/components/schemas/HexQuantity'
+        gasPrice:
+          $ref: '#/components/schemas/HexQuantity'
+        data:
+          $ref: '#/components/schemas/HexData'
+        hash:
+          $ref: '#/components/schemas/Hash'
+
+    Receipt:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/HexQuantity'
+          description: "1 for success, 0 for failure"
+        gasUsed:
+          $ref: '#/components/schemas/HexQuantity'
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Log'
+        txHash:
+          $ref: '#/components/schemas/Hash'
+        blockHash:
+          $ref: '#/components/schemas/Hash'
+        blockHeight:
+          $ref: '#/components/schemas/HexQuantity'
+        txIndex:
+          $ref: '#/components/schemas/HexQuantity'
+
+    Log:
+      type: object
+      properties:
+        address:
+          $ref: '#/components/schemas/Address'
+        topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/Hash'
+        data:
+          $ref: '#/components/schemas/HexData'
+
+    BlockTag:
+      oneOf:
+        - $ref: '#/components/schemas/HexQuantity'
+        - type: string
+          enum: ["latest", "earliest", "pending"]
+      description: Block number or tag
+
+    # Light Client Types
+    LightClientSyncStatus:
+      type: object
+      properties:
+        syncing:
+          type: boolean
+          description: Whether the light client is currently syncing
+        latestHeight:
+          $ref: '#/components/schemas/HexQuantity'
+        checkpointCount:
+          type: integer
+          description: Number of trusted checkpoints
+
+    BandwidthStats:
+      type: object
+      properties:
+        bytesSent:
+          type: integer
+          description: Total bytes sent
+        bytesReceived:
+          type: integer
+          description: Total bytes received
+        compressedSent:
+          type: integer
+          description: Total compressed bytes sent
+        requestCount:
+          type: integer
+          description: Total number of requests
+        compressionRatio:
+          type: number
+          description: Compression ratio (compressed/uncompressed)
+        lastUpdated:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    CompressedHeadersResponse:
+      type: object
+      properties:
+        headers:
+          type: string
+          description: Hex-encoded gzip compressed headers
+        count:
+          type: integer
+          description: Number of headers
+        uncompressedSize:
+          type: integer
+          description: Size before compression
+        compressedSize:
+          type: integer
+          description: Size after compression
+
+    DeltaHeadersResponse:
+      type: object
+      properties:
+        baseHeader:
+          $ref: '#/components/schemas/BlockHeader'
+        deltas:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeltaHeader'
+
+    DeltaHeader:
+      type: object
+      properties:
+        height:
+          $ref: '#/components/schemas/HexQuantity'
+        timestampDelta:
+          type: integer
+          description: Timestamp difference from previous header
+        stateRoot:
+          $ref: '#/components/schemas/Hash'
+        txRoot:
+          $ref: '#/components/schemas/Hash'
+        receiptRoot:
+          $ref: '#/components/schemas/Hash'
+        proposer:
+          $ref: '#/components/schemas/Address'
+          description: Only included if different from previous
+
+    BlockHeader:
+      type: object
+      properties:
+        height:
+          $ref: '#/components/schemas/HexQuantity'
+        hash:
+          $ref: '#/components/schemas/Hash'
+        parentHash:
+          $ref: '#/components/schemas/Hash'
+        stateRoot:
+          $ref: '#/components/schemas/Hash'
+        txRoot:
+          $ref: '#/components/schemas/Hash'
+        receiptRoot:
+          $ref: '#/components/schemas/Hash'
+        timestamp:
+          type: integer
+        proposer:
+          $ref: '#/components/schemas/Address'
+
+    TxStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: ["pending", "confirmed", "failed", "unknown"]
+        blockHeight:
+          type: integer
+        blockHash:
+          $ref: '#/components/schemas/Hash'
+        txIndex:
+          type: integer
+        gasUsed:
+          type: integer
+        error:
+          type: string
+
+    CompactProofResponse:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: ["tx", "state"]
+        proof:
+          type: string
+          description: Hex-encoded compact proof
+        size:
+          type: integer
+          description: Proof size in bytes
+
+  examples:
+    GetBalanceRequest:
+      summary: Get account balance
+      value:
+        jsonrpc: "2.0"
+        method: "eth_getBalance"
+        params: ["0x742d35Cc6634C0532925a3b844Bc9e7595f8fE00", "latest"]
+        id: 1
+
+    GetBalanceResponse:
+      summary: Balance response
+      value:
+        jsonrpc: "2.0"
+        result: "0x1bc16d674ec80000"
+        id: 1
+
+    # Light Client Examples
+    LightClientGetCompressedHeaders:
+      summary: Get compressed block headers
+      value:
+        jsonrpc: "2.0"
+        method: "qau_light_getCompressedHeaders"
+        params:
+          startHeight: "0x0000000000000000"
+          count: 100
+        id: 1
+
+    LightClientSubmitTransaction:
+      summary: Submit transaction via light client
+      value:
+        jsonrpc: "2.0"
+        method: "qau_light_submitTransaction"
+        params:
+          rawTx: "0x..."
+        id: 1
+
+    LightClientBatchRequest:
+      summary: Batch multiple light client requests
+      value:
+        jsonrpc: "2.0"
+        method: "qau_light_batchRequest"
+        params:
+          requests:
+            - method: "getLatestHeader"
+              params: null
+              id: 1
+            - method: "getSyncStatus"
+              params: null
+              id: 2
+        id: 1
+
+# Light Client API Methods Documentation
+x-light-client-methods:
+  qau_light_getBlockHeader:
+    description: Get a block header by height or hash
+    params:
+      - name: blockId
+        type: string
+        description: Block height (hex) or block hash
+    returns: BlockHeader object
+
+  qau_light_getBlockHeaders:
+    description: Get a range of block headers
+    params:
+      - name: startHeight
+        type: string
+        description: Starting block height (hex)
+      - name: count
+        type: number
+        description: Number of headers to retrieve (max 1000)
+    returns: Array of BlockHeader objects
+
+  qau_light_getCompressedHeaders:
+    description: Get gzip-compressed block headers for bandwidth optimization
+    params:
+      - name: startHeight
+        type: string
+        description: Starting block height (hex)
+      - name: count
+        type: number
+        description: Number of headers (max 1000)
+    returns: CompressedHeadersResponse
+
+  qau_light_getDeltaHeaders:
+    description: Get delta-encoded headers (only changed fields)
+    params:
+      - name: startHeight
+        type: string
+        description: Starting block height (hex)
+      - name: count
+        type: number
+        description: Number of headers (max 1000)
+    returns: DeltaHeadersResponse
+
+  qau_light_getLatestHeader:
+    description: Get the latest block header
+    returns: BlockHeader object
+
+  qau_light_getCheckpoints:
+    description: Get all trusted checkpoints
+    returns: Array of Checkpoint objects
+
+  qau_light_getSyncStatus:
+    description: Get light client sync status
+    returns: LightClientSyncStatus
+
+  qau_light_submitTransaction:
+    description: Submit a signed transaction
+    params:
+      - name: rawTx
+        type: string
+        description: Hex-encoded signed transaction
+    returns: Object with txHash
+
+  qau_light_getBalance:
+    description: Get account balance (simplified endpoint)
+    params:
+      - name: address
+        type: string
+        description: Account address
+    returns: Object with address, balance, and nonce
+
+  qau_light_getTxStatus:
+    description: Get transaction status
+    params:
+      - name: txHash
+        type: string
+        description: Transaction hash
+    returns: TxStatus object
+
+  qau_light_getBandwidthStats:
+    description: Get bandwidth usage statistics
+    returns: BandwidthStats object
+
+  qau_light_getTxProof:
+    description: Get SPV proof for transaction inclusion
+    params:
+      - name: txHash
+        type: string
+        description: Transaction hash
+    returns: TxProofResponse
+
+  qau_light_getStateProof:
+    description: Get state proof for an account
+    params:
+      - name: address
+        type: string
+        description: Account address
+      - name: storageKeys
+        type: array
+        description: Optional storage keys to include
+    returns: StateProofResponse
+
+  qau_light_getCompactProof:
+    description: Get bandwidth-optimized compact proof
+    params:
+      - name: type
+        type: string
+        description: Proof type ("tx" or "state")
+      - name: target
+        type: string
+        description: Transaction hash or address
+      - name: keys
+        type: array
+        description: Storage keys (for state proofs)
+    returns: CompactProofResponse
+
+  qau_light_batchRequest:
+    description: Execute multiple light client requests in a single call
+    params:
+      - name: requests
+        type: array
+        description: Array of request objects with method, params, and id
+    returns: Array of response objects

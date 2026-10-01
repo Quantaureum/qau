@@ -101,7 +101,7 @@ func TestGOV_R6_01_NoRunnerFailClosed(t *testing.T) {
 func TestGOV_R6_01_RunnerActivatesExecutive(t *testing.T) {
 	_, coordinator, _ := setupStardustEnv(t, 10)
 	executive := coordinator.GetExecutiveChamber()
-	_ = executive.SetMembers([]int{0, 1, 2}, 0)
+	_ = executive.SetMembers([]int{0, 1, 2}, 42)
 
 	// Inject a runner that returns a non-empty key.
 	expectedKey := make([]byte, minGroupPublicKeyLen)

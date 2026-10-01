@@ -5,6 +5,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
+	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -44,8 +47,16 @@ const (
 	// MaxVoteMessageSize is the maximum size for vote messages (64 KB)
 	MaxVoteMessageSize = 64 * 1024
 
-	// MaxStatusMessageSize is the maximum size for status messages (1 KB)
-	MaxStatusMessageSize = 1 * 1024
+	// MaxStatusMessageSize is the maximum size for status messages.
+	// TSS-R7-09 (2026-09): raised from 1 KB to 16 KB. A SIGNED status carries
+	// the validator's Dilithium3 public key (1952 B) + signature (3293 B) on top
+	// of the 104-byte base + length framing + optional V2/V3 extension, totaling
+	// ~5.4 KB. The old 1 KB cap silently rejected every signed status in
+	// readLoop's ValidateMessage BEFORE it reached handleBaseProtocol, so the
+	// validator↔PeerID mapping never populated and TSS/DKG sender validation
+	// rejected all messages. 16 KB leaves headroom for the ML-DSA-65 sizes and
+	// future extension fields while still bounding status DoS.
+	MaxStatusMessageSize = 16 * 1024
 
 	// MaxPingPongMessageSize is the maximum size for ping/pong messages (256 bytes)
 	MaxPingPongMessageSize = 256
@@ -362,6 +373,7 @@ func NewMessageValidator() *MessageValidator {
 	// Max size covers slot(8) + hash(32) + sigLen(4) + Dilithium3 sig(3293)
 	// + sealerCount(4) + sealers(4*N, N bounded by executive chamber size ~11).
 	v.RegisterValidator(MsgTypeQTDSealAnnouncement, &QTDSealAnnouncementValidator{})
+	v.RegisterValidator(MsgTypeQTDSealRequest, &QTDSealRequestValidator{})
 	v.RegisterValidator(MsgTypeChallenge, &ChallengeValidator{})
 	v.RegisterValidator(MsgTypeChallengeResponse, &ChallengeResponseValidator{})
 	v.RegisterValidator(MsgTypeBatch, &BatchMessageValidator{})
@@ -380,6 +392,47 @@ func NewMessageValidator() *MessageValidator {
 	// other than the commit-submitter to reject the originating tx
 	// with "requires commitment for front-running protection".
 	v.RegisterValidator(MsgTypeCommit, &CommitMessageValidator{})
+
+	// TSS-R7-09 (2026-09): register validators for the TSS/DKG protocol message
+	// types (70-78). Without these, ValidateRawMessage rejects every inbound TSS
+	// frame with "invalid message type: NN" in readLoop BEFORE it reaches the
+	// protocol handler — which is why distributed DKG saw "have 0 commitments"
+	// (every Round1 commitment broadcast was dropped at validation). The DKG
+	// commitment set (Feldman/Pedersen VSS over all Shamir coefficients) is the
+	// largest TSS payload (~700 KB for 4-of-6 ML-DSA-65); BatchMessageValidator's
+	// 2 MB cap + 4-byte floor bounds it while allowing the real sizes.
+	v.RegisterValidator(MsgTypeTSSSessionInit, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSRound1Commit, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSRound2Reveal, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSRound2Private, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSSignature, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSDKGShare, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSKeyExchange, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSDKGCommitment, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSDKGAck, &BatchMessageValidator{})
+	v.RegisterValidator(MsgTypeTSSDKGReshare, &BatchMessageValidator{})
+	for _, messageType := range []uint8{
+		MsgTypeTDilithium3DKGRandomness,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement,
+		MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution,
+		MsgTypeTDilithium3DKGActivation,
+	} {
+		v.RegisterValidator(messageType, &tdilithium3DKGMessageValidator{messageType: messageType})
+	}
+	for _, messageType := range []uint8{
+		MsgTypeTDilithium3SigningCommit,
+		MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance,
+		MsgTypeTDilithium3SigningResponse,
+	} {
+		v.RegisterValidator(messageType, &tdilithium3SigningMessageValidator{messageType: messageType})
+	}
+	// Activation certificate is a serialized JSON blob (magic "QTD3ACT1"),
+	// NOT a threshold envelope, so it uses a plain size-bounded validator.
+	v.RegisterValidator(MsgTypeTDilithium3DKGActivationCertificate, &BatchMessageValidator{})
 
 	// L16-009 FIX: Start cleanup goroutine by default to prevent unbounded
 	// growth of seenMessages map. Uses context.Background() so the goroutine
@@ -562,7 +615,28 @@ func (v *MessageValidator) ValidateMessage(msg *Message) error {
 	//   - Timestamp-based replay protection (lastMessages map)
 	//   - Format validation (each type's Validate method)
 	// so content-hash dedup is redundant for them.
-	if !isControlMessageType(msg.Type) {
+	// R42-DKG-RETRANSMIT FIX (2026-09-26): the Dilithium3 v1 DKG phase drivers
+	// re-send the SAME signed envelope every second until the phase completes
+	// (see node/tdilithium3_dkg_randomness_network.go and
+	// node/tdilithium3_dkg_group_network.go). Content-hash dedup flagged those
+	// retransmissions as replays and swallowed them, so a group seed or
+	// contribution lost to a full inbound queue could only be recovered after
+	// the 30-second TTL expired instead of on the next retry. DKG types are
+	// exempt for the same reason the control types above are:
+	//   - every envelope is bound to the DKG session digest and signed by its
+	//     sender, so a message from another session cannot pass validation;
+	//   - the inbound queue already dedups on (type, sender, sequence, group,
+	//     attempt) and rejects a conflicting payload for the same tuple, so an
+	//     identical retransmission is idempotent rather than a replay vector;
+	//   - per-peer per-type rate limiting still applies.
+	// The Dilithium3 v1 signing executor kinds are exempt for the same reason
+	// the DKG kinds are: its gate dedups on (sender, slot, kind) and treats an
+	// identical retransmission as an idempotent duplicate, so a content-hash
+	// dedup window would only delay recovery of a lost round message while the
+	// signatures of the envelope still bind every message to its session.
+	if !isControlMessageType(msg.Type) && !isTDilithium3DKGMessageType(msg.Type) &&
+		!isTDilithium3SigningMessageType(msg.Type) &&
+		msg.Type != MsgTypeTDilithium3DKGActivationCertificate {
 		msgHash := fmt.Sprintf("%x-%d", sha3.Sum256(msg.Payload), msg.Type)
 		if v.IsDuplicate(msgHash) {
 			return ErrDuplicateMessage
@@ -959,6 +1033,17 @@ func (v *CheckpointReqValidator) Validate(payload []byte) error {
 // MaxSize = 8 + 32 + 4 + 4096 (sig headroom) + 4 + 4*64 (sealers headroom) ~= 8.4KB.
 type QTDSealAnnouncementValidator struct{}
 
+type QTDSealRequestValidator struct{}
+
+func (v *QTDSealRequestValidator) MinSize() uint64 { return 40 }
+func (v *QTDSealRequestValidator) MaxSize() uint64 { return 40 }
+func (v *QTDSealRequestValidator) Validate(payload []byte) error {
+	if len(payload) != 40 {
+		return fmt.Errorf("%w: QTD seal request requires exactly 40 bytes", ErrInvalidMessageFormat)
+	}
+	return nil
+}
+
 func (v *QTDSealAnnouncementValidator) MaxSize() uint64 { return 8 * 1024 } // 8KB max
 func (v *QTDSealAnnouncementValidator) MinSize() uint64 { return 49 }       // slot + hash + sigLen + 1 sig + sealerCount
 
@@ -1100,6 +1185,43 @@ func isControlMessageType(msgType uint8) bool {
 	}
 }
 
+// isTDilithium3DKGMessageType reports whether msgType belongs to the Dilithium3
+// v1 DKG envelope family. These messages are exempt from content-hash dedup
+// because the DKG phase drivers deliberately retransmit the identical signed
+// envelope until the phase completes; see the R42-DKG-RETRANSMIT note in
+// ValidateMessage.
+func isTDilithium3DKGMessageType(msgType uint8) bool {
+	switch msgType {
+	case MsgTypeTDilithium3DKGRandomness,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement,
+		MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution,
+		MsgTypeTDilithium3DKGActivation:
+		return true
+	default:
+		return false
+	}
+}
+
+// isTDilithium3SigningMessageType reports whether msgType belongs to the
+// Dilithium3 v1 signing executor family. These messages are exempt from
+// content-hash dedup because the executor gate already treats an identical
+// retransmission of a (sender, slot, kind) message as an idempotent duplicate;
+// see the R42-DKG-RETRANSMIT note in ValidateMessage.
+func isTDilithium3SigningMessageType(msgType uint8) bool {
+	switch msgType {
+	case MsgTypeTDilithium3SigningCommit,
+		MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance,
+		MsgTypeTDilithium3SigningResponse:
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidateMessageType checks if a message type is valid
 func ValidateMessageType(msgType uint8) bool {
 	switch msgType {
@@ -1132,7 +1254,21 @@ func ValidateMessageType(msgType uint8) bool {
 		MsgTypeTSSRound2Reveal, MsgTypeTSSRound2Private,
 		MsgTypeTSSSignature, MsgTypeTSSDKGShare, MsgTypeTSSKeyExchange,
 		// Task 5 (node-layer distributed DKG) round messages
-		MsgTypeTSSDKGCommitment, MsgTypeTSSDKGAck,
+		MsgTypeTSSDKGCommitment, MsgTypeTSSDKGAck, MsgTypeTSSDKGReshare,
+		MsgTypeTDilithium3DKGRandomness,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement,
+		MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution,
+		MsgTypeTDilithium3DKGActivation,
+		// Dilithium3 v1 signing executor round messages (97-100)
+		MsgTypeTDilithium3SigningCommit,
+		MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance,
+		MsgTypeTDilithium3SigningResponse,
+		// Dilithium3 v1 activation certificate broadcast (101)
+		MsgTypeTDilithium3DKGActivationCertificate,
 		// QTD consensus message types
 		MsgTypeQTDSealRequest, MsgTypeQTDPartialSeal,
 		// HIGH-01 (R18, 2026-07-23): completed QTD seal announcement
@@ -1153,6 +1289,138 @@ func ValidateMessageType(msgType uint8) bool {
 	default:
 		return false
 	}
+}
+
+type tdilithium3DKGMessageValidator struct {
+	messageType uint8
+}
+
+func (validator *tdilithium3DKGMessageValidator) MaxSize() uint64 {
+	return uint64(protocol.MaxThresholdEnvelopePayload + protocol.MaxThresholdIdentitySignature + 128)
+}
+
+func (validator *tdilithium3DKGMessageValidator) MinSize() uint64 { return 96 }
+
+func (validator *tdilithium3DKGMessageValidator) Validate(payload []byte) error {
+	return ValidateTDilithium3DKGEnvelope(validator.messageType, payload)
+}
+
+// ValidateTDilithium3DKGEnvelope bounds and decodes one Dilithium3 v1 DKG message.
+func ValidateTDilithium3DKGEnvelope(messageType uint8, encoded []byte) error {
+	if len(encoded) == 0 || len(encoded) > protocol.MaxThresholdEnvelopePayload+protocol.MaxThresholdIdentitySignature+128 {
+		return ErrInvalidMessageFormat
+	}
+	envelope, err := protocol.DecodeEnvelope(encoded)
+	if err != nil {
+		return fmt.Errorf("%w: threshold envelope: %v", ErrInvalidMessageFormat, err)
+	}
+	if envelope.Protocol != protocol.ThresholdProtocolDilithium3V1 || envelope.Algorithm != protocol.Dilithium3V1Profile().Algorithm || envelope.MessageType != uint16(messageType) {
+		return fmt.Errorf("%w: Dilithium3 v1 envelope context", ErrInvalidMessageFormat)
+	}
+	if len(envelope.IdentitySignature) != protocol.Dilithium3V1Profile().Algorithm.SignatureSize() {
+		return fmt.Errorf("%w: Dilithium3 v1 identity signature size", ErrInvalidMessageFormat)
+	}
+	switch messageType {
+	case MsgTypeTDilithium3DKGRandomness, MsgTypeTDilithium3DKGRandomnessCommitment:
+		if envelope.Sequence != 1 || len(envelope.Payload) != 32 || allZeroTDilithium3DKGBytes(envelope.Payload) {
+			return fmt.Errorf("%w: randomness payload", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3DKGGroupSeed:
+		message, err := dilithium3v1.UnmarshalGroupSeedMessage(envelope.Payload)
+		if err != nil || message.SessionDigest != envelope.SessionID {
+			return fmt.Errorf("%w: group seed", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3DKGAcknowledgement:
+		acknowledgement, err := dilithium3v1.UnmarshalContributionAcknowledgement(envelope.Payload)
+		if err != nil || acknowledgement.SessionDigest != envelope.SessionID {
+			return fmt.Errorf("%w: group acknowledgement", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3DKGComplaint:
+		complaint, err := dilithium3v1.UnmarshalComplaint(envelope.Payload)
+		if err != nil || complaint.SessionDigest != envelope.SessionID {
+			return fmt.Errorf("%w: complaint", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3DKGContribution:
+		contribution, err := dilithium3v1.UnmarshalPublicContribution(envelope.Payload)
+		if err != nil || contribution.SessionDigest != envelope.SessionID {
+			return fmt.Errorf("%w: public contribution", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3DKGActivation:
+		if len(envelope.Payload) != 64 || len(envelope.IdentitySignature) != protocol.Dilithium3V1Profile().Algorithm.SignatureSize() ||
+			bytes.Equal(envelope.Payload[:32], make([]byte, 32)) || bytes.Equal(envelope.Payload[32:], make([]byte, 32)) {
+			return fmt.Errorf("%w: activation acknowledgement", ErrInvalidMessageFormat)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported Dilithium3 v1 DKG message type", ErrInvalidMessageType)
+	}
+	return nil
+}
+
+func allZeroTDilithium3DKGBytes(value []byte) bool {
+	var combined byte
+	for _, item := range value {
+		combined |= item
+	}
+	return combined == 0
+}
+
+type tdilithium3SigningMessageValidator struct {
+	messageType uint8
+}
+
+func (validator *tdilithium3SigningMessageValidator) MaxSize() uint64 {
+	return uint64(protocol.MaxThresholdEnvelopePayload + protocol.MaxThresholdIdentitySignature + 128)
+}
+
+func (validator *tdilithium3SigningMessageValidator) MinSize() uint64 { return 96 }
+
+func (validator *tdilithium3SigningMessageValidator) Validate(payload []byte) error {
+	return ValidateTDilithium3SigningEnvelope(validator.messageType, payload)
+}
+
+// ValidateTDilithium3SigningEnvelope bounds and decodes one Dilithium3 v1
+// signing-executor round message. It pins the envelope context (protocol,
+// algorithm, message type, non-zero session and sequence) and the exact
+// canonical payload of the round, so a wrong magic, a wrong length, or a zero
+// slot never reaches the executor. Sender authorization and the identity
+// signature remain the executor's own concern, exactly as in the DKG family.
+func ValidateTDilithium3SigningEnvelope(messageType uint8, encoded []byte) error {
+	if len(encoded) == 0 || len(encoded) > protocol.MaxThresholdEnvelopePayload+protocol.MaxThresholdIdentitySignature+128 {
+		return ErrInvalidMessageFormat
+	}
+	envelope, err := protocol.DecodeEnvelope(encoded)
+	if err != nil {
+		return fmt.Errorf("%w: threshold envelope: %v", ErrInvalidMessageFormat, err)
+	}
+	if envelope.Protocol != protocol.ThresholdProtocolDilithium3V1 ||
+		envelope.Algorithm != protocol.Dilithium3V1Profile().Algorithm ||
+		envelope.MessageType != uint16(messageType) {
+		return fmt.Errorf("%w: Dilithium3 v1 signing envelope context", ErrInvalidMessageFormat)
+	}
+	if len(envelope.IdentitySignature) != protocol.Dilithium3V1Profile().Algorithm.SignatureSize() {
+		return fmt.Errorf("%w: Dilithium3 v1 signing identity signature size", ErrInvalidMessageFormat)
+	}
+	switch messageType {
+	case MsgTypeTDilithium3SigningCommit:
+		if _, _, err := dilithium3v1.DecodeSigningExecutorCommit(envelope.Payload); err != nil {
+			return fmt.Errorf("%w: signing commit payload: %v", ErrInvalidMessageFormat, err)
+		}
+	case MsgTypeTDilithium3SigningReveal:
+		if _, _, err := dilithium3v1.DecodeSigningExecutorReveal(envelope.Payload); err != nil {
+			return fmt.Errorf("%w: signing reveal payload: %v", ErrInvalidMessageFormat, err)
+		}
+	case MsgTypeTDilithium3SigningAcceptance:
+		if _, _, err := dilithium3v1.DecodeSigningExecutorAcceptance(envelope.Payload); err != nil {
+			return fmt.Errorf("%w: signing acceptance payload: %v", ErrInvalidMessageFormat, err)
+		}
+	case MsgTypeTDilithium3SigningResponse:
+		if _, _, err := dilithium3v1.DecodeSigningExecutorResponse(envelope.Payload); err != nil {
+			return fmt.Errorf("%w: signing response payload: %v", ErrInvalidMessageFormat, err)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported Dilithium3 v1 signing message type", ErrInvalidMessageType)
+	}
+	return nil
 }
 
 // ValidateStatusMessageFormat validates the format of a status message payload

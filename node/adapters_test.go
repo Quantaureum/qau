@@ -2,10 +2,12 @@
 package node
 
 import (
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
 
+	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss"
@@ -256,24 +258,36 @@ func TestAggregatePartialSignatures_LocalModeNoSigsSucceeds(t *testing.T) {
 	}
 }
 
-// TestAggregatePartialSignatures_DistributedModeNotEnabled verifies that
-// even with a distributed signer, without QAU_ENABLE_DISTRIBUTED_TSS=1
-// the distributed path is NOT taken (security kill-switch).
-func TestAggregatePartialSignatures_DistributedModeNotEnabled(t *testing.T) {
+// TestDistributedTSSHasNoEnableSwitch is the regression guard for TSS-R3-B-1.
+// The former two-key env gate (QAU_ENABLE_DISTRIBUTED_TSS +
+// QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS) let a deployment turn the distributed
+// signing path on, and that path hands the aggregator (= block proposer)
+// enough material to recover s1. The switches are removed, so setting both must
+// now have zero effect and a node configured for distributed mode must fail
+// closed with an explicit reason instead of aggregating.
+func TestDistributedTSSHasNoEnableSwitch(t *testing.T) {
+	t.Setenv("QAU_ENABLE_DISTRIBUTED_TSS", "1")
+	t.Setenv("QAU_ALLOW_UNSAFE_DISTRIBUTED_TSS", "1")
+	if distributedTSSEnabled() {
+		t.Fatal("distributed TSS must be permanently disabled regardless of env")
+	}
+
 	mgr, err := tss.NewTSSManager(tss.DefaultTSSConfig())
 	if err != nil {
 		t.Fatalf("NewTSSManager: %v", err)
 	}
-
-	// Create adapter with node but without env var
-	adapter := newTSSSignerAdapterWithNode(mgr, nil) // node=nil but distributedSigner path check
-
-	// Without QAU_ENABLE_DISTRIBUTED_TSS=1, should fall through to local mode
-	// and reject external partialSigs
 	partialSigs := map[int][]byte{1: []byte("sig")}
-	_, err = adapter.AggregatePartialSignatures([]int{1, 2, 3}, partialSigs, []byte("msg"))
-	if err == nil {
-		t.Error("expected fail-closed without QAU_ENABLE_DISTRIBUTED_TSS=1")
+
+	distributed := newTSSSignerAdapterWithNode(mgr, &Node{distributedSigner: tss.NewDistributedSigner(nil)})
+	_, err = distributed.AggregatePartialSignatures([]int{1, 2, 3}, partialSigs, []byte("msg"))
+	if err == nil || !strings.Contains(err.Error(), "permanently disabled") {
+		t.Fatalf("distributed sealing error = %v, want permanent-disable error", err)
+	}
+
+	// Without a distributed signer the same call stays fail-closed as well.
+	local := newTSSSignerAdapterWithNode(mgr, nil)
+	if _, err := local.AggregatePartialSignatures([]int{1, 2, 3}, partialSigs, []byte("msg")); err == nil {
+		t.Fatal("expected fail-closed error for external partial signatures")
 	}
 }
 
@@ -465,5 +479,55 @@ func TestPercentileReward_TwoValues(t *testing.T) {
 	p50 := percentileReward(rewards, 50)
 	if p50.Cmp(big.NewInt(10)) != 0 && p50.Cmp(big.NewInt(20)) != 0 {
 		t.Errorf("expected 10 or 20 for p50 of two values, got %s", p50.String())
+	}
+}
+
+// TestConsensusStakeUpdaterAdapter_RefusesOffBlockValidatorSetMutation locks in
+// the block-derived-mutation invariant that the finalized-epoch roster snapshot
+// depends on (Dilithium3 v1 CNF-RSS design, "Finalized-Epoch Validator
+// Snapshot"): the RPC stake updater must not add, re-weight, or otherwise touch
+// the consensus validator set from outside block processing.
+//
+// Fails before the fix: the old implementation called
+// ValidatorManager.UpdateStake and QPOS.AddStakingValidator, which added the
+// unknown address to the QPOS set and rewrote the known validator's weight.
+func TestConsensusStakeUpdaterAdapter_RefusesOffBlockValidatorSetMutation(t *testing.T) {
+	qpos, err := consensus.NewQPOS(r88BPValidatorSet(t))
+	if err != nil {
+		t.Fatalf("NewQPOS failed: %v", err)
+	}
+	vm := consensus.NewValidatorManager()
+	adapter := &consensusStakeUpdaterAdapter{vm: vm, qpos: qpos}
+
+	known := types.Address{0xAA}
+	unknown := types.Address{0xDD}
+	const originalStake = int64(1_000_000)
+
+	for _, addr := range []types.Address{known, unknown} {
+		if err := adapter.UpdateValidatorStake(addr, big.NewInt(9_999_999), 100, 42); !errors.Is(err, errConsensusStakeMutationNotBlockDerived) {
+			t.Fatalf("UpdateValidatorStake(%x) error = %v, want errConsensusStakeMutationNotBlockDerived", addr[:4], err)
+		}
+	}
+
+	set := qpos.GetValidatorSet()
+	if set == nil {
+		t.Fatal("QPOS validator set is nil")
+	}
+	if added := set.GetValidator(unknown); added != nil {
+		t.Errorf("off-block update ADDED validator %x to the QPOS set (stake=%s) — the set is no longer a function of the applied blocks",
+			unknown[:4], added.Stake.String())
+	}
+	if v := set.GetValidator(known); v == nil {
+		t.Errorf("validator %x disappeared from the QPOS set", known[:4])
+	} else if v.Stake.Cmp(big.NewInt(originalStake)) != 0 {
+		t.Errorf("off-block update re-weighted known validator %x: stake=%s, want %d", known[:4], v.Stake.String(), originalStake)
+	}
+	if vm.IsValidator(known) || vm.IsValidator(unknown) {
+		t.Error("off-block update mutated the ValidatorManager set")
+	}
+
+	// The read-only half of the interface must keep working.
+	if adapter.IsKnownValidator(unknown) {
+		t.Error("IsKnownValidator reported an unknown address as registered")
 	}
 }

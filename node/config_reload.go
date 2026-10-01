@@ -36,7 +36,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/quantaureum/qau/internal/version"
 	"github.com/quantaureum/qau/metrics"
 	"github.com/quantaureum/qau/rpc"
 )
@@ -292,7 +291,7 @@ func (n *Node) reloadMetrics(old, newCfg *Config) {
 	needCollector := n.nodeMetrics == nil
 	if needCollector {
 		n.nodeMetrics = metrics.NewNodeMetrics()
-		n.nodeMetrics.SetVersion(version.Version, version.GitCommit)
+		n.nodeMetrics.SetVersion("1.0.0", "dev")
 	}
 	metricsGlobal := metrics.Global()
 	metricsGlobal.SetLabel("node_name", newCfg.Name)

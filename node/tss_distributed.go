@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -43,10 +44,6 @@ func isAllZeroBytes(b []byte) bool {
 	}
 	return true
 }
-
-// tssCanonicalBindingDomain is the fixed domain-separation prefix for the
-// canonical TSS session init binding hash. R38-P1-03 FIX.
-const tssCanonicalBindingDomain = "QAU-TSS-v1"
 
 // tssDomainTagBlock / tssDomainTagVote distinguish the two legitimate uses
 // of the distributed TSS oracle so that a signature produced for one purpose
@@ -87,24 +84,7 @@ const (
 // makes the encoding unambiguous for auditors and prevents the classic
 // "different arguments, same concatenated bytes" collision.
 func computeTSSCanonicalBinding(chainID, epoch, slot uint64, proposer types.Address, domainTag string, originalMessage []byte) [32]byte {
-	h := sha256.New()
-	binary.Write(h, binary.BigEndian, uint64(len(tssCanonicalBindingDomain)))
-	h.Write([]byte(tssCanonicalBindingDomain))
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, chainID)
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, epoch)
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, slot)
-	binary.Write(h, binary.BigEndian, uint64(len(proposer)))
-	h.Write(proposer[:])
-	binary.Write(h, binary.BigEndian, uint64(len(domainTag)))
-	h.Write([]byte(domainTag))
-	binary.Write(h, binary.BigEndian, uint64(len(originalMessage)))
-	h.Write(originalMessage)
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
+	return consensus.ComputeTSSCanonicalBinding(chainID, epoch, slot, proposer, domainTag, originalMessage)
 }
 
 // tssSessionInitBindingMagic is a 4-byte sentinel that marks the presence of
@@ -294,11 +274,14 @@ func (n *Node) tssProcessingLoop() {
 		}
 	}()
 
-	if n.distributedSigner == nil || n.p2pHost == nil {
+	if (n.distributedSigner == nil && !n.config.TSSDistributedDKG && !n.tdilithium3DKGInboundAllowed() && !experimentalTDilithium3V1Enabled()) || n.p2pHost == nil {
 		return
 	}
 
 	tssCh := n.p2pHost.SubscribeTSS()
+	n.broadcastKyberPublicKey()
+	keyTicker := time.NewTicker(30 * time.Second)
+	defer keyTicker.Stop()
 	cleanupTicker := time.NewTicker(10 * time.Second)
 	defer cleanupTicker.Stop()
 
@@ -306,6 +289,8 @@ func (n *Node) tssProcessingLoop() {
 		select {
 		case <-n.ctx.Done():
 			return
+		case <-keyTicker.C:
+			n.broadcastKyberPublicKey()
 
 		case msg := <-tssCh:
 			// NODE-P2-01 FIX (R31, 2026-07-28): per-message recover so a
@@ -331,7 +316,9 @@ func (n *Node) tssProcessingLoop() {
 						nodeLog.Error("tssProcessingLoop: cleanup panic recovered (continuing): %v", r)
 					}
 				}()
-				n.distributedSigner.CleanExpiredSessions()
+				if n.distributedSigner != nil {
+					n.distributedSigner.CleanExpiredSessions()
+				}
 			}()
 		}
 	}
@@ -345,12 +332,65 @@ func (n *Node) tssProcessingLoop() {
 // DKG) without enabling the legacy distributed-signing path.
 func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 	switch msg.Type {
+	case p2p.MsgTypeTDilithium3DKGRandomness, p2p.MsgTypeTDilithium3DKGRandomnessCommitment, p2p.MsgTypeTDilithium3DKGGroupSeed,
+		p2p.MsgTypeTDilithium3DKGAcknowledgement, p2p.MsgTypeTDilithium3DKGComplaint,
+		p2p.MsgTypeTDilithium3DKGContribution, p2p.MsgTypeTDilithium3DKGActivation:
+		// Activation envelopes bypass the authenticated inbox (it refuses
+		// them by design) and go to the running ceremony's activation
+		// exchange while one is collecting receipts; the assembler verifies
+		// the collected set. Outside an exchange they are dropped.
+		if msg.Type == p2p.MsgTypeTDilithium3DKGActivation && n.deliverTDilithium3DKGActivation(msg.Payload) {
+			return
+		}
+		inbox := n.tdilithium3DKGInboxSnapshot()
+		if !n.tdilithium3DKGInboxAdmissible(inbox) {
+			return
+		}
+		if err := inbox.accept(msg); err != nil {
+			nodeLog.Debug("Dilithium3 DKG inbound rejected: %v", err)
+		}
+		return
+	case p2p.MsgTypeTDilithium3DKGActivationCertificate:
+		// A peer committed its own activation certificate and gossiped it
+		// so nodes that never collected the full six-acknowledgement set
+		// can adopt the same group key. The adoption is fail-closed:
+		// ActivateCandidate re-checks the session digest and requires the
+		// matching candidate share. This path does not touch the inbox
+		// (which refuses activation envelopes) or the running exchange.
+		n.adoptTDilithium3DKGActivationCertificate(msg.Payload)
+		return
+	case p2p.MsgTypeTDilithium3SigningCommit, p2p.MsgTypeTDilithium3SigningReveal,
+		p2p.MsgTypeTDilithium3SigningAcceptance, p2p.MsgTypeTDilithium3SigningResponse:
+		// Signing-executor round messages reach the inbox of their own session.
+		// The seal executor drives its candidate sessions concurrently, so the
+		// message is routed to the session id it carries rather than to a single
+		// installed inbox. Nothing registers an inbox unless a slot is being
+		// driven behind the experimental gate, so this branch is inert by default.
+		sessionID, ok := tdilithium3SigningEnvelopeSession(msg.Payload)
+		if !ok {
+			tdilithium3SealTrace("signing inbound type %d from %s: undecodable envelope", msg.Type, msg.From)
+			return
+		}
+		inbox := n.tdilithium3SigningInboxForSession(sessionID)
+		if !n.tdilithium3SigningInboxAdmissible(inbox) {
+			tdilithium3SealTrace("signing inbound type %d from %s: no admissible inbox for session %x",
+				msg.Type, msg.From, sessionID[:6])
+			return
+		}
+		if err := inbox.accept(msg); err != nil {
+			nodeLog.Debug("Dilithium3 signing inbound rejected: %v", err)
+		}
+		return
 	case p2p.MsgTypeTSSDKGCommitment:
 		n.handleTSSDKGCommitment(msg)
 		return
 
 	case p2p.MsgTypeTSSDKGAck:
 		n.handleTSSDKGShare(msg)
+		return
+
+	case p2p.MsgTypeTSSDKGReshare:
+		n.handleTSSDKGReshare(msg)
 		return
 	}
 
@@ -401,9 +441,16 @@ func (n *Node) handleTSSDKGCommitment(msg p2p.PeerMessage) {
 		nodeLog.Debug("DKG commitment ignored: distributed DKG not enabled (TSSDistributedDKG off)")
 		return
 	}
-	commit, err := decodeDKGCommitmentPayload(msg.Payload)
+	commit, sess, err := decodeDKGCommitmentPayload(msg.Payload)
 	if err != nil {
 		nodeLog.Warn("DKG commitment decode error: %v", err)
+		return
+	}
+	// TSS-R7-11: reject commitments stamped with a different session (round
+	// window) than our current coordinator — prevents a stale message from a
+	// neighbor's other attempt from poisoning this round's buffer (VSS fail).
+	if !bytes.Equal(sess, n.dkgCoordinator.Transport().SessionID()) {
+		nodeLog.Debug("DKG commitment ignored: session mismatch (cross-round) from participant %d", commit.ParticipantID)
 		return
 	}
 	// AUDIT TSS B-3: bind sender to participant ID so an unauthenticated
@@ -425,9 +472,14 @@ func (n *Node) handleTSSDKGShare(msg p2p.PeerMessage) {
 		nodeLog.Debug("DKG share ignored: distributed DKG not enabled (TSSDistributedDKG off)")
 		return
 	}
-	share, err := decodeDKGSharePayload(msg.Payload)
+	share, sess, err := decodeDKGSharePayload(msg.Payload)
 	if err != nil {
 		nodeLog.Warn("DKG share decode error: %v", err)
+		return
+	}
+	// TSS-R7-11: reject shares stamped with a different session (round window).
+	if !bytes.Equal(sess, n.dkgCoordinator.Transport().SessionID()) {
+		nodeLog.Debug("DKG share ignored: session mismatch (cross-round) from participant %d", share.ParticipantID)
 		return
 	}
 	// AUDIT TSS B-3: bind sender to participant ID. Shares are private key
@@ -770,6 +822,9 @@ func verifyTSSSessionInitBinding(
 // signing oracle" attack — a malicious proposer cannot sign anything that
 // does not deterministically correspond to its own chain view.
 func (n *Node) handleTSSSessionInit(msg p2p.PeerMessage) {
+	if !distributedTSSEnabled() || n.distributedSigner == nil {
+		return
+	}
 	// R38-P1-03: Strip the optional binding tail before handing the legacy
 	// frame to tss.DecodeSessionInit. preR38Frame is the legacy wire frame
 	// (possibly equal to msg.Payload if no binding tail is present).
@@ -790,7 +845,8 @@ func (n *Node) handleTSSSessionInit(msg p2p.PeerMessage) {
 	//   2. Message must not be all-zero (would allow signing a null hash).
 	//   3. InitiatedAt must be within a reasonable freshness window of
 	//      the participant's local clock to prevent replay of old sessions.
-	if len(message) != 32 {
+	sealSession := binding != nil && binding.domainTag == tssDomainTagSeal
+	if !sealSession && len(message) != 32 {
 		nodeLog.Warn("TSS session init: rejecting — message length %d is not 32 bytes (R38-P1-03)", len(message))
 		return
 	}
@@ -815,10 +871,28 @@ func (n *Node) handleTSSSessionInit(msg p2p.PeerMessage) {
 	// AUDIT (2026) TSS B-5: Verify the sender is the current block proposer.
 	// Without this, any peer can force all participants into expensive TSS
 	// computation and trigger private share leakage.
-	if n.blockProducer != nil {
+	var aggregatorAddr types.Address
+	if sealSession {
+		sender, known := n.resolveSenderAddress(msg.From)
+		if !known || initiatedAt <= 0 {
+			nodeLog.Warn("TSS seal init: unknown sender or missing timestamp")
+			return
+		}
+		context, authErr := n.authorizeQTDSealSigning(message, participantIDs, sender)
+		if authErr != nil {
+			nodeLog.Warn("TSS seal init: rejected: %v", authErr)
+			return
+		}
+		if binding.chainID != context.chainID || binding.epoch != context.epoch || binding.slot != context.slot ||
+			binding.proposer != context.proposer || !bytes.Equal(binding.originalMessage, message) {
+			nodeLog.Warn("TSS seal init: canonical binding mismatch")
+			return
+		}
+		aggregatorAddr = context.proposer
+	} else if n.blockProducer != nil {
 		slot := n.blockProducer.GetCurrentSlot()
-		isProposer, proposerAddr := n.blockProducer.isProposerForSlot(slot)
-		if !isProposer {
+		_, proposerAddr := n.blockProducer.isProposerForSlot(slot)
+		if proposerAddr == (types.Address{}) {
 			nodeLog.Warn("TSS session init: rejecting — current slot has no proposer (B-5)")
 			return
 		}
@@ -844,6 +918,9 @@ func (n *Node) handleTSSSessionInit(msg p2p.PeerMessage) {
 			nodeLog.Warn("TSS session init: rejecting — %s (R38-P1-03)", reason)
 			return
 		}
+		aggregatorAddr = proposerAddr
+	} else {
+		return
 	}
 
 	// Check if we are a participant
@@ -866,12 +943,17 @@ func (n *Node) handleTSSSessionInit(msg p2p.PeerMessage) {
 	}
 
 	// Don't re-process if we're the aggregator (we already initiated)
-	if n.isAggregator() {
+	if aggregatorAddr == n.blockProducer.ValidatorAddr() {
+		return
+	}
+	if err := n.registerTSSRoute(sessionID, aggregatorAddr, message, initiatedAt); err != nil {
+		nodeLog.Debug("TSS session init: routing rejected: %v", err)
 		return
 	}
 
 	// Create local participant session
 	if err := n.distributedSigner.InitiateParticipantSession(sessionID, message, participantIDs, myPID, initiatedAt); err != nil {
+		n.removeTSSRoute(sessionID)
 		nodeLog.Warn("TSS session init: create participant session failed: %v", err)
 		return
 	}
@@ -944,7 +1026,7 @@ func (n *Node) handleTSSRound1Commit(msg p2p.PeerMessage) {
 
 	// If we're a participant (not aggregator) and Round1 is now complete, compute Round2
 	myPID := n.getMyParticipantID()
-	if myPID > 0 && !n.isAggregator() {
+	if myPID > 0 && !n.isTSSAggregator(sessionID) {
 		n.tryComputeRound2(sessionID, myPID)
 	}
 }
@@ -992,9 +1074,13 @@ func (n *Node) tryComputeRound2(sessionID [32]byte, myPID int) {
 //
 // RESIDUAL RISK (High): The aggregator can still recover s1 from the aggregated
 // Z0Share because c·(t0-s2) = c·(A·s1 - t1·2^d). However, the aggregator CANNOT
-// recover s2 or t0 individually, so it CANNOT forge signatures. Full closure
-// requires DH-based pairwise masking or distributed hint generation. Until then,
-// distributed TSS is HARD-BLOCKED in production (see distributedTSSEnabled()).
+// recover s2 or t0 individually, so it CANNOT forge signatures. Closure needs a
+// protocol redesign in which the aggregator only combines partial signatures
+// (distributed hint generation, or an equivalent MPC construction); pairwise
+// zero-sum masking does not help, because it cancels in the sum the aggregator
+// is entitled to compute. Distributed TSS is therefore permanently disabled —
+// see distributedTSSEnabled() in adapters.go, which returns false with no
+// runtime switch.
 //
 // Raw secret-key shares (S2Share/T0Share) are NEVER transmitted over the wire.
 // The old ScShare (λ_i·s1_i·c) transmission is also removed — it leaked s1.
@@ -1024,9 +1110,12 @@ func (n *Node) sendPrivateRound2(sessionID [32]byte, pid int, reveal *qtd.Round2
 		return
 	}
 
-	// Get the aggregator (current block proposer) address
-	slot := n.blockProducer.GetCurrentSlot()
-	_, aggregatorAddr := n.blockProducer.isProposerForSlot(slot)
+	route, authorized := n.tssRoute(sessionID)
+	if !authorized {
+		nodeLog.Warn("TSS private contribution has no authorized session route")
+		return
+	}
+	aggregatorAddr := route.aggregator
 
 	// Encrypt private data for the aggregator using one-shot Kyber768 KEM
 	encrypted, err := n.keyExchange.SealForPeer(aggregatorAddr, privateData)
@@ -1138,7 +1227,7 @@ func (n *Node) handleTSSRound2Private(msg p2p.PeerMessage) {
 	// AUDIT (2026) TSS B-4: Only accept shares for the current
 	// aggregator session. Prevents cross-session share misdelivery where
 	// z0 contributions from an old session are attached to a new one.
-	if !n.isCurrentAggregatorSession(sessionID[:]) {
+	if !n.isTSSAggregator(sessionID) {
 		nodeLog.Warn("TSS Round2 private: session %x is not the current aggregator session, rejecting (B-4)",
 			sessionID[:8])
 		return
@@ -1189,11 +1278,21 @@ func (n *Node) handleTSSSignature(msg p2p.PeerMessage) {
 		nodeLog.Warn("TSS signature decode error: %v", err)
 		return
 	}
+	route, exists := n.tssRoute(sessionID)
+	sender, known := n.resolveSenderAddress(msg.From)
+	if !exists || !known || sender != route.aggregator || n.tssManager == nil {
+		return
+	}
+	if err := n.tssManager.VerifyCombinedSignature(signature, route.message); err != nil {
+		nodeLog.Warn("TSS final signature verification failed: %v", err)
+		return
+	}
 
 	nodeLog.Info("TSS final signature received: session=%x, sig_size=%d",
 		sessionID[:8], len(signature))
 
 	n.distributedSigner.CleanSession(sessionID)
+	n.removeTSSRoute(sessionID)
 }
 
 // handleTSSKeyExchange processes a Kyber public key broadcast from another validator.
@@ -1400,15 +1499,26 @@ func (n *Node) broadcastKyberPublicKey() {
 }
 
 // wireTSSDistributed connects the distributed signer to the P2P layer.
-func (n *Node) wireTSSDistributed() {
-	if n.distributedSigner == nil || n.p2pHost == nil {
-		return
+func (n *Node) wireTSSDistributed() error {
+	if n.distributedSigner == nil || n.keyExchange != nil {
+		return nil
 	}
-
-	// Broadcast our Kyber public key so other nodes can encrypt to us
-	n.broadcastKyberPublicKey()
-
-	nodeLog.Info("TSS distributed signer wired to P2P layer")
+	if n.blockProducer == nil || n.blockProducer.ValidatorKey() == nil || n.blockProducer.QPOS() == nil {
+		return fmt.Errorf("TSS transport requires validator identity and consensus state")
+	}
+	address := n.blockProducer.ValidatorAddr()
+	if address == (types.Address{}) {
+		return fmt.Errorf("TSS transport refuses a zero validator identity")
+	}
+	exchange, err := consensus.NewValidatorKeyExchange(address)
+	if err != nil {
+		return fmt.Errorf("initialize TSS transport: %w", err)
+	}
+	auth := &tssTransportIdentity{producer: n.blockProducer}
+	exchange.SetAuthSigner(auth)
+	exchange.SetValidatorLookup(auth)
+	n.keyExchange = exchange
+	return nil
 }
 
 // tssCanonicalMessageForCurrentSlot derives the canonical 32-byte message
@@ -1542,6 +1652,28 @@ func (n *Node) distributeTSSSign(message []byte, participantIDs []int, allowFall
 	// Participants re-derive the canonical envelope from the binding tail
 	// and reject any mismatch — see handleTSSSessionInit.
 	canonicalMessage := n.tssCanonicalMessageForCurrentSlot(message)
+	var sealBinding *tssSessionInitBinding
+	var aggregatorAddr types.Address
+	if bytes.HasPrefix(message, []byte(consensus.QTDDomainSep)) {
+		if n.blockProducer == nil {
+			return nil, fmt.Errorf("QTD block producer unavailable")
+		}
+		var authErr error
+		sealBinding, authErr = n.authorizeQTDSealSigning(message, participantIDs, n.blockProducer.ValidatorAddr())
+		if authErr != nil {
+			return nil, authErr
+		}
+		canonicalMessage = append([]byte(nil), message...)
+		aggregatorAddr = sealBinding.proposer
+	} else {
+		if n.blockProducer == nil {
+			return nil, fmt.Errorf("TSS block producer unavailable")
+		}
+		_, aggregatorAddr = n.blockProducer.isProposerForSlot(n.blockProducer.GetCurrentSlot())
+		if aggregatorAddr != n.blockProducer.ValidatorAddr() {
+			return nil, fmt.Errorf("TSS initiator is not the block proposer")
+		}
+	}
 	// Step 1: Initiate session
 	sessionID, err := n.distributedSigner.InitiateSession(canonicalMessage, participantIDs, myPID)
 	if err != nil {
@@ -1551,8 +1683,12 @@ func (n *Node) distributeTSSSign(message []byte, participantIDs []int, allowFall
 	// that incoming private shares can be validated against it. The defer
 	// guarantees the session is cleared on EVERY exit path (success, error,
 	// fallback), preventing cross-session share misdelivery.
-	n.setAggregatorSession(sessionID[:])
-	defer n.clearAggregatorSession()
+	initiatedAt := time.Now().UnixNano()
+	if err := n.registerTSSRoute(sessionID, aggregatorAddr, canonicalMessage, initiatedAt); err != nil {
+		n.distributedSigner.CleanSession(sessionID)
+		return nil, err
+	}
+	defer n.removeTSSRoute(sessionID)
 
 	// Step 2: Broadcast session init
 	// TSS-M8 (R8 2026-07-19 FIX): Attach the aggregator's authoritative
@@ -1565,6 +1701,10 @@ func (n *Node) distributeTSSSign(message []byte, participantIDs []int, allowFall
 	// binding tail) so participants can re-derive and verify the canonical
 	// envelope on receipt.
 	boundInitData := n.encodeBoundSessionInit(sessionID, canonicalMessage, participantIDs, message)
+	if sealBinding != nil {
+		boundInitData = encodeTSSSessionInitBound(sessionID, canonicalMessage, participantIDs, initiatedAt,
+			sealBinding.chainID, sealBinding.epoch, sealBinding.slot, sealBinding.proposer, tssDomainTagSeal, message)
+	}
 	if err := n.p2pHost.BroadcastTSS(p2p.MsgTypeTSSSessionInit, boundInitData); err != nil {
 		nodeLog.Warn("DistributeTSSSign: broadcast session init failed: %v", err)
 	}
@@ -1713,4 +1853,102 @@ func (n *Node) waitForRound2(sessionID [32]byte, timeout time.Duration) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
+}
+func (n *Node) handleTSSDKGReshare(msg p2p.PeerMessage) {
+	if isTMLDSAResharePrivatePayload(msg.Payload) {
+		if err := n.handleTMLDSAResharePrivateContribution(msg); err != nil {
+			nodeLog.Debug("TMLDSA private reshare contribution rejected: %v", err)
+		}
+		return
+	}
+	if isTMLDSAReshareControlPayload(msg.Payload) {
+		message, err := decodeTMLDSAReshareControlMessage(msg.Payload)
+		if err != nil {
+			nodeLog.Debug("TMLDSA reshare control rejected: %v", err)
+			return
+		}
+		if !n.validateDKGMessageSender(msg.From, int(message.SenderID)) {
+			nodeLog.Debug("TMLDSA reshare control sender binding mismatch")
+			return
+		}
+		if err := n.applyTMLDSAReshareControlMessage(message); err != nil {
+			nodeLog.Debug("TMLDSA reshare control rejected after validation: %v", err)
+		}
+		return
+	}
+	var message reshareWireMessage
+	if err := json.Unmarshal(msg.Payload, &message); err != nil {
+		nodeLog.Debug("reshare message rejected: decode failed: %v", err)
+		return
+	}
+	if len(message.SessionID) != sha256.Size || message.FromParticipant <= 0 || (!message.Acknowledgement && message.Contribution == nil) {
+		nodeLog.Debug("reshare message rejected: invalid envelope (session=%d from=%d contribution=%v)",
+			len(message.SessionID), message.FromParticipant, message.Contribution != nil)
+		return
+	}
+	if !message.Acknowledgement && (message.Contribution.FromParticipant != message.FromParticipant ||
+		message.Contribution.ToParticipant != message.ToParticipant) {
+		nodeLog.Debug("reshare message rejected: contribution binding mismatch (from=%d to=%d)",
+			message.FromParticipant, message.ToParticipant)
+		return
+	}
+	if !n.validateDKGMessageSender(msg.From, message.FromParticipant) {
+		nodeLog.Debug("reshare message rejected: sender binding mismatch (from=%d to=%d)",
+			message.FromParticipant, message.ToParticipant)
+		return
+	}
+
+	n.reshareMu.Lock()
+	transport := n.reshareTransport
+	n.reshareMu.Unlock()
+	if message.Acknowledgement {
+		if transport != nil {
+			transport.Acknowledge(&message)
+		}
+		return
+	}
+	if message.ToParticipant != n.getMyParticipantID() ||
+		len(message.OldParticipants) > 256 || len(message.NewParticipants) > 256 ||
+		message.Threshold < 2 || message.Threshold > len(message.NewParticipants) ||
+		!containsInt(message.OldParticipants, message.FromParticipant) ||
+		!containsInt(message.NewParticipants, message.ToParticipant) ||
+		!bytes.Equal(message.SessionID, n.reshareSessionID(message.Epoch, message.OldParticipants, message.NewParticipants, message.Threshold)) {
+		return
+	}
+	if n.blockProducer == nil {
+		return
+	}
+	currentEpoch := consensus.SlotToEpoch(n.blockProducer.GetCurrentSlot())
+	if message.Epoch > currentEpoch+1 || (currentEpoch > 0 && message.Epoch < currentEpoch-1) {
+		return
+	}
+	if n.tssManager != nil && n.tssManager.ShareCount() > 0 && n.tssManager.Threshold() == message.Threshold {
+		if holders, ok := n.tssManager.ActiveParticipantIDs(); ok && sameParticipants(holders, message.NewParticipants) {
+			n.acknowledgeReshare(msg.From, &message)
+			return
+		}
+	}
+	if err := n.persistInboundReshareMessage(&message); err != nil {
+		nodeLog.Warn("reshare message not acknowledged before durable storage: %v", err)
+		return
+	}
+	if transport == nil {
+		if n.bufferReshareMessage(&message) {
+			n.acknowledgeReshare(msg.From, &message)
+		}
+		return
+	}
+	if !bytes.Equal(message.SessionID, transport.SessionID()) ||
+		message.ToParticipant != transport.ParticipantID() ||
+		message.FromParticipant <= 0 || message.Contribution == nil {
+		nodeLog.Debug("reshare message rejected: active transport mismatch (session=%x from=%d to=%d local=%d)",
+			message.SessionID[:8], message.FromParticipant, message.ToParticipant, transport.ParticipantID())
+		return
+	}
+	if !transport.Ingest(&message) {
+		return
+	}
+	n.acknowledgeReshare(msg.From, &message)
+	nodeLog.Debug("reshare contribution accepted (session=%x from=%d to=%d)",
+		message.SessionID[:8], message.FromParticipant, message.ToParticipant)
 }

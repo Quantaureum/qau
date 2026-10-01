@@ -19,8 +19,8 @@ var (
 	insecureRPC bool
 )
 
-// NewRootCmd creates the root command.
-func NewRootCmd(version, commit, buildTime string) *cobra.Command {
+// NewRootCmd creates the root command
+func NewRootCmd(version, commit string) *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "qauctl",
 		Short: "Quantaureum CLI management tool",
@@ -32,7 +32,7 @@ It provides commands for:
   - Key management (generate, import, export)
   - Backup and restore operations
   - Performance analysis`,
-		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, commit, buildTime),
+		Version: fmt.Sprintf("%s (commit: %s)", version, commit),
 	}
 
 	// Global flags
@@ -52,6 +52,7 @@ It provides commands for:
 	rootCmd.AddCommand(newBackupCmd())
 	rootCmd.AddCommand(newRestoreCmd())
 	rootCmd.AddCommand(newPerfCmd())
+	rootCmd.AddCommand(newAuditCmd())
 	rootCmd.AddCommand(newValidatorCmd())
 	rootCmd.AddCommand(newAccountRemoteCmd())
 	rootCmd.AddCommand(newGenesisCmd())

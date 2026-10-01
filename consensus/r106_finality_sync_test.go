@@ -131,6 +131,30 @@ func TestR106_AdoptHeaderFinality_RootPrefersRecordedEpochRoot(t *testing.T) {
 	}
 }
 
+func TestR106_SetEpochBlockRootReconcilesAdoptedCheckpointRoot(t *testing.T) {
+	vs := makeSlotPruneTestValidatorSet(6)
+	qpos, err := NewQPOS(vs)
+	if err != nil {
+		t.Fatalf("NewQPOS failed: %v", err)
+	}
+
+	headerFallback := r106TestHash(0xA1)
+	canonicalSourceRoot := r106TestHash(0xE5)
+	canonicalTargetRoot := r106TestHash(0xF6)
+
+	qpos.AdoptHeaderFinality(42, 41, headerFallback)
+	qpos.SetEpochBlockRoot(42, canonicalSourceRoot)
+	qpos.SetEpochBlockRoot(43, canonicalTargetRoot)
+
+	att := qpos.CreateAttestation(EpochStartSlot(43), canonicalTargetRoot, 0)
+	if att == nil {
+		t.Fatal("CreateAttestation returned nil after target epoch root was recorded")
+	}
+	if att.Source.Root != canonicalSourceRoot {
+		t.Fatalf("attestation source root = %x, want canonical epoch root %x", att.Source.Root[:4], canonicalSourceRoot[:4])
+	}
+}
+
 // TestR106_AdoptHeaderFinality_EpochZeroKeepsZeroRoot verifies the genesis
 // bootstrap contract: an adoption of epoch 0 without a registered genesis
 // root keeps the zero hash, so the genesis-bootstrap branches in

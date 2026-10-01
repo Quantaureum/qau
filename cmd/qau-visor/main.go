@@ -16,11 +16,16 @@ import (
 	"os"
 
 	"github.com/quantaureum/qau/cmd/qau-visor/cmd"
-	"github.com/quantaureum/qau/internal/version"
+)
+
+var (
+	version   = "0.1.0"
+	gitCommit = "unknown"
+	buildTime = "unknown"
 )
 
 func main() {
-	rootCmd := cmd.NewRootCmd(version.Version, version.GitCommit, version.BuildTime)
+	rootCmd := cmd.NewRootCmd(version, gitCommit, buildTime)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

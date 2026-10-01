@@ -20,6 +20,7 @@ import (
 const (
 	maxValidatorKyberKeys    = 250000
 	maxEncryptedSessions     = 1024
+	maxTSSReplayEntries      = 16 * 1024
 	sessionKeyValidity       = 4 * time.Hour
 	sessionKeyRotationPeriod = 1 * time.Hour
 	kyberPublicKeySize       = crypto.KyberPublicKeySize
@@ -52,10 +53,12 @@ type EncryptedSession struct {
 	ExpiresAt   time.Time
 	sendCipher  cipher.AEAD
 	recvCipher  cipher.AEAD
+	exporterKey [32]byte
 	// audit-fix MEDIUM: protect nonce counters from concurrent access to
 	// prevent nonce reuse in AES-GCM, which would be catastrophic.
 	sendMu sync.Mutex
 	recvMu sync.Mutex
+	keyMu  sync.RWMutex
 }
 
 func (s *EncryptedSession) IsExpired() bool {
@@ -103,6 +106,39 @@ func (s *EncryptedSession) Decrypt(ciphertext []byte) ([]byte, error) {
 	return s.recvCipher.Open(nil, nonce, ciphertext, nil)
 }
 
+func (s *EncryptedSession) exportSecret(label string, context []byte) ([32]byte, error) {
+	if s == nil || s.IsExpired() {
+		return [32]byte{}, ErrSessionExpired
+	}
+	if label == "" {
+		return [32]byte{}, ErrSessionNotFound
+	}
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	if s.exporterKey == ([32]byte{}) {
+		return [32]byte{}, ErrSessionNotFound
+	}
+	digest := sha3.New256()
+	digest.Write([]byte("quantaureum-validator-session-exporter-v1"))
+	digest.Write(s.exporterKey[:])
+	binary.Write(digest, binary.BigEndian, uint32(len(label)))
+	digest.Write([]byte(label))
+	binary.Write(digest, binary.BigEndian, uint32(len(context)))
+	digest.Write(context)
+	var result [32]byte
+	copy(result[:], digest.Sum(nil))
+	return result, nil
+}
+
+func (s *EncryptedSession) zeroize() {
+	if s == nil {
+		return
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	crypto.ZeroBytesSecure(s.exporterKey[:])
+}
+
 // TSSAuthSigner provides Dilithium3 authentication for TSS share transport.
 // AUDIT (2026) HIGH-07: SealForPeer/OpenFromPeer previously relied solely
 // on Kyber KEM + AES-GCM with sender address embedded in plaintext. The AES
@@ -141,7 +177,8 @@ type ValidatorKeyExchange struct {
 	authSigner  TSSAuthSigner
 	requireAuth bool
 	// CRND-07: track latest timestamp per peer to reject replayed messages
-	peerTimestamps map[types.Address]int64
+	peerTimestamps     map[types.Address]int64
+	peerMessageDigests map[[32]byte]int64
 	// AUDIT (2026) CRND-01: track latest Kyber-broadcast timestamp per
 	// peer to reject replayed key-exchange broadcasts. Without this, a captured
 	// signed broadcast (addr || kyberPubKey) could be replayed indefinitely,
@@ -167,6 +204,7 @@ func NewValidatorKeyExchange(localAddr types.Address) (*ValidatorKeyExchange, er
 		localKyber:               kp,
 		requireAuth:              true, // AUDIT (2026) HIGH-07: fail-closed by default
 		peerTimestamps:           make(map[types.Address]int64),
+		peerMessageDigests:       make(map[[32]byte]int64),
 		kyberBroadcastTimestamps: make(map[types.Address]int64),
 	}, nil
 }
@@ -179,6 +217,7 @@ func NewValidatorKeyExchangeWithKey(localAddr types.Address, kp *crypto.KyberKey
 		localKyber:               kp,
 		requireAuth:              true, // AUDIT (2026) HIGH-07: fail-closed by default
 		peerTimestamps:           make(map[types.Address]int64),
+		peerMessageDigests:       make(map[[32]byte]int64),
 		kyberBroadcastTimestamps: make(map[types.Address]int64),
 	}
 }
@@ -365,6 +404,7 @@ func (vke *ValidatorKeyExchange) UnregisterKyberKey(addr types.Address) {
 	prefix := addr.String()
 	for k := range vke.sessions {
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			vke.sessions[k].zeroize()
 			delete(vke.sessions, k)
 		}
 	}
@@ -407,7 +447,9 @@ func (vke *ValidatorKeyExchange) InitiateSession(peerAddr types.Address) ([]byte
 		return nil, fmt.Errorf("session key derivation failed: %w", err)
 	}
 
-	session, err := newEncryptedSession(peerAddr, sendKey, recvKey)
+	exporterKey := deriveValidatorSessionExporter(sharedSecret, vke.localAddr, peerAddr)
+	defer crypto.ZeroBytesSecure(exporterKey[:])
+	session, err := newEncryptedSession(peerAddr, sendKey, recvKey, exporterKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
@@ -442,7 +484,9 @@ func (vke *ValidatorKeyExchange) CompleteSession(peerAddr types.Address, ciphert
 		return fmt.Errorf("session key derivation failed: %w", err)
 	}
 
-	session, err := newEncryptedSession(peerAddr, sendKey, recvKey)
+	exporterKey := deriveValidatorSessionExporter(sharedSecret, peerAddr, vke.localAddr)
+	defer crypto.ZeroBytesSecure(exporterKey[:])
+	session, err := newEncryptedSession(peerAddr, sendKey, recvKey, exporterKey)
 	if err != nil {
 		return fmt.Errorf("failed to create session: %w", err)
 	}
@@ -497,6 +541,20 @@ func (vke *ValidatorKeyExchange) GetSession(peerAddr types.Address) (*EncryptedS
 	return session, nil
 }
 
+// ExportPairwiseSecret derives a domain-separated secret from an authenticated
+// post-quantum validator session without exposing its AEAD keys.
+func (vke *ValidatorKeyExchange) ExportPairwiseSecret(
+	peerAddr types.Address,
+	label string,
+	context []byte,
+) ([32]byte, error) {
+	session, err := vke.GetSession(peerAddr)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return session.exportSecret(label, context)
+}
+
 func (vke *ValidatorKeyExchange) RotateLocalKey() error {
 	vke.mu.Lock()
 	defer vke.mu.Unlock()
@@ -522,6 +580,7 @@ func (vke *ValidatorKeyExchange) RotateLocalKey() error {
 	vke.kyberKeys[vke.localAddr] = append([]byte(nil), pubBytes...)
 
 	for k := range vke.sessions {
+		vke.sessions[k].zeroize()
 		delete(vke.sessions, k)
 	}
 
@@ -574,6 +633,7 @@ func (vke *ValidatorKeyExchange) evictExpiredSessionsLocked() {
 	now := time.Now() // NOT consensus-critical: local session cleanup
 	for k, s := range vke.sessions {
 		if now.After(s.ExpiresAt) {
+			s.zeroize()
 			delete(vke.sessions, k)
 		}
 	}
@@ -635,7 +695,7 @@ func hkdfExpandValidatorKey(prk []byte, label string, firstID, secondID []byte) 
 	return result
 }
 
-func newEncryptedSession(peerAddr types.Address, sendKey, recvKey []byte) (*EncryptedSession, error) {
+func newEncryptedSession(peerAddr types.Address, sendKey, recvKey []byte, exporterKey [32]byte) (*EncryptedSession, error) {
 	sendBlock, err := aes.NewCipher(sendKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create send cipher: %w", err)
@@ -671,7 +731,23 @@ func newEncryptedSession(peerAddr types.Address, sendKey, recvKey []byte) (*Encr
 		ExpiresAt:   now.Add(sessionKeyValidity),
 		sendCipher:  sendAEAD,
 		recvCipher:  recvAEAD,
+		exporterKey: exporterKey,
 	}, nil
+}
+
+func deriveValidatorSessionExporter(sharedSecret []byte, initiator, responder types.Address) [32]byte {
+	firstID, secondID := initiator.Bytes(), responder.Bytes()
+	if bytes.Compare(firstID, secondID) > 0 {
+		firstID, secondID = secondID, firstID
+	}
+	digest := sha3.New256()
+	digest.Write([]byte("quantaureum-validator-session-exporter-root-v1"))
+	digest.Write(sharedSecret)
+	digest.Write(firstID)
+	digest.Write(secondID)
+	var result [32]byte
+	copy(result[:], digest.Sum(nil))
+	return result
 }
 
 func GenerateKyberKeyPairForValidator() (*crypto.KyberKeyPair, error) {
@@ -900,7 +976,7 @@ func (vke *ValidatorKeyExchange) OpenFromPeer(peerAddr types.Address, ciphertext
 		return nil, fmt.Errorf("%w: timestamp out of acceptable range (stale or future)", ErrInvalidCiphertext)
 	}
 
-	// CRND-07: Reject replayed messages (timestamp <= last seen from this peer).
+	// CRND-07: Reject older timestamps; equal timestamps use authenticated message deduplication.
 	// CRND-FIX: Only READ the high-water mark here for early rejection.
 	// The WRITE (updating the high-water mark) is deferred to AFTER signature
 	// verification succeeds. Previously, the high-water mark was updated before
@@ -912,7 +988,7 @@ func (vke *ValidatorKeyExchange) OpenFromPeer(peerAddr types.Address, ciphertext
 	vke.mu.RLock()
 	lastTs, exists := vke.peerTimestamps[peerAddr]
 	vke.mu.RUnlock()
-	if exists && timestamp <= lastTs {
+	if exists && timestamp < lastTs {
 		return nil, fmt.Errorf("%w: replayed or out-of-order message (ts=%d, last=%d)", ErrInvalidCiphertext, timestamp, lastTs)
 	}
 
@@ -954,10 +1030,30 @@ func (vke *ValidatorKeyExchange) OpenFromPeer(peerAddr types.Address, ciphertext
 	// Re-check under write lock: another goroutine may have updated the mark
 	// concurrently between the RLock read above and this write lock.
 	currentTs, stillExists := vke.peerTimestamps[peerAddr]
-	if stillExists && timestamp <= currentTs {
+	if stillExists && timestamp < currentTs {
 		vke.mu.Unlock()
 		return nil, fmt.Errorf("%w: concurrent replay detected (ts=%d, current=%d)", ErrInvalidCiphertext, timestamp, currentTs)
 	}
+	digest := sha3.Sum256(buildTSSAuthMessage(peerAddr, localAddr, timestamp, actualPlaintext))
+	if _, duplicate := vke.peerMessageDigests[digest]; duplicate {
+		vke.mu.Unlock()
+		return nil, fmt.Errorf("%w: replayed authenticated message", ErrInvalidCiphertext)
+	}
+	if len(vke.peerMessageDigests) >= maxTSSReplayEntries {
+		for knownDigest, seenAt := range vke.peerMessageDigests {
+			if seenAt < now-maxClockSkewSeconds {
+				delete(vke.peerMessageDigests, knownDigest)
+			}
+		}
+		if len(vke.peerMessageDigests) >= maxTSSReplayEntries {
+			vke.mu.Unlock()
+			return nil, fmt.Errorf("%w: authenticated replay cache is full", ErrInvalidCiphertext)
+		}
+	}
+	if vke.peerMessageDigests == nil {
+		vke.peerMessageDigests = make(map[[32]byte]int64)
+	}
+	vke.peerMessageDigests[digest] = timestamp
 	vke.peerTimestamps[peerAddr] = timestamp
 	vke.mu.Unlock()
 

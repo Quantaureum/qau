@@ -33,7 +33,6 @@ import (
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/event"
 	"github.com/quantaureum/qau/graphql"
-	"github.com/quantaureum/qau/internal/version"
 	"github.com/quantaureum/qau/lightclient"
 	"github.com/quantaureum/qau/metrics"
 	"github.com/quantaureum/qau/p2p"
@@ -56,6 +55,7 @@ import (
 	"github.com/quantaureum/qau/upgrade"
 	"github.com/quantaureum/qau/wallet/multisig"
 	"github.com/quantaureum/qau/wallet/tss"
+	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
 // audit-fix R2-L3: debug logging is gated behind this flag.
@@ -171,15 +171,16 @@ type NewAttestationEvent struct {
 //   - PoW verification in verifyPeerProofOfWork() - allows fake peers without real PoW
 //   - PoW generation in generatePoWNonce() - uses trivial nonce of 42 instead of real computation
 //
-// This check is defense-in-depth. Config validation blocks DevMode on named
-// public networks, while this function also blocks it by public network ID.
+// This check is defense-in-depth. The config validation (config.go:344) also blocks DevMode on
+// Mainnet, but this function provides an additional hard stop at runtime.
 //
-// Returns error if DevMode is enabled on mainnet or testnet.
+// Returns error if DevMode is enabled AND NetworkID is MainnetNetworkID.
+// For non-mainnet networks (testnet, devnet), DevMode may be intentionally used for testing
+// but operators should be aware they are operating without PoW protection.
 func (n *Node) validateProductionConfig() error {
 	// DevMode bypasses PoW - this is only safe for isolated local development
-	if n.config.DevMode &&
-		(n.config.NetworkID == MainnetNetworkID || n.config.NetworkID == TestnetNetworkID) {
-		return fmt.Errorf("DevMode is enabled on a public network (networkId=%d): "+
+	if n.config.DevMode && n.config.NetworkID == MainnetNetworkID {
+		return fmt.Errorf("DevMode is enabled on mainnet (networkId=%d): "+
 			"DevMode bypasses PoW verification which is a critical Sybil resistance mechanism. "+
 			"This configuration is unsafe for production use. "+
 			"PoW bypass reference: p2p/host.go:1039-1043, 1073", n.config.NetworkID)
@@ -240,11 +241,85 @@ type Node struct {
 	// TSSDistributedDKG switch is enabled on a non-mainnet network). When
 	// non-nil, it owns the P2P DKGTransport that handleTSSMessage feeds.
 	dkgCoordinator *DKGCoordinator
+	// tdilithium3DKGInbox is the authenticated inbox of the running Dilithium3
+	// v1 DKG ceremony. The ceremony goroutine installs and clears it while the
+	// TSS processing loop reads it, so every access goes through
+	// tdilithium3DKGInboxSnapshot / installTDilithium3DKGInbox.
+	tdilithium3DKGInbox   *tdilithium3DKGInbox
+	tdilithium3DKGInboxMu sync.RWMutex
+	// tdilithium3SigningInboxes holds the authenticated inboxes of every signing
+	// executor session currently running on this node, keyed by session id. The
+	// seal executor drives its candidate sessions concurrently (the protocol's
+	// parallel candidate slots), each with its own session id, so a single
+	// installed inbox would drop every message destined for a sibling session.
+	// The slot owners register and unregister their inbox while the TSS
+	// processing loop routes each inbound message to the matching session, so
+	// every access goes through the register / unregister / lookup helpers.
+	tdilithium3SigningInboxes map[[32]byte]*tdilithium3SigningInbox
+	tdilithium3SigningInboxMu sync.RWMutex
+	// tdilithium3SealSigningMu/tdilithium3SealSigningSessions hold the node's
+	// seal signing executor sessions keyed by slot: at most one running attempt
+	// per slot and the highest announced ordinal. The seal flow and the seal
+	// request notification handler are the only writers.
+	// tdilithium3SealSigningRunning bounds how many slots' sessions run at once;
+	// distinct slots seal concurrently because the inbox is keyed by session id.
+	tdilithium3SealSigningMu       sync.Mutex
+	tdilithium3SealSigningSessions map[uint64]*tdilithium3SealSigningSession
+	tdilithium3SealSigningRunning  chan struct{}
+	// tdilithium3SigningJournals caches the per-key signing journal handles.
+	// Each is a bbolt database that takes an exclusive file lock, so a fresh
+	// handle per session (the old single-session path opened one per attempt)
+	// collides once distinct slots seal concurrently -- the second open blocks
+	// on the file lock and times out. One shared handle per path, internally
+	// mutex-guarded, is reused across every concurrent session and closed at
+	// node shutdown.
+	tdilithium3SigningJournals   map[string]*dilithium3v1.SigningJournal
+	tdilithium3SigningJournalsMu sync.Mutex
+	// tdilithium3DKGCeremonyMu/tdilithium3DKGCeremonyRunning make the ceremony
+	// single-flight. Two overlapping ceremonies would fight over the single
+	// inbox field, so the second caller is refused instead of interleaving.
+	tdilithium3DKGCeremonyMu      sync.Mutex
+	tdilithium3DKGCeremonyRunning bool
+	// tdilithium3DKGActivationMu/tdilithium3DKGActivationSink deliver inbound
+	// activation acknowledgements to the running ceremony's activation
+	// exchange. The authenticated DKG inbox deliberately refuses activation
+	// envelopes (they carry the candidate-bound activation transcript, not the
+	// per-message identity domain), so the certificate assembler verifies them
+	// as a set instead; the sink is only installed while a ceremony is
+	// collecting receipts and every delivered packet is re-verified there.
+	tdilithium3DKGActivationMu   sync.Mutex
+	tdilithium3DKGActivationSink chan []byte
+	// tdilithium3DKGEpochRosterStore is the lazily created finalized-epoch
+	// validator roster sidecar (Dilithium3 v1 CNF-RSS "Finalized-Epoch
+	// Validator Snapshot", option 2). It is nil until an epoch-boundary capture
+	// or a roster lookup runs with the experimental gates open, so a production
+	// node never creates or reads the file.
+	tdilithium3DKGEpochRosterStore   *tdilithium3DKGEpochRosterStore
+	tdilithium3DKGEpochRosterStoreMu sync.Mutex
+	// reshareTransport is installed only for the current epoch-bound share
+	// rotation and is separate from the initial-DKG transport.
+	reshareTransport    *P2PReshareTransport
+	resharePending      map[string][]*reshareWireMessage
+	resharePendingBytes int
+	reshareMu           sync.Mutex
+	reshareRunMu        sync.Mutex
+	tssPersistMu        sync.Mutex
+	tssStateLoadErr     error
+	// TSS-R7-08 (2026-09): when TSSDistributedDKG is enabled, distributed DKG
+	// is NOT run synchronously in initRPC (which executes before startServices
+	// creates the blockProducer and before the P2P mesh forms — that caused
+	// participant-ID collisions and Round1 timeouts). Instead initRPC sets
+	// dkgPending=true and skips the synchronous DKG; runDistributedDKGBackground
+	// (launched after startServices) waits for peer connectivity + a resolvable
+	// participant ID, then runs DKG with retries. The RPC-M1 fail-closed guard
+	// treats dkgPending as a non-fatal "not ready yet" state.
+	dkgPending bool
 	// AUDIT (2026) TSS B-4: Track the current aggregator session to
 	// prevent share misdelivery across sessions. Only the aggregator sets
 	// this; participants accept shares only for this session.
 	currentAggregatorSession []byte
 	aggregatorSessionMu      sync.Mutex
+	tssSessionRoutes         map[[32]byte]tssSessionRoute
 
 	// AUDIT (2026) TSS- Per-(session, participant) last-seen
 	// timestamp for Round2 private messages. The aggregator enforces strict
@@ -435,9 +510,10 @@ type Node struct {
 	//
 	// Both fields are lazily initialized (see ensureQTDSealLimiter) so that
 	// tests that construct &Node{} directly without NewNode still work.
-	qtdSealSem  chan struct{}
-	qtdPeerRate map[p2p.PeerID]*qtdPeerRateInfo
-	qtdPeerRtMu sync.Mutex
+	qtdSealSem      chan struct{}
+	qtdPeerRate     map[p2p.PeerID]*qtdPeerRateInfo
+	qtdPeerRtMu     sync.Mutex
+	qtdSealInFlight map[uint64]struct{}
 
 	// R39-P3-03 (2026-08-02) FIX: panic-counter for blockInsertLoop's
 	// per-iteration recover. The audit finding observes that the
@@ -569,7 +645,7 @@ func NewNode(cfg *Config) (*Node, error) {
 	if cfg.HealthEnabled {
 		node.healthServer = ha.NewHealthServer(&ha.HealthServerConfig{
 			Addr:            cfg.HealthAddr,
-			Version:         version.Version,
+			Version:         "1.0.0",
 			ShutdownHandler: shutdownHandler,
 		})
 	}
@@ -875,6 +951,35 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to start services: %w", err)
 	}
 
+	// TSS-R7-09 (2026-09): wire the syncer's validator address + SIGNING key
+	// NOW, after startServices has created the blockProducer. initSyncer runs
+	// at line ~848 (before startServices), where n.blockProducer is still nil,
+	// so the setter block there is a no-op — the validator↔PeerID mapping was
+	// never populated, which silently broke TSS/DKG sender validation. Re-wire
+	// here with the now-ready blockProducer so status broadcasts are signed and
+	// peers register the mapping. No-op for non-validators.
+	if n.syncer != nil && n.blockProducer != nil {
+		n.syncer.SetValidatorAddress(n.blockProducer.ValidatorAddr())
+		if vk := n.blockProducer.ValidatorKey(); vk != nil {
+			if pub, perr := vk.PublicKeySafe(); perr == nil && pub != nil {
+				n.syncer.SetValidatorSigner(vk, pub.Bytes())
+				nodeLog.Info("TSS-R7-09: syncer validator signer wired (addr=%x) — status broadcasts now signed for validator↔peer discovery",
+					n.blockProducer.ValidatorAddr().Bytes()[:6])
+			}
+		}
+	}
+
+	// TSS-R7-08 (2026-09): launch the deferred distributed-DKG task now that
+	// startServices has created the blockProducer (needed to resolve this
+	// node's participant ID) and the P2P host is accepting peers. The task
+	// waits for peer connectivity + a resolvable participant ID, then runs
+	// the multi-round DKG with retries. Non-blocking: node startup completes
+	// while DKG converges in the background (liveness continues; finality
+	// waits for the group key). No-op unless TSSDistributedDKG is enabled.
+	if n.dkgPending {
+		go n.runDistributedDKGBackground()
+	}
+
 	// P2P-R12-CRIT-001 (2026-07-20) FIX: wire up the Dilithium3 payload
 	// signature verifier for both direct-P2P and GossipSub paths. MUST run
 	// after startServices() because vote/attestation verification requires
@@ -960,20 +1065,15 @@ func (n *Node) Stop() error {
 
 	n.cancel()
 
+	// Close the cached Dilithium3 signing journals after the node context is
+	// cancelled, so every seal session has stopped touching them first.
+	n.closeTDilithium3SigningJournals()
+
 	// SECURITY (audit-fix): Persist TSS key shares on graceful
 	// shutdown with AES-256-GCM encryption. No hardcoded password.
 	if n.tssManager != nil && n.config.TSSKeyShareFile != "" {
-		tssPwd, pwdErr := n.getTSSPassword()
-		if pwdErr != nil {
-			nodeLog.Error("Cannot persist TSS key shares on shutdown: %v", pwdErr)
-		} else if data, err := n.tssManager.ExportKeySharesEncrypted(tssPwd); err == nil {
-			if err := os.WriteFile(n.config.TSSKeyShareFile, data, 0600); err != nil {
-				nodeLog.Error("Failed to persist TSS key shares on shutdown: %v", err)
-			} else {
-				nodeLog.Info("TSS key shares persisted (encrypted) on shutdown to %s", n.config.TSSKeyShareFile)
-			}
-		} else {
-			nodeLog.Warn("Failed to export TSS key shares on shutdown: %v", err)
+		if err := n.persistTSSKeyState(); err != nil {
+			nodeLog.Error("Failed to persist encrypted TSS state: %v", err)
 		}
 	}
 
@@ -1198,13 +1298,8 @@ func (n *Node) cleanupPartialInit() {
 	// AES-256-GCM encryption. Best-effort — failures are logged but do not
 	// block cleanup.
 	if n.tssManager != nil && n.config.TSSKeyShareFile != "" {
-		tssPwd, pwdErr := n.getTSSPassword()
-		if pwdErr == nil {
-			if data, err := n.tssManager.ExportKeySharesEncrypted(tssPwd); err == nil {
-				if err := os.WriteFile(n.config.TSSKeyShareFile, data, 0600); err != nil {
-					nodeLog.Warn("cleanupPartialInit: failed to persist TSS key shares: %v", err)
-				}
-			}
+		if err := n.persistTSSKeyState(); err != nil {
+			nodeLog.Error("Failed to persist encrypted TSS state: %v", err)
 		}
 	}
 
@@ -1533,45 +1628,37 @@ func (n *Node) MigrationManager() *upgrade.MigrationManager {
 
 // loadGenesis loads and validates the genesis configuration
 func (n *Node) loadGenesis() error {
-	genesis, err := LoadGenesisForConfig(n.config)
-	if err != nil {
-		return fmt.Errorf("failed to load genesis: %w", err)
+	genesisPath := n.config.GenesisFile
+	if genesisPath == "" {
+		genesisPath = filepath.Join(n.config.DataDir, "genesis.json")
 	}
-	if genesis != nil {
-		n.genesis = genesis
-		if n.config.GenesisFile != "" {
-			nodeLog.Info("Loaded genesis from %s", n.config.GenesisFile)
-		} else {
-			nodeLog.Info("Using built-in %s genesis", n.config.Network)
+
+	// Check if genesis file exists
+	if _, err := os.Stat(genesisPath); os.IsNotExist(err) {
+		// Select appropriate default genesis based on config NetworkID/DevMode.
+		// Check specific network IDs first — a configured network takes precedence over DevMode.
+		switch {
+		case n.config.NetworkID == TestnetNetworkID:
+			n.genesis = TestnetGenesis()
+		case n.config.DevMode || n.config.NetworkID == DevnetNetworkID:
+			n.genesis = DevGenesis()
+		default:
+			n.genesis = DefaultGenesis()
 		}
+		nodeLog.Info("Using default genesis (no genesis file at %s)", genesisPath)
 	} else {
-		genesisPath := filepath.Join(n.config.DataDir, "genesis.json")
-		if _, statErr := os.Stat(genesisPath); statErr == nil {
-			genesis, loadErr := LoadGenesis(genesisPath)
-			if loadErr != nil {
-				return fmt.Errorf("failed to load genesis: %w", loadErr)
-			}
-			n.genesis = genesis
-			nodeLog.Info("Loaded genesis from %s", genesisPath)
-		} else {
-			switch {
-			case n.config.NetworkID == TestnetNetworkID:
-				n.genesis = TestnetGenesis()
-			case n.config.DevMode || n.config.NetworkID == DevnetNetworkID:
-				n.genesis = DevGenesis()
-			default:
-				n.genesis = DefaultGenesis()
-			}
-			nodeLog.Info("Using default genesis (no genesis file at %s)", genesisPath)
+		// Load genesis from file
+		genesis, err := LoadGenesis(genesisPath)
+		if err != nil {
+			return fmt.Errorf("failed to load genesis: %w", err)
 		}
+		n.genesis = genesis
+		nodeLog.Info("Loaded genesis from %s", genesisPath)
 	}
 
 	// Validate genesis
 	if err := n.genesis.Validate(); err != nil {
 		return fmt.Errorf("invalid genesis: %w", err)
-	}
-	if err := ValidateGenesisForNetwork(n.config.Network, n.genesis); err != nil {
-		return fmt.Errorf("invalid genesis for network %q: %w", n.config.Network, err)
 	}
 
 	// AUDIT (2026) NODE-08 FIX: Removed the misleading ComputeAllocHash
@@ -2687,7 +2774,7 @@ func (n *Node) initDanksharding() error {
 // redactEnodeURL truncates the public key in an enode URL to prevent leaking
 // the full node identity in logs. Example:
 //
-//	"enode://abcdef...123@peer.example.invalid:9000" → "enode://abcdef…REDACTED@peer.example.invalid:9000"
+//	"enode://abcdef...123@198.51.100.10:9000" → "enode://abcdef…REDACTED@198.51.100.10:9000"
 func redactEnodeURL(enodeURL string) string {
 	if len(enodeURL) > 22 { // "enode://" = 7 chars + "@" minimum
 		atIdx := -1
@@ -2952,25 +3039,12 @@ func (n *Node) initRPC() error {
 	}
 
 	if n.tssManager != nil {
-		sharesLoaded := false
-		if n.config.TSSKeyShareFile != "" {
-			if data, err := os.ReadFile(n.config.TSSKeyShareFile); err == nil {
-				// SECURITY (audit P0- + P1-): Use encrypted import only.
-				// Plaintext import fallback removed —all key shares must be encrypted.
-				if tss.IsEncryptedKeyShareData(data) {
-					tssPwd, pwdErr := n.getTSSPassword()
-					if pwdErr != nil {
-						nodeLog.Error("Cannot import encrypted TSS key shares (password not configured): %v", pwdErr)
-					} else if err := n.tssManager.ImportKeySharesEncrypted(data, tssPwd); err != nil {
-						nodeLog.Error("Failed to import encrypted TSS key shares from %s: %v", n.config.TSSKeyShareFile, err)
-					} else {
-						nodeLog.Info("TSS key shares imported (encrypted) from %s (size=%d, shares=%d)", n.config.TSSKeyShareFile, len(data), n.tssManager.ShareCount())
-						sharesLoaded = true
-					}
-				} else {
-					nodeLog.Error("TSS key share file %s is not encrypted —refusing to load plaintext shares (audit-fix). Use encrypted format only.", n.config.TSSKeyShareFile)
-				}
-			}
+		sharesLoaded, loadErr := n.loadTSSKeyState()
+		if loadErr != nil {
+			return fmt.Errorf("load encrypted TSS state: %w", loadErr)
+		}
+		if sharesLoaded {
+			nodeLog.Info("TSS encrypted state restored (active shares=%d)", n.tssManager.ShareCount())
 		}
 
 		if !sharesLoaded {
@@ -2994,16 +3068,23 @@ func (n *Node) initRPC() error {
 			// instead of the single-process simulated trusted-dealer path.
 			// When TSSDistributedDKG is OFF (the default), no coordinator is
 			// created and node behavior is unchanged.
+			// TSS-R7-08 (2026-09): when distributed DKG is enabled, DEFER it to
+			// a background task (runDistributedDKGBackground, launched after
+			// startServices). Running it here in initRPC is too early: the
+			// blockProducer that resolves this node's participant ID is created
+			// later in startServices, and no P2P peers are connected yet — so a
+			// synchronous run here made every node believe it was participant=1
+			// and timed out Round1 with zero commitments. Set the pending flag
+			// and skip the synchronous DKG below; the RPC-M1 guard treats
+			// dkgPending as a non-fatal "not ready yet" state.
 			if n.config.TSSDistributedDKG && n.tssManager != nil {
-				n.dkgCoordinator = n.wireDKGCoordinator()
-				if n.dkgCoordinator != nil {
-					nodeLog.Info("TSS distributed DKG ENABLED (TSSDistributedDKG=true) — "+
-						"multi-party runtime DKG active (participant=%d, session=%x)",
-						n.dkgCoordinator.Transport().ParticipantID(), n.dkgCoordinator.SessionID()[:8])
-				}
+				n.dkgPending = true
+				nodeLog.Info("TSS distributed DKG ENABLED (TSSDistributedDKG=true) — " +
+					"deferring multi-party DKG to background task (runs after peer mesh + " +
+					"blockProducer are ready; see runDistributedDKGBackground)")
 			}
 
-			if !groupKeyLoaded {
+			if !groupKeyLoaded && !n.dkgPending {
 				// TSS- / TSS- (2026-07-17) — Defense-in-depth mainnet guard.
 				// Config.Validate() already blocks this combination, but we
 				// re-check here to fail-closed if Validate was bypassed (e.g.
@@ -3082,16 +3163,8 @@ func (n *Node) initRPC() error {
 					} else {
 						nodeLog.Info("TSS DKG completed: generated %d key shares, group public key size=%d", len(shares), len(n.tssManager.GroupPublicKey()))
 						if n.config.TSSKeyShareFile != "" {
-							// SECURITY (audit-fix): Export with AES-256-GCM encryption
-							tssPwd, pwdErr := n.getTSSPassword()
-							if pwdErr != nil {
-								nodeLog.Error("Cannot export encrypted TSS key shares (password not configured): %v", pwdErr)
-							} else if data, expErr := n.tssManager.ExportKeySharesEncrypted(tssPwd); expErr == nil {
-								if err := os.WriteFile(n.config.TSSKeyShareFile, data, 0600); err != nil {
-									nodeLog.Error("Failed to write TSS key shares to %s: %v", n.config.TSSKeyShareFile, err)
-								} else {
-									nodeLog.Info("TSS key shares exported to %s (size=%d)", n.config.TSSKeyShareFile, len(data))
-								}
+							if err := n.persistTSSKeyState(); err != nil {
+								nodeLog.Error("Failed to persist encrypted TSS state: %v", err)
 							}
 						}
 						if n.config.TSSGroupKeyFile != "" {
@@ -3140,10 +3213,21 @@ func (n *Node) initRPC() error {
 				n.config.TSSDistributedMode, n.config.TSSKeyShareFile, n.config.TSSGroupKeyFile)
 		}
 		if !n.tssManager.HasThreshold() && !n.tssManager.HasGroupPublicKey() {
-			return fmt.Errorf("RPC-M1: TSS initialization required but no threshold shares "+
-				"(shareCount=%d, threshold=%d) and no group public key loaded — refusing "+
-				"to start in degraded mode",
-				n.tssManager.ShareCount(), n.config.TSSThreshold)
+			// TSS-R7-08 (2026-09): distributed DKG runs in the background after
+			// startServices (peer mesh + blockProducer must be ready first).
+			// While it is pending, having no shares/group key yet is EXPECTED,
+			// not a fail-closed condition. The background task will populate the
+			// group key on completion; until then the node runs without threshold
+			// signing (liveness continues, finality waits for the group key).
+			if n.dkgPending {
+				nodeLog.Info("RPC-M1: TSS shares/group key not loaded yet — distributed DKG " +
+					"is pending (runs in background after peer mesh forms); allowing startup")
+			} else {
+				return fmt.Errorf("RPC-M1: TSS initialization required but no threshold shares "+
+					"(shareCount=%d, threshold=%d) and no group public key loaded — refusing "+
+					"to start in degraded mode",
+					n.tssManager.ShareCount(), n.config.TSSThreshold)
+			}
 		}
 	}
 
@@ -3182,18 +3266,6 @@ func (n *Node) initRPC() error {
 			nodeLog.Info("TSS distributed mode ENABLED — P2P multi-party signing active (threshold=%d, shares=%d)",
 				n.tssManager.Threshold(), n.tssManager.TotalShares())
 
-			// Initialize Kyber768 key exchange for encrypted ScShare transport
-			var validatorAddr types.Address
-			if n.blockProducer != nil {
-				validatorAddr = n.blockProducer.ValidatorAddr()
-			}
-			vke, err := consensus.NewValidatorKeyExchange(validatorAddr)
-			if err != nil {
-				nodeLog.Error("Failed to initialize ValidatorKeyExchange: %v", err)
-			} else {
-				n.keyExchange = vke
-				nodeLog.Info("ValidatorKeyExchange initialized for TSS encrypted transport (address=%s)", validatorAddr.String())
-			}
 		}
 	}
 
@@ -3539,6 +3611,16 @@ func (n *Node) initSyncer() error {
 	// TSS: Set validator address for auto-discovery (peers auto-register Address→PeerID mapping)
 	if n.blockProducer != nil {
 		n.syncer.SetValidatorAddress(n.blockProducer.ValidatorAddr())
+		// TSS-R7-09 (2026-09): also give the syncer the validator signing key +
+		// public key so its status broadcasts are SIGNED. The host only registers
+		// the validator↔PeerID mapping from a status with a valid pubkey+signature;
+		// without a signed status the mapping stays empty and TSS/DKG sender
+		// validation rejects every message (root cause of DKG "have 0 commitments").
+		if vk := n.blockProducer.ValidatorKey(); vk != nil {
+			if pub, perr := vk.PublicKeySafe(); perr == nil && pub != nil {
+				n.syncer.SetValidatorSigner(vk, pub.Bytes())
+			}
+		}
 		// Link QPOS so applyBlockInternal can replicate epoch reward application.
 		// Without this, the validator's stateRoot never matches the proposer's
 		// at epoch boundaries (block_producer.go applies rewards that validators
@@ -3943,7 +4025,7 @@ func (n *Node) initMetrics() error {
 	// replay it here, after nodeMetrics is safely created exactly once.
 	if n.nodeMetrics == nil {
 		n.nodeMetrics = metrics.NewNodeMetrics()
-		n.nodeMetrics.SetVersion(version.Version, version.GitCommit)
+		n.nodeMetrics.SetVersion("1.0.0", "dev")
 	}
 	// Replay any pending DKG observation captured by initRPC.
 	if n.pendingDKGObservation != nil {
@@ -6180,6 +6262,9 @@ func (n *Node) startServices() error {
 			interval = 12 * time.Second // Default 12 second block time
 		}
 		n.blockProducer = NewBlockProducer(n, interval)
+		if err := n.wireTSSDistributed(); err != nil {
+			return err
+		}
 		n.blockProducer.Start()
 	}
 
@@ -6195,6 +6280,9 @@ func (n *Node) startServices() error {
 		}
 		nodeLog.Info("Starting validator block producer with %v interval", interval)
 		n.blockProducer = NewBlockProducer(n, interval)
+		if err := n.wireTSSDistributed(); err != nil {
+			return err
+		}
 		n.blockProducer.Start()
 	} else if shouldCreateElectionVerifierProducer(n.config.DevMode, n.config.ValidatorEnabled, n.config.BlockProducer, n.config.SyncOnlyMode) {
 		// Create BlockProducer for election verification only — do NOT start
@@ -6213,6 +6301,9 @@ func (n *Node) startServices() error {
 		nodeLog.Info("Creating BlockProducer for election verification only (validatorEnabled=%v, blockProducer=%v — production loop NOT started)",
 			n.config.ValidatorEnabled, n.config.BlockProducer)
 		n.blockProducer = NewBlockProducer(n, interval)
+		if err := n.wireTSSDistributed(); err != nil {
+			return err
+		}
 		// Do NOT call Start() — only needed for election verifier initialization
 	}
 
@@ -6308,22 +6399,13 @@ func (n *Node) startServices() error {
 			//
 			// The callback is only ever invoked under qpos's internal lock
 			// (SetEpochVRFAccumulator holds q.mu), so the debounce state below
-			// needs no extra synchronization.
-			//
-			// R108-VRF-REPLAY-BATCH (2026-09-25): the debounce only collapses
-			// REPEATED (epoch, value) pairs, and every block inside an epoch
-			// carries a distinct running accumulator — so during the R52 replay
-			// it never fires and each of the O(chain height) blocks cost its own
-			// fsync, all of it on the synchronous startup path before the P2P
-			// listener is bound. On a slow-disk host that stall never finished
-			// (peers stayed 0). The replay therefore suppresses this callback and
-			// accumulates into an in-memory map flushed in one batch transaction;
-			// the live block-import path keeps the per-epoch debounced write.
+			// needs no extra synchronization. Debouncing identical
+			// (epoch, value) writes collapses the R52 replay's ~32k per-block
+			// calls into ~1 write per distinct value, keeping startup fast.
 			var lastPersistEpoch uint64
 			var lastPersistAcc types.Hash
-			var replayingVRF atomic.Bool
 			qpos.SetVRFPersistCallback(func(epoch uint64, acc types.Hash) {
-				if n.blockStore == nil || replayingVRF.Load() {
+				if n.blockStore == nil {
 					return
 				}
 				if epoch == lastPersistEpoch && acc == lastPersistAcc {
@@ -6367,13 +6449,6 @@ func (n *Node) startServices() error {
 				count := 0
 				var lastEpoch uint64
 				var lastAcc types.Hash
-				// R108-VRF-REPLAY-BATCH: buffer what the replay observes and
-				// persist it in a single transaction afterwards (see the callback
-				// comment above). Later blocks of an epoch overwrite earlier ones,
-				// so the map ends up holding the last on-chain value per epoch —
-				// exactly what the per-block callback used to write.
-				replayAccs := make(map[uint64]types.Hash)
-				replayingVRF.Store(true)
 				for h := uint64(1); h <= continuousTip; h++ {
 					blk, err := n.blockStore.GetBlockByHeight(h)
 					if err != nil || blk == nil {
@@ -6384,16 +6459,11 @@ func (n *Node) startServices() error {
 					// the ON-CHAIN header value (deterministic across nodes), not
 					// by re-XOR-ing VRF outputs (path-asymmetric → fork).
 					qpos.SetEpochVRFAccumulator(blk.Header.Epoch, blk.Header.VRFAccumulator)
-					replayAccs[blk.Header.Epoch] = blk.Header.VRFAccumulator
 					if blk.Header.Epoch >= lastEpoch {
 						lastEpoch = blk.Header.Epoch
 						lastAcc = blk.Header.VRFAccumulator
 					}
 					count++
-				}
-				replayingVRF.Store(false)
-				if err := n.blockStore.PutVRFAccumulatorsBatch(replayAccs); err != nil {
-					nodeLog.Error("R108-VRF-REPLAY-BATCH: failed to persist %d replayed epoch accumulator(s): %v", len(replayAccs), err)
 				}
 				nodeLog.Info("R52 FIX: Rebuilt VRF accumulator from %d canonical blocks (height 1..%d, lastOnChainEpoch=%d)", count, continuousTip, lastEpoch)
 
@@ -6670,6 +6740,12 @@ func (n *Node) startServices() error {
 	n.wireElectionVerifier()
 	n.wireDankshardingToConsensus()
 
+	// Experimental Dilithium3 v1: a node restarted with an already installed
+	// active share rebinds the signing executor's finality surface from that
+	// share, so the development network needs no extra wiring after activation.
+	// Gated and a quiet no-op while the gate is closed or no share is installed.
+	n.refreshTDilithium3SigningFinalitySigner()
+
 	// Enable syncing mode if the node is starting from genesis or a very low
 	// height. This skips election verification until sync completes, because
 	// QPOS internal state (randaoMix, finalizedRoot) cannot be rebuilt without
@@ -6721,9 +6797,13 @@ func (n *Node) startServices() error {
 	go n.checkpointRecoveryMonitor()
 
 	// Start TSS message processing loop (distributed signing mode and/or
-	// distributed DKG mode — both route TSS P2P messages through
-	// handleTSSMessage).
-	if n.distributedSigner != nil || n.dkgCoordinator != nil {
+	// distributed DKG mode - both route TSS P2P messages through
+	// handleTSSMessage). Distributed DKG creates its coordinator after peer
+	// readiness, so the loop must start before that delayed initialization.
+	// The Dilithium3 v1 DKG ceremony installs its inbox only when an epoch
+	// transition fires, so the loop must also start when the experimental gates
+	// are open, otherwise the ceremony's own traffic would never be consumed.
+	if n.distributedSigner != nil || n.dkgCoordinator != nil || n.config.TSSDistributedDKG || n.tdilithium3DKGInboundAllowed() || experimentalTDilithium3V1Enabled() {
 		n.wg.Add(1)
 		go n.tssProcessingLoop()
 	}
@@ -6748,7 +6828,30 @@ func (n *Node) wireTSSSigner() {
 			nodeLog.Info("TSS signer wired to QPOS consensus engine")
 		}
 		n.blockProducer.QPOS().SetThresholdSigner(adapter)
+		qpos := n.blockProducer.QPOS()
+		qpos.InitChambers()
+		coordinator := qpos.GetChambersCoordinator()
+		if coordinator != nil {
+			requireDistributed := n.config.NetworkID == MainnetNetworkID || n.config.TSSDistributedDKG
+			coordinator.SetRequireDistributedDKG(requireDistributed)
+			coordinator.SetDistributedDKGRunner(&nodeConsensusDKGRunner{node: n})
+			if holders, ok := n.tssManager.ActiveParticipantIDs(); ok {
+				if err := coordinator.RestoreHolderParticipantIDs(holders); err != nil {
+					nodeLog.Error("Failed to restore committed TSS holder generation: %v", err)
+				} else {
+					nodeLog.Info("Committed TSS holder generation restored (%d holders)", len(holders))
+				}
+			}
+			nodeLog.Info("Distributed DKG/reshare runner wired to Three Chambers (required=%v)", requireDistributed)
+		}
 	}
+}
+
+func (n *Node) refreshTSSFinalitySigner() {
+	if n == nil || n.blockProducer == nil || n.blockProducer.QPOS() == nil {
+		return
+	}
+	n.blockProducer.QPOS().InitChambers()
 }
 
 func (n *Node) wireKeyVersionValidator() {
@@ -7612,6 +7715,11 @@ func (n *Node) blockInsertLoop() {
 				if shouldSyncStaking {
 					n.syncStakingFromBlock(blk)
 					n.syncValidatorKeysFromBlock(blk)
+					// Dilithium3 v1 CNF-RSS epoch-boundary roster capture. Gated
+					// on the same condition that applies the staking side
+					// effects, because the roster is only deterministic when the
+					// validator set is a function of the applied blocks.
+					n.captureTDilithium3DKGEpochRosterFromBlock(blk)
 				}
 				// Always give a queued rescan a chance: it self-guards on
 				// "still far behind" and on "already running".
@@ -7758,13 +7866,8 @@ func (n *Node) blockInsertLoop() {
 						if blk.Header.RANDAOReveal != (types.Hash{}) {
 							if blk.Header.Slot%consensus.SlotsPerEpoch == 0 {
 								n.blockProducer.QPOS().SetEpochBlockRoot(blk.Header.Epoch, blockHash)
-							} else {
-								// R42-P3 FIX: If this is the first block of the epoch
-								// but NOT at the boundary slot (slot 32 was skipped),
-								// set the epoch boundary to the parent block's hash.
-								// The parent is the chain tip at the start of this epoch.
-								n.blockProducer.QPOS().EnsureEpochBlockRoot(blk.Header.Epoch, blk.Header.ParentHash)
 							}
+							n.blockProducer.ensureEpochStateForBlock(blk.Header)
 							vs := n.blockProducer.QPOS().GetValidatorSet()
 							validatorIdx := -1
 							if vs != nil {
@@ -7780,19 +7883,11 @@ func (n *Node) blockInsertLoop() {
 								// expected and safely ignored.
 								_ = n.blockProducer.QPOS().UpdateRANDAO(blk.Header.RANDAOReveal, blk.Header.Epoch, validatorIdx)
 							}
-							// P0-2 (2026-07-13): Transition executive chamber at epoch boundary.
-							// This selects executive members and transitions the state machine.
-							// If a TSS group key is available, DKG completes immediately.
-							if blk.Header.Slot%consensus.SlotsPerEpoch == 0 {
-								coordinator := n.blockProducer.QPOS().GetChambersCoordinator()
-								if coordinator != nil && vs != nil {
-									groupPk := n.blockProducer.QPOS().GetGroupPublicKey()
-									if err := coordinator.TransitionExecutiveForEpoch(blk.Header.Epoch, vs, groupPk); err != nil {
-										nodeLog.Warn("Executive chamber transition failed for epoch %d: %v", blk.Header.Epoch, err)
-									}
-								}
-							}
 						}
+					}
+
+					if shouldSwitch && n.blockProducer != nil {
+						n.blockProducer.onCanonicalBlockImported(blk.Header)
 					}
 
 					// P1-T8 (2026-07-14): Persist ministry state at epoch boundaries.
@@ -8869,9 +8964,8 @@ func (n *Node) handleIncomingBlock(data []byte) {
 		if blk.Header.RANDAOReveal != (types.Hash{}) {
 			if blk.Header.Slot%consensus.SlotsPerEpoch == 0 {
 				n.blockProducer.QPOS().SetEpochBlockRoot(blk.Header.Epoch, blockHash)
-			} else {
-				n.blockProducer.QPOS().EnsureEpochBlockRoot(blk.Header.Epoch, blk.Header.ParentHash)
 			}
+			n.blockProducer.ensureEpochStateForBlock(blk.Header)
 			vs := n.blockProducer.QPOS().GetValidatorSet()
 			validatorIdx := -1
 			if vs != nil {
@@ -8883,16 +8977,6 @@ func (n *Node) handleIncomingBlock(data []byte) {
 				// "no RANDAO commitment" error. The shuffle seed now
 				// depends only on the epoch and no longer on randaoMix.
 				_ = n.blockProducer.QPOS().UpdateRANDAO(blk.Header.RANDAOReveal, blk.Header.Epoch, validatorIdx)
-			}
-			// P0-2 (2026-07-13): Transition executive chamber at epoch boundary.
-			if blk.Header.Slot%consensus.SlotsPerEpoch == 0 {
-				coordinator := n.blockProducer.QPOS().GetChambersCoordinator()
-				if coordinator != nil && vs != nil {
-					groupPk := n.blockProducer.QPOS().GetGroupPublicKey()
-					if err := coordinator.TransitionExecutiveForEpoch(blk.Header.Epoch, vs, groupPk); err != nil {
-						nodeLog.Warn("Executive chamber transition failed for epoch %d: %v", blk.Header.Epoch, err)
-					}
-				}
 			}
 		}
 	}
@@ -8910,6 +8994,9 @@ func (n *Node) handleIncomingBlock(data []byte) {
 		}
 		n.syncStakingFromBlock(blk)
 		n.syncValidatorKeysFromBlock(blk)
+		// Dilithium3 v1 CNF-RSS epoch-boundary roster capture (no-op unless the
+		// experimental gates are open).
+		n.captureTDilithium3DKGEpochRosterFromBlock(blk)
 	}
 
 	// Publish new block event for real-time subscribers (GraphQL, WS, etc.)
@@ -8922,6 +9009,9 @@ func (n *Node) handleIncomingBlock(data []byte) {
 
 	if n.blockProducer != nil {
 		n.blockProducer.RecordBlockProducer(blk.Header.ProposerAddr, blk.Header.Height)
+		if shouldSwitch {
+			n.blockProducer.onCanonicalBlockImported(blk.Header)
+		}
 	}
 
 	if height%100 == 0 {
@@ -9152,7 +9242,7 @@ func (n *Node) NetworkID() uint64 {
 
 // ProtocolVersion returns the protocol version
 func (n *Node) ProtocolVersion() string {
-	return version.ProtocolVersion
+	return "1.0.0"
 }
 
 // IsSyncing returns whether the node is syncing

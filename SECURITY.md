@@ -1,38 +1,71 @@
 # Security Policy
 
-## Reporting a vulnerability
+## Supported Versions
 
-Do not disclose suspected vulnerabilities in public issues, pull requests, chat,
-or logs. Use GitHub's private vulnerability reporting interface if it is enabled:
+| Version | Supported          |
+|---------|--------------------|
+| 0.1.x   | :white_check_mark: |
 
-https://github.com/Quantaureum/qau/security/advisories/new
+## Reporting a Vulnerability
 
-If that interface is unavailable, ask a repository maintainer for a private
-reporting channel without including vulnerability details. Do not send sensitive
-material until a private channel has been confirmed. Availability of private
-reporting must be verified by the repository administrator; this file does not
-enable the GitHub feature.
+We take security vulnerabilities seriously. Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Include the affected commit or version, affected component, impact, and a minimal
-sanitized description. Any validation must be limited to isolated environments
-you control. Do not test against public networks, third-party nodes, or real
-assets. Never submit credentials, real private keys, or production topology.
+### How to Report
 
-## Handling reports
+1. Email security@quantaureum.com with a description of the vulnerability
+2. Include steps to reproduce if possible
+3. We will acknowledge receipt within 48 hours
 
-Maintainers should acknowledge receipt, assess impact, coordinate remediation,
-and agree on disclosure timing with the reporter. This policy does not promise
-a response deadline or a fixed disclosure date. Publication should avoid exposing
-users before a mitigation is available. Attribution requires reporter consent.
+### Response Timeline
 
-No paid bug bounty or guaranteed reward is established by this policy.
+- **Acknowledgment**: Within 48 hours
+- **Initial Assessment**: Within 7 days
+- **Fix or Mitigation**: Depends on severity (Critical: 24h, High: 72h, Medium: 7d, Low: 30d)
 
-## Supported versions and assurance
+### Disclosure Policy
 
-There is currently no published security-maintenance window or supported-release
-matrix. Include the exact version and commit in reports. A release tag, passing
-tests, or use of post-quantum primitives is not proof of a completed independent
-security audit or compliance certification.
+- We follow responsible disclosure
+- We will credit reporters in release notes (unless they prefer to remain anonymous)
+- Please do not disclose the vulnerability publicly until a fix is released
 
-Changes to cryptography, consensus, transaction validation, key handling, and
-serialization require careful review and explicit compatibility analysis.
+## Bug Bounty
+
+Modeled on the Ethereum Foundation's early bounty program — which allocated a **fixed, capped pool** of 25,000 ETH for security researchers — Quantaureum allocates a **fixed bug-bounty fund of 25,000 QAU** (0.125% of the 20,000,000 QAU supply), drawn from the on-chain **Ecosystem Fund**. The pool is capped: each reward draws down the balance and payouts stop once it is exhausted. Funds are never taken from user balances.
+
+| Severity | Examples | Reward (QAU) |
+|----------|----------|--------------|
+| Critical | Consensus compromise, direct theft of funds, remote code execution | Up to 5,000 |
+| High | Broad loss of funds, stake/protocol integrity compromise | Up to 2,500 |
+| Medium | Limited impact, information disclosure, denial of service | Up to 1,000 |
+| Low | Low-impact issues, missing best practices | 200 |
+
+Eligibility: issues must be previously undisclosed, reproducible, and not already known to the team. Rewards are the upper bounds above, assessed case-by-case and paid in QAU from the capped bounty fund.
+
+## Security Features
+
+### Post-Quantum Cryptography
+
+Quantaureum uses NIST-standardized post-quantum cryptography:
+
+- **Dilithium3** (FIPS 204) — Digital signatures replacing ECDSA
+- **Kyber768** (FIPS 203) — Key encapsulation for encrypted P2P channels
+- **GM-QTD** — Gaussian-masked threshold distance signing for distributed key shares
+
+### Threshold Signatures (TSS)
+
+- Private key shares are never stored in a single location
+- ScShare (private key material) is transmitted only via encrypted P2P channels
+- Kyber768 + AES-256-GCM encryption for all private TSS communications
+
+### Wallet Security
+
+- Network-locked: Only ChainID 1668/1669/1333 are allowed
+- Custom network addition is disabled
+- ECDSA signatures are disabled; only quantum signatures are accepted
+
+## Security Considerations for Developers
+
+- **Never** commit private keys, mnemonics, or keystore files
+- **Always** use `qauctl` for key management (never handle raw private keys in code)
+- **Review** all changes to `crypto/`, `consensus/`, and `qvm/` with extra scrutiny
+- **Test** with `go test -race` before submitting changes to concurrent code paths

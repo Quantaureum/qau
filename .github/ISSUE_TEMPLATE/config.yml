@@ -1,9 +1,9 @@
-# Contact: metadata pointers
-blank_issues_enabled: false
+# Issue templates entry point — config.yml + per-type templates
+blank_issues_enabled: true
 contact_links:
-  - name: Private vulnerability report
-    url: https://github.com/Quantaureum/qau/security/advisories/new
-    about: Report security vulnerabilities privately — never in a public issue.
-  - name: General discussion
-    url: https://github.com/Quantaureum/qau/discussions
-    about: Questions, ideas, and design discussion that are not yet an actionable issue.
+  - name: Discord — community chat, dev Q&A, validator coordination
+    url: https://discord.gg/MSctkBT5j
+    about: Real-time chat with other Quantaureum developers and operators
+  - name: Security Vulnerability (do not open public issue)
+    url: mailto:security@quantaureum.com
+    about: Report vulnerabilities privately per docs/SECURITY_POLICY.md

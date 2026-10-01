@@ -26,10 +26,14 @@ func resetGenesisTimeForTest() {
 // (2-of-3 by default) requires at least 2 distinct executive members to submit
 // partial seals.
 func TestP2_2_SingleNodeCannotForgeThreshold(t *testing.T) {
-	qpos, coordinator, _ := setupStardustWithQTD(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). Use a 3-validator set so the executive members {0,1,2} ARE
+	// the full set (total 3000, required 2000): two distinct signatures
+	// cover 2000 >= 2000 and complete the seal.
+	qpos, coordinator, _ := setupStardustWithQTD(t, 3)
 	qfs := qpos.GetQTDFinality()
 
-	// Set up executive chamber: members {4, 5, 6}, threshold = 2.
+	// Set up executive chamber: members {0, 1, 2}, threshold = 2.
 	// CHAMBER-H03 FIX (R31, 2026-07-27): CanSeal now requires executive
 	// assignment for the slot's SPECIFIC epoch. Slot 100 is in epoch 3
 	// (100/32=3), so we must assign executive for epoch 3 (not epoch 0
@@ -37,9 +41,9 @@ func TestP2_2_SingleNodeCannotForgeThreshold(t *testing.T) {
 	// returns "not authorized to seal for slot 100".
 	const sealSlot = uint64(100)
 	const sealEpoch = uint64(3) // 100 / 32 = 3
-	_ = coordinator.AssignExecutive([]int{4, 5, 6}, sealEpoch)
+	_ = coordinator.AssignExecutive([]int{0, 1, 2}, sealEpoch)
 	executive := coordinator.GetExecutiveChamber()
-	_ = executive.SetMembers([]int{4, 5, 6}, sealEpoch)
+	_ = executive.SetMembers([]int{0, 1, 2}, sealEpoch)
 	_ = executive.SetDKGComplete(make([]byte, minGroupPublicKeyLen))
 	// QUANTUM- Pre-populate canonical root so fail-closed gate passes.
 	blockHash := types.Hash{}
@@ -53,10 +57,10 @@ func TestP2_2_SingleNodeCannotForgeThreshold(t *testing.T) {
 		t.Fatalf("RequestSeal failed: %v", err)
 	}
 
-	// Submit only 1 partial seal (from validator 4) — should NOT finalize.
-	sig := []byte("validator-4-partial-sig-min16bytes")
-	if err := qfs.SubmitPartialSeal(4, sealSlot, sig); err != nil {
-		t.Fatalf("SubmitPartialSeal(4) failed: %v", err)
+	// Submit only 1 partial seal (from validator 0) — should NOT finalize.
+	sig := []byte("validator-0-partial-sig-min16bytes")
+	if err := qfs.SubmitPartialSeal(0, sealSlot, sig); err != nil {
+		t.Fatalf("SubmitPartialSeal(0) failed: %v", err)
 	}
 	if qfs.IsSlotFinalized(sealSlot) {
 		t.Error("slot should NOT be finalized with only 1 partial seal (threshold=2)")
@@ -65,16 +69,16 @@ func TestP2_2_SingleNodeCannotForgeThreshold(t *testing.T) {
 	// Submit the SAME validator's seal again — should NOT inflate count.
 	// The map[int][]byte keyed by validatorIndex means re-submission overwrites,
 	// not adds. The count of distinct sealers stays at 1.
-	if err := qfs.SubmitPartialSeal(4, sealSlot, []byte("different-sig-from-same-validator")); err != nil {
-		t.Fatalf("SubmitPartialSeal(4) second time failed: %v", err)
+	if err := qfs.SubmitPartialSeal(0, sealSlot, []byte("different-sig-from-same-validator")); err != nil {
+		t.Fatalf("SubmitPartialSeal(0) second time failed: %v", err)
 	}
 	if qfs.IsSlotFinalized(sealSlot) {
 		t.Error("slot should NOT be finalized after same validator re-submits (count still 1)")
 	}
 
-	// Submit from a second validator (5) — now threshold met, should finalize.
-	if err := qfs.SubmitPartialSeal(5, sealSlot, []byte("validator-5-partial-sig-min16bytes")); err != nil {
-		t.Fatalf("SubmitPartialSeal(5) failed: %v", err)
+	// Submit from a second validator (1) — now threshold met, should finalize.
+	if err := qfs.SubmitPartialSeal(1, sealSlot, []byte("validator-1-partial-sig-min16bytes")); err != nil {
+		t.Fatalf("SubmitPartialSeal(1) failed: %v", err)
 	}
 	if !qfs.IsSlotFinalized(sealSlot) {
 		t.Error("slot should be finalized with 2 distinct partial seals (threshold=2)")
@@ -86,7 +90,11 @@ func TestP2_2_SingleNodeCannotForgeThreshold(t *testing.T) {
 // TestP2_2_ThresholdEnforcement verifies that the threshold is correctly
 // enforced for different threshold values.
 func TestP2_2_ThresholdEnforcement(t *testing.T) {
-	qpos, coordinator, _ := setupStardustWithQTD(t, 10)
+	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
+	// stake). Use a 3-validator set so the executive members {0,1,2} ARE
+	// the full set (total 3000, required 2000): two distinct signatures
+	// cover 2000 >= 2000 and complete the seal.
+	qpos, coordinator, _ := setupStardustWithQTD(t, 3)
 	qfs := qpos.GetQTDFinality()
 
 	// Set up executive chamber with threshold=2 (default 3-of-2).

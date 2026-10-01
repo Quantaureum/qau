@@ -14,6 +14,8 @@ package tss
 import (
 	"bytes"
 	"testing"
+
+	"github.com/quantaureum/qau/wallet/tss/qtd"
 )
 
 func TestEncryptSingleShareBlob_RoundTrip(t *testing.T) {
@@ -160,6 +162,38 @@ func TestEncryptSingleShareBlob_InputValidation(t *testing.T) {
 	}
 	if _, err := EncryptSingleShareBlob(nil, nil); err == nil {
 		t.Fatal("expected error for both nil inputs")
+	}
+}
+
+func TestImportKeySharesAcceptsShareAboveLegacy16KiBLimit(t *testing.T) {
+	share := &qtd.QTDShare{
+		ParticipantID: 1,
+		Rho:           make([]byte, 32),
+		S1ShareBytes:  make([]byte, 6000),
+		S2ShareBytes:  make([]byte, 6000),
+		T0ShareBytes:  make([]byte, 6000),
+	}
+	shareBytes := share.Encode()
+	if len(shareBytes) <= 16*1024 {
+		t.Fatalf("test share must exceed the legacy 16 KiB limit, got %d bytes", len(shareBytes))
+	}
+
+	blob := make([]byte, 0, 2+4+len(shareBytes))
+	blob = appendUint16BE(blob, 1)
+	blob = appendUint32BE(blob, uint32(len(shareBytes)))
+	blob = append(blob, shareBytes...)
+
+	manager, err := NewTSSManager(TSSConfig{Threshold: 2, TotalShares: 3, SecurityLevel: 256})
+	if err != nil {
+		t.Fatalf("NewTSSManager: %v", err)
+	}
+	defer manager.ZeroizeAllShares()
+
+	if err := manager.ImportKeyShares(blob); err != nil {
+		t.Fatalf("ImportKeyShares rejected a decoder-valid QTD share: %v", err)
+	}
+	if manager.ShareCount() != 1 {
+		t.Fatalf("ShareCount = %d, want 1", manager.ShareCount())
 	}
 }
 

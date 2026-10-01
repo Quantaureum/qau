@@ -1,0 +1,12 @@
+# Quantaureum Prometheus scrape config (local monitoring profile)
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "qau-node"
+    static_configs:
+      - targets: ["qau-node:9090"]
+  - job_name: "qau-testnet"
+    static_configs:
+      - targets: ["qau-testnet:9090"]

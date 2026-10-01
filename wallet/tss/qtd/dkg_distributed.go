@@ -195,6 +195,15 @@ func zeroizePolyVec(v PolyVec) {
 	}
 }
 
+// zeroizeFullPolyVec clears un-reduced Feldman evaluations (see fullPolyVec).
+func zeroizeFullPolyVec(v fullPolyVec) {
+	for i := range v {
+		for j := range v[i] {
+			v[i][j] = 0
+		}
+	}
+}
+
 // InitiateRound1 samples local (s1_i, s2_i), computes the PubContribution and the
 // Pedersen VSS commitment set (Feldman variant).
 func (r *realDistributedDKGRunner) InitiateRound1(participantID, threshold, totalParticipants int) (*Round1CommitmentMessage, error) {
@@ -377,8 +386,8 @@ func (r *realDistributedDKGRunner) InitiateRound2() (map[int]*Round1OpenMessage,
 			S1BlindShares: map[int][]byte{recipient: s1BlindShares[recipient]},
 			S2BlindShares: map[int][]byte{recipient: s2BlindShares[recipient]},
 		}
-		zeroizePolyVec(s1Shares[recipient])
-		zeroizePolyVec(s2Shares[recipient])
+		zeroizeFullPolyVec(s1Shares[recipient])
+		zeroizeFullPolyVec(s2Shares[recipient])
 		zeroizePolyVec(t0Shares[recipient])
 	}
 
@@ -490,13 +499,13 @@ func (r *realDistributedDKGRunner) SubmitShare(msg *Round1OpenMessage) error {
 	}
 	myS2Full, err := vecFromBytesFull(gotS2, Dilithium3K)
 	if err != nil {
-		zeroizePolyVec(myS1Full)
+		zeroizeFullPolyVec(myS1Full)
 		return fmt.Errorf("dkg: decode s2 share from pid=%d: %w", sender, err)
 	}
 	myS1 := reduceFullShareToQ(myS1Full)
 	myS2 := reduceFullShareToQ(myS2Full)
-	zeroizePolyVec(myS1Full)
-	zeroizePolyVec(myS2Full)
+	zeroizeFullPolyVec(myS1Full)
+	zeroizeFullPolyVec(myS2Full)
 	myT0 := make(PolyVec, Dilithium3K)
 	copy(myT0, expT0[r.pid])
 	zeroizePolyVec(expT0[r.pid])

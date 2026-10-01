@@ -46,8 +46,7 @@ var (
 	ErrPartyIndexTooHigh = errors.New("party index too high, must be less than 10000")
 )
 
-//	Default TTL for MPC sessions. Sessions that have not completed
-//
+//  Default TTL for MPC sessions. Sessions that have not completed
 // within this duration are eligible for cleanup to prevent memory leaks
 // and sensitive key material from persisting indefinitely.
 const DefaultSessionTTL = 30 * time.Minute
@@ -763,9 +762,7 @@ func (mpc *MPCManager) evictOldestCompletedLocked() {
 
 // evictExpiredSessionsLocked removes sessions that have exceeded their TTL
 // without completing. The caller MUST hold mpc.mu.
-//
-//	Prevent memory leaks and persistent sensitive key material from
-//
+//  Prevent memory leaks and persistent sensitive key material from
 // abandoned sessions that never reach Complete state.
 func (mpc *MPCManager) evictExpiredSessionsLocked() {
 	now := time.Now()

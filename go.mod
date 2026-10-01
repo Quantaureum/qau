@@ -8,6 +8,9 @@ require (
 	github.com/golang/snappy v1.0.0
 	github.com/jchv/go-webview2 v0.0.0-20250406165304-0bcfea011047
 	github.com/prometheus/client_golang v1.23.2
+	github.com/quantaureum/qau/crypto v0.0.0-00010101000000-000000000000
+	github.com/quantaureum/qau/encoding v0.0.0-00010101000000-000000000000
+	github.com/quantaureum/qau/types v0.0.0-00010101000000-000000000000
 	github.com/rs/zerolog v1.34.0
 	github.com/spf13/cobra v1.10.2
 	go.etcd.io/bbolt v1.4.3
@@ -49,7 +52,15 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
+replace (
+	github.com/quantaureum/qau/crypto => ./crypto
+	github.com/quantaureum/qau/encoding => ./encoding
+	github.com/quantaureum/qau/test/integration/testutil => ./tools/tests/integration/testutil
+	github.com/quantaureum/qau/types => ./types
+)
+
 // Core module dependencies:
+// - pgregory.net/rapid: Property-based testing library (used for all property tests)
 // - github.com/cloudflare/circl: Post-quantum cryptography (Dilithium signatures)
 // - golang.org/x/crypto: Standard cryptographic primitives (scrypt, blake2b, etc.)
 // - github.com/spf13/cobra: CLI framework for qauctl and qaud commands

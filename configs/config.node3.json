@@ -1,0 +1,49 @@
+{
+  "name": "qau-node-science",
+  "dataDir": "./data3",
+  "network": "dev",
+  "listenAddr": ":9002",
+  "bootstrapPeers": ["127.0.0.1:9000", "127.0.0.1:9001"],
+  "maxPeers": 20,
+  "rpcEnabled": true,
+  "rpcAuthEnabled": true,
+  "rpcAddr": "127.0.0.1:8565",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8566",
+  "frontendEnabled": false,
+  "frontendAddr": ":8090",
+  "healthEnabled": true,
+  "healthAddr": ":8082",
+  "validatorEnabled": true,
+  "validatorKey": "keys/validator3.key",
+  "cacheSize": 256,
+  "maxGasLimit": 20000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "blockProducer": true,
+  "allowLegacySignatures": false,
+  "syncOnlyMode": false,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 2,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 512,
+    "l1MaxMemory": 33554432,
+    "l2MaxSize": 4096,
+    "l2MaxMemory": 134217728,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 500,
+    "batchSize": 100
+  },
+  "memoryLimitMB": 4096,
+  "maxConcurrentRequests": 20,
+  "requestTimeout": 30,
+  "requestsPerSecond": 5,
+  "allowedOrigins": ["http://localhost:3000", "http://localhost:8090", "chrome-extension://"]
+}

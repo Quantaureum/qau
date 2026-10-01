@@ -1,55 +1,98 @@
-name: Bug report
-description: Report a reproducible defect in a node binary, library, or SDK.
+name: Bug Report
+description: Report a defect in the Quantaureum codebase (node, consensus, VM, p2p)
 title: "[Bug]: "
-labels: [bug]
+labels: ["bug", "needs-triage"]
+assignees: []
 body:
   - type: markdown
     attributes:
       value: |
-        Do not include private keys, passwords, mnemonics, real wallet-to-host
-        mappings, or production network topology in this report.
+        Thanks for taking the time to fill out this bug report!
+        Before continuing, please make sure you've:
+        - Searched existing open/closed issues to avoid duplicates
+        - Confirmed this is a code defect, not a usage question (for usage, see the docs under `docs/` or start a Discussion)
   - type: textarea
-    id: summary
+    id: what-happened
     attributes:
-      label: Summary
-      description: What happened and what did you expect instead?
+      label: What happened?
+      description: A clear description of the bug and its observed impact.
+      placeholder: |
+        Example: After upgrading to a specific commit, qaud stops proposing blocks and logs the following error: ...
     validations:
       required: true
   - type: textarea
-    id: reproduce
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      description: The behavior you expected under these circumstances.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Paste any relevant logs (journalctl, qaud stdout, stderr).
+        **Never paste private keys, keystore files, or passwords.**
+      render: shell
+  - type: textarea
+    id: repro
     attributes:
       label: Steps to reproduce
-      description: The smallest command sequence that reproduces the issue.
+      description: Minimal, deterministic steps that reliably trigger the bug.
       placeholder: |
-        1. git checkout <commit>
-        2. go build ...
-        3. qaud --dev --network dev ...
+        1. Build qaud at commit ...
+        2. Start a 6-node localtest chain with ...
+        3. Submit a staking tx ...
+        4. Observe error ...
     validations:
       required: true
-  - type: textarea
+  - type: input
+    id: version
+    attributes:
+      label: Quantaureum commit / version
+      description: |
+        Commit hash or release tag. From repo root: `git rev-parse HEAD`.
+        If you have a deployed binary: `strings /usr/local/bin/qaud | grep 'mod.*quantaureum' | head -1`
+      placeholder: e.g., 1746480
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - consensus (QPOS / finality / validator management)
+        - p2p (networking / mTLS / peer discovery)
+        - qvm (QVM execution / QASM contracts)
+        - mempool
+        - encoding / crypto primitives
+        - wallet / keystore
+        - RPC / HTTP / JSON-RPC
+        - contracts (Solidity or QASM)
+        - toolbox / CLI (deploy_qswap, qswap_smoke, etc)
+        - documentation / plans
+        - other
+    validations:
+      required: true
+  - type: dropdown
     id: environment
     attributes:
       label: Environment
-      description: Commit hash, Go version, OS/architecture, and network (dev/testnet/mainnet context only).
-      placeholder: |
-        commit: a41e1f7
-        go: 1.26
-        os: linux/amd64
-        network: dev
+      options:
+        - production mainnet (chainId 1668)
+        - public testnet
+        - local dev / localtest
+        - CI / automated test
+        - other (explain in logs above)
     validations:
       required: true
-  - type: textarea
-    id: evidence
-    attributes:
-      label: Logs or terminal output
-      description: Sanitized excerpts only. Remove addresses tied to real operations and internal hostnames.
-      render: shell
   - type: checkboxes
-    id: checks
+    id: disclosure
     attributes:
-      label: Checks
+      label: Pre-flight checklist
       options:
-        - label: I searched existing issues and did not find this report.
+        - label: I have removed **any** private keys, keystore, or wallet secrets from logs before submitting.
           required: true
-        - label: This is not a security vulnerability (use GitHub private vulnerability reporting instead).
+        - label: I have searched existing issues to confirm this is not a duplicate.
           required: true

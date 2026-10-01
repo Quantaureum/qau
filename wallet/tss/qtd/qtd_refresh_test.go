@@ -422,6 +422,42 @@ func TestRefreshAndReshare_Combined(t *testing.T) {
 	}
 }
 
+func TestCombineSubShareForParticipant(t *testing.T) {
+	publicKey, shares, err := GenerateDKGSharesShamir(2, 3)
+	if err != nil {
+		t.Fatalf("Shamir DKG failed: %v", err)
+	}
+
+	oldIDs := []int{1, 2, 3}
+	newIDs := []int{2, 3, 4}
+	contributions := make([]*SubShare, 0, len(shares))
+	for _, share := range shares {
+		batch, err := GenerateSubShares(share.ParticipantID, share, newIDs, 2)
+		if err != nil {
+			t.Fatalf("GenerateSubShares failed for %d: %v", share.ParticipantID, err)
+		}
+		for _, contribution := range batch {
+			if contribution.ToParticipant == 4 {
+				contributions = append(contributions, contribution)
+			}
+		}
+	}
+
+	reshared, err := CombineSubShareForParticipant(contributions, 4, 2, oldIDs, publicKey)
+	if err != nil {
+		t.Fatalf("CombineSubShareForParticipant failed: %v", err)
+	}
+	if reshared.ParticipantID != 4 {
+		t.Fatalf("reshared participant ID = %d, want 4", reshared.ParticipantID)
+	}
+	if len(reshared.S1ShareBytes) == 0 || len(reshared.S2ShareBytes) == 0 || len(reshared.T0ShareBytes) == 0 {
+		t.Fatal("reshared share contains an empty component")
+	}
+	if len(reshared.Rho) != len(publicKey.Rho) || len(reshared.T1Bytes) != len(publicKey.T1) {
+		t.Fatal("reshared share does not retain public-key metadata")
+	}
+}
+
 func TestRefreshDeltas_DeterministicCommitment(t *testing.T) {
 	ids := []int{1, 2, 3}
 	d1, err := GenerateRefreshDeltas(1, ids, Dilithium3L, Dilithium3K, Dilithium3K)

@@ -1,0 +1,33 @@
+{
+  "name": "Quantaureum V2 - 3 Node Testnet",
+  "image": "mcr.microsoft.com/devcontainers/go:1.24",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    }
+  },
+  "forwardPorts": [8545, 8547, 8549, 8546, 8548, 8550, 8080, 8081, 8082],
+  "portsAttributes": {
+    "8545": { "label": "Node1 RPC", "onAutoForward": "notify" },
+    "8547": { "label": "Node2 RPC", "onAutoForward": "notify" },
+    "8549": { "label": "Node3 RPC", "onAutoForward": "notify" },
+    "8546": { "label": "Node1 WebSocket" },
+    "8548": { "label": "Node2 WebSocket" },
+    "8550": { "label": "Node3 WebSocket" },
+    "8080": { "label": "Node1 Health" },
+    "8081": { "label": "Node2 Health" },
+    "8082": { "label": "Node3 Health" }
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ]
+    }
+  },
+  "remoteEnv": {
+    "QAU_NETWORK": "dev"
+  }
+}

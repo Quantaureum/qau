@@ -8,8 +8,13 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+)
 
-	"github.com/quantaureum/qau/internal/version"
+// Version information
+var (
+	version   = "1.0.0"
+	buildDate = "unknown"
+	commit    = "unknown"
 )
 
 // RootCmd represents the base command when called without any subcommands
@@ -20,7 +25,6 @@ var RootCmd = &cobra.Command{
 
 This tool provides developers with utilities for account management, transaction processing,
 smart contract deployment, network monitoring, and more.`,
-	Version: version.String(),
 }
 
 // VersionCmd represents the version command
@@ -29,9 +33,9 @@ var VersionCmd = &cobra.Command{
 	Short: "Print the version number of qau-cli",
 	Long:  `All software has versions. This is qau-cli's.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("qau-cli version %s\n", version.Version)
-		fmt.Printf("Build Time: %s\n", version.BuildTime)
-		fmt.Printf("Git Commit: %s\n", version.GitCommit)
+		fmt.Printf("qau-cli version %s\n", version)
+		fmt.Printf("Build Date: %s\n", buildDate)
+		fmt.Printf("Git Commit: %s\n", commit)
 	},
 }
 

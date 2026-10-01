@@ -28,12 +28,12 @@ import (
 // verify on-chain state against the model.
 type fuzzEnv struct {
 	f          *pairFixture
-	rng        *rand.Rand
-	sysWqau    *big.Int // total wqau in circulation tracked by the test
-	sysMock    *big.Int // total mock in circulation tracked by the test
-	lpSupply   *big.Int // expected LP supply (Go-side model)
-	kFloor     *big.Int // min k allowed after the next round's action
-	lastAction string
+	rng         *rand.Rand
+	sysWqau     *big.Int // total wqau in circulation tracked by the test
+	sysMock     *big.Int // total mock in circulation tracked by the test
+	lpSupply    *big.Int // expected LP supply (Go-side model)
+	kFloor      *big.Int // min k allowed after the next round's action
+	lastAction  string
 }
 
 // shadow state: we track what users hold OUTSIDE the pair; the invariant is
@@ -255,7 +255,7 @@ func (env *fuzzEnv) fuzzSwap(t *testing.T, actor Address, u *shadowUser) {
 	swapIn := append([]byte{}, pSelSwap...)
 	if dir == 0 {
 		swapIn = append(swapIn, u256(big.NewInt(0))...) // amount0Out = 0
-		swapIn = append(swapIn, u256(out)...)           // amount1Out = out
+		swapIn = append(swapIn, u256(out)...)          // amount1Out = out
 	} else {
 		swapIn = append(swapIn, u256(out)...) // amount0Out = out
 		swapIn = append(swapIn, u256(big.NewInt(0))...)

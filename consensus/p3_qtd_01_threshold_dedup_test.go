@@ -2,10 +2,10 @@
 package consensus
 
 // P3-QTD-01 FIX (R29, 2026-07-26): Regression tests for the centralized
-// snapshotExecutiveStakes + computeSealerWeight helpers.
+// snapshotSealerStakes + computeSealerWeight helpers.
 //
-// Previously the weight-threshold computation (snapshot executive member
-// stakes → compute total → compute requiredWeight = ceil(2/3 * total))
+// Previously the weight-threshold computation (snapshot stake basis
+// → compute total → compute requiredWeight = ceil(2/3 * total))
 // and the sealer weight accumulation (sum stakes of participating
 // sealers) were duplicated across three call sites:
 //   - RequestSeal (local seal request path)
@@ -14,9 +14,13 @@ package consensus
 //
 // The three copies had already diverged slightly (different variable
 // names for the modulo check, slightly different guard structure). The
-// fix centralized the logic into snapshotExecutiveStakes and
+// fix centralized the logic into snapshotSealerStakes and
 // computeSealerWeight. These tests verify the helpers compute the
 // correct values so the three call sites remain consistent.
+//
+// R47-QTD-QUORUM (2026-09-26): the stake basis is the FULL VALIDATOR SET
+// (the DKG threshold-group holder set covers every validator), no longer
+// the executive chamber members for the epoch.
 
 import (
 	"math/big"
@@ -25,14 +29,16 @@ import (
 	"github.com/quantaureum/qau/types"
 )
 
-// TestP3_QTD_01_SnapshotExecutiveStakes_ComputesCorrectThreshold
-// verifies that snapshotExecutiveStakes returns the correct member stakes,
-// total executive stake, and required weight (ceil(2/3 * total)).
+// TestP3_QTD_01_SnapshotSealerStakes_ComputesCorrectThreshold
+// verifies that snapshotSealerStakes returns the correct sealer stakes,
+// total stake, and required weight (ceil(2/3 * total)) over the full
+// validator set.
 //
 // Setup: 10 validators with stakes [100, 100, 9800, 1000, 1000, ...].
-// Executive chamber = {0, 1, 2} (total = 10000).
-// RequiredWeight = ceil(10000 * 2 / 3) = ceil(20000/3) = ceil(6666.67) = 6667.
-func TestP3_QTD_01_SnapshotExecutiveStakes_ComputesCorrectThreshold(t *testing.T) {
+// Executive chamber = {0, 1, 2} (irrelevant to the basis since R47).
+// Total stake = 17000.
+// RequiredWeight = ceil(17000 * 2 / 3) = ceil(34000/3) = ceil(11333.33) = 11334.
+func TestP3_QTD_01_SnapshotSealerStakes_ComputesCorrectThreshold(t *testing.T) {
 	validators := make([]*Validator, 10)
 	for i := 0; i < 10; i++ {
 		var addr types.Address
@@ -66,7 +72,9 @@ func TestP3_QTD_01_SnapshotExecutiveStakes_ComputesCorrectThreshold(t *testing.T
 		t.Fatal("coordinator is nil")
 	}
 
-	// Executive chamber = {0, 1, 2}, total stake = 100 + 100 + 9800 = 10000
+	// Executive chamber = {0, 1, 2}. Since R47-QTD-QUORUM the helper's basis
+	// is the full validator set, so this assignment must NOT change the
+	// snapshot. Kept to prove the executive shape no longer narrows it.
 	if err := coordinator.AssignExecutive([]int{0, 1, 2}, 0); err != nil {
 		t.Fatalf("AssignExecutive failed: %v", err)
 	}
@@ -81,48 +89,48 @@ func TestP3_QTD_01_SnapshotExecutiveStakes_ComputesCorrectThreshold(t *testing.T
 	qfs := qpos.GetQTDFinality()
 
 	// Call the shared helper.
-	memberStakes, totalExecutiveStake, requiredWeight := qfs.snapshotExecutiveStakes(0)
+	memberStakes, totalStake, requiredWeight := qfs.snapshotSealerStakes()
 
-	// Verify member stakes.
+	// Verify sealer stakes cover ALL 10 validators.
 	if memberStakes == nil {
-		t.Fatal("P3-QTD-01 REGRESSION: memberStakes is nil — snapshotExecutiveStakes " +
-			"should return a non-nil map when the executive chamber is configured")
+		t.Fatal("P3-QTD-01 REGRESSION: memberStakes is nil — snapshotSealerStakes " +
+			"should return a non-nil map when the coordinator is configured")
 	}
-	if len(memberStakes) != 3 {
-		t.Errorf("expected 3 executive members, got %d", len(memberStakes))
+	if len(memberStakes) != 10 {
+		t.Errorf("expected 10 validator entries (R47 full-set basis), got %d", len(memberStakes))
 	}
-	for _, idx := range []int{0, 1, 2} {
+	for _, idx := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
 		if _, ok := memberStakes[idx]; !ok {
-			t.Errorf("memberStakes missing member %d", idx)
+			t.Errorf("memberStakes missing validator %d", idx)
 		}
 	}
 
-	// Verify total stake = 10000.
-	if totalExecutiveStake == nil {
-		t.Fatal("P3-QTD-01 REGRESSION: totalExecutiveStake is nil")
+	// Verify total stake = 17000 (100 + 100 + 9800 + 7 * 1000).
+	if totalStake == nil {
+		t.Fatal("P3-QTD-01 REGRESSION: totalStake is nil")
 	}
-	if totalExecutiveStake.Cmp(big.NewInt(10000)) != 0 {
-		t.Errorf("totalExecutiveStake = %s, want 10000", totalExecutiveStake.String())
+	if totalStake.Cmp(big.NewInt(17000)) != 0 {
+		t.Errorf("totalStake = %s, want 17000", totalStake.String())
 	}
 
-	// Verify required weight = ceil(10000 * 2 / 3) = 6667.
+	// Verify required weight = ceil(17000 * 2 / 3) = 11334.
 	if requiredWeight == nil {
 		t.Fatal("P3-QTD-01 REGRESSION: requiredWeight is nil")
 	}
-	if requiredWeight.Cmp(big.NewInt(6667)) != 0 {
-		t.Errorf("requiredWeight = %s, want 6667 (ceil(2/3 * 10000))",
+	if requiredWeight.Cmp(big.NewInt(11334)) != 0 {
+		t.Errorf("requiredWeight = %s, want 11334 (ceil(2/3 * 17000))",
 			requiredWeight.String())
 	}
 }
 
-// TestP3_QTD_01_SnapshotExecutiveStakes_CeilingRounding verifies the
+// TestP3_QTD_01_SnapshotSealerStakes_CeilingRounding verifies the
 // ceil(2/3 * total) computation rounds UP for non-divisible totals.
 //
 // Setup: total = 10 → 2*10 = 20 → 20/3 = 6 remainder 2 → ceil = 7.
 // This catches regressions where the modulo check is accidentally
 // inverted (using floor instead of ceil), which would lower the
 // threshold and allow minority-stake finalization.
-func TestP3_QTD_01_SnapshotExecutiveStakes_CeilingRounding(t *testing.T) {
+func TestP3_QTD_01_SnapshotSealerStakes_CeilingRounding(t *testing.T) {
 	validators := make([]*Validator, 3)
 	for i := 0; i < 3; i++ {
 		var addr types.Address
@@ -160,7 +168,7 @@ func TestP3_QTD_01_SnapshotExecutiveStakes_CeilingRounding(t *testing.T) {
 	}
 
 	qfs := qpos.GetQTDFinality()
-	_, total, requiredWeight := qfs.snapshotExecutiveStakes(0)
+	_, total, requiredWeight := qfs.snapshotSealerStakes()
 
 	// total = 3 + 3 + 4 = 10
 	if total.Cmp(big.NewInt(10)) != 0 {
@@ -176,13 +184,13 @@ func TestP3_QTD_01_SnapshotExecutiveStakes_CeilingRounding(t *testing.T) {
 	}
 }
 
-// TestP3_QTD_01_SnapshotExecutiveStakes_NilWhenNoCoordinator verifies
+// TestP3_QTD_01_SnapshotSealerStakes_NilWhenNoCoordinator verifies
 // the helper returns (nil, nil, nil) when the coordinator is unavailable,
 // matching the previous behavior where the weight check was skipped
 // rather than failing closed. This is important because callers
 // (RequestSeal, ReceiveSealAnnouncement) rely on the nil return to
 // skip the weight check gracefully when stakes are not configured.
-func TestP3_QTD_01_SnapshotExecutiveStakes_NilWhenNoCoordinator(t *testing.T) {
+func TestP3_QTD_01_SnapshotSealerStakes_NilWhenNoCoordinator(t *testing.T) {
 	vs := createTestValidatorSet(t, 5)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
@@ -191,7 +199,7 @@ func TestP3_QTD_01_SnapshotExecutiveStakes_NilWhenNoCoordinator(t *testing.T) {
 	// Do NOT call InitChambers — coordinator will be nil.
 	qfs := NewQTDFinalityState(qpos)
 
-	memberStakes, total, requiredWeight := qfs.snapshotExecutiveStakes(0)
+	memberStakes, total, requiredWeight := qfs.snapshotSealerStakes()
 
 	if memberStakes != nil || total != nil || requiredWeight != nil {
 		t.Errorf("P3-QTD-01 REGRESSION: expected (nil, nil, nil) when "+
@@ -274,8 +282,8 @@ func TestP3_QTD_01_ComputeSealerWeight_NilStakeSkipped(t *testing.T) {
 // reject insufficient-weight seals).
 //
 // Before the P3-QTD-01 fix, the two paths had separate inline
-// computations that could diverge. Now both use snapshotExecutiveStakes,
-// so they MUST return identical values for the same epoch.
+// computations that could diverge. Now both use snapshotSealerStakes,
+// so they MUST return identical values for the same validator set.
 func TestP3_QTD_01_RequestSealAndReceiveSealAnnouncement_UseSameThreshold(t *testing.T) {
 	validators := make([]*Validator, 10)
 	for i := 0; i < 10; i++ {
@@ -318,9 +326,9 @@ func TestP3_QTD_01_RequestSealAndReceiveSealAnnouncement_UseSameThreshold(t *tes
 	qfs.SetQTDSigner(&mockThresholdSigner{})
 
 	// Compute the threshold via the shared helper (used by both paths).
-	_, _, expectedRequiredWeight := qfs.snapshotExecutiveStakes(0)
+	_, _, expectedRequiredWeight := qfs.snapshotSealerStakes()
 	if expectedRequiredWeight == nil {
-		t.Fatal("expected non-nil requiredWeight from snapshotExecutiveStakes")
+		t.Fatal("expected non-nil requiredWeight from snapshotSealerStakes")
 	}
 
 	// Path 1: RequestSeal stores RequiredWeight in the PendingSeal.
@@ -353,11 +361,11 @@ func TestP3_QTD_01_RequestSealAndReceiveSealAnnouncement_UseSameThreshold(t *tes
 	}
 	if pending.RequiredWeight == nil {
 		t.Fatal("PendingSeal.RequiredWeight is nil — RequestSeal did not " +
-			"use snapshotExecutiveStakes")
+			"use snapshotSealerStakes")
 	}
 	if pending.RequiredWeight.Cmp(expectedRequiredWeight) != 0 {
 		t.Errorf("P3-QTD-01 REGRESSION: RequestSeal RequiredWeight = %s, "+
-			"but snapshotExecutiveStakes returned %s. The two paths "+
+			"but snapshotSealerStakes returned %s. The two paths "+
 			"diverged — they MUST use the same helper.",
 			pending.RequiredWeight.String(), expectedRequiredWeight.String())
 	}
@@ -368,9 +376,9 @@ func TestP3_QTD_01_RequestSealAndReceiveSealAnnouncement_UseSameThreshold(t *tes
 	// (cryptographic verification is mocked, so the weight check is the
 	// only gate).
 	//
-	// Executive stakes: 0=100, 1=100, 2=9800. Total=10000. Threshold=6667.
-	// Sealers {0, 1} → weight 200 < 6667 → rejected.
-	// Sealers {0, 2} → weight 9900 >= 6667 → accepted (if sig verifies).
+	// Full validator set stakes (R47-QTD-QUORUM basis): 0=100, 1=100,
+	// 2=9800, others 1000 each. Total=17000. Threshold=11334.
+	// Sealers {0, 1} → weight 200 < 11334 → rejected.
 	//
 	// We can't easily test the "accepted" path here because the mock
 	// signer's VerifyBlock requires the signature to be exactly
@@ -404,7 +412,7 @@ func TestP3_QTD_01_RequestSealAndReceiveSealAnnouncement_UseSameThreshold(t *tes
 	// doesn't accept a below-threshold seal.
 	if ok {
 		t.Error("P3-QTD-01: ReceiveSealAnnouncement accepted a seal with " +
-			"sealers {0,1} (weight 200 < threshold 6667). The weight " +
+			"sealers {0,1} (weight 200 < threshold 11334). The weight " +
 			"check did not run, or the threshold was computed incorrectly.")
 	}
 }

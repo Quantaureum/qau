@@ -144,6 +144,19 @@ func (sv *SigningVerifier) VerifyMessageSignature(pubKeyBytes []byte, message []
 	return sv.VerifyTransactionSignature(pubKeyBytes, message, signature)
 }
 
+// VerifyMessageSignatureForAlgorithm verifies a message using explicit
+// algorithm metadata. It intentionally bypasses the legacy-only cache because
+// cache entries do not yet include algorithm and context in their keys.
+func (sv *SigningVerifier) VerifyMessageSignatureForAlgorithm(
+	algorithm SignatureAlgorithm,
+	pubKeyBytes []byte,
+	message []byte,
+	context []byte,
+	signature []byte,
+) error {
+	return VerifySignatureForAlgorithm(algorithm, pubKeyBytes, message, context, signature)
+}
+
 func (sv *SigningVerifier) ValidatePublicKey(pubKeyBytes []byte) error {
 	// FIX: Removed early len(pubKeyBytes) return that leaks length info
 	// via timing. PublicKeyFromBytes performs a constant-time public key length

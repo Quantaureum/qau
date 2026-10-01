@@ -1,0 +1,100 @@
+﻿{
+  "_comment_top": "QTD/TSS enabled Quantaureum mainnet config TEMPLATE. Not loaded by default.",
+  "_comment_usage": "TEMPLATE ONLY. Complete DKG with the ceremony tooling, distribute the resulting encrypted shares and group key through the operator's approved secure channel, copy this file to a deployment-specific config, and edit dataDir / validatorKey / validatorEnabled. Start or restart nodes through the deployment supervisor.",
+  "_comment_tss_guards": "TSS fields trigger 3 safety guards: node/config.go:823,854 and node/node.go:2963 (RPC-M1). Guards REQUIRE: tssKeyShareFile path exists AND is decryptable with TSS_PASSWORD env var, tssGroupKeyFile path exists. Loading fails => node refuses to start.",
+  "_comment_password": "TSS password via env var TSS_PASSWORD on each node, NOT in JSON. Supply it through the deployment supervisor's secret mechanism; do not store it in this template.",
+  "name": "qau-node",
+  "dataDir": "./data",
+  "network": "mainnet",
+  "listenAddr": ":9000",
+  "bootstrapPeers": [],
+  "maxPeers": 50,
+  "rpcEnabled": true,
+  "rpcAddr": "127.0.0.1:8745",
+  "wsEnabled": true,
+  "wsAddr": "127.0.0.1:8746",
+  "frontendEnabled": false,
+  "frontendAddr": "",
+  "healthEnabled": true,
+  "healthAddr": "127.0.0.1:8080",
+  "metricsEnabled": true,
+  "metricsAddr": "127.0.0.1:9090",
+  "validatorEnabled": false,
+  "validatorKey": "",
+  "cacheSize": 512,
+  "maxGasLimit": 30000000,
+  "logLevel": "info",
+  "logFormat": "json",
+  "shutdownTimeout": 30,
+  "devMode": false,
+  "blockInterval": 12,
+  "parallelExecution": {
+    "enabled": true,
+    "numWorkers": 4,
+    "maxRetries": 3
+  },
+  "cacheConfig": {
+    "l1MaxSize": 1024,
+    "l1MaxMemory": 67108864,
+    "l2MaxSize": 8192,
+    "l2MaxMemory": 268435456,
+    "ttlSeconds": 300
+  },
+  "pruningConfig": {
+    "enabled": true,
+    "retentionBlocks": 1000,
+    "batchSize": 100
+  },
+  "expertConfig": {
+    "enabled": false
+  },
+  "computerUse": {
+    "enabled": false
+  },
+  "alerting": {
+    "enabled": true,
+    "configFile": "configs/alerting.json"
+  },
+  "bridge": {
+    "_comment": "Cross-chain bridge config (mainnet). QAU_ENABLE_BRIDGE=1 env var required to enable.",
+    "nodeUrls": {
+      "quantaureum": "http://127.0.0.1:8745",
+      "ethereum": ""
+    },
+    "bridgeContractAddresses": {
+      "quantaureum": "",
+      "ethereum": ""
+    },
+    "gasLimit": 2000000,
+    "confirmationsRequired": 20,
+    "messageExpiration": 86400,
+    "pollingInterval": 15,
+    "maxRetries": 5,
+    "initializerAddress": "",
+    "validatorPublicKeyHex": "",
+    "relayerPublicKeyHex": ""
+  },
+  "allowedOrigins": [],
+  "danksharding": {
+    "enabled": false,
+    "experimental": false,
+    "committeeSize": 0,
+    "subnetCount": 0
+  },
+  "sharding": {
+    "maxCount": 64,
+    "blockSize": 1048576,
+    "interval": 12,
+    "minValidators": 3
+  },
+  "_tss_comment": "=== QTD/TSS fields (NEW). DO NOT enable these until DKG ceremony outputs are deployed ===",
+  "tssThreshold": 4,
+  "tssTotalShares": 6,
+  "tssKeyShareFile": "/var/lib/quantaureum/tss_keyshare.enc",
+  "tssGroupKeyFile": "/var/lib/quantaureum/tss_group_key.bin",
+  "tssDistributedMode": true,
+  "_tss_threshold_comment": "tssThreshold=4 of 6 => BFT quorum 2/3+1, tolerates up to 2 Byzantine validators",
+  "_tss_distributed_mode_comment": "tssDistributedMode=true required on mainnet (Validate-2 guard at config.go:854). Each node holds only its own share and signs via P2P.",
+  "_tss_keyshare_path_comment": "Per-node file path. Each operator installs only its assigned encrypted TSS share at this path.",
+  "_tss_groupkey_path_comment": "Per-node file path for the common non-secret TSS group public key."
+}

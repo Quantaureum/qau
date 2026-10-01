@@ -420,8 +420,8 @@ type Blacklist struct {
 	//     Add/IsBlacklisted; the IP/subnet maps are additive overlays.
 	//   - Empty IP ("") is a no-op for the IP/subnet maps so legacy callers
 	//     (e.g., tests that don't track remote addr) keep working.
-	ips     map[string]*blacklistEntry // key = a literal IP address
-	subnets map[string]*blacklistEntry // key = a /24 subnet
+	ips     map[string]*blacklistEntry // key = literal IP string ("198.51.100.10")
+	subnets map[string]*blacklistEntry // key = /24 subnet ("198.51.100.0/24")
 
 	// P2P-R11-M02 (2026-07-20) FIX: persistence for permanent + long-TTL bans.
 	// Without this, a node restart clears the entire blacklist and every
@@ -490,7 +490,7 @@ func extractIPFromAddr(addr string) string {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		// Either no port (bare IP/hostname) or malformed. Try parsing the
-		// whole string as an IP - succeeds for a literal IPv4 address or "::1".
+		// whole string as an IP — succeeds for "198.51.100.10" / "::1".
 		if ip := net.ParseIP(addr); ip != nil {
 			return ip.String()
 		}

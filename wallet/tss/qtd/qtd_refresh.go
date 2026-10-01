@@ -442,14 +442,14 @@ func GenerateSubShares(participantID int, share *QTDShare, newParticipantIDs []i
 }
 
 func generateSubSharesForVec(vec PolyVec, participantID int, newParticipantIDs []int, newThreshold int) (map[int][]byte, error) {
-	subVecs, err := shamirSplitPolyVec(vec, newThreshold, len(newParticipantIDs))
+	subVecs, err := shamirSplitPolyVecAt(vec, newThreshold, newParticipantIDs)
 	if err != nil {
 		return nil, err
 	}
 
 	result := make(map[int][]byte, len(newParticipantIDs))
-	for i, newID := range newParticipantIDs {
-		result[newID] = VecToBytes(subVecs[i+1])
+	for _, newID := range newParticipantIDs {
+		result[newID] = VecToBytes(subVecs[newID])
 	}
 
 	return result, nil
@@ -462,12 +462,12 @@ func CombineSubShares(
 	oldParticipantIDs []int,
 	publicKey *QTDPublicKey,
 ) (*ReshareResult, error) {
-	if len(allSubShares) == 0 || len(newParticipantIDs) == 0 {
+	if len(allSubShares) == 0 || newThreshold < 2 || newThreshold > len(newParticipantIDs) {
 		return nil, ErrInvalidConfig
 	}
 
-	if len(oldParticipantIDs) < newThreshold {
-		return nil, fmt.Errorf("%w: need at least %d old participants, got %d", ErrInsufficientParticipants, newThreshold, len(oldParticipantIDs))
+	if len(oldParticipantIDs) < 2 {
+		return nil, fmt.Errorf("%w: need at least 2 old participants, got %d", ErrInsufficientParticipants, len(oldParticipantIDs))
 	}
 
 	lagrangeCoeffs := make(map[int]int64, len(oldParticipantIDs))
@@ -476,86 +476,20 @@ func CombineSubShares(
 	}
 
 	newShares := make([]*QTDShare, len(newParticipantIDs))
-
 	for idx, newID := range newParticipantIDs {
-		s1Accum := make(PolyVec, Dilithium3L)
-		s2Accum := make(PolyVec, Dilithium3K)
-		t0Accum := make(PolyVec, Dilithium3K)
-
-		for _, fromID := range oldParticipantIDs {
-			var subShare *SubShare
-			for _, batch := range allSubShares {
-				for _, ss := range batch {
-					if ss.FromParticipant == fromID && ss.ToParticipant == newID {
-						subShare = ss
-						break
-					}
-				}
-				if subShare != nil {
-					break
+		var contributions []*SubShare
+		for _, batch := range allSubShares {
+			for _, subShare := range batch {
+				if subShare != nil && subShare.ToParticipant == newID {
+					contributions = append(contributions, subShare)
 				}
 			}
-			if subShare == nil {
-				return nil, fmt.Errorf("%w: missing sub-share from %d to %d", ErrParticipantNotFound, fromID, newID)
-			}
-
-			coeff := lagrangeCoeffs[fromID]
-
-			s1SubVec, err := VecFromBytes(subShare.S1SubShare, Dilithium3L)
-			if err != nil {
-				return nil, fmt.Errorf("s1 sub-share deserialize failed: %w", err)
-			}
-			s2SubVec, err := VecFromBytes(subShare.S2SubShare, Dilithium3K)
-			if err != nil {
-				return nil, fmt.Errorf("s2 sub-share deserialize failed: %w", err)
-			}
-			t0SubVec, err := VecFromBytes(subShare.T0SubShare, Dilithium3K)
-			if err != nil {
-				return nil, fmt.Errorf("t0 sub-share deserialize failed: %w", err)
-			}
-
-			s1Weighted := VecScalarMul(s1SubVec, coeff)
-			s2Weighted := VecScalarMul(s2SubVec, coeff)
-			t0Weighted := VecScalarMul(t0SubVec, coeff)
-
-			s1Accum = VecAdd(s1Accum, s1Weighted)
-			s2Accum = VecAdd(s2Accum, s2Weighted)
-			t0Accum = VecAdd(t0Accum, t0Weighted)
 		}
-
-		newShare := &QTDShare{
-			ParticipantID: newID,
-			S1ShareBytes:  VecToBytes(s1Accum),
-			S2ShareBytes:  VecToBytes(s2Accum),
-			T0ShareBytes:  VecToBytes(t0Accum),
-		}
-
-		if publicKey != nil {
-			newShare.Rho = make([]byte, len(publicKey.Rho))
-			copy(newShare.Rho, publicKey.Rho)
-			newShare.T1Bytes = make([]byte, len(publicKey.T1))
-			copy(newShare.T1Bytes, publicKey.T1)
-		}
-
-		vVector, err := generateVerificationVector(newShare.S1ShareBytes, newThreshold)
+		share, err := CombineSubShareForParticipant(contributions, newID, newThreshold, oldParticipantIDs, publicKey)
 		if err != nil {
-			return nil, fmt.Errorf("verification vector generation failed: %w", err)
+			return nil, err
 		}
-		newShare.VVector = vVector
-
-		vVectorS2, errS2 := generateVerificationVector(newShare.S2ShareBytes, newThreshold)
-		if errS2 != nil {
-			return nil, fmt.Errorf("failed to generate S2 verification vector: %w", errS2)
-		}
-		newShare.VVectorS2 = vVectorS2
-
-		vVectorT0, errT0 := generateVerificationVector(newShare.T0ShareBytes, newThreshold)
-		if errT0 != nil {
-			return nil, fmt.Errorf("failed to generate T0 verification vector: %w", errT0)
-		}
-		newShare.VVectorT0 = vVectorT0
-
-		newShares[idx] = newShare
+		newShares[idx] = share
 	}
 
 	return &ReshareResult{
@@ -564,6 +498,101 @@ func CombineSubShares(
 		NewTotal:          len(newParticipantIDs),
 		NewParticipantIDs: newParticipantIDs,
 	}, nil
+}
+
+// CombineSubShareForParticipant combines only the contribution destined for
+// targetID. It is the distributed counterpart of CombineSubShares: a joining
+// validator can derive its own refreshed share without ever materializing the
+// other validators' shares in its process.
+func CombineSubShareForParticipant(
+	contributions []*SubShare,
+	targetID int,
+	newThreshold int,
+	oldParticipantIDs []int,
+	publicKey *QTDPublicKey,
+) (*QTDShare, error) {
+	if len(contributions) == 0 || targetID <= 0 || targetID >= Q || newThreshold < 2 {
+		return nil, ErrInvalidConfig
+	}
+	if len(oldParticipantIDs) < 2 {
+		return nil, fmt.Errorf("%w: need at least 2 old participants, got %d", ErrInsufficientParticipants, len(oldParticipantIDs))
+	}
+
+	lagrangeCoeffs := make(map[int]int64, len(oldParticipantIDs))
+	for _, id := range oldParticipantIDs {
+		if id <= 0 || id >= Q {
+			return nil, fmt.Errorf("%w: invalid old participant ID %d", ErrInvalidParticipant, id)
+		}
+		if _, exists := lagrangeCoeffs[id]; exists {
+			return nil, fmt.Errorf("%w: duplicate old participant ID %d", ErrInvalidParticipant, id)
+		}
+		lagrangeCoeffs[id] = lagrangeCoeff(id, oldParticipantIDs)
+	}
+
+	bySender := make(map[int]*SubShare, len(contributions))
+	for _, contribution := range contributions {
+		if contribution == nil || contribution.ToParticipant != targetID {
+			return nil, fmt.Errorf("%w: contribution target mismatch for participant %d", ErrInvalidShare, targetID)
+		}
+		if _, expected := lagrangeCoeffs[contribution.FromParticipant]; !expected {
+			return nil, fmt.Errorf("%w: contribution from unknown participant %d", ErrInvalidParticipant, contribution.FromParticipant)
+		}
+		if _, duplicate := bySender[contribution.FromParticipant]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate contribution from participant %d", ErrInvalidShare, contribution.FromParticipant)
+		}
+		bySender[contribution.FromParticipant] = contribution
+	}
+	if len(bySender) != len(oldParticipantIDs) {
+		return nil, fmt.Errorf("%w: expected %d contributions, got %d", ErrParticipantNotFound, len(oldParticipantIDs), len(bySender))
+	}
+
+	s1Accum := make(PolyVec, Dilithium3L)
+	s2Accum := make(PolyVec, Dilithium3K)
+	t0Accum := make(PolyVec, Dilithium3K)
+	for _, fromID := range oldParticipantIDs {
+		contribution := bySender[fromID]
+		coeff := lagrangeCoeffs[fromID]
+
+		s1SubVec, err := VecFromBytes(contribution.S1SubShare, Dilithium3L)
+		if err != nil {
+			return nil, fmt.Errorf("s1 sub-share deserialize failed: %w", err)
+		}
+		s2SubVec, err := VecFromBytes(contribution.S2SubShare, Dilithium3K)
+		if err != nil {
+			return nil, fmt.Errorf("s2 sub-share deserialize failed: %w", err)
+		}
+		t0SubVec, err := VecFromBytes(contribution.T0SubShare, Dilithium3K)
+		if err != nil {
+			return nil, fmt.Errorf("t0 sub-share deserialize failed: %w", err)
+		}
+
+		s1Accum = VecAdd(s1Accum, VecScalarMul(s1SubVec, coeff))
+		s2Accum = VecAdd(s2Accum, VecScalarMul(s2SubVec, coeff))
+		t0Accum = VecAdd(t0Accum, VecScalarMul(t0SubVec, coeff))
+	}
+
+	newShare := &QTDShare{
+		ParticipantID: targetID,
+		S1ShareBytes:  VecToBytes(s1Accum),
+		S2ShareBytes:  VecToBytes(s2Accum),
+		T0ShareBytes:  VecToBytes(t0Accum),
+	}
+	if publicKey != nil {
+		newShare.Rho = append([]byte(nil), publicKey.Rho...)
+		newShare.T1Bytes = append([]byte(nil), publicKey.T1...)
+	}
+
+	var err error
+	if newShare.VVector, err = generateVerificationVector(newShare.S1ShareBytes, newThreshold); err != nil {
+		return nil, fmt.Errorf("verification vector generation failed: %w", err)
+	}
+	if newShare.VVectorS2, err = generateVerificationVector(newShare.S2ShareBytes, newThreshold); err != nil {
+		return nil, fmt.Errorf("S2 verification vector generation failed: %w", err)
+	}
+	if newShare.VVectorT0, err = generateVerificationVector(newShare.T0ShareBytes, newThreshold); err != nil {
+		return nil, fmt.Errorf("T0 verification vector generation failed: %w", err)
+	}
+	return newShare, nil
 }
 
 func AddParticipant(

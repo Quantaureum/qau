@@ -42,6 +42,10 @@ func (m *keyAwareSigner) VerifyVote(pubKey []byte, message []byte, signature []b
 }
 func (m *keyAwareSigner) GroupPublicKey() []byte { return m.currentKey }
 func (m *keyAwareSigner) IsThresholdMode() bool  { return true }
+
+// Threshold implements consensus.ThresholdKeySigner. Returning 0 keeps the
+// chamber-based quorum unchanged for this mock.
+func (m *keyAwareSigner) Threshold() int { return 0 }
 func (m *keyAwareSigner) AggregatePartialSignatures(
 	sealers []int, partialSigs map[int][]byte, message []byte,
 ) ([]byte, error) {
