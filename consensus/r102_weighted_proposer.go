@@ -223,6 +223,13 @@ func (q *QPOS) epochSeedLocked(epoch uint64) (types.Hash, bool) {
 		srcEpoch := epoch - 2
 		if vrfAcc := q.getEpochVRFAccumulatorLocked(srcEpoch); vrfAcc != (types.Hash{}) {
 			seedData = append(seedData, vrfAcc[:]...)
+			// VDF seed hardening (stage-2): mix VDF(acc[srcEpoch]) when the
+			// feature is active for this shuffle epoch. Deterministic
+			// cache-or-inline — async precompute and inline fallback produce
+			// the same bytes, so the merge cannot fork (see vdf_seed.go).
+			if vdfSeed, ok := q.vdfSeedFor(srcEpoch, vrfAcc); ok {
+				seedData = append(seedData, vdfSeed[:]...)
+			}
 		} else {
 			coldStart = true
 		}

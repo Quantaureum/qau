@@ -161,6 +161,21 @@ type Config struct {
 	// the network — proposer election is cross-verified ("invalid block
 	// proposer"), so a divergent value forks the chain at the cutover epoch.
 	WeightedConsensusCutoverEpoch uint64 `json:"weightedConsensusCutoverEpoch,omitempty"`
+	// VDFSeedActivationEpoch enables the VDF-hardened proposer shuffle seed
+	// for shuffle epochs >= this value. 0 / unset = disabled (pre-VDF seed).
+	// MUST be identical on every node of the network — the seed feeds
+	// proposer election, which is cross-verified; a divergent value forks
+	// the chain at the activation epoch. See consensus/vdf_seed.go.
+	VDFSeedActivationEpoch uint64 `json:"vdfSeedActivationEpoch,omitempty"`
+	// VDFSeedTimeSteps is the VDF sequential length T. 0 = the calibrated
+	// default (16,384). Governance pins this before activation; changing it
+	// after activation is a protocol change (same upgrade path).
+	VDFSeedTimeSteps int `json:"vdfSeedTimeSteps,omitempty"`
+	// VDFSeedCRSSeedHex pins the CRS seed (hex, 64 chars). Empty = derive
+	// from the genesis hash (chain-pinned, identical across nodes). Setting
+	// it explicitly is a governance decision; divergent values fork the
+	// chain.
+	VDFSeedCRSSeedHex string `json:"vdfSeedCRSSeedHex,omitempty"`
 	DevBlocks                     bool   `json:"devBlocks"`     // Enable block production in dev mode (replaces QAU_DEV_MODE_BLOCKS env var)
 	BlockInterval                 int    `json:"blockInterval"` // Block production interval in seconds (dev mode only)
 	BlockProducer                 bool   `json:"blockProducer"` // Enable block production (default true in dev mode, set false for sync-only nodes)

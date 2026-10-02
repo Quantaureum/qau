@@ -847,6 +847,25 @@ func (bp *BlockProducer) initValidatorSet() {
 			bp.node.config.WeightedConsensusCutoverEpoch)
 	}
 
+	// VDF seed hardening (stage-2): activation-gated from node config.
+	// The ElectionVerifier shares this QPOS instance, so a single setter
+	// covers every consumer of the shuffle seed.
+	if bp.node.config.VDFSeedActivationEpoch > 0 {
+		cfg := consensus.VDFSeedConfig{
+			ActivationEpoch: bp.node.config.VDFSeedActivationEpoch,
+			TimeSteps:       bp.node.config.VDFSeedTimeSteps,
+		}
+		if cfg.TimeSteps == 0 {
+			cfg.TimeSteps = 16384 // stage-2 calibration (35 s per evaluation)
+		}
+		if err := qpos.EnableVDFSeed(cfg); err != nil {
+			bpLog.Warn("VDF seed hardening rejected: %v", err)
+		} else {
+			bpLog.Info("VDF seed hardening configured: activationEpoch=%d T=%d",
+				cfg.ActivationEpoch, cfg.TimeSteps)
+		}
+	}
+
 	// Genesis time is set during node startup (main.go / genesis loader).
 	// No need to set it here — consensus.SetGenesisTime uses sync.Once.
 
@@ -1091,8 +1110,16 @@ func (bp *BlockProducer) produceLoop() {
 						} else {
 							// P1-4: Broadcast seal request so executive members submit partial seals.
 							// Use the block hash recorded in the lifecycle (set by ProposeBlock).
+							//
+							// QTD-NOISE-FIX (2026-10-02): only the slot's proposer
+							// broadcasts. Receivers reject non-proposer senders
+							// (B-5), so broadcasting from every node produced a
+							// 5/6 warning-noise storm per slot on 6-validator
+							// devnets without contributing anything.
 							if lc := bp.threeChambersFlow.GetLifecycle(prevSlot); lc != nil {
-								bp.node.requestQTDSeal(prevSlot, lc.BlockHash)
+								if proposer, err := bp.qpos.GetProposerForSlot(prevSlot); err == nil && proposer != nil && proposer.Address == bp.validatorAddr {
+									bp.node.requestQTDSeal(prevSlot, lc.BlockHash)
+								}
 							}
 						}
 					}

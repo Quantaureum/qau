@@ -438,6 +438,16 @@ type QPOS struct {
 	// shouldSwitch in node.go), so all honest nodes agree on the contents.
 	epochVRFAccumulator map[uint64]types.Hash // epoch -> XOR of VRF outputs
 
+	// VDF seed hardening (stage-2 spec; see vdf_seed.go). nil = disabled:
+	// the shuffle seed derivation stays byte-identical to the pre-VDF
+	// behavior. When enabled (shuffle epoch >= ActivationEpoch), the seed
+	// mixes in VDF(accumulator[epoch-2]) — a T-step sequential time lock
+	// that cannot be ground within an epoch window.
+	vdfSeedCfg   *VDFSeedConfig
+	vdfSeedMu    sync.Mutex
+	vdfSeedCache map[vdfSeedKey]types.Hash // (srcEpoch, acc) -> hardened seed
+	vdfSeedBusy  map[vdfSeedKey]struct{}   // async precompute dedup
+
 	// R58-VRF-PERSIST (2026-08-18): optional callback invoked (under q.mu)
 	// whenever SetEpochVRFAccumulator commits an authoritative per-epoch
 	// accumulator. node.go registers it to write the value to the block
@@ -675,6 +685,9 @@ func NewQPOS(validators *ValidatorSet) (*QPOS, error) {
 		epochBlockRoots:         make(map[uint64]types.Hash),
 		slotBlockRoots:          make(map[uint64]types.Hash),   // AUDIT (2026) GOV-05
 		epochVRFAccumulator:     make(map[uint64]types.Hash),   // AUDIT (2026) R4-CORE-01
+		vdfSeedCache:            make(map[vdfSeedKey]types.Hash), // stage-2 VDF seed hardening
+		vdfSeedBusy:             make(map[vdfSeedKey]struct{}),   // stage-2 VDF seed hardening
+		vdfSeedCfg:              vdfSeedConfigFromEnv(),          // nil unless QAU_VDF_SEED_ENABLED=1 (+activation epoch)
 		appliedBlockRoots:       make(map[types.Hash]struct{}), // R38-P1-08 DEEP FIX
 		randaoMix:               types.Hash{},
 		authorizedCallers:       NewAuthorizedCallers(),

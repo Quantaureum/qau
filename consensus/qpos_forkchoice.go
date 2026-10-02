@@ -730,11 +730,22 @@ func (q *QPOS) SetEpochVRFAccumulator(epoch uint64, accOnChain types.Hash) {
 
 	q.epochVRFAccumulator[epoch] = accOnChain
 
+	// VDF seed hardening (stage-2): kick off the async T-step evaluation
+	// for this epoch's accumulator so the shuffle for epoch+2 finds the
+	// hardened seed cached. Never blocks: on cache miss the derivation
+	// falls back to a deterministic inline compute (see vdf_seed.go).
+	q.spawnVDFSeedPrecompute(epoch, accOnChain)
+
 	// SECURITY (R4-CORE-01): Invalidate the shuffle cache for epochs that
 	// depend on this epoch's VRF accumulator (same policy as
 	// AccumulateVRFOutput / CONS-R13-M03).
 	delete(q.shuffleCache, epoch+1)
 	delete(q.shuffleCache, epoch+2)
+
+	// VDF seed reorg note (stage-2): the hardened-seed cache is keyed by
+	// (srcEpoch, acc), so a reorg writing a different accumulator for this
+	// epoch cannot reuse a stale entry — the new accumulator gets its own
+	// computation (see TestVDFSeedReorgSafety).
 
 	// R45-PoA-FIX (2026-08-12): The accumulator for THIS epoch just got
 	// populated from the on-chain header. Epochs that depend on it
