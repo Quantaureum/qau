@@ -9,7 +9,6 @@ import (
 
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
-	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -59,11 +58,33 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 	if runner == nil || result.Share == nil {
 		return fmt.Errorf("Dilithium3 v1 activation exchange requires a finalized share")
 	}
+	return n.runTDilithium3ActivationExchange(
+		ctx, session, result.Share, runner.shareStore, runner.password,
+		verifier, sign, broadcast,
+	)
+}
+
+// runTDilithium3ActivationExchange is the share-level core of the activation
+// exchange: the DKG ceremony hands it a finalized candidate and the same-key
+// reshare ceremony (R77) hands it the rotated store-candidate share.
+func (n *Node) runTDilithium3ActivationExchange(
+	ctx context.Context,
+	session dilithium3v1.DKGSession,
+	share *dilithium3v1.LocalShare,
+	shareStore *thresholdShareStore,
+	password []byte,
+	verifier dilithium3v1.DKGIdentityVerifier,
+	sign func([]byte) ([]byte, error),
+	broadcast func(messageType uint8, payload []byte) error,
+) error {
+	if share == nil || shareStore == nil || len(password) == 0 {
+		return fmt.Errorf("Dilithium3 v1 activation exchange requires a finalized share")
+	}
 	if session.ActivationEpoch == 0 {
 		return fmt.Errorf("Dilithium3 v1 activation exchange requires a non-zero activation epoch")
 	}
 	// Sign and broadcast our own acknowledgement.
-	own, err := encodeTDilithium3DKGActivationEnvelope(session, result.Share, sign)
+	own, err := encodeTDilithium3DKGActivationEnvelope(session, share, sign)
 	if err != nil {
 		return fmt.Errorf("encode activation envelope: %w", err)
 	}
@@ -71,15 +92,16 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 		return fmt.Errorf("broadcast activation envelope: %w", err)
 	}
 
-	// Collect six verified packets from all committee members, then assemble
+	// Collect verified packets from all committee members, then assemble
 	// the certificate.
 	//
-	// Because the six nodes begin their ceremonies at staggered times (the
+	// Because the nodes begin their ceremonies at staggered times (the
 	// per-slot produce loop drives the retry cadence), a node that installs
 	// its sink after a peer already fired its single acknowledgement would
 	// otherwise never observe that peer. Mirror the randomness round and
 	// rebroadcast our own acknowledgement every second until every member is
 	// collected, so late-starting nodes still converge on the full set.
+	memberCount := len(session.Committee.Participants)
 	colslected := map[string][]byte{string(own): own}
 	sink := make(chan []byte, tdilithium3DKGActivationSinkCapacity)
 	n.installTDilithium3DKGActivationSink(sink)
@@ -88,7 +110,7 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 	defer cancel()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for len(colslected) < int(protocol.ThresholdV1ParticipantCount) {
+	for len(colslected) < memberCount {
 		select {
 		case packet := <-sink:
 			// Dedup by content; a retransmitted packet is identical.
@@ -103,12 +125,10 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 			// redundant: the share is already persisted and the finality
 			// surface is already registered. Skip the assembly (which
 			// requires all six receipts) and return success.
-			if runner.shareStore != nil {
-				activeEpoch, _, probeErr := runner.shareStore.ActiveSharePublicIdentity(runner.password)
-				if probeErr == nil && activeEpoch == session.ActivationEpoch {
-					nodeLog.Info("Dilithium3 v1 activation exchange: active share adopted via gossip during collection; skipping assembly (collected %d/%d, epoch %d)", len(colslected), protocol.ThresholdV1ParticipantCount, session.ActivationEpoch)
-					return nil
-				}
+			activeEpoch, _, _, probeErr := shareStore.ActiveSharePublicIdentity(password)
+			if probeErr == nil && activeEpoch == session.ActivationEpoch {
+				nodeLog.Info("Dilithium3 v1 activation exchange: active share adopted via gossip during collection; skipping assembly (collected %d/%d, epoch %d)", len(colslected), memberCount, session.ActivationEpoch)
+				return nil
 			}
 			// Retransmit our own acknowledgement so peers that installed
 			// their sink after our first broadcast still receive it.
@@ -117,14 +137,16 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 			}
 		case <-deadline.Done():
 			return fmt.Errorf("Dilithium3 v1 activation exchange collected %d/%d acknowledgements before the deadline",
-				len(colslected), protocol.ThresholdV1ParticipantCount)
+				len(colslected), memberCount)
 		}
 	}
 	colslectedIn := make([][]byte, 0, len(colslected))
 	for _, packet := range colslected {
 		colslectedIn = append(colslectedIn, packet)
 	}
-	certificate, err := assembleTDilithium3DKGActivationCertificate(session, result.PublicKey, result.TranscriptDigest, colslectedIn, verifier)
+	var sharePublicKey [1952]byte
+	copy(sharePublicKey[:], share.Key.PublicKey)
+	certificate, err := assembleTDilithium3DKGActivationCertificate(session, sharePublicKey, share.TranscriptDigest, colslectedIn, verifier)
 	if err != nil {
 		return fmt.Errorf("assemble activation certificate: %w", err)
 	}
@@ -132,11 +154,11 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 	if err != nil {
 		return fmt.Errorf("session digest: %w", err)
 	}
-	if err := runner.shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, runner.password); err != nil {
+	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, password); err != nil {
 		return fmt.Errorf("commit active share: %w", err)
 	}
 	nodeLog.Info("Dilithium3 v1 activation committed (activation epoch %d, session %x, group key prefix %x)",
-		session.ActivationEpoch, sessionDigest[:8], result.PublicKey[:4])
+		session.ActivationEpoch, sessionDigest[:8], sharePublicKey[:4])
 
 	// Gossip the assembled certificate so peers that never reached the full
 	// six-acknowledgement set for this session can adopt the same group key
@@ -330,12 +352,16 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 
 	// Register the finality surface so the seal executor can sign with the
 	// adopted group key. This mirrors refreshTDilithium3SigningFinalitySigner.
-	adoptedEpoch, groupPublicKey, err := store.ActiveSharePublicIdentity(password)
+	adoptedEpoch, groupPublicKey, committeeThreshold, err := store.ActiveSharePublicIdentity(password)
 	if err != nil {
 		nodeLog.Warn("Dilithium3 v1 activation adopted but identity probe failed: %v", err)
 		return
 	}
-	if err := n.registerTDilithium3SigningFinalitySigner(adoptedEpoch, groupPublicKey); err != nil {
+	if committeeThreshold == 0 {
+		nodeLog.Warn("Dilithium3 v1 activation adopted with a zero committee threshold")
+		return
+	}
+	if err := n.registerTDilithium3SigningFinalitySigner(adoptedEpoch, groupPublicKey, int(committeeThreshold)); err != nil {
 		nodeLog.Warn("Dilithium3 v1 activation finality surface registration deferred: %v", err)
 	}
 }

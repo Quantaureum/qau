@@ -178,7 +178,7 @@ func validateTDilithium3DKGStructure(messageType uint8, encoded []byte, session 
 		if err != nil {
 			return protocol.ThresholdEnvelope{}, err
 		}
-		if message.CommitteeDigest != committeeDigest || senderPosition != message.LeaderPosition || recipientPosition == nil || *recipientPosition >= 6 || message.RecipientPosition != *recipientPosition {
+		if message.CommitteeDigest != committeeDigest || senderPosition != message.LeaderPosition || recipientPosition == nil || *recipientPosition >= uint8(len(session.Committee.Participants)) || message.RecipientPosition != *recipientPosition {
 			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG private seed identity mismatch")
 		}
 	case p2p.MsgTypeTDilithium3DKGAcknowledgement:
@@ -208,6 +208,16 @@ func validateTDilithium3DKGStructure(messageType uint8, encoded []byte, session 
 	case p2p.MsgTypeTDilithium3DKGActivation:
 		if recipientPosition != nil {
 			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG activation cannot have a private recipient")
+		}
+	case p2p.MsgTypeTDilithium3ReshareDelta:
+		message, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+		if err != nil {
+			return protocol.ThresholdEnvelope{}, err
+		}
+		if message.CommitteeDigest != committeeDigest || senderPosition != message.AnchorPosition ||
+			recipientPosition == nil || *recipientPosition >= uint8(len(session.Committee.Participants)) ||
+			message.RecipientPosition != *recipientPosition {
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 v1 reshare delta identity mismatch")
 		}
 	default:
 		return protocol.ThresholdEnvelope{}, fmt.Errorf("unsupported Dilithium3 DKG message type %d", messageType)

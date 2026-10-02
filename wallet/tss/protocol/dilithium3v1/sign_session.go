@@ -28,7 +28,13 @@ func Dilithium3SigningSessionID(request protocol.SignRequest, signerIDs []uint32
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("%w: %v", ErrInvalidDilithium3SigningSession, err)
 	}
-	if len(signerIDs) != int(protocol.ThresholdV1Threshold) {
+	// The signer count must equal the committee's own threshold and must map
+	// to a pinned signing row (R76b): a five-signer set is legitimate on a
+	// seven-member committee, not on a six-member one.
+	if len(signerIDs) != int(request.Committee.Threshold) {
+		return [32]byte{}, ErrInvalidDilithium3SigningSession
+	}
+	if _, err := SigningParametersForThresholdCount(len(signerIDs)); err != nil {
 		return [32]byte{}, ErrInvalidDilithium3SigningSession
 	}
 	for index, signerID := range signerIDs {

@@ -86,18 +86,22 @@ const (
 )
 
 // SigningExecutorPolicy is the per-session admissibility snapshot: the session
-// identifier and the four active signer identities in canonical ascending
-// order.
+// identifier and the active signer identities in canonical ascending order.
+// Since R76b the signer count is the pinned row threshold (4 or 5) instead of
+// a fixed four.
 type SigningExecutorPolicy struct {
 	SessionID [32]byte
-	Signers   [4]uint32
+	Signers   []uint32
 }
 
-// Validate rejects a policy that does not describe exactly four strictly
-// ascending, non-zero signer identities bound to a non-zero session.
+// Validate rejects a policy that does not describe a strictly ascending,
+// non-zero signer identity list that matches a pinned committee row.
 func (policy SigningExecutorPolicy) Validate() error {
 	if policy.SessionID == ([32]byte{}) {
 		return fmt.Errorf("%w: zero session", ErrInvalidSigningExecutorGate)
+	}
+	if _, err := SigningParametersForThresholdCount(len(policy.Signers)); err != nil {
+		return err
 	}
 	for index, signer := range policy.Signers {
 		if signer == 0 {

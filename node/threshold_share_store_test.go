@@ -6,6 +6,7 @@ import (
 	"crypto/sha3"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,6 +15,10 @@ import (
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
+
+func tdilithium3ComponentsEqual(a, b []dilithium3v1.RSSComponent) bool {
+	return slices.Equal(a, b)
+}
 
 func TestThresholdShareStoreProtocolPaths(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "shares.enc")
@@ -56,7 +61,7 @@ func TestThresholdShareStoreRoundTripAndRollbackProtection(t *testing.T) {
 	if loaded.Key.Generation != 2 || loaded.ParticipantID != share.ParticipantID || loaded.ParticipantPosition != share.ParticipantPosition || loaded.TranscriptDigest != share.TranscriptDigest {
 		t.Fatal("loaded share mismatch")
 	}
-	if loaded.Components != share.Components {
+	if !tdilithium3ComponentsEqual(loaded.Components, share.Components) {
 		t.Fatal("loaded RSS components mismatch")
 	}
 	loaded.Zeroize()
@@ -129,7 +134,7 @@ func TestThresholdShareStoreCandidateCrashRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recovered candidate: %v", err)
 	}
-	if loaded.Components != upcoming.Components {
+	if !tdilithium3ComponentsEqual(loaded.Components, upcoming.Components) {
 		t.Fatal("recovered candidate changed its components")
 	}
 	loaded.Zeroize()
@@ -173,7 +178,7 @@ func TestThresholdShareStoreRequiresCertificateAtEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load activated share after restart: %v", err)
 	}
-	if loaded.Components != share.Components {
+	if !tdilithium3ComponentsEqual(loaded.Components, share.Components) {
 		t.Fatal("activated share components changed")
 	}
 	loaded.Zeroize()
@@ -267,7 +272,7 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load after interrupted rotation recovery: %v", err)
 	}
-	if loaded.Key.Generation != second.Key.Generation || loaded.Components != second.Components {
+	if loaded.Key.Generation != second.Key.Generation || !tdilithium3ComponentsEqual(loaded.Components, second.Components) {
 		t.Fatal("interrupted rotation recovered the wrong share")
 	}
 	loaded.Zeroize()
@@ -404,6 +409,7 @@ func testThresholdStoreShare(t *testing.T, generation uint64) *dilithium3v1.Loca
 	if err != nil {
 		t.Fatal(err)
 	}
+	share.Components = make([]dilithium3v1.RSSComponent, len(groups))
 	for index, group := range groups {
 		dealer, err := group.Leader(uint8(index % 3))
 		if err != nil {
@@ -414,6 +420,7 @@ func testThresholdStoreShare(t *testing.T, generation uint64) *dilithium3v1.Loca
 			GroupMask:          group,
 			DealerPosition:     dealer,
 			ContributionDigest: [32]byte{byte(generation), byte(index + 1), byte(group)},
+			Multiplicity:       1,
 		}
 		share.Components[index].S1[0][0] = coefficient
 		share.Components[index].S2[0][0] = dilithium3v1.Q - coefficient

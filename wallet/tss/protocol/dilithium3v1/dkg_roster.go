@@ -19,7 +19,7 @@ type DKGIdentityBinding struct {
 }
 
 func DKGIdentityRosterDigest(committee protocol.CommitteeID, bindings []DKGIdentityBinding) ([32]byte, error) {
-	if err := protocol.Dilithium3V1Profile().ValidateCommittee(committee); err != nil || len(bindings) != len(committee.Participants) {
+	if err := protocol.ValidateDilithium3V1Committee(committee); err != nil || len(bindings) != len(committee.Participants) {
 		return [32]byte{}, fmt.Errorf("%w: invalid identity roster committee", ErrInvalidDKGSession)
 	}
 	committeeDigest, err := committee.CanonicalDigest()

@@ -22,7 +22,7 @@ func testTDilithium3DKGRunners(t *testing.T) ([6]*tdilithium3DKGRunner, *tdilith
 		Nonce:           [32]byte{1, 2, 3},
 	}
 	session.IdentityRosterDigest = testTDilithium3IdentityRosterDigest(t, session, "DEVNET ONLY live DKG identity")
-	transport := newTDilithium3DKGMemoryTransport()
+	transport := newTDilithium3DKGMemoryTransport(6)
 	var runners [6]*tdilithium3DKGRunner
 	for position := range runners {
 		entropy := bytes.NewReader(bytes.Repeat([]byte{byte(position + 1), byte(position + 17), byte(position + 33)}, 1<<16))

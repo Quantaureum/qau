@@ -120,7 +120,7 @@ func TestTDilithium3DKGRandomnessRoundSixIndependentNodes(t *testing.T) {
 			}
 		}
 	}
-	wantGlobal, wantRho, err := dilithium3v1.DeriveDKGRandomness(runners[0].session, contributions)
+	wantGlobal, wantRho, err := dilithium3v1.DeriveDKGRandomness(runners[0].session, contributions[:])
 	if err != nil {
 		t.Fatal(err)
 	}

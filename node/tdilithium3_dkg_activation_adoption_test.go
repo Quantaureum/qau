@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha3"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
@@ -149,7 +150,7 @@ func TestAdoptTDilithium3DKGActivationCertificateLiveInboxAdopts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("adoption left no active share: %v", err)
 	}
-	if active.Components != share.Components || active.ActivationEpoch != share.ActivationEpoch {
+	if !slices.Equal(active.Components, share.Components) || active.ActivationEpoch != share.ActivationEpoch {
 		t.Fatal("adopted share mismatch")
 	}
 	active.Zeroize()

@@ -54,8 +54,8 @@ type signingExecutorSlotOutcome struct {
 // ball points and the four one-time records. The journals live across the whole
 // request, one per signer; each record is consumed by at most one candidate.
 type signingExecutorCandidate struct {
-	randomness [4]*signingRandomness
-	records    [4]*PreprocessingRecord
+	randomness []*signingRandomness
+	records    []*PreprocessingRecord
 }
 
 // signingExecutorSchedule drives one signing request across its candidate
@@ -63,17 +63,17 @@ type signingExecutorCandidate struct {
 type signingExecutorSchedule struct {
 	request    protocol.SignRequest
 	active     []*LocalShare
-	journals   [4]*SigningJournal
+	journals   []*SigningJournal
 	candidates []signingExecutorCandidate
 }
 
 // signingExecutorCandidateMaterial assembles one candidate's per-signer session
 // material out of the request-long journals and the candidate's own records.
 func signingExecutorCandidateMaterial(
-	journals [4]*SigningJournal,
+	journals []*SigningJournal,
 	candidate signingExecutorCandidate,
-) [4]signingExecutorSlotMaterial {
-	var material [4]signingExecutorSlotMaterial
+) []signingExecutorSlotMaterial {
+	material := make([]signingExecutorSlotMaterial, len(candidate.records))
 	for index := range material {
 		material[index] = signingExecutorSlotMaterial{
 			randomness: candidate.randomness[index],
@@ -92,12 +92,24 @@ func signingExecutorCandidateMaterial(
 func newSigningExecutorSchedule(
 	request protocol.SignRequest,
 	activeShares []*LocalShare,
-	journals [4]*SigningJournal,
+	journals []*SigningJournal,
 	candidates []signingExecutorCandidate,
 ) (*signingExecutorSchedule, error) {
-	if len(candidates) == 0 || len(candidates) > SigningParallelSlots {
+	if len(candidates) == 0 || len(candidates) > SigningMaxParallelSlots {
 		return nil, fmt.Errorf(
-			"%w: %d candidate slots, want [1, %d]", errInvalidSigningAttempt, len(candidates), SigningParallelSlots,
+			"%w: %d candidate slots, want [1, %d]", errInvalidSigningAttempt, len(candidates), SigningMaxParallelSlots,
+		)
+	}
+	if len(activeShares) == 0 || activeShares[0] == nil {
+		return nil, fmt.Errorf("%w: missing active shares", errInvalidSigningAttempt)
+	}
+	params, err := SigningParametersForParticipants(len(activeShares[0].Committee.Participants))
+	if err != nil {
+		return nil, ErrUnsupportedSigningCommitteeSize
+	}
+	if len(candidates) > params.ParallelSlots {
+		return nil, fmt.Errorf(
+			"%w: %d candidate slots, the pinned row admits [1, %d]", errInvalidSigningAttempt, len(candidates), params.ParallelSlots,
 		)
 	}
 	if err := request.Validate(); err != nil {

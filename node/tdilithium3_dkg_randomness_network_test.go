@@ -90,7 +90,7 @@ func TestTDilithium3DKGRandomnessNetworkSixNodes(t *testing.T) {
 	if !droppedCommitment.Load() {
 		t.Fatal("fault injection did not drop a commitment")
 	}
-	wantGlobal, wantRho, err := dilithium3v1.DeriveDKGRandomness(runners[0].session, contributions)
+	wantGlobal, wantRho, err := dilithium3v1.DeriveDKGRandomness(runners[0].session, contributions[:])
 	if err != nil {
 		t.Fatal(err)
 	}

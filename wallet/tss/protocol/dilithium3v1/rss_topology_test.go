@@ -46,10 +46,18 @@ func TestRSSCanonicalTopology(t *testing.T) {
 }
 
 func TestRSSRejectsInvalidGroupsAndPositions(t *testing.T) {
-	invalidGroups := []RSSGroupMask{0, 1, 3, 15, 0b1000111, 0xff}
-	for _, group := range invalidGroups {
+	// Family validation (R76a): a mask is valid if some committee size in
+	// [6, 12] uses it canonically. 15 (popcount 4, positions 0..3) is a
+	// canonical group of the nine-to-eleven-member committees.
+	for _, group := range []RSSGroupMask{0, 1, 3, 0xff} {
 		if !errors.Is(group.Validate(), ErrInvalidRSSGroup) {
 			t.Fatalf("group %08b error = %v", group, group.Validate())
+		}
+	}
+	// The strict C=6 rule still rejects groups outside its own committee.
+	for _, group := range []RSSGroupMask{0, 1, 3, 15, 0b1000111, 0xff} {
+		if !errors.Is(group.ValidateFor(6), ErrInvalidRSSGroup) {
+			t.Fatalf("group %08b c=6 error = %v", group, group.ValidateFor(6))
 		}
 	}
 	if _, err := GroupsForPosition(6); !errors.Is(err, ErrInvalidRSSPosition) {

@@ -69,7 +69,7 @@ func (acknowledgement DKGActivationAcknowledgement) validateUnsigned() error {
 	if err := acknowledgement.Key.Validate(); err != nil {
 		return fmt.Errorf("%w: key: %v", ErrInvalidDKGActivationCertificate, err)
 	}
-	if err := protocol.Dilithium3V1Profile().ValidateCommittee(acknowledgement.Committee); err != nil {
+	if err := protocol.ValidateDilithium3V1Committee(acknowledgement.Committee); err != nil {
 		return fmt.Errorf("%w: committee: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	for _, participantID := range acknowledgement.Committee.Participants {
@@ -147,10 +147,16 @@ func (certificate DKGActivationCertificate) VerifyCandidate(share *LocalShare, s
 }
 
 func (certificate DKGActivationCertificate) validateStructure() error {
-	if len(certificate.Acknowledgements) != int(protocol.ThresholdV1ParticipantCount) {
+	if len(certificate.Acknowledgements) == 0 {
 		return ErrInvalidDKGActivationCertificate
 	}
 	first := certificate.Acknowledgements[0]
+	// The acknowledgement set must cover the certificate's whole committee
+	// (R76: the family size, not the legacy six).
+	if int(first.Committee.Threshold) == 0 ||
+		len(certificate.Acknowledgements) != len(first.Committee.Participants) {
+		return ErrInvalidDKGActivationCertificate
+	}
 	if err := first.validateUnsigned(); err != nil {
 		return err
 	}

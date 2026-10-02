@@ -141,8 +141,8 @@ func UnmarshalPublicContribution(encoded []byte) (PublicContribution, error) {
 	var contribution PublicContribution
 	copy(contribution.SessionDigest[:], encoded[offset:offset+32])
 	offset += 32
-	contribution.GroupMask = RSSGroupMask(encoded[offset])
-	offset++
+	contribution.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+	offset += 2
 	contribution.DealerPosition = encoded[offset]
 	offset++
 	for index := range contribution.T {
@@ -166,9 +166,10 @@ func (contribution PublicContribution) canonicalPayload() ([]byte, error) {
 	if err := contribution.Validate(); err != nil {
 		return nil, err
 	}
-	payload := make([]byte, 0, 32+1+1+K*PolyEncodedSize)
+	payload := make([]byte, 0, 32+2+1+K*PolyEncodedSize)
 	payload = append(payload, contribution.SessionDigest[:]...)
-	payload = append(payload, byte(contribution.GroupMask), contribution.DealerPosition)
+	payload = binary.BigEndian.AppendUint16(payload, uint16(contribution.GroupMask))
+	payload = append(payload, contribution.DealerPosition)
 	var err error
 	payload, err = appendVectorK(payload, contribution.T)
 	if err != nil {
@@ -178,5 +179,5 @@ func (contribution PublicContribution) canonicalPayload() ([]byte, error) {
 }
 
 func publicContributionEncodedSize() int {
-	return len(publicContributionMagic) + 2 + 32 + 1 + 1 + K*PolyEncodedSize + 32
+	return len(publicContributionMagic) + 2 + 32 + 2 + 1 + K*PolyEncodedSize + 32
 }

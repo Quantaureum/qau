@@ -41,29 +41,36 @@ func signingExecutorTestForeignKeyRequest(fixture *signingTestFixture) protocol.
 
 // signingExecutorTestRandomness draws four ball points from a deterministic
 // source derived from the case label.
-func signingExecutorTestRandomness(t *testing.T, label int64) [4]*signingRandomness {
+func signingExecutorTestRandomness(t *testing.T, label int64) []*signingRandomness {
 	t.Helper()
 	return signingTestAttemptRandomness(t, rand.New(rand.NewSource(label)))
 }
 
 // signingExecutorTestJournals opens one signing journal per active position,
 // the way four signer processes would each keep their own.
-func signingExecutorTestJournals(t *testing.T) [4]*SigningJournal {
+func signingExecutorTestJournals(t *testing.T) []*SigningJournal {
 	t.Helper()
 	directory := t.TempDir()
-	var journals [4]*SigningJournal
+	journals := make([]*SigningJournal, 4)
 	for index := range journals {
 		journals[index] = signingTestJournalAt(t, filepath.Join(directory, fmt.Sprintf("signer-%d", index)))
 	}
 	return journals
 }
 
-// signingExecutorTestRecords returns the four fresh one-time records of one
-// slot. The metadata is test scaffolding; production records come from the
-// preprocessing layer.
-func signingExecutorTestRecords(t *testing.T, slot int) [4]*PreprocessingRecord {
+// signingExecutorTestRecords returns fresh one-time records of one slot, the
+// pinned C=6 threshold count of them. The metadata is test scaffolding;
+// production records come from the preprocessing layer.
+func signingExecutorTestRecords(t *testing.T, slot int) []*PreprocessingRecord {
 	t.Helper()
-	var records [4]*PreprocessingRecord
+	return signingExecutorTestRecordsFor(t, slot, signingTestParameters(t).Threshold)
+}
+
+// signingExecutorTestRecordsFor is signingExecutorTestRecords with an explicit
+// signer count, for the family-row tests.
+func signingExecutorTestRecordsFor(t *testing.T, slot, signers int) []*PreprocessingRecord {
+	t.Helper()
+	records := make([]*PreprocessingRecord, signers)
 	for index := range records {
 		records[index] = mpcTestRecord(t, byte(0x30+((slot-1)%24)*4+index))
 	}
@@ -75,12 +82,12 @@ func signingExecutorTestRecords(t *testing.T, slot int) [4]*PreprocessingRecord 
 func signingExecutorTestMaterial(
 	t *testing.T,
 	slot int,
-	randomness [4]*signingRandomness,
-	journals [4]*SigningJournal,
-) [4]signingExecutorSlotMaterial {
+	randomness []*signingRandomness,
+	journals []*SigningJournal,
+) []signingExecutorSlotMaterial {
 	t.Helper()
-	records := signingExecutorTestRecords(t, slot)
-	var material [4]signingExecutorSlotMaterial
+	records := signingExecutorTestRecordsFor(t, slot, len(randomness))
+	material := make([]signingExecutorSlotMaterial, len(randomness))
 	for index := range material {
 		material[index] = signingExecutorSlotMaterial{
 			randomness: randomness[index],
@@ -98,8 +105,8 @@ func signingExecutorTestSession(
 	fixture *signingTestFixture,
 	mask uint8,
 	slot uint16,
-	randomness [4]*signingRandomness,
-	journals [4]*SigningJournal,
+	randomness []*signingRandomness,
+	journals []*SigningJournal,
 ) *signingExecutorSession {
 	t.Helper()
 	active := fixture.activeShares(t, mask)
@@ -122,7 +129,7 @@ func signingExecutorTestReference(
 	request protocol.SignRequest,
 	active []*LocalShare,
 	slot uint16,
-	randomness [4]*signingRandomness,
+	randomness []*signingRandomness,
 ) (*signingAttempt, bool) {
 	t.Helper()
 	attempt, err := newSigningAttempt(
@@ -167,7 +174,7 @@ type signingExecutorTestRoute func(batchIndex int, batch []signingExecutorEnvelo
 // signingExecutorTestBroadcast expands a batch into one delivery per receiver
 // other than the sender: every kind of the construction is a broadcast inside
 // the active set.
-func signingExecutorTestBroadcast(ids [4]uint32, batch []signingExecutorEnvelope) []signingExecutorTestDelivery {
+func signingExecutorTestBroadcast(ids []uint32, batch []signingExecutorEnvelope) []signingExecutorTestDelivery {
 	var deliveries []signingExecutorTestDelivery
 	for _, envelope := range batch {
 		for target, identity := range ids {
@@ -368,7 +375,7 @@ func signingExecutorTestTamperResponse(t *testing.T, payload []byte) []byte {
 func signingExecutorTestBaseline(
 	t *testing.T,
 	fixture *signingTestFixture,
-) ([]byte, uint16, [4]*signingRandomness) {
+) ([]byte, uint16, []*signingRandomness) {
 	t.Helper()
 	const mask = uint8(0x0F)
 	journals := signingExecutorTestJournals(t)
@@ -385,7 +392,7 @@ func signingExecutorTestBaseline(
 		}
 	}
 	t.Fatal("no accepted slot in 128 deterministic candidates")
-	return nil, 0, [4]*signingRandomness{}
+	return nil, 0, []*signingRandomness{}
 }
 
 // TestSigningExecutorHonestRunMatchesReference drives the executor and the
@@ -798,7 +805,7 @@ func TestSigningExecutorCorruptSignersCannotExtractRejectedResponse(t *testing.T
 
 // signingExecutorTestRejectingSlot scans deterministic slots until the executor
 // rejects one with signer 0's own bit false, the negative-test precondition.
-func signingExecutorTestRejectingSlot(t *testing.T, fixture *signingTestFixture) (uint16, [4]*signingRandomness) {
+func signingExecutorTestRejectingSlot(t *testing.T, fixture *signingTestFixture) (uint16, []*signingRandomness) {
 	t.Helper()
 	journals := signingExecutorTestJournals(t)
 	for candidate := 1; candidate <= 128; candidate++ {
@@ -816,7 +823,7 @@ func signingExecutorTestRejectingSlot(t *testing.T, fixture *signingTestFixture)
 		}
 	}
 	t.Fatal("no rejected slot with signer 0 rejecting in 128 candidates")
-	return 0, [4]*signingRandomness{}
+	return 0, []*signingRandomness{}
 }
 
 // signingExecutorTestChallenge recomputes the public challenge from the four
@@ -868,7 +875,7 @@ func TestSigningExecutorSessionRejectsInvalidBindings(t *testing.T) {
 		request  protocol.SignRequest
 		shares   []*LocalShare
 		slot     uint16
-		material [4]signingExecutorSlotMaterial
+		material []signingExecutorSlotMaterial
 	}{
 		{
 			name: "three shares", request: request, shares: active[:3],

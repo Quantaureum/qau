@@ -96,7 +96,8 @@ var (
 	ErrInvalidEncodingSize = errors.New("invalid Dilithium3 v1 encoding size")
 )
 
-// Parameters contains the immutable CIRCL mode3 and QAU threshold profile.
+// Parameters contains the CIRCL mode3 constants and the v1 CNF-RSS committee
+// shape (Participants, Threshold, MaxCorrupt).
 type Parameters struct {
 	N              int
 	Q              int
@@ -119,20 +120,131 @@ type Parameters struct {
 	MaxCorrupt     int
 }
 
-// StandardParameters returns the immutable qau-threshold-dilithium3-v1 profile.
+// StandardParameters returns the canonical six-of-six committee row of the
+// qau-threshold-dilithium3-v1 profile (R76a: one row of the derived family).
 func StandardParameters() Parameters {
+	return ParametersForParticipants(6)
+}
+
+// Committee size family (R76a): the CNF group size is floor(C/3)+1 and the
+// threshold is ceil(2C/3); MaxCorrupt stays 2, the deployed threat model.
+const (
+	MinCommitteeParticipants = 6
+	MaxCommitteeParticipants = 12
+)
+
+// R76b: the threshold-signing MPC is parameterized per committee size. The
+// family derivation (exponent grid search plus Monte-Carlo estimation of the
+// public combine-check probabilities over the accepted-randomness model) is
+// recorded in docs/superpowers/specs/2026-10-01-qau-dilithium3-v1-dynamic-committee.md
+// ("R76b — signing-MPC parameter family"). Only the rows the derivation
+// shows to be operational are pinned: C ∈ {6, 7}. C = 8 was measured at
+// J ≈ 265 parallel slots (~2 MB per party per request — not operational),
+// and C >= 9 is provably degenerate: the hint-weight check collapses because
+// the per-coefficient randomness spread grows with sqrt(owned) while the
+// mode3 HighBits segment width is fixed. SigningParametersForParticipants
+// fails closed for unpinned sizes.
+
+// SigningParameters is one committee row of the R76b signing-MPC family.
+type SigningParameters struct {
+	Participants  int     // C, committee size
+	Threshold     int     // t = ceil(2C/3), active signers per request
+	OwnedPerOwner int     // worst-case owned components ceil(binomial(C,g)/t)
+	Exponent      float64 // expo, log2 of the per-slot acceptance inverse
+	Divergence    float64 // M = 2^(expo/t)
+	ShiftBound    float64 // B
+	Radius        float64 // r, the accept radius of HRej
+	SampleRadius  float64 // r' = M^(1/(N*(L+K))) * r
+	HintCheckProb float64 // MC-estimated hint-check probability
+	ParallelSlots int     // J = ceil(ln2 / -ln(1-pfinal))
+}
+
+// SigningMaxParallelSlots is the largest pinned slot count across the
+// signing rows; transports and schedules must stay within it regardless of the
+// committee row a request actually uses.
+const SigningMaxParallelSlots = 43
+
+// ErrNoSigningRow rejects a committee size with no pinned signing-MPC row.
+var ErrNoSigningRow = errors.New("no pinned Dilithium3 v1 signing parameter row")
+
+// signingParameterFamily pins the operational rows. The numbers are pinned to
+// 0.01 (B, r, r') exactly as derived; tests re-derive them from the closed
+// forms, so the table and the derivation cannot silently diverge.
+var signingParameterFamily = map[int]SigningParameters{
+	6: {
+		Participants: 6, Threshold: 4, OwnedPerOwner: 5,
+		Exponent: 3.30, Divergence: SigningRandomnessDivergence(),
+		ShiftBound:    SigningShiftBound,
+		Radius:        SigningRandomnessRadius,
+		SampleRadius:  SigningRandomnessSampleRadius,
+		HintCheckProb: 0.6506,
+		ParallelSlots: SigningParallelSlots,
+	},
+	7: {
+		Participants: 7, Threshold: 5, OwnedPerOwner: 7,
+		Exponent:      4.95,
+		Divergence:    math.Pow(2, 4.95/5),
+		ShiftBound:    779.31,
+		Radius:        402748.8,
+		SampleRadius:  402847.0,
+		HintCheckProb: 0.5052,
+		ParallelSlots: 43,
+	},
+}
+
+// SigningParametersForParticipants returns the pinned signing-MPC row for a
+// committee size; any other size fails closed.
+func SigningParametersForParticipants(participants int) (SigningParameters, error) {
+	row, ok := signingParameterFamily[participants]
+	if !ok {
+		return SigningParameters{}, fmt.Errorf("%w: committee size %d", ErrNoSigningRow, participants)
+	}
+	return row, nil
+}
+
+// SigningParametersForThresholdCount returns the unique pinned row whose
+// threshold count matches; any other signer count fails closed.
+func SigningParametersForThresholdCount(threshold int) (SigningParameters, error) {
+	for _, row := range signingParameterFamily {
+		if row.Threshold == threshold {
+			return row, nil
+		}
+	}
+	return SigningParameters{}, fmt.Errorf("%w: signer count %d", ErrNoSigningRow, threshold)
+}
+
+// ThresholdForParticipants returns ceil(2C/3), the family threshold rule.
+func ThresholdForParticipants(participants int) int {
+	return (2*participants + 2) / 3
+}
+
+// GroupSizeForParticipants returns the replicated-group size C - t + 1.
+func GroupSizeForParticipants(participants int) int {
+	return participants - ThresholdForParticipants(participants) + 1
+}
+
+// ParametersForParticipants returns the CIRCL mode3 constants with the v1
+// committee shape (C, ceil(2C/3), 2). A C outside [6, 12] fails later at
+// Validate, keeping out-of-family counts unreachable.
+func ParametersForParticipants(participants int) Parameters {
 	return Parameters{
 		N: N, Q: Q, K: K, L: L, Eta: Eta, Tau: Tau, Beta: Beta,
 		Gamma1: Gamma1, Gamma2: Gamma2, Omega: Omega, D: D,
 		CTildeSize: CTildeSize, TRSize: TRSize,
 		PublicKeySize: mode3.PublicKeySize, PrivateKeySize: mode3.PrivateKeySize,
-		SignatureSize: mode3.SignatureSize, Participants: 6, Threshold: 4, MaxCorrupt: 2,
+		SignatureSize: mode3.SignatureSize, Participants: participants,
+		Threshold: ThresholdForParticipants(participants), MaxCorrupt: 2,
 	}
 }
 
-// Validate rejects any parameter set that differs from the fixed profile.
+// Validate rejects any parameter set outside the derived committee family:
+// the mode3 constants must match the fixed profile and the committee shape
+// must obey the (C, ceil(2C/3), 2) rule within the supported range.
 func (parameters Parameters) Validate() error {
-	if parameters != StandardParameters() {
+	canonical := ParametersForParticipants(parameters.Participants)
+	if parameters != canonical ||
+		parameters.Participants < MinCommitteeParticipants ||
+		parameters.Participants > MaxCommitteeParticipants {
 		return ErrInvalidParameters
 	}
 	return nil

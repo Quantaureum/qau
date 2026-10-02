@@ -59,9 +59,15 @@ var (
 	// is opened and the attempt burns.
 	errSigningRejected = errors.New("Dilithium3 v1 signing attempt rejected")
 
-	// errSigningInconsistent reports that the public reconstruction no longer
-	// matches the committed transcript, which must never produce a signature.
 	errSigningInconsistent = errors.New("inconsistent Dilithium3 v1 signing transcript")
+
+	// ErrUnsupportedSigningCommitteeSize fails closed when a session asks the
+	// signing engine to work over a committee shape other than the pinned
+	// four-of-six profile. R76a generalized the DKG and share formats to the
+	// committee family; the rejection-sampling parameters of the signing MPC
+	// (shift bound, radii, parallel slots) remain pinned to the four-of-six
+	// row until the per-size re-derivation lands (see the R76 spec, D7).
+	ErrUnsupportedSigningCommitteeSize = errors.New("Dilithium3 v1 signing supports only the four-of-six committee in this release")
 )
 
 // signingState is the monotonic lifecycle of one attempt. Challenged is the
@@ -140,18 +146,19 @@ type signingAttempt struct {
 	key           protocol.ThresholdKeyID
 	sessionID     [32]byte
 	bindingDigest [32]byte
-	randomness    [4]*signingRandomness
+	params        SigningParameters
+	randomness    []*signingRandomness
 
-	// Reference dealer model: each active signer's partial secret from its five
-	// assigned components, and the public values the combine needs.
-	partialFirst   [4]VectorL
-	partialSecond  [4]VectorK
+	// Reference driver state: each active signer's partial secret from its
+	// owned components, and the public values the combine needs.
+	partialFirst   []VectorL
+	partialSecond  []VectorK
 	t1             VectorK
 	representative [64]byte
 
 	state signingState
 
-	contributions  [4]VectorK
+	contributions  []VectorK
 	w              VectorK
 	challengeValue Poly
 	challengeSeed  [CTildeSize]byte
@@ -164,8 +171,8 @@ type signingAttempt struct {
 // newSigningAttempt validates the round-0 binding and returns an attempt in the
 // created state. Nothing is persisted and nothing is released until prepare.
 //
-// The four randomness points are supplied by the caller because the in-process
-// reference drives all four signers; a networked deployment samples each point
+// The t randomness points are supplied by the caller because the in-process
+// reference drives all t signers; a networked deployment samples each point
 // inside its own signer process, which is open obligation 1 of the design note.
 func newSigningAttempt(
 	journal *SigningJournal,
@@ -173,7 +180,7 @@ func newSigningAttempt(
 	request protocol.SignRequest,
 	activeShares []*LocalShare,
 	coordinatorID uint32,
-	randomness [4]*signingRandomness,
+	randomness []*signingRandomness,
 ) (*signingAttempt, error) {
 	if journal == nil || record == nil {
 		return nil, fmt.Errorf("%w: missing journal or preprocessing record", errInvalidSigningAttempt)
@@ -184,15 +191,32 @@ func newSigningAttempt(
 	if coordinatorID == 0 {
 		return nil, fmt.Errorf("%w: zero coordinator identity", errInvalidSigningAttempt)
 	}
-	if len(activeShares) != 4 {
-		return nil, fmt.Errorf("%w: %d active shares, want 4", errInvalidSigningAttempt, len(activeShares))
+	if len(activeShares) == 0 {
+		return nil, fmt.Errorf("%w: no active shares", errInvalidSigningAttempt)
 	}
-	var participantIDs [4]uint32
-	var positions [4]uint8
-	activeMask := uint8(0)
+	participants := len(activeShares[0].Committee.Participants)
+	params, err := SigningParametersForParticipants(participants)
+	if err != nil {
+		// R76b: strict — a committee size with no pinned signing row fails
+		// closed here as ErrUnsupportedSigningCommitteeSize.
+		return nil, ErrUnsupportedSigningCommitteeSize
+	}
+	threshold := params.Threshold
+	if len(activeShares) != threshold {
+		return nil, fmt.Errorf("%w: %d active shares, want %d", errInvalidSigningAttempt, len(activeShares), threshold)
+	}
+	if len(randomness) != threshold {
+		return nil, fmt.Errorf("%w: %d randomness points, want %d", errInvalidSigningAttempt, len(randomness), threshold)
+	}
+	participantIDs := make([]uint32, threshold)
+	positions := make([]uint8, threshold)
+	activeMask := uint16(0)
 	for index, share := range activeShares {
 		if share == nil || share.Validate() != nil {
 			return nil, fmt.Errorf("%w: active share %d is invalid", errInvalidSigningAttempt, index)
+		}
+		if len(share.Committee.Participants) != participants {
+			return nil, fmt.Errorf("%w: active share %d committee size mismatch", errInvalidSigningAttempt, index)
 		}
 		participantIDs[index] = share.ParticipantID
 		positions[index] = share.ParticipantPosition
@@ -201,7 +225,7 @@ func newSigningAttempt(
 		}
 		activeMask |= 1 << share.ParticipantPosition
 	}
-	signerIDs := participantIDs[:]
+	signerIDs := append([]uint32(nil), participantIDs...)
 	sessionID, err := Dilithium3SigningSessionID(request, signerIDs)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
@@ -212,9 +236,9 @@ func newSigningAttempt(
 			return nil, fmt.Errorf("%w: active share %d does not match the request", errInvalidSigningAttempt, index)
 		}
 	}
-	allocation, err := AllocateRSSGroups(activeMask)
+	allocation, err := AllocateRSSGroupsFor(activeMask, participants)
 	if err != nil {
-		return nil, fmt.Errorf("%w: active set %06b: %v", errInvalidSigningAttempt, activeMask, err)
+		return nil, fmt.Errorf("%w: active set %012b: %v", errInvalidSigningAttempt, activeMask, err)
 	}
 	var rho [32]byte
 	copy(rho[:], request.Key.PublicKey[:32])
@@ -228,11 +252,11 @@ func newSigningAttempt(
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 	}
 	for index := range randomness {
-		if err := validateSigningRandomness(randomness[index]); err != nil {
+		if err := validateSigningRandomness(randomness[index], params); err != nil {
 			return nil, fmt.Errorf("%w: randomness %d: %v", errInvalidSigningAttempt, index, err)
 		}
 	}
-	partialFirst, partialSecond, err := reconstructPartialSecrets(activeShares, allocation)
+	partialFirst, partialSecond, err := reconstructPartialSecrets(activeShares, participants, allocation)
 	if err != nil {
 		return nil, err
 	}
@@ -251,11 +275,13 @@ func newSigningAttempt(
 		key:            request.Key.Clone(),
 		sessionID:      sessionID,
 		bindingDigest:  bindingDigest,
+		params:         params,
 		randomness:     randomness,
 		partialFirst:   partialFirst,
 		partialSecond:  partialSecond,
 		t1:             t1,
 		representative: representative,
+		contributions:  make([]VectorK, threshold),
 		state:          signingStateCreated,
 	}, nil
 }
@@ -388,8 +414,8 @@ func (attempt *signingAttempt) respond() (signingResponse, error) {
 		return signingResponse{}, err
 	}
 	challengeNTT := ForwardNTT(attempt.challengeValue)
-	var shiftFirst [4][L]SignedPoly
-	var shiftSecond [4][K]SignedPoly
+	shiftFirst := make([][L]SignedPoly, len(attempt.randomness))
+	shiftSecond := make([][K]SignedPoly, len(attempt.randomness))
 	for index := range attempt.randomness {
 		for row := 0; row < L; row++ {
 			product := InverseNTT(pointwiseMultiply(challengeNTT, ForwardNTT(attempt.partialFirst[index][row])))
@@ -406,7 +432,7 @@ func (attempt *signingAttempt) respond() (signingResponse, error) {
 	}
 	// The per-party rejection is local: every signer must accept this slot.
 	for index := range attempt.randomness {
-		passes, err := signingRejectionTest(attempt.randomness[index], shiftFirst[index], shiftSecond[index])
+		passes, err := signingRejectionTest(attempt.randomness[index], shiftFirst[index], shiftSecond[index], attempt.params.Radius)
 		if err != nil {
 			return signingResponse{}, attempt.burnLocked(fmt.Errorf("%w: %v", errInvalidSigningAttempt, err))
 		}
@@ -565,40 +591,45 @@ func (attempt *signingAttempt) rejectLocked(predicate string) error {
 	return attempt.burnLocked(fmt.Errorf("%w: %s predicate", errSigningRejected, predicate))
 }
 
-// reconstructPartialSecrets sums every three-member component into the partial
-// secret of the active position that owns it, and requires the three copies of
-// each component to agree. The reference driver holds all active shares in one
-// process; no production path may reconstruct either a partial secret or the
-// aggregate secret this way.
-func reconstructPartialSecrets(activeShares []*LocalShare, allocation [20]uint8) ([4]VectorL, [4]VectorK, error) {
-	var partialFirst [4]VectorL
-	var partialSecond [4]VectorK
-	var activeIndex [6]int
+// reconstructPartialSecrets sums every replicated component into the partial
+// secret of the active position that owns it, and requires the group copies
+// to agree. The reference driver holds all active shares in one process; no
+// production path may reconstruct either a partial secret or the aggregate
+// secret this way.
+func reconstructPartialSecrets(activeShares []*LocalShare, participants int, allocation []uint8) ([]VectorL, []VectorK, error) {
+	threshold := len(activeShares)
+	partialFirst := make([]VectorL, threshold)
+	partialSecond := make([]VectorK, threshold)
+	activeIndex := make([]int, participants)
 	for position := range activeIndex {
 		activeIndex[position] = -1
 	}
 	for index, share := range activeShares {
 		activeIndex[share.ParticipantPosition] = index
 	}
-	groups := CanonicalRSSGroups()
+	groups, err := CanonicalRSSGroupsFor(participants)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(groups) != len(allocation) {
-		return [4]VectorL{}, [4]VectorK{}, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"%w: %d groups against %d allocations", errInvalidSigningAttempt, len(groups), len(allocation),
 		)
 	}
-	var owners [20]int
-	var owned [4]int
+	owners := make([]int, len(allocation))
+	owned := make([]int, threshold)
 	for groupIndex := range allocation {
 		owner := activeIndex[allocation[groupIndex]]
 		if owner < 0 {
-			return [4]VectorL{}, [4]VectorK{}, fmt.Errorf(
-				"%w: group %06b is allocated to inactive position %d",
+			return nil, nil, fmt.Errorf(
+				"%w: group %012b is allocated to inactive position %d",
 				errInvalidSigningAttempt, groups[groupIndex], allocation[groupIndex],
 			)
 		}
 		owners[groupIndex] = owner
 		owned[owner]++
 	}
+	ownedMultiplicity := make([]int, threshold)
 	for groupIndex, group := range groups {
 		var reference *RSSComponent
 		for _, share := range activeShares {
@@ -612,18 +643,19 @@ func reconstructPartialSecrets(activeShares []*LocalShare, allocation [20]uint8)
 					continue
 				}
 				if *component != *reference {
-					return [4]VectorL{}, [4]VectorK{}, fmt.Errorf(
-						"%w: group %06b components disagree", errInvalidSigningAttempt, group,
+					return nil, nil, fmt.Errorf(
+						"%w: group %012b components disagree", errInvalidSigningAttempt, group,
 					)
 				}
 			}
 		}
 		if reference == nil {
-			return [4]VectorL{}, [4]VectorK{}, fmt.Errorf(
-				"%w: group %06b has no active holder", errInvalidSigningAttempt, group,
+			return nil, nil, fmt.Errorf(
+				"%w: group %012b has no active holder", errInvalidSigningAttempt, group,
 			)
 		}
 		owner := owners[groupIndex]
+		ownedMultiplicity[owner] += componentMultiplicity(*reference)
 		for row := 0; row < L; row++ {
 			partialFirst[owner][row] = Add(partialFirst[owner][row], reference.S1[row])
 		}
@@ -631,16 +663,16 @@ func reconstructPartialSecrets(activeShares []*LocalShare, allocation [20]uint8)
 			partialSecond[owner][row] = Add(partialSecond[owner][row], reference.S2[row])
 		}
 	}
-	for position := 0; position < 4; position++ {
-		bound := owned[position] * RSSComponentEta
+	for position := 0; position < threshold; position++ {
+		bound := ownedMultiplicity[position] * RSSComponentEta
 		for row := 0; row < L; row++ {
 			if err := validatePartialBound("s1", position, row, partialFirst[position][row], bound); err != nil {
-				return [4]VectorL{}, [4]VectorK{}, err
+				return nil, nil, err
 			}
 		}
 		for row := 0; row < K; row++ {
 			if err := validatePartialBound("s2", position, row, partialSecond[position][row], bound); err != nil {
-				return [4]VectorL{}, [4]VectorK{}, err
+				return nil, nil, err
 			}
 		}
 	}
@@ -648,9 +680,9 @@ func reconstructPartialSecrets(activeShares []*LocalShare, allocation [20]uint8)
 	// components: that is how a networked signer derives it, without ever
 	// seeing another signer's material.
 	for index, share := range activeShares {
-		localFirst, localSecond := localPartialSecrets(share, allocation)
+		localFirst, localSecond := localPartialSecrets(share, participants, allocation)
 		if localFirst != partialFirst[index] || localSecond != partialSecond[index] {
-			return [4]VectorL{}, [4]VectorK{}, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"%w: signer %d partial secret is not reproducible from its own components",
 				errInvalidSigningAttempt, share.ParticipantID,
 			)
@@ -664,13 +696,16 @@ func reconstructPartialSecrets(activeShares []*LocalShare, allocation [20]uint8)
 // reconstruction: a networked signer derives its partial secret from its own
 // share, and its owned groups are exactly the allocation entries naming its
 // position, each of which contains it (rss_topology.go).
-func localPartialSecrets(share *LocalShare, allocation [20]uint8) (VectorL, VectorK) {
+func localPartialSecrets(share *LocalShare, participants int, allocation []uint8) (VectorL, VectorK) {
 	var first VectorL
 	var second VectorK
 	if share == nil {
 		return first, second
 	}
-	groups := CanonicalRSSGroups()
+	groups, err := CanonicalRSSGroupsFor(participants)
+	if err != nil {
+		return first, second
+	}
 	for groupIndex, group := range groups {
 		if groupIndex >= len(allocation) || allocation[groupIndex] != share.ParticipantPosition {
 			continue
@@ -708,13 +743,13 @@ func validatePartialBound(name string, position, row int, polynomial Poly, bound
 
 // signingBindingDigest is the digest of every value a signing transition is
 // bound to: chain, protocol, algorithm, generation, key, committee, epoch,
-// slot, domain, message, attempt nonce, the four signers, the coordinator, the
+// slot, domain, message, attempt nonce, the signers, the coordinator, the
 // group allocation, and the session identifier.
 func signingBindingDigest(
 	request protocol.SignRequest,
-	participantIDs [4]uint32,
+	participantIDs []uint32,
 	coordinatorID uint32,
-	allocation [20]uint8,
+	allocation []uint8,
 	sessionID [32]byte,
 ) ([32]byte, error) {
 	keyDigest, err := request.Key.CanonicalDigest()
@@ -784,10 +819,10 @@ func signingChallengeSeed(representative [64]byte, high PublicHighBits) ([CTilde
 }
 
 // signingPreparedDigest binds the attempt, the preprocessing commitment, and
-// the four rounded randomness expansions into the durable prepared payload.
+// the rounded randomness expansions into the durable prepared payload.
 func signingPreparedDigest(
 	bindingDigest, recordCommitment [32]byte,
-	randomness [4]*signingRandomness,
+	randomness []*signingRandomness,
 ) ([32]byte, error) {
 	buffer := make([]byte, 0, 64+len(randomness)*(L+K)*PolyEncodedSize)
 	buffer = append(buffer, signingPreparedDomain...)

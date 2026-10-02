@@ -23,7 +23,6 @@ import (
 
 	"github.com/quantaureum/qau/consensus"
 	qcrypto "github.com/quantaureum/qau/crypto"
-	"github.com/quantaureum/qau/wallet/tss/protocol"
 )
 
 // tdilithium3SigningFinalitySigner is the executor's ThresholdKeySigner. It
@@ -32,17 +31,21 @@ import (
 type tdilithium3SigningFinalitySigner struct {
 	groupPublicKey []byte
 	groupKey       *qcrypto.PublicKey
+	threshold      int
 }
 
 // newTDilithium3SigningFinalitySigner checks the group public key is a
 // canonical non-degenerate Dilithium3 key before it becomes the verification
 // key of an epoch.
-func newTDilithium3SigningFinalitySigner(groupPublicKey []byte) (*tdilithium3SigningFinalitySigner, error) {
+func newTDilithium3SigningFinalitySigner(groupPublicKey []byte, threshold int) (*tdilithium3SigningFinalitySigner, error) {
 	if len(groupPublicKey) != qcrypto.Dilithium3PublicKeySize || qcrypto.IsZeroPublicKeyBytes(groupPublicKey) {
 		return nil, fmt.Errorf(
 			"Dilithium3 v1 finality signer requires a non-zero %d-byte group public key",
 			qcrypto.Dilithium3PublicKeySize,
 		)
+	}
+	if threshold < 1 {
+		return nil, fmt.Errorf("Dilithium3 v1 finality signer requires a threshold")
 	}
 	key, err := qcrypto.PublicKeyFromBytes(groupPublicKey)
 	if err != nil {
@@ -51,19 +54,23 @@ func newTDilithium3SigningFinalitySigner(groupPublicKey []byte) (*tdilithium3Sig
 	return &tdilithium3SigningFinalitySigner{
 		groupPublicKey: append([]byte(nil), groupPublicKey...),
 		groupKey:       key,
+		threshold:      threshold,
 	}, nil
 }
 
-// IsThresholdMode reports the executor's shape: a four-of-six session is a
+// IsThresholdMode reports the executor's shape: the v1 family session is a
 // threshold operation, so the finality engine may derive its seal quorum from
 // Threshold.
 func (signer *tdilithium3SigningFinalitySigner) IsThresholdMode() bool {
 	return signer != nil && len(signer.groupPublicKey) > 0
 }
 
-// Threshold returns the t of the v1 profile's t-of-n shape.
+// Threshold returns the committee's own t (4 at C=6, 5 at C=7).
 func (signer *tdilithium3SigningFinalitySigner) Threshold() int {
-	return int(protocol.ThresholdV1Threshold)
+	if signer == nil || signer.threshold < 1 {
+		return 0
+	}
+	return signer.threshold
 }
 
 // GroupPublicKey returns the epoch's group public key, copied so no caller can
@@ -126,7 +133,7 @@ func (signer *tdilithium3SigningFinalitySigner) AggregatePartialSignatures(
 // surface to one activation epoch. Callers are the activation wiring and the
 // development-network integration; every precondition is checked here because a
 // half-registered surface would verify seals with no key or the wrong one.
-func (n *Node) registerTDilithium3SigningFinalitySigner(activationEpoch uint64, groupPublicKey []byte) error {
+func (n *Node) registerTDilithium3SigningFinalitySigner(activationEpoch uint64, groupPublicKey []byte, threshold int) error {
 	if !tdilithium3SealExecutorEnabled(n) {
 		return fmt.Errorf("Dilithium3 v1 finality signer requires the open experimental gate off the mainnet")
 	}
@@ -140,7 +147,7 @@ func (n *Node) registerTDilithium3SigningFinalitySigner(activationEpoch uint64, 
 	if qfs == nil {
 		return fmt.Errorf("Dilithium3 v1 finality signer requires the QTD finality engine")
 	}
-	signer, err := newTDilithium3SigningFinalitySigner(groupPublicKey)
+	signer, err := newTDilithium3SigningFinalitySigner(groupPublicKey, threshold)
 	if err != nil {
 		return err
 	}
@@ -157,12 +164,21 @@ func (n *Node) refreshTDilithium3SigningFinalitySigner() {
 		return
 	}
 	store := newThresholdShareStore(n.config.DataDir)
-	activationEpoch, groupPublicKey, err := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+	activationEpoch, groupPublicKey, committeeThreshold, err := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
 	if err != nil {
 		nodeLog.Debug("Dilithium3 v1 finality signer not refreshed (no loadable active share): %v", err)
 		return
 	}
-	if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, groupPublicKey); err != nil {
+	// The seal quorum is the activated committee's own threshold, read back
+	// from the same decrypted active share bytes the identity probe carried.
+	threshold := int(committeeThreshold)
+	if threshold == 0 {
+		// Without a share there is nothing trustworthy to bind: stay quiet and
+		// let the activation path register with its session's threshold instead.
+		nodeLog.Debug("Dilithium3 v1 finality signer refresh skipped (no threshold from active share)")
+		return
+	}
+	if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, groupPublicKey, threshold); err != nil {
 		nodeLog.Warn("Dilithium3 v1 finality signer refresh failed: %v", err)
 		return
 	}

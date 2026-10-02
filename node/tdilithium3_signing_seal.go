@@ -113,53 +113,54 @@ func tdilithium3SealSigningOrdinal(payload []byte) uint64 {
 	return binary.BigEndian.Uint64(payload[tdilithium3SealSigningRequestBaseLen : tdilithium3SealSigningRequestBaseLen+8])
 }
 
-// tdilithium3SealSigningSignersForRoster returns the fixed four signers of one
-// epoch: the first four committee participants in canonical order, which are
-// the first four roster positions. The boolean reports whether local is one of
-// them. Fixing the set keeps the selection deterministic on every node with no
-// extra round; a later revision may rotate the subset without touching the
-// session binding.
+// tdilithium3SealSigningSignersForRoster returns the fixed signers of one
+// epoch: the first t committee participants in canonical order, which are the
+// first t roster positions, where t comes from the committee itself (t = 4 at
+// C = 6, t = 5 at C = 7 per the pinned family). The boolean reports whether
+// local is one of them. Fixing the set keeps the selection deterministic on
+// every node with no extra round; a later revision may rotate the subset
+// without touching the session binding.
 func tdilithium3SealSigningSignersForRoster(
 	roster *tdilithium3DKGEpochRoster,
 	committee protocol.CommitteeID,
 	local types.Address,
-) ([4]uint32, bool, error) {
+) ([]uint32, bool, error) {
+	threshold := int(committee.Threshold)
 	if roster == nil || len(committee.Participants) != len(roster.Entries) ||
-		len(committee.Participants) < int(protocol.ThresholdV1Threshold) {
-		return [4]uint32{}, false, fmt.Errorf("Dilithium3 v1 seal signers require a roster and its committee")
+		len(committee.Participants) < threshold || threshold == 0 {
+		return nil, false, fmt.Errorf("Dilithium3 v1 seal signers require a roster and its committee")
 	}
-	var signers [4]uint32
-	for index := range signers {
-		signers[index] = committee.Participants[index]
-		if signers[index] == 0 || (index > 0 && signers[index-1] >= signers[index]) {
-			return [4]uint32{}, false, fmt.Errorf("Dilithium3 v1 seal signer set is not canonically ordered")
+	selected := append([]uint32(nil), committee.Participants[:threshold]...)
+	for index, signer := range selected {
+		if signer == 0 || (index > 0 && selected[index-1] >= signer) {
+			return nil, false, fmt.Errorf("Dilithium3 v1 seal signer set is not canonically ordered")
 		}
 	}
 	for position, entry := range roster.Entries {
 		if entry.Address != local {
 			continue
 		}
-		return signers, position < len(signers), nil
+		return selected, position < len(selected), nil
 	}
-	return [4]uint32{}, false, fmt.Errorf("local validator is not in the epoch roster")
+	return nil, false, fmt.Errorf("local validator is not in the epoch roster")
 }
 
 // tdilithium3SealSigningSigners resolves the fixed signer set of the epoch a
 // local share activated at, and whether this node is one of the four. The
 // roster is read at the activation epoch's anchor, the same roster the signing
 // binding and the DKG ceremony derive from.
-func (n *Node) tdilithium3SealSigningSigners(activationEpoch uint64) ([4]uint32, bool, error) {
+func (n *Node) tdilithium3SealSigningSigners(activationEpoch uint64) ([]uint32, bool, error) {
 	rosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activationEpoch)
 	if err != nil {
-		return [4]uint32{}, false, err
+		return nil, false, err
 	}
 	roster, err := n.capturedEpochValidatorRoster(rosterEpoch)
 	if err != nil {
-		return [4]uint32{}, false, err
+		return nil, false, err
 	}
 	committee, _, err := n.tdilithium3DKGCommitteeForRoster(roster)
 	if err != nil {
-		return [4]uint32{}, false, err
+		return nil, false, err
 	}
 	return tdilithium3SealSigningSignersForRoster(roster, committee, n.blockProducer.ValidatorAddr())
 }
@@ -308,34 +309,34 @@ func (n *Node) tdilithium3SealSigningAttempt(
 	slot, epoch, chainID uint64,
 	blockHash types.Hash,
 	attempt uint64,
-) ([]byte, [4]uint32, []tdilithium3SigningRequestOutcome, error) {
+) ([]byte, []uint32, []tdilithium3SigningRequestOutcome, error) {
 	if n == nil || n.config == nil || n.config.DataDir == "" || n.config.ValidatorKeyPassword == "" {
-		return nil, [4]uint32{}, nil, fmt.Errorf("Dilithium3 v1 seal executor requires a configured node")
+		return nil, nil, nil, fmt.Errorf("Dilithium3 v1 seal executor requires a configured node")
 	}
 	store := newThresholdShareStore(n.config.DataDir)
-	activationEpoch, _, err := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+	activationEpoch, _, _, err := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
 	if err != nil {
 		tdilithium3SealTrace("slot %d attempt %d: active share: %v", slot, attempt, err)
-		return nil, [4]uint32{}, nil, fmt.Errorf("Dilithium3 v1 seal executor active share: %w", err)
+		return nil, nil, nil, fmt.Errorf("Dilithium3 v1 seal executor active share: %w", err)
 	}
 	signers, localSigner, err := n.tdilithium3SealSigningSigners(activationEpoch)
 	if err != nil {
 		tdilithium3SealTrace("slot %d attempt %d: signers at activation epoch %d: %v",
 			slot, attempt, activationEpoch, err)
-		return nil, [4]uint32{}, nil, err
+		return nil, nil, nil, err
 	}
 	if !localSigner {
-		return nil, [4]uint32{}, nil, errTDilithium3SealSigningNotASigner
+		return nil, nil, nil, errTDilithium3SealSigningNotASigner
 	}
 	if epoch < activationEpoch {
-		return nil, [4]uint32{}, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"Dilithium3 v1 seal executor slot %d epoch %d precedes the activation epoch %d",
 			slot, epoch, activationEpoch,
 		)
 	}
 	binding, err := n.newTDilithium3SigningBinding(activationEpoch, signers, rand.Reader)
 	if err != nil {
-		return nil, [4]uint32{}, nil, fmt.Errorf("Dilithium3 v1 seal executor binding: %w", err)
+		return nil, nil, nil, fmt.Errorf("Dilithium3 v1 seal executor binding: %w", err)
 	}
 	defer binding.close()
 	message := consensus.QTDSignedMessage(chainID, epoch, slot, blockHash)
@@ -352,7 +353,7 @@ func (n *Node) tdilithium3SealSigningAttempt(
 // engine, which verifies it against the epoch's group public key before the
 // slot is finalized. A slot another signer finalized first is a success: the
 // finality record exists, so this node's submission has nothing left to do.
-func (n *Node) submitTDilithium3SealSignature(slot uint64, signers [4]uint32, signature []byte) {
+func (n *Node) submitTDilithium3SealSignature(slot uint64, signers []uint32, signature []byte) {
 	if n.blockProducer == nil || n.blockProducer.QPOS() == nil {
 		return
 	}

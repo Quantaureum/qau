@@ -262,51 +262,51 @@ func (store *thresholdShareStore) LoadActiveAtEpoch(currentEpoch uint64, verifie
 // still runs LoadActiveAtEpoch with the roster verifier, which checks the
 // activation certificate, so a forged or mismatched active share still fails
 // closed there.
-func (store *thresholdShareStore) ActiveSharePublicIdentity(password []byte) (uint64, []byte, error) {
+func (store *thresholdShareStore) ActiveSharePublicIdentity(password []byte) (uint64, []byte, uint32, error) {
 	if store == nil || store.basePath == "" || len(password) == 0 {
-		return 0, nil, fmt.Errorf("threshold activation store or password is not configured")
+		return 0, nil, 0, fmt.Errorf("threshold activation store or password is not configured")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	lock, err := store.lockFile()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	defer lock.Close()
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	active, exists, err := loadThresholdPlaintext(paths.Active, password)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	if !exists {
-		return 0, nil, os.ErrNotExist
+		return 0, nil, 0, os.ErrNotExist
 	}
 	defer tss.SecureZero(active)
 	ledger, exists, err := loadThresholdPlaintext(paths.LedgerHead, password)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	if !exists {
-		return 0, nil, fmt.Errorf("threshold activation ledger is missing")
+		return 0, nil, 0, fmt.Errorf("threshold activation ledger is missing")
 	}
 	defer tss.SecureZero(ledger)
 	if !bytes.Equal(active, ledger) {
-		return 0, nil, fmt.Errorf("threshold activation ledger mismatch")
+		return 0, nil, 0, fmt.Errorf("threshold activation ledger mismatch")
 	}
 	share, err := dilithium3v1.UnmarshalLocalShare(active)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	epoch := share.ActivationEpoch
 	publicKey := append([]byte(nil), share.Key.PublicKey...)
 	share.Zeroize()
 	if epoch == 0 || len(publicKey) == 0 {
-		return 0, nil, fmt.Errorf("threshold activation share has no activation epoch or group key")
+		return 0, nil, 0, fmt.Errorf("threshold activation share has no activation epoch or group key")
 	}
-	return epoch, publicKey, nil
+	return epoch, publicKey, share.Committee.Threshold, nil
 }
 
 func loadThresholdActivationCertificate(path string, password []byte) (dilithium3v1.DKGActivationCertificate, bool, error) {

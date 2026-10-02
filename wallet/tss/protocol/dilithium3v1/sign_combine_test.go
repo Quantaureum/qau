@@ -161,9 +161,9 @@ func testMode3RSSShares(t *testing.T) ([6]*LocalShare, protocol.ThresholdKeyID, 
 		if err != nil {
 			t.Fatal(err)
 		}
-		components[groupIndex] = RSSComponent{GroupMask: group, DealerPosition: leader, ContributionDigest: digest, S1: s1, S2: s2}
+		components[groupIndex] = RSSComponent{GroupMask: group, DealerPosition: leader, ContributionDigest: digest, Multiplicity: 1, S1: s1, S2: s2}
 	}
-	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions)
+	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions[:], 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +176,7 @@ func testMode3RSSShares(t *testing.T) ([6]*LocalShare, protocol.ThresholdKeyID, 
 		if err != nil {
 			t.Fatal(err)
 		}
+		share.Components = make([]RSSComponent, len(owned))
 		for componentIndex, group := range owned {
 			for groupIndex, candidate := range groups {
 				if candidate == group {

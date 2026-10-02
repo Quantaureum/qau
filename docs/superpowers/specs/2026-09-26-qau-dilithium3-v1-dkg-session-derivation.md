@@ -112,10 +112,13 @@ commits that pairing in `DKGIdentityRosterDigest`
 (`node/tdilithium3_dkg_validator_snapshot.go:86-101`). Building the committee
 any other way would make the pairing depend on state outside the snapshot.
 
-The roster must contain exactly six entries. A different size fails closed
-(`node/tdilithium3_dkg_validator_snapshot.go:82-85`); there is no subsetting,
-because the committee-selection rule is consensus state and is not reproduced in
-the node layer.
+The roster must contain between six and twelve entries (R76a; originally
+"exactly six"). A different size fails closed
+(`node/tdilithium3_dkg_validator_snapshot.go`→`tdilithium3DKGCommitteeForRoster`);
+there is no subsetting, because the committee-selection rule is consensus
+state and is not reproduced in the node layer (see the dynamic-committee spec
+`2026-10-01-qau-dilithium3-v1-dynamic-committee.md`: subsetting beyond 12
+validators is R76b's sampling problem).
 
 Note on the existing convention: the legacy TSS path treats a participant ID as
 a 1-based index into the **live** validator set
@@ -126,9 +129,13 @@ snapshot exists to solve. The v1 path stays self-consistent because it supplies
 its own peer resolver derived from the roster (D5) and because the v1 inbound
 path never calls `validateSenderParticipantID`.
 
-One consequence to state plainly: a validator set with more than six active
+One consequence to state plainly: a validator set with more than twelve active
 members cannot run v1 DKG under this rule; such a chain fails closed until a
-consensus accessor exists (section 9).
+consensus accessor exists (section 9), and even then the R76a note applies:
+DKG and activation family support committee sizes 6–12 directly, while the
+threshold signing MPC stays pinned to the four-of-six parameter row until the
+per-size signing parameters (B, r, r′, J, MC check probabilities) are
+re-derived (R76b).
 
 The `threshold` and `total` arguments the consensus caller passes are **not**
 the v1 committee shape and are not compared against it. They describe the
@@ -140,7 +147,7 @@ member count once `SetMembers` runs (`consensus/provinces.go:344-357`,
 chain — the local devnet reaches the runner with one-of-one. The legacy branch
 ignores the same arguments for the same reason: it returns the already
 established `tssManager` group key. The shape the v1 construction must match is
-the epoch roster, and that is enforced by the six-entry rule above. An earlier
+the epoch roster, and that is enforced by the [6, 12] entry rule above. An earlier
 revision of this document's implementation added a runner gate comparing the
 two shapes; it was retracted (R43-DKG-CHAMBER-RETRACT) because it made the v1
 branch unreachable in production.
@@ -492,10 +499,11 @@ New tests, all in `node/`:
    produces a different digest.
 2. **Roster epoch rule (D1)** — a session for activation epoch `N` reads the
    `N-1` roster; a missing, at-bootstrap, or non-finalized-but-uncaptured
-   roster fails closed; a six-entry roster is accepted.
-3. **Committee rule (D2)** — committee is `[1..6]` in roster order; a local
-   address at roster position `i` yields recipient position `i`; a roster of a
-   size other than six is refused.
+   roster fails closed; a roster of size in [6, 12] is accepted (originally
+   exactly six).
+3. **Committee rule (D2)** — committee is `[1..C]` in roster order for roster
+   size C; a local address at roster position `i` yields recipient position
+   `i`; a roster size outside [6, 12] is refused.
 4. **Identity key agreement (D6)** — the roster public key for the local address
    equals `blockProducer.ValidatorKey().Public()` bytes.
 5. **Gates closed (D9)** — with either gate unset, `RunDistributedDKG` returns
@@ -615,11 +623,13 @@ Applied:
 
 ## 9. Open Items Requiring Explicit Approval
 
-1. **Consensus accessor for the epoch committee** (D1/D2 alternative). Would
-   make the roster epoch and the committee finality-anchored and consensus-
-   derived, and would lift the "exactly six active validators" restriction. It
-   is the only change in this document's orbit that touches `consensus/`, so it
-   is not proposed for this round.
+1. **Consensus accessor for the epoch committee** (D1/D2 alternative). R76a
+   partially landed this family: committee sizes 6–12 now DKG/activate directly
+   (`tdilithium3DKGCommitteeForRoster`, the R76a infrastructure), so the
+   "exactly six" restriction is partially lifted. Still open: finality-anchored
+   consensus-derived committee selection for validator sets above 12 members
+   needs committee sampling, which is consensus state and stays out of the node
+   layer (R76b scope).
 2. **Consensus-backed key generation counter** (D4 follow-up). Needed before
    reshare, not before the initial ceremony.
 3. Unchanged and still open from the CNF-RSS design: online threshold signing,

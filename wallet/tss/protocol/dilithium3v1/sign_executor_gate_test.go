@@ -12,7 +12,7 @@ func signingExecutorTestGate(t *testing.T) *SigningExecutorGate {
 	t.Helper()
 	gate, err := NewSigningExecutorGate(SigningExecutorPolicy{
 		SessionID: [32]byte{0x51, 0x55},
-		Signers:   [4]uint32{3, 5, 8, 13},
+		Signers:   []uint32{3, 5, 8, 13},
 	})
 	if err != nil {
 		t.Fatalf("NewSigningExecutorGate(): %v", err)
@@ -27,10 +27,10 @@ func TestSigningExecutorGatePolicyValidation(t *testing.T) {
 		name   string
 		policy SigningExecutorPolicy
 	}{
-		{name: "zero session", policy: SigningExecutorPolicy{Signers: [4]uint32{1, 2, 3, 4}}},
-		{name: "zero signer", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: [4]uint32{1, 0, 3, 4}}},
-		{name: "unsorted signers", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: [4]uint32{1, 3, 2, 4}}},
-		{name: "duplicate signer", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: [4]uint32{1, 2, 2, 4}}},
+		{name: "zero session", policy: SigningExecutorPolicy{Signers: []uint32{1, 2, 3, 4}}},
+		{name: "zero signer", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: []uint32{1, 0, 3, 4}}},
+		{name: "unsorted signers", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: []uint32{1, 3, 2, 4}}},
+		{name: "duplicate signer", policy: SigningExecutorPolicy{SessionID: [32]byte{1}, Signers: []uint32{1, 2, 2, 4}}},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -41,7 +41,7 @@ func TestSigningExecutorGatePolicyValidation(t *testing.T) {
 	}
 	if err := (SigningExecutorPolicy{
 		SessionID: [32]byte{0x51, 0x55},
-		Signers:   [4]uint32{3, 5, 8, 13},
+		Signers:   []uint32{3, 5, 8, 13},
 	}).Validate(); err != nil {
 		t.Fatalf("valid policy rejected: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestSigningExecutorGateIsolation(t *testing.T) {
 	gate := signingExecutorTestGate(t)
 	other, err := NewSigningExecutorGate(SigningExecutorPolicy{
 		SessionID: [32]byte{0x51, 0x56},
-		Signers:   [4]uint32{3, 5, 8, 13},
+		Signers:   []uint32{3, 5, 8, 13},
 	})
 	if err != nil {
 		t.Fatalf("NewSigningExecutorGate(): %v", err)

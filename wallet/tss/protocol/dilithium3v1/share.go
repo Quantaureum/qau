@@ -15,15 +15,40 @@ var (
 )
 
 // RSSComponent is one replicated secret component held by three participants.
+//
+// Multiplicity counts the fresh group contributions folded into the
+// component: newly dealt components carry 1; every R77 fold adds the
+// source's multiplicity to the target's. It bounds the signing protocol's
+// per-signer partial norm (a member's partial is the sum of mult(G)
+// |-eta|-bounded base contributions across the groups allocated to it), so
+// sign.go and the executor scale their bound by the multiplicity sum rather
+// than the raw group count. The value follows deterministically from the
+// rotation history (committee versions), so it is byte-identical across
+// honest members and discloses nothing the rotation plan does not already
+// publish.
 type RSSComponent struct {
 	GroupMask          RSSGroupMask
 	DealerPosition     uint8
 	ContributionDigest [32]byte
+	Multiplicity       uint32
 	S1                 VectorL
 	S2                 VectorK
 }
 
-// LocalShare binds one participant's ten RSS components to one key generation.
+// componentMultiplicity returns the floor of an unsigned multiplicity: a
+// never-dealt component has no defined contribution count only if it was
+// decoded from the pre-multiplicity share encoding, which treated every
+// group as a single fresh contribution.
+func componentMultiplicity(component RSSComponent) int {
+	if component.Multiplicity == 0 {
+		return 1
+	}
+	return int(component.Multiplicity)
+}
+
+// LocalShare binds one participant's RSS components to one key generation.
+// The component count is binomial(C-1, g-1) for the session's committee size
+// C (ten for the six-member profile).
 type LocalShare struct {
 	Protocol            protocol.ThresholdProtocol
 	Key                 protocol.ThresholdKeyID
@@ -33,7 +58,7 @@ type LocalShare struct {
 	ActivationEpoch     uint64
 	TranscriptDigest    [32]byte
 	Rho                 [32]byte
-	Components          [10]RSSComponent
+	Components          []RSSComponent
 	zeroized            bool
 }
 
@@ -54,9 +79,10 @@ func (share *LocalShare) Validate() error {
 	if err := share.Key.Validate(); err != nil {
 		return fmt.Errorf("%w: key: %v", ErrInvalidLocalShare, err)
 	}
-	if err := protocol.Dilithium3V1Profile().ValidateCommittee(share.Committee); err != nil {
+	if err := protocol.ValidateDilithium3V1Committee(share.Committee); err != nil {
 		return fmt.Errorf("%w: committee: %v", ErrInvalidLocalShare, err)
 	}
+	participants := len(share.Committee.Participants)
 	position, found := committeePosition(share.Committee, share.ParticipantID)
 	if !found {
 		return fmt.Errorf("%w: participant %d is not in committee", ErrInvalidLocalShare, share.ParticipantID)
@@ -70,19 +96,25 @@ func (share *LocalShare) Validate() error {
 	if share.TranscriptDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: zero transcript digest", ErrInvalidLocalShare)
 	}
-	expectedGroups, err := GroupsForPosition(position)
+	expectedGroups, err := GroupsForPositionN(position, participants)
 	if err != nil {
 		return fmt.Errorf("%w: participant groups: %v", ErrInvalidLocalShare, err)
+	}
+	if len(share.Components) != len(expectedGroups) {
+		return fmt.Errorf("%w: component count %d, want %d", ErrInvalidLocalShare, len(share.Components), len(expectedGroups))
 	}
 	for index, component := range share.Components {
 		if component.GroupMask != expectedGroups[index] {
 			return fmt.Errorf("%w: component %d has group %06b, want %06b", ErrInvalidLocalShare, index, component.GroupMask, expectedGroups[index])
 		}
-		if component.DealerPosition >= 6 || !component.GroupMask.Contains(component.DealerPosition) {
+		if int(component.DealerPosition) >= participants || !component.GroupMask.Contains(component.DealerPosition) {
 			return fmt.Errorf("%w: component %d dealer %d is outside group", ErrInvalidLocalShare, index, component.DealerPosition)
 		}
 		if component.ContributionDigest == ([32]byte{}) {
 			return fmt.Errorf("%w: component %d has zero contribution digest", ErrInvalidLocalShare, index)
+		}
+		if component.Multiplicity == 0 {
+			return fmt.Errorf("%w: component %d has zero fold multiplicity", ErrInvalidLocalShare, index)
 		}
 		if err := validateVectorL(fmt.Sprintf("components[%d].s1", index), component.S1); err != nil {
 			return err
@@ -102,6 +134,7 @@ func (share *LocalShare) Clone() *LocalShare {
 	clone := *share
 	clone.Key = share.Key.Clone()
 	clone.Committee = share.Committee.Clone()
+	clone.Components = append([]RSSComponent(nil), share.Components...)
 	return &clone
 }
 
@@ -120,6 +153,12 @@ func (share *LocalShare) Zeroize() {
 // IsZeroized reports whether the secret vectors have been retired.
 func (share *LocalShare) IsZeroized() bool {
 	return share == nil || share.zeroized
+}
+
+// CommitteePositionOf exports participant-position lookup for node-side
+// ceremony drivers (rotation plans consume positions rather than IDs).
+func CommitteePositionOf(committee protocol.CommitteeID, participantID uint32) (uint8, bool) {
+	return committeePosition(committee, participantID)
 }
 
 func committeePosition(committee protocol.CommitteeID, participantID uint32) (uint8, bool) {

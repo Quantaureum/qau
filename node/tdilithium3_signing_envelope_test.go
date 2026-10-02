@@ -21,7 +21,7 @@ func tdilithium3SigningTestContext() tdilithium3SigningContext {
 		SessionID:        [32]byte{0x51, 0x55},
 		KeyGeneration:    7,
 		CommitteeVersion: 2,
-		Signers:          [4]uint32{3, 5, 8, 13},
+		Signers:          []uint32{3, 5, 8, 13},
 	}
 }
 
@@ -146,7 +146,7 @@ func TestTDilithium3SigningEnvelopeRejections(t *testing.T) {
 		{SessionID: context.SessionID, CommitteeVersion: 1, Signers: context.Signers},
 		{SessionID: context.SessionID, KeyGeneration: 1, Signers: context.Signers},
 		{SessionID: context.SessionID, KeyGeneration: 1, CommitteeVersion: 1},
-		{SessionID: context.SessionID, KeyGeneration: 1, CommitteeVersion: 1, Signers: [4]uint32{3, 3, 8, 13}},
+		{SessionID: context.SessionID, KeyGeneration: 1, CommitteeVersion: 1, Signers: []uint32{3, 3, 8, 13}},
 	}
 	for index, badContext := range badContexts {
 		if _, err := encodeTDilithium3SigningEnvelope(badContext, kind, 5, 3, payload, sign); err == nil {

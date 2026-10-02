@@ -11,7 +11,7 @@ import (
 
 func TestTDilithium3DKGJournalTransitionsAndRecovery(t *testing.T) {
 	journal := newTDilithium3DKGJournal(filepath.Join(t.TempDir(), "journal.enc"), []byte("DEVNET ONLY journal password"))
-	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 2)
+	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 2, 6)
 	if err := journal.Store(record); err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,7 @@ func TestTDilithium3DKGJournalTransitionsAndRecovery(t *testing.T) {
 	if err := journal.Store(changedLocal); !errors.Is(err, errTDilithium3DKGJournalTransition) {
 		t.Fatalf("local entropy rewrite accepted: %v", err)
 	}
-	if err := record.MarkRandomnessCommitments(testTDilithium3DKGCommitments()); err != nil {
+	if err := record.MarkRandomnessCommitments(func() [][32]byte { v := testTDilithium3DKGCommitments(); return v[:] }()); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.Store(record); err != nil {
@@ -96,7 +96,7 @@ func TestTDilithium3DKGJournalTransitionsAndRecovery(t *testing.T) {
 
 func TestTDilithium3DKGJournalRejectsSkippingRollbackAndAttemptReuse(t *testing.T) {
 	journal := newTDilithium3DKGJournal(filepath.Join(t.TempDir(), "journal.enc"), []byte("DEVNET ONLY journal password"))
-	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 1)
+	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 1, 6)
 	if err := journal.Store(record); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestTDilithium3DKGJournalRejectsSkippingRollbackAndAttemptReuse(t *testing.
 	if err := journal.Store(crossSession); !errors.Is(err, errTDilithium3DKGJournalTransition) {
 		t.Fatalf("cross-session error = %v", err)
 	}
-	if err := record.MarkRandomnessCommitments(testTDilithium3DKGCommitments()); err != nil {
+	if err := record.MarkRandomnessCommitments(func() [][32]byte { v := testTDilithium3DKGCommitments(); return v[:] }()); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.Store(record); err != nil {
@@ -151,28 +151,35 @@ func TestTDilithium3DKGJournalRejectsSkippingRollbackAndAttemptReuse(t *testing.
 
 func TestTDilithium3DKGJournalRequiresDurableImmutableRandomnessCommitments(t *testing.T) {
 	journal := newTDilithium3DKGJournal(filepath.Join(t.TempDir(), "journal.enc"), []byte("DEVNET ONLY commitment password"))
-	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 0)
+	record := newTDilithium3DKGJournalRecord([32]byte{1}, [32]byte{2}, 0, 6)
 	if err := journal.Store(record); err != nil {
 		t.Fatal(err)
 	}
 	if err := record.MarkRandomnessComplete([64]byte{3}, [32]byte{4}); err == nil {
 		t.Fatal("reveal completed without commitments")
 	}
-	var commitments [6][32]byte
+	var commitments [][32]byte = make([][32]byte, 6)
 	for position := range commitments {
 		commitments[position][0] = byte(position + 1)
 	}
-	if err := record.MarkRandomnessCommitments(commitments); err != nil {
+	if err := record.MarkRandomnessCommitments(commitments[:]); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.Store(record); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := journal.Load(record.SessionDigest)
-	if err != nil || loaded.RandomnessCommitments != commitments {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ParticipantCount != uint8(6) {
+		t.Fatalf("participant count = %d", loaded.ParticipantCount)
+	}
+	if err != nil || !tdilithium3DKGCommitmentsEqual(loaded.RandomnessCommitments, commitments[:]) {
 		t.Fatalf("lost persisted commitments: %v", err)
 	}
 	mutated := record
+	mutated.RandomnessCommitments = append([][32]byte(nil), record.RandomnessCommitments...)
 	mutated.RandomnessCommitments[0][0]++
 	mutated.Sequence++
 	if err := journal.Store(mutated); !errors.Is(err, errTDilithium3DKGJournalTransition) {

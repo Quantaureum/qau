@@ -48,6 +48,13 @@ func encodeTDilithium3DKGSignedEnvelope(
 		}
 		recipientPosition = &seedMessage.RecipientPosition
 	}
+	if messageType == p2p.MsgTypeTDilithium3ReshareDelta {
+		deltaMessage, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+		if err != nil {
+			return nil, err
+		}
+		recipientPosition = &deltaMessage.RecipientPosition
+	}
 	unsigned, err := protocol.EncodeEnvelope(envelope)
 	if err != nil {
 		return nil, err

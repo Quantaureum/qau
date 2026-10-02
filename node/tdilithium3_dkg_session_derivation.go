@@ -48,28 +48,31 @@ func tdilithium3DKGSessionRosterEpoch(activationEpoch uint64) (uint64, error) {
 	return activationEpoch - 1, nil
 }
 
-// tdilithium3DKGCommitteeForRoster builds the fixed four-of-six committee from a
+// tdilithium3DKGCommitteeForRoster builds the Dilithium3 v1 committee from a
 // roster and returns the local node's position in it.
 //
-// The committee is the roster in canonical order and participant IDs are
-// position+1 (see the design, D2). A roster whose size differs from the profile
-// is refused rather than subsetted, because which validators form the committee
-// is consensus state that the node layer does not reproduce.
+// R76a: the committee is the whole epoch roster in canonical order and
+// participant IDs are position+1, with the family shape (C = roster size,
+// threshold = ceil(2C/3)). Rosters smaller than the family minimum or larger
+// than the family maximum fail closed; subsetting a larger set is R76b, which
+// requires a consensus-anchored sampling rule to stay deterministic.
 func (n *Node) tdilithium3DKGCommitteeForRoster(roster *tdilithium3DKGEpochRoster) (protocol.CommitteeID, uint8, error) {
 	if roster == nil {
 		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: roster is missing", errTDilithium3DKGSessionUnavailable)
 	}
-	profile := protocol.Dilithium3V1Profile()
-	if len(roster.Entries) != int(profile.Participants) {
-		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: epoch %d roster has %d members but the profile requires %d",
-			errTDilithium3DKGSessionUnavailable, roster.Epoch, len(roster.Entries), profile.Participants)
+	count := len(roster.Entries)
+	threshold := protocol.Dilithium3V1ThresholdFor(uint32(count))
+	if threshold == 0 {
+		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: epoch %d roster has %d members, outside the Dilithium3 v1 committee family [%d, %d]",
+			errTDilithium3DKGSessionUnavailable, roster.Epoch, count,
+			protocol.Dilithium3V1MinParticipants, protocol.Dilithium3V1MaxParticipants)
 	}
-	participants := make([]uint32, int(profile.Participants))
+	participants := make([]uint32, count)
 	for position := range participants {
 		participants[position] = uint32(position) + 1
 	}
-	committee := protocol.CommitteeID{Version: 1, Threshold: profile.Threshold, Participants: participants}
-	if err := profile.ValidateCommittee(committee); err != nil {
+	committee := protocol.CommitteeID{Version: 1, Threshold: threshold, Participants: participants}
+	if err := protocol.ValidateDilithium3V1Committee(committee); err != nil {
 		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: committee: %v", errTDilithium3DKGSessionUnavailable, err)
 	}
 	if n == nil || n.blockProducer == nil {

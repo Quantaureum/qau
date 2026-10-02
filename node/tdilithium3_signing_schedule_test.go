@@ -286,7 +286,7 @@ func TestTDilithium3SigningScheduleRejectsInvalidShapes(t *testing.T) {
 		t.Fatal("zero candidates accepted")
 	}
 	if _, err := newTDilithium3SigningRequestSchedule(
-		node, factory, dilithium3v1.SigningParallelSlots+1, time.Second,
+		node, factory, dilithium3v1.SigningMaxParallelSlots+1, time.Second,
 	); err == nil {
 		t.Fatal("too many candidates accepted")
 	}
@@ -324,7 +324,7 @@ func TestTDilithium3SigningScheduleRejectsInvalidShapes(t *testing.T) {
 		{name: "missing broadcast", mutate: func(config *tdilithium3SigningPartyConfig) { config.Broadcast = nil }},
 		{name: "missing entropy", mutate: func(config *tdilithium3SigningPartyConfig) { config.Entropy = nil }},
 		{name: "signers not ascending", mutate: func(config *tdilithium3SigningPartyConfig) {
-			config.Signers = [4]uint32{config.Signers[1], config.Signers[0], config.Signers[2], config.Signers[3]}
+			config.Signers = []uint32{config.Signers[1], config.Signers[0], config.Signers[2], config.Signers[3]}
 		}},
 		{name: "missing identity", mutate: func(config *tdilithium3SigningPartyConfig) {
 			delete(config.Identities, config.Signers[3])

@@ -62,7 +62,7 @@ func TestThresholdSigningAttemptRejectsInvalidBindings(t *testing.T) {
 		request     protocol.SignRequest
 		active      []*LocalShare
 		coordinator uint32
-		randomness  [4]*signingRandomness
+		randomness  []*signingRandomness
 	}
 	baseline := func(t *testing.T) arguments {
 		t.Helper()
@@ -471,7 +471,7 @@ func TestThresholdSigningAttemptLeavesNoSecretArtifacts(t *testing.T) {
 		reflect.TypeOf(VectorK{}),
 		reflect.TypeOf(Poly{}),
 		reflect.TypeOf(signingRandomness{}),
-		reflect.TypeOf([4]*signingRandomness{}),
+		reflect.TypeOf([]*signingRandomness{}),
 		reflect.TypeOf(sharedPoly{}),
 		reflect.TypeOf(sharedCoefficient{}),
 		reflect.TypeOf(sharedPolyNTT{}),
@@ -488,7 +488,7 @@ func TestThresholdSigningAttemptLeavesNoSecretArtifacts(t *testing.T) {
 	active := fixture.activeShares(t, 0b001111)
 	slot, _, _ := signingTestSign(t, journal, request, active, rand.New(rand.NewSource(0xA5)))
 	for _, point := range slot.randomness {
-		if err := validateSigningRandomness(point); err != nil {
+		if err := validateSigningRandomness(point, signingTestParameters(t)); err != nil {
 			t.Fatalf("accepted randomness is invalid: %v", err)
 		}
 	}
@@ -551,7 +551,7 @@ func signingTestAcceptedRandomness(
 	active []*LocalShare,
 	request protocol.SignRequest,
 	source *rand.Rand,
-) [4]*signingRandomness {
+) []*signingRandomness {
 	t.Helper()
 	probeJournal := signingTestJournal(t)
 	for probe := 1; probe <= signingTestAttemptLimit; probe++ {
@@ -584,7 +584,7 @@ func signingTestAcceptedRandomness(
 		return randomness
 	}
 	t.Fatalf("no accepted randomness in %d probes", signingTestAttemptLimit)
-	return [4]*signingRandomness{}
+	return []*signingRandomness{}
 }
 
 // TestThresholdSigningAttemptRestartBoundariesFailClosed requires every restart boundary

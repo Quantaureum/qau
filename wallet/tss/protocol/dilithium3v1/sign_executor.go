@@ -227,7 +227,8 @@ func signingExecutorResponsePartDigest(
 
 // signingExecutorSigner is one in-process signer instance. It holds its own
 // ball randomness and its own partial secret, its own inbox gate, and the
-// public values it received; nothing else.
+// public values it received; nothing else. Every per-signer slice is sized by
+// the pinned committee row's threshold (4 or 5 for R76b).
 type signingExecutorSigner struct {
 	lock sync.Mutex
 
@@ -236,7 +237,9 @@ type signingExecutorSigner struct {
 	slot          uint16
 	sessionID     [32]byte
 	participantID uint32
-	identities    [4]uint32
+	identities    []uint32
+	fullMask      uint8
+	params        SigningParameters
 
 	randomness    *signingRandomness
 	partialFirst  VectorL
@@ -252,14 +255,14 @@ type signingExecutorSigner struct {
 
 	contribution VectorK
 
-	commits         [4][32]byte
+	commits         [][32]byte
 	commitsSeen     uint8
-	reveals         [4]VectorK
+	reveals         []VectorK
 	revealsSeen     uint8
 	digestsChecked  uint8
-	acceptances     [4]bool
+	acceptances     []bool
 	acceptancesSeen uint8
-	parts           [4][L]SignedPoly
+	parts           [][L]SignedPoly
 	partsSeen       uint8
 
 	accepted   bool
@@ -473,7 +476,7 @@ func (signer *signingExecutorSigner) advanceLocked() error {
 		if err := signer.checkDigestsLocked(); err != nil {
 			return err
 		}
-		if signer.commitsSeen == 0xF && !signer.revealSent {
+		if signer.commitsSeen == signer.fullMask && !signer.revealSent {
 			payload, err := EncodeSigningExecutorReveal(signer.slot, signer.contribution)
 			if err != nil {
 				return fmt.Errorf("%w: signer %d reveal: %v", errInvalidSigningAttempt, signer.participantID, err)
@@ -486,7 +489,7 @@ func (signer *signingExecutorSigner) advanceLocked() error {
 			})
 			changed = true
 		}
-		if signer.digestsChecked == 0xF && !signer.acceptanceSent {
+		if signer.digestsChecked == signer.fullMask && !signer.acceptanceSent {
 			if err := signer.computeChallengeLocked(); err != nil {
 				return err
 			}
@@ -502,7 +505,7 @@ func (signer *signingExecutorSigner) advanceLocked() error {
 			})
 			changed = true
 		}
-		if signer.acceptanceSent && signer.acceptancesSeen == 0xF && !signer.rejected && !signer.responseSent {
+		if signer.acceptanceSent && signer.acceptancesSeen == signer.fullMask && !signer.rejected && !signer.responseSent {
 			if !signer.allAcceptedLocked() {
 				// Some signer rejected the slot, so this signer must not release
 				// its response part, whatever the coordinator still delivers: it
@@ -544,7 +547,7 @@ func (signer *signingExecutorSigner) advanceLocked() error {
 				changed = true
 			}
 		}
-		if !signer.rejected && signer.partsSeen == 0xF && signer.signature == nil && signer.allAcceptedLocked() {
+		if !signer.rejected && signer.partsSeen == signer.fullMask && signer.signature == nil && signer.allAcceptedLocked() {
 			var z [L]SignedPoly
 			for index := range signer.parts {
 				for row := 0; row < L; row++ {
@@ -619,7 +622,7 @@ func (signer *signingExecutorSigner) burn() error {
 // checkDigestsLocked opens every (commit, reveal) pair that is now complete and
 // aborts on the first reveal that does not match its commitment.
 func (signer *signingExecutorSigner) checkDigestsLocked() error {
-	for index := 0; index < 4; index++ {
+	for index := range signer.identities {
 		bit := uint8(1) << index
 		if signer.commitsSeen&bit == 0 || signer.revealsSeen&bit == 0 || signer.digestsChecked&bit != 0 {
 			continue
@@ -669,7 +672,7 @@ func (signer *signingExecutorSigner) computeChallengeLocked() error {
 		return fmt.Errorf("%w: signer %d challenge: %v", errInvalidSigningAttempt, signer.participantID, err)
 	}
 	shiftFirst, shiftSecond := signingExecutorChallengeShift(signer.partialFirst, signer.partialSecond, challenge)
-	passes, err := signingRejectionTest(signer.randomness, shiftFirst, shiftSecond)
+	passes, err := signingRejectionTest(signer.randomness, shiftFirst, shiftSecond, signer.params.Radius)
 	if err != nil {
 		return fmt.Errorf("%w: signer %d rejection test: %v", errInvalidSigningAttempt, signer.participantID, err)
 	}
@@ -685,7 +688,7 @@ func (signer *signingExecutorSigner) computeChallengeLocked() error {
 // allAcceptedLocked reports whether every acceptance bit of the slot is in and
 // true, which is the only condition under which a response may be released.
 func (signer *signingExecutorSigner) allAcceptedLocked() bool {
-	if signer.acceptancesSeen != 0xF {
+	if signer.acceptancesSeen != signer.fullMask {
 		return false
 	}
 	for _, accepted := range signer.acceptances {
@@ -702,24 +705,24 @@ func (signer *signingExecutorSigner) missingLocked() (uint16, uint32, bool) {
 	if signer.rejected || signer.burned || signer.signature != nil {
 		return 0, 0, false
 	}
-	if signer.commitsSeen != 0xF {
-		return SigningExecutorKindCommit, signer.identities[firstMissing(signer.commitsSeen)], true
+	if signer.commitsSeen != signer.fullMask {
+		return SigningExecutorKindCommit, signer.identities[firstMissing(signer.commitsSeen, len(signer.identities))], true
 	}
-	if signer.revealsSeen != 0xF {
-		return SigningExecutorKindReveal, signer.identities[firstMissing(signer.revealsSeen)], true
+	if signer.revealsSeen != signer.fullMask {
+		return SigningExecutorKindReveal, signer.identities[firstMissing(signer.revealsSeen, len(signer.identities))], true
 	}
-	if signer.acceptancesSeen != 0xF {
-		return SigningExecutorKindAcceptance, signer.identities[firstMissing(signer.acceptancesSeen)], true
+	if signer.acceptancesSeen != signer.fullMask {
+		return SigningExecutorKindAcceptance, signer.identities[firstMissing(signer.acceptancesSeen, len(signer.identities))], true
 	}
 	if signer.partsSeen != 0xF {
-		return SigningExecutorKindResponse, signer.identities[firstMissing(signer.partsSeen)], true
+		return SigningExecutorKindResponse, signer.identities[firstMissing(signer.partsSeen, len(signer.identities))], true
 	}
 	return 0, 0, false
 }
 
 // firstMissing returns the lowest position absent from a non-full bit mask.
-func firstMissing(mask uint8) int {
-	for index := 0; index < 4; index++ {
+func firstMissing(mask uint8, count int) int {
+	for index := 0; index < count; index++ {
 		if mask&(1<<index) == 0 {
 			return index
 		}
@@ -727,12 +730,12 @@ func firstMissing(mask uint8) int {
 	return -1
 }
 
-// signingExecutorSession drives one slot of one signing request across four
-// in-process signer instances.
+// signingExecutorSession drives one slot of one signing request across the t
+// in-process signer instances of the pinned committee row.
 type signingExecutorSession struct {
 	policy  SigningExecutorPolicy
 	slot    uint16
-	signers [4]*signingExecutorSigner
+	signers []*signingExecutorSigner
 
 	started bool
 	aborted *signingExecutorAbort
@@ -740,14 +743,15 @@ type signingExecutorSession struct {
 
 // newSigningExecutorSession validates the slot binding and returns a session
 // whose signers hold only their own material. The material is caller-supplied
-// because the in-process reference drives all four signers; a deployment
-// samples each ball point and binds each one-time record inside its own signer
-// process.
+// because the in-process reference drives all t signers; a deployment samples
+// each ball point and binds each one-time record inside its own signer
+// process. The committee size comes from the active shares and must have a
+// pinned signing row (R76b).
 func newSigningExecutorSession(
 	request protocol.SignRequest,
 	activeShares []*LocalShare,
 	slot uint16,
-	material [4]signingExecutorSlotMaterial,
+	material []signingExecutorSlotMaterial,
 ) (*signingExecutorSession, error) {
 	if slot == 0 || slot > signingExecutorSlotLimit {
 		return nil, fmt.Errorf(
@@ -757,15 +761,30 @@ func newSigningExecutorSession(
 	if err := request.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 	}
-	if len(activeShares) != 4 {
-		return nil, fmt.Errorf("%w: %d active shares, want 4", errInvalidSigningAttempt, len(activeShares))
+	if len(activeShares) == 0 {
+		return nil, fmt.Errorf("%w: no active shares", errInvalidSigningAttempt)
 	}
-	var participantIDs [4]uint32
-	var positions [4]uint8
-	activeMask := uint8(0)
+	participants := len(activeShares[0].Committee.Participants)
+	params, err := SigningParametersForParticipants(participants)
+	if err != nil {
+		return nil, ErrUnsupportedSigningCommitteeSize
+	}
+	threshold := params.Threshold
+	if len(activeShares) != threshold {
+		return nil, fmt.Errorf("%w: %d active shares, want %d", errInvalidSigningAttempt, len(activeShares), threshold)
+	}
+	if len(material) != threshold {
+		return nil, fmt.Errorf("%w: %d material sets, want %d", errInvalidSigningAttempt, len(material), threshold)
+	}
+	participantIDs := make([]uint32, threshold)
+	positions := make([]uint8, threshold)
+	activeMask := uint16(0)
 	for index, share := range activeShares {
 		if share == nil || share.Validate() != nil {
 			return nil, fmt.Errorf("%w: active share %d is invalid", errInvalidSigningAttempt, index)
+		}
+		if len(share.Committee.Participants) != participants {
+			return nil, fmt.Errorf("%w: active share %d committee size mismatch", errInvalidSigningAttempt, index)
 		}
 		participantIDs[index] = share.ParticipantID
 		positions[index] = share.ParticipantPosition
@@ -774,7 +793,7 @@ func newSigningExecutorSession(
 		}
 		activeMask |= 1 << share.ParticipantPosition
 	}
-	signerIDs := participantIDs[:]
+	signerIDs := append([]uint32(nil), participantIDs...)
 	sessionID, err := Dilithium3SigningSessionID(request, signerIDs)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
@@ -785,9 +804,9 @@ func newSigningExecutorSession(
 			return nil, fmt.Errorf("%w: active share %d does not match the request", errInvalidSigningAttempt, index)
 		}
 	}
-	allocation, err := AllocateRSSGroups(activeMask)
+	allocation, err := AllocateRSSGroupsFor(activeMask, participants)
 	if err != nil {
-		return nil, fmt.Errorf("%w: active set %06b: %v", errInvalidSigningAttempt, activeMask, err)
+		return nil, fmt.Errorf("%w: active set %012b: %v", errInvalidSigningAttempt, activeMask, err)
 	}
 	var rho [32]byte
 	copy(rho[:], request.Key.PublicKey[:32])
@@ -800,11 +819,11 @@ func newSigningExecutorSession(
 		if material[index].journal == nil || material[index].record == nil {
 			return nil, fmt.Errorf("%w: signer %d material is incomplete", errInvalidSigningAttempt, index)
 		}
-		if err := validateSigningRandomness(material[index].randomness); err != nil {
+		if err := validateSigningRandomness(material[index].randomness, params); err != nil {
 			return nil, fmt.Errorf("%w: randomness %d: %v", errInvalidSigningAttempt, index, err)
 		}
 	}
-	partialFirst, partialSecond, err := reconstructPartialSecrets(activeShares, allocation)
+	partialFirst, partialSecond, err := reconstructPartialSecrets(activeShares, participants, allocation)
 	if err != nil {
 		return nil, err
 	}
@@ -812,8 +831,9 @@ func newSigningExecutorSession(
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 	}
-	policy := SigningExecutorPolicy{SessionID: sessionID, Signers: participantIDs}
-	session := &signingExecutorSession{policy: policy, slot: slot}
+	fullMask := uint8(1<<threshold) - 1
+	policy := SigningExecutorPolicy{SessionID: sessionID, Signers: append([]uint32(nil), participantIDs...)}
+	session := &signingExecutorSession{policy: policy, slot: slot, signers: make([]*signingExecutorSigner, threshold)}
 	for index := range activeShares {
 		gate, err := NewSigningExecutorGate(policy)
 		if err != nil {
@@ -826,6 +846,8 @@ func newSigningExecutorSession(
 			sessionID:      sessionID,
 			participantID:  participantIDs[index],
 			identities:     participantIDs,
+			fullMask:       fullMask,
+			params:         params,
 			randomness:     material[index].randomness,
 			partialFirst:   partialFirst[index],
 			partialSecond:  partialSecond[index],
@@ -835,6 +857,10 @@ func newSigningExecutorSession(
 			representative: representative,
 			key:            request.Key.Clone(),
 			message:        append([]byte(nil), request.Message...),
+			commits:        make([][32]byte, threshold),
+			reveals:        make([]VectorK, threshold),
+			acceptances:    make([]bool, threshold),
+			parts:          make([][L]SignedPoly, threshold),
 		}
 	}
 	return session, nil

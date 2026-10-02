@@ -24,6 +24,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
@@ -74,7 +75,7 @@ func newTDilithium3SigningSlotDriver(
 	if transport.context.SessionID != inbox.context.SessionID ||
 		transport.context.KeyGeneration != inbox.context.KeyGeneration ||
 		transport.context.CommitteeVersion != inbox.context.CommitteeVersion ||
-		transport.context.Signers != inbox.context.Signers ||
+		!slices.Equal(transport.context.Signers, inbox.context.Signers) ||
 		!inbox.context.activeSigner(transport.senderID) {
 		return nil, fmt.Errorf("Dilithium3 signing slot driver requires one session across transport and inbox")
 	}

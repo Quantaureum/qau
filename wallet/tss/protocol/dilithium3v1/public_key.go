@@ -3,6 +3,7 @@ package dilithium3v1
 
 import (
 	"crypto/sha3"
+	"encoding/binary"
 	"errors"
 	"fmt"
 )
@@ -11,12 +12,23 @@ const publicKeyTranscriptDomain = "QAU-TDILITHIUM3-V1-PUBLIC-KEY-TRANSCRIPT"
 
 var ErrInvalidPublicKeyAssembly = errors.New("invalid Dilithium3 v1 public-key assembly")
 
-// AssembleMode3PublicKey aggregates twenty public contributions into one mode3 key.
+// AssembleMode3PublicKey aggregates the binomial(C, floor(C/3)+1) public
+// contributions of one session's committee into one mode3 key (R76a family;
+// C = participants must be within the committee family).
 func AssembleMode3PublicKey(
 	rho [32]byte,
-	contributions [20]PublicContribution,
+	contributions []PublicContribution,
+	participants int,
 ) (publicKey [1952]byte, transcriptDigest [32]byte, err error) {
-	ordered := contributions
+	groups, err := CanonicalRSSGroupsFor(participants)
+	if err != nil {
+		return [1952]byte{}, [32]byte{}, err
+	}
+	if len(contributions) != len(groups) {
+		return [1952]byte{}, [32]byte{}, fmt.Errorf("%w: contribution count %d, want %d for a %d-member committee",
+			ErrInvalidPublicKeyAssembly, len(contributions), len(groups), participants)
+	}
+	ordered := append([]PublicContribution(nil), contributions...)
 	for index := range ordered {
 		if err := ordered[index].Validate(); err != nil {
 			return [1952]byte{}, [32]byte{}, fmt.Errorf("%w: contribution %d: %v", ErrInvalidPublicKeyAssembly, index, err)
@@ -31,10 +43,9 @@ func AssembleMode3PublicKey(
 		}
 		ordered[position] = current
 	}
-	groups := CanonicalRSSGroups()
 	sessionDigest := ordered[0].SessionDigest
 	var aggregate VectorK
-	var contributionDigests [20][32]byte
+	contributionDigests := make([][32]byte, len(ordered))
 	for index, contribution := range ordered {
 		if contribution.GroupMask != groups[index] {
 			return [1952]byte{}, [32]byte{}, fmt.Errorf("%w: group %d is %06b, want %06b", ErrInvalidPublicKeyAssembly, index, contribution.GroupMask, groups[index])
@@ -76,7 +87,8 @@ func AssembleMode3PublicKey(
 	transcript = append(transcript, rho[:]...)
 	transcript = append(transcript, publicKey[:]...)
 	for index, contribution := range ordered {
-		transcript = append(transcript, byte(contribution.GroupMask), contribution.DealerPosition)
+		transcript = binary.BigEndian.AppendUint16(transcript, uint16(contribution.GroupMask))
+		transcript = append(transcript, contribution.DealerPosition)
 		transcript = append(transcript, contributionDigests[index][:]...)
 	}
 	return publicKey, sha3.Sum256(transcript), nil

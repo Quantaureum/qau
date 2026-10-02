@@ -124,8 +124,8 @@ func tdilithium3SeamFixtureFor(t *testing.T) *tdilithium3SeamFixture {
 
 // signersFor returns the fixed four-signer subset of the seal path: the first
 // four committee participants in canonical order.
-func (fixture *tdilithium3SeamFixture) signersFor() [4]uint32 {
-	var signers [4]uint32
+func (fixture *tdilithium3SeamFixture) signersFor() []uint32 {
+	signers := make([]uint32, 4)
 	for index := range signers {
 		signers[index] = fixture.session.Committee.Participants[index]
 	}
@@ -235,7 +235,7 @@ type tdilithium3SeamHarness struct {
 func tdilithium3SeamHarnessFor(
 	t *testing.T,
 	fixture *tdilithium3SeamFixture,
-	signers [4]uint32,
+	signers []uint32,
 	request protocol.SignRequest,
 	slotTimeout time.Duration,
 ) *tdilithium3SeamHarness {
@@ -362,7 +362,7 @@ func (harness *tdilithium3SeamHarness) signOne(t *testing.T) []byte {
 func tdilithium3SeamSign(
 	t *testing.T,
 	fixture *tdilithium3SeamFixture,
-	signers [4]uint32,
+	signers []uint32,
 	share *dilithium3v1.LocalShare,
 	firstSlot uint64,
 ) []byte {
@@ -426,8 +426,8 @@ func TestTDilithium3DKGSeamFailsClosed(t *testing.T) {
 	t.Run("signer set excludes the share holder", func(t *testing.T) {
 		// A signer set the share is not part of cannot host that share's
 		// party, so the session never starts.
-		var excluded [4]uint32
-		copy(excluded[:], signers[1:])
+		excluded := make([]uint32, 4)
+		copy(excluded, signers[1:])
 		excluded[3] = fixture.session.Committee.Participants[5]
 		if excluded[0] >= excluded[1] || excluded[1] >= excluded[2] || excluded[2] >= excluded[3] {
 			t.Skip("fixture committee does not yield a strictly ascending alternate set")
@@ -451,7 +451,10 @@ func TestTDilithium3DKGSeamFailsClosed(t *testing.T) {
 		// binds cannot produce a signature the group key verifies. The party
 		// either refuses the tampered share or signs under a foreign key; in
 		// neither case may a signature verify under the ceremony's group key.
+		// Components is a slice since R76a: copy the backing array too, so the
+		// tampered variant never aliases the fixture's honest share.
 		copied := *share
+		copied.Components = append([]dilithium3v1.RSSComponent(nil), share.Components...)
 		copied.Components[0].S1[0][0] = dilithium3v1.Add(copied.Components[0].S1[0], dilithium3v1.Poly{0x7f})[0]
 		party, err := dilithium3v1.NewSigningExecutorParty(dilithium3v1.SigningExecutorPartyConfig{
 			Request: tdilithium3SeamRequest(t, share, epoch, 66, message),

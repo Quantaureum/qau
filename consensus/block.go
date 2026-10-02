@@ -687,7 +687,7 @@ func NewQPOS(validators *ValidatorSet) (*QPOS, error) {
 		epochVRFAccumulator:     make(map[uint64]types.Hash),   // AUDIT (2026) R4-CORE-01
 		vdfSeedCache:            make(map[vdfSeedKey]types.Hash), // stage-2 VDF seed hardening
 		vdfSeedBusy:             make(map[vdfSeedKey]struct{}),   // stage-2 VDF seed hardening
-		vdfSeedCfg:              vdfSeedConfigFromEnv(),          // nil unless QAU_VDF_SEED_ENABLED=1 (+activation epoch)
+		vdfSeedCfg:              vdfSeedConfigFromEnv(),        // nil unless QAU_VDF_SEED_ACTIVATION_EPOCH is set
 		appliedBlockRoots:       make(map[types.Hash]struct{}), // R38-P1-08 DEEP FIX
 		randaoMix:               types.Hash{},
 		authorizedCallers:       NewAuthorizedCallers(),

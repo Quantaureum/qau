@@ -13,13 +13,16 @@ import (
 )
 
 const (
-	localShareMagic          = "QTD3SH02"
-	legacyLocalShareMagic    = "QTD3SH01"
-	localShareVersion        = uint16(2)
-	shareDigestSize          = 32
-	componentMetadataSize    = 1 + 1 + 32
-	componentSecretPolyCount = L + K
-	localComponentCount      = 10
+	localShareMagic   = "QTD3SH02"
+	legacyLocalShareMagic = "QTD3SH01"
+	// localShareVersion is the current share-encoding version. Version 3
+	// added the 32-bit fold multiplicity ahead of each component's secret
+	// vectors so R77-rotated shares round-trip their norm history.
+	localShareVersion          = uint16(3)
+	legacyLocalShareVersion    = uint16(2)
+	shareDigestSize            = 32
+	componentMetadataSize      = 2 + 1 + 32 + 4
+	componentSecretPolyCount   = L + K
 )
 
 var (
@@ -33,7 +36,7 @@ func (share *LocalShare) MarshalBinary() ([]byte, error) {
 	if err := share.Validate(); err != nil {
 		return nil, err
 	}
-	encoded := make([]byte, 0, localShareEncodedSize())
+	encoded := make([]byte, 0, localShareEncodedSize(share))
 	encoded = append(encoded, localShareMagic...)
 	encoded = binary.BigEndian.AppendUint16(encoded, localShareVersion)
 	encoded = binary.BigEndian.AppendUint16(encoded, uint16(share.Protocol))
@@ -53,8 +56,10 @@ func (share *LocalShare) MarshalBinary() ([]byte, error) {
 	encoded = append(encoded, share.TranscriptDigest[:]...)
 	encoded = append(encoded, share.Rho[:]...)
 	for _, component := range share.Components {
-		encoded = append(encoded, byte(component.GroupMask), component.DealerPosition)
+		encoded = binary.BigEndian.AppendUint16(encoded, uint16(component.GroupMask))
+		encoded = append(encoded, component.DealerPosition)
 		encoded = append(encoded, component.ContributionDigest[:]...)
+		encoded = binary.BigEndian.AppendUint32(encoded, uint32(componentMultiplicity(component)))
 		var err error
 		encoded, err = appendVectorL(encoded, component.S1)
 		if err != nil {
@@ -81,18 +86,17 @@ func UnmarshalLocalShare(encoded []byte) (*LocalShare, error) {
 	if !bytes.Equal(encoded[:len(localShareMagic)], []byte(localShareMagic)) {
 		return nil, ErrInvalidLocalShareEncoding
 	}
-	if len(encoded) != localShareEncodedSize() {
-		return nil, ErrInvalidLocalShareEncoding
-	}
 	payload := encoded[:len(encoded)-shareDigestSize]
 	wantDigest := sha3.Sum256(payload)
 	if subtle.ConstantTimeCompare(wantDigest[:], encoded[len(payload):]) != 1 {
 		return nil, ErrShareDigestMismatch
 	}
 	offset := len(localShareMagic)
-	if binary.BigEndian.Uint16(encoded[offset:offset+2]) != localShareVersion {
+	version := binary.BigEndian.Uint16(encoded[offset : offset+2])
+	if version != localShareVersion && version != legacyLocalShareVersion {
 		return nil, ErrUnsupportedLocalShareVersion
 	}
+	legacyVersionTwo := version == legacyLocalShareVersion
 	offset += 2
 	thresholdProtocol := protocol.ThresholdProtocol(binary.BigEndian.Uint16(encoded[offset : offset+2]))
 	offset += 2
@@ -113,7 +117,7 @@ func UnmarshalLocalShare(encoded []byte) (*LocalShare, error) {
 	offset += 4
 	participantCount := int(binary.BigEndian.Uint32(encoded[offset : offset+4]))
 	offset += 4
-	if participantCount != 6 {
+	if participantCount < MinCommitteeParticipants || participantCount > MaxCommitteeParticipants {
 		return nil, ErrInvalidLocalShareEncoding
 	}
 	participants := make([]uint32, participantCount)
@@ -143,14 +147,32 @@ func UnmarshalLocalShare(encoded []byte) (*LocalShare, error) {
 		TranscriptDigest:    transcriptDigest,
 		Rho:                 rho,
 	}
+	groups, err := GroupsForPositionN(participantPosition, participantCount)
+	if err != nil {
+		return nil, ErrInvalidLocalShareEncoding
+	}
+	share.Components = make([]RSSComponent, len(groups))
 	for index := range share.Components {
 		component := &share.Components[index]
-		component.GroupMask = RSSGroupMask(encoded[offset])
-		offset++
+		if offset+2 > len(payload) {
+			return nil, ErrInvalidLocalShareEncoding
+		}
+		component.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+		offset += 2
 		component.DealerPosition = encoded[offset]
 		offset++
 		copy(component.ContributionDigest[:], encoded[offset:offset+32])
 		offset += 32
+		if legacyVersionTwo {
+			component.Multiplicity = 1
+		} else {
+			component.Multiplicity = binary.BigEndian.Uint32(encoded[offset : offset+4])
+			offset += 4
+			if component.Multiplicity == 0 {
+				share.Zeroize()
+				return nil, ErrInvalidLocalShareEncoding
+			}
+		}
 		var err error
 		component.S1, offset, err = decodeVectorL(encoded, offset)
 		if err != nil {
@@ -176,10 +198,11 @@ func UnmarshalLocalShare(encoded []byte) (*LocalShare, error) {
 
 const mode3PublicKeySize = 1952
 
-func localShareEncodedSize() int {
-	metadataSize := 8 + 2 + 2 + 2 + 8 + 4 + mode3PublicKeySize + 8 + 4 + 4 + 6*4 + 4 + 1 + 8 + 32 + 32
+func localShareEncodedSize(share *LocalShare) int {
+	participants := len(share.Committee.Participants)
+	metadataSize := 8 + 2 + 2 + 2 + 8 + 4 + mode3PublicKeySize + 8 + 4 + 4 + participants*4 + 4 + 1 + 8 + 32 + 32
 	componentSize := componentMetadataSize + componentSecretPolyCount*PolyEncodedSize
-	return metadataSize + localComponentCount*componentSize + shareDigestSize
+	return metadataSize + len(share.Components)*componentSize + shareDigestSize
 }
 
 func appendVectorL(destination []byte, vector VectorL) ([]byte, error) {

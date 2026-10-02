@@ -25,7 +25,7 @@ type DKGSession struct {
 	IdentityRosterDigest [32]byte
 }
 
-// Validate enforces the fixed Dilithium3 v1 four-of-six profile.
+// Validate enforces the Dilithium3 v1 committee family (R76a).
 func (session DKGSession) Validate() error {
 	if session.Protocol != protocol.ThresholdProtocolDilithium3V1 {
 		return fmt.Errorf("%w: wrong protocol", ErrInvalidDKGSession)
@@ -39,7 +39,7 @@ func (session DKGSession) Validate() error {
 	if session.KeyGeneration == 0 {
 		return fmt.Errorf("%w: zero key generation", ErrInvalidDKGSession)
 	}
-	if err := protocol.Dilithium3V1Profile().ValidateCommittee(session.Committee); err != nil {
+	if err := protocol.ValidateDilithium3V1Committee(session.Committee); err != nil {
 		return fmt.Errorf("%w: committee: %v", ErrInvalidDKGSession, err)
 	}
 	if session.ActivationEpoch == 0 {

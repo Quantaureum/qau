@@ -17,7 +17,41 @@ const (
 	TMLDSAV1ParticipantCount = ThresholdV1ParticipantCount
 	TMLDSAV1Threshold        = ThresholdV1Threshold
 	TMLDSAV1MaxCorrupt       = ThresholdV1MaxCorrupt
+
+	// Dilithium3 v1 committee family (R76): the CNF-RSS committee size is a
+	// per-session value in [6, 12] with threshold ceil(2C/3). The TMLDSA v1
+	// (mldsa65) line keeps the fixed 6/4 shape above.
+	Dilithium3V1MinParticipants uint32 = 6
+	Dilithium3V1MaxParticipants uint32 = 12
 )
+
+// Dilithium3V1ThresholdFor returns ceil(2*participants/3), the family
+// threshold rule t = ceil(2C/3). Out-of-range counts return zero.
+func Dilithium3V1ThresholdFor(participants uint32) uint32 {
+	if participants < Dilithium3V1MinParticipants || participants > Dilithium3V1MaxParticipants {
+		return 0
+	}
+	return (2*participants + 2) / 3
+}
+
+// ValidateDilithium3V1Committee requires a well-formed committee whose shape
+// obeys the Dilithium3 v1 family rule (participant list length C in [6, 12],
+// threshold ceil(2C/3)). Fail-closed on any deviation.
+func ValidateDilithium3V1Committee(committee CommitteeID) error {
+	if err := committee.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidThresholdProfile, err)
+	}
+	participants := uint32(len(committee.Participants))
+	want := Dilithium3V1ThresholdFor(participants)
+	if want == 0 {
+		return fmt.Errorf("%w: participant count %d outside [%d, %d]", ErrInvalidThresholdProfile,
+			participants, Dilithium3V1MinParticipants, Dilithium3V1MaxParticipants)
+	}
+	if committee.Threshold != want {
+		return fmt.Errorf("%w: threshold %d, want %d", ErrInvalidThresholdProfile, committee.Threshold, want)
+	}
+	return nil
+}
 
 var (
 	ErrInvalidThresholdProfile    = errors.New("invalid threshold protocol profile")
@@ -85,10 +119,18 @@ func (profile ThresholdProtocolProfile) Validate() error {
 	return nil
 }
 
-// ValidateCommittee requires the fixed four-of-six committee.
+// ValidateCommittee requires the fixed four-of-six committee for the TMLDSA
+// v1 line, and the family rule (C in [6, 12], t = ceil(2C/3)) for the
+// Dilithium3 v1 line — the latter is consensus-derived since R76a and its
+// acceptable DKG committee sizes form a family, while the signing MPC stays
+// pinned per row (signing surfaces fail closed again for sizes with no
+// pinned parameter row).
 func (profile ThresholdProtocolProfile) ValidateCommittee(committee CommitteeID) error {
 	if err := profile.Validate(); err != nil {
 		return err
+	}
+	if profile.Protocol == ThresholdProtocolDilithium3V1 {
+		return ValidateDilithium3V1Committee(committee)
 	}
 	if err := committee.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidThresholdProfile, err)

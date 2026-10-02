@@ -89,18 +89,19 @@ type tdilithium3DKGPacket struct {
 }
 
 type tdilithium3DKGMemoryTransport struct {
-	packets   map[string]tdilithium3DKGPacket
-	pending   []tdilithium3DKGPacket
-	delayed   bool
-	reordered bool
+	participants int
+	packets      map[string]tdilithium3DKGPacket
+	pending      []tdilithium3DKGPacket
+	delayed      bool
+	reordered    bool
 }
 
-func newTDilithium3DKGMemoryTransport() *tdilithium3DKGMemoryTransport {
-	return &tdilithium3DKGMemoryTransport{packets: make(map[string]tdilithium3DKGPacket)}
+func newTDilithium3DKGMemoryTransport(participants int) *tdilithium3DKGMemoryTransport {
+	return &tdilithium3DKGMemoryTransport{participants: participants, packets: make(map[string]tdilithium3DKGPacket)}
 }
 
 func (transport *tdilithium3DKGMemoryTransport) deliver(packet tdilithium3DKGPacket, duplicate bool) error {
-	if transport == nil || packet.SessionDigest == ([32]byte{}) || packet.CommitteeDigest == ([32]byte{}) || packet.SenderPosition >= 6 || packet.RecipientPosition >= 6 || len(packet.Payload) == 0 {
+	if transport == nil || packet.SessionDigest == ([32]byte{}) || packet.CommitteeDigest == ([32]byte{}) || int(packet.SenderPosition) >= transport.participants || int(packet.RecipientPosition) >= transport.participants || len(packet.Payload) == 0 {
 		return errTDilithium3DKGInvalidCluster
 	}
 	if transport.delayed {
@@ -182,7 +183,7 @@ func newTDilithium3DKGRunner(config tdilithium3DKGRunnerConfig) (*tdilithium3DKG
 	if err := config.Session.Validate(); err != nil {
 		return nil, err
 	}
-	if config.ParticipantPosition >= 6 || config.BasePath == "" || len(config.Password) == 0 || config.Entropy == nil {
+	if int(config.ParticipantPosition) >= len(config.Session.Committee.Participants) || config.BasePath == "" || len(config.Password) == 0 || config.Entropy == nil {
 		return nil, errTDilithium3DKGInvalidCluster
 	}
 	sessionDigest, err := config.Session.Digest()
@@ -214,7 +215,7 @@ func newTDilithium3DKGRunner(config tdilithium3DKGRunnerConfig) (*tdilithium3DKG
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	record = newTDilithium3DKGJournalRecord(sessionDigest, committeeDigest, config.ParticipantPosition)
+	record = newTDilithium3DKGJournalRecord(sessionDigest, committeeDigest, config.ParticipantPosition, len(config.Session.Committee.Participants))
 	if err := readTDilithium3DKGRandom(config.Entropy, record.LocalRandomness[:]); err != nil {
 		return nil, err
 	}
@@ -240,8 +241,8 @@ func runTDilithium3DKGCluster(ctx context.Context, runners [6]*tdilithium3DKGRun
 		return results, errTDilithium3DKGInjectedCrash
 	}
 
-	var randomnessContributions [6][32]byte
-	var randomnessCommitments [6][32]byte
+	var randomnessContributions = make([][32]byte, len(runners))
+	var randomnessCommitments = make([][32]byte, len(runners))
 	for position, runner := range runners {
 		randomnessContributions[position] = runner.record.LocalRandomness
 		commitment, err := dilithium3v1.DKGRandomnessCommitment(runner.session, uint8(position), runner.record.LocalRandomness)
@@ -253,7 +254,7 @@ func runTDilithium3DKGCluster(ctx context.Context, runners [6]*tdilithium3DKGRun
 	var dirty [6]bool
 	for position, runner := range runners {
 		if runner.record.CommitmentsPersisted {
-			if runner.record.RandomnessCommitments != randomnessCommitments {
+			if !tdilithium3DKGCommitmentsEqual(runner.record.RandomnessCommitments, randomnessCommitments) {
 				return results, errTDilithium3DKGJournalSession
 			}
 			continue
@@ -354,7 +355,7 @@ func runTDilithium3DKGCluster(ctx context.Context, runners [6]*tdilithium3DKGRun
 			return results, err
 		}
 		componentDigest := tdilithium3DKGComponentDigest(group, leader, contributionDigest, s1, s2)
-		component := dilithium3v1.RSSComponent{GroupMask: group, DealerPosition: leader, ContributionDigest: contributionDigest, S1: s1, S2: s2}
+		component := dilithium3v1.RSSComponent{GroupMask: group, DealerPosition: leader, ContributionDigest: contributionDigest, Multiplicity: 1, S1: s1, S2: s2}
 		dirty = [6]bool{}
 		for position, runner := range runners {
 			state := &runner.record.Groups[groupIndex]
@@ -433,7 +434,7 @@ func runTDilithium3DKGCluster(ctx context.Context, runners [6]*tdilithium3DKGRun
 		}
 	}
 
-	publicKey, transcriptDigest, err := dilithium3v1.AssembleMode3PublicKey(rho, contributions)
+	publicKey, transcriptDigest, err := dilithium3v1.AssembleMode3PublicKey(rho, contributions[:], len(runners[0].session.Committee.Participants))
 	if err != nil {
 		return results, err
 	}
@@ -554,7 +555,7 @@ func recoverOrCreateTDilithium3DKGSeed(runners [6]*tdilithium3DKGRunner, groupIn
 }
 
 func deliverTDilithium3DKGSeedPackets(transport *tdilithium3DKGMemoryTransport, sessionDigest, committeeDigest [32]byte, group dilithium3v1.RSSGroupMask, attempt, leader uint8, seed [32]byte, duplicate bool) error {
-	for recipient := uint8(0); recipient < 6; recipient++ {
+	for recipient := uint8(0); recipient < uint8(transport.participants); recipient++ {
 		if !group.Contains(recipient) || recipient == leader {
 			continue
 		}
@@ -571,10 +572,11 @@ func deliverTDilithium3DKGSeedPackets(transport *tdilithium3DKGMemoryTransport, 
 }
 
 func buildTDilithium3DKGShare(runner *tdilithium3DKGRunner, publicKey [1952]byte, transcriptDigest [32]byte) (*dilithium3v1.LocalShare, error) {
-	groups, err := dilithium3v1.GroupsForPosition(runner.participantPosition)
+	groups, err := dilithium3v1.GroupsForPositionN(runner.participantPosition, len(runner.session.Committee.Participants))
 	if err != nil {
 		return nil, err
 	}
+	participantCount := len(runner.session.Committee.Participants)
 	share := &dilithium3v1.LocalShare{
 		Protocol:            runner.session.Protocol,
 		Key:                 protocolThresholdKey(publicKey, runner.session.KeyGeneration),
@@ -585,8 +587,9 @@ func buildTDilithium3DKGShare(runner *tdilithium3DKGRunner, publicKey [1952]byte
 		TranscriptDigest:    transcriptDigest,
 		Rho:                 runner.record.Rho,
 	}
+	share.Components = make([]dilithium3v1.RSSComponent, len(groups))
 	for index, group := range groups {
-		groupIndex, _ := tdilithium3DKGGroupIndex(group)
+		groupIndex, _ := tdilithium3DKGGroupIndex(group, participantCount)
 		component := runner.record.Groups[groupIndex].Component
 		if component.GroupMask != group {
 			return nil, errTDilithium3DKGJournalTransition

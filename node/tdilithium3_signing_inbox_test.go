@@ -30,7 +30,7 @@ func tdilithium3SigningInboxTestFixtureFor(t *testing.T) *tdilithium3SigningInbo
 		SessionID:        [32]byte{0x57, 0x11},
 		KeyGeneration:    7,
 		CommitteeVersion: 3,
-		Signers:          [4]uint32{1, 3, 5, 8},
+		Signers:          []uint32{1, 3, 5, 8},
 	}
 	identities := make(map[uint32]tdilithium3SigningIdentity, len(context.Signers))
 	publicKeys := make(map[uint32]*mode3.PublicKey, len(context.Signers))

@@ -18,8 +18,8 @@ import (
 
 // signingExecutorPartyTestIdentities returns the four active identities in
 // canonical order.
-func signingExecutorPartyTestIdentities(active []*LocalShare) [4]uint32 {
-	var identities [4]uint32
+func signingExecutorPartyTestIdentities(active []*LocalShare) []uint32 {
+	identities := make([]uint32, len(active))
 	for index, share := range active {
 		identities[index] = share.ParticipantID
 	}
@@ -54,16 +54,21 @@ func signingExecutorPartyTestParties(
 	fixture *signingTestFixture,
 	mask uint8,
 	slot uint16,
-	randomness [4]*signingRandomness,
-	journals [4]*SigningJournal,
-	records [4]*PreprocessingRecord,
-) [4]*SigningExecutorParty {
+	randomness []*signingRandomness,
+	journals []*SigningJournal,
+	records []*PreprocessingRecord,
+) []*SigningExecutorParty {
 	t.Helper()
 	active := fixture.activeShares(t, mask)
-	var parties [4]*SigningExecutorParty
+	params, err := SigningParametersForParticipants(len(fixture.shares[0].Committee.Participants))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parties := make([]*SigningExecutorParty, len(active))
 	for index := range parties {
 		party, err := newSigningExecutorParty(
 			signingExecutorPartyTestConfig(fixture, active, index, slot, journals[index], records[index]),
+			params,
 			randomness[index],
 		)
 		if err != nil {
@@ -88,15 +93,15 @@ type signingExecutorPartyTestRecord struct {
 // emitted message by sender and every delivery failure.
 func signingExecutorPartyTestPump(
 	t *testing.T,
-	parties [4]*SigningExecutorParty,
-	identities [4]uint32,
+	parties []*SigningExecutorParty,
+	identities []uint32,
 ) (map[uint32][]signingExecutorPartyTestRecord, []error) {
 	t.Helper()
 	emitted := make(map[uint32][]signingExecutorPartyTestRecord)
 	var failures []error
-	var stopped [4]bool
+	stopped := make([]bool, len(parties))
 	for {
-		var batches [4][]SigningExecutorRoundMessage
+		batches := make([][]SigningExecutorRoundMessage, len(parties))
 		quiet := true
 		for index := range parties {
 			batches[index] = parties[index].Drain()
@@ -155,7 +160,7 @@ func signingExecutorPartyTestCompare(
 	slot int,
 	run *signingExecutorTestRun,
 	emitted map[uint32][]signingExecutorPartyTestRecord,
-	identities [4]uint32,
+	identities []uint32,
 ) {
 	t.Helper()
 	if len(run.outbound) != len(emitted) {
@@ -289,7 +294,7 @@ func signingExecutorPartyTestAcceptedSlot(
 	t *testing.T,
 	fixture *signingTestFixture,
 	active []*LocalShare,
-) (uint16, [4]*signingRandomness) {
+) (uint16, []*signingRandomness) {
 	t.Helper()
 	journal := signingTestJournal(t)
 	for slot := 1; slot <= 128; slot++ {
@@ -301,7 +306,7 @@ func signingExecutorPartyTestAcceptedSlot(
 		}
 	}
 	t.Fatal("no accepted slot in 128 deterministic candidates")
-	return 0, [4]*signingRandomness{}
+	return 0, nil
 }
 
 // TestSigningExecutorPartyRefusesUnauthorizedNoise requires refused
@@ -427,8 +432,13 @@ func TestSigningExecutorPartySingleUseIsTerminal(t *testing.T) {
 				t.Fatalf("slot %d signer %d: signature differs from signer 0", slot, index)
 			}
 		}
+		params, pErr := SigningParametersForParticipants(len(active[0].Committee.Participants))
+		if pErr != nil {
+			t.Fatal(pErr)
+		}
 		reuse, err := newSigningExecutorParty(
 			signingExecutorPartyTestConfig(fixture, active, 0, slotIndex, signingTestJournal(t), records[0]),
+			params,
 			randomness[0],
 		)
 		if err != nil {
@@ -443,6 +453,7 @@ func TestSigningExecutorPartySingleUseIsTerminal(t *testing.T) {
 		freshRecords := signingExecutorTestRecords(t, slot)
 		replay, err := newSigningExecutorParty(
 			signingExecutorPartyTestConfig(fixture, active, 0, slotIndex, journals[0], freshRecords[0]),
+			params,
 			randomness[0],
 		)
 		if err != nil {
@@ -654,6 +665,10 @@ func TestSigningExecutorPartyRejectsInvalidBindings(t *testing.T) {
 	active := fixture.activeShares(t, 0x0F)
 	identities := signingExecutorPartyTestIdentities(active)
 	point := signingExecutorTestRandomness(t, 0x91)[0]
+	params, paramsErr := SigningParametersForParticipants(6)
+	if paramsErr != nil {
+		t.Fatal(paramsErr)
+	}
 	base := signingExecutorPartyTestConfig(fixture, active, 0, 1, signingTestJournal(t), signingExecutorTestRecords(t, 1)[0])
 	cases := []struct {
 		name   string
@@ -670,10 +685,10 @@ func TestSigningExecutorPartyRejectsInvalidBindings(t *testing.T) {
 			config.Share = fixture.shares[4]
 		}},
 		{name: "signers not ascending", mutate: func(config *SigningExecutorPartyConfig) {
-			config.Signers = [4]uint32{identities[1], identities[0], identities[2], identities[3]}
+			config.Signers = []uint32{identities[1], identities[0], identities[2], identities[3]}
 		}},
 		{name: "signer outside the committee", mutate: func(config *SigningExecutorPartyConfig) {
-			config.Signers = [4]uint32{identities[0], identities[1], identities[2], identities[3] + 1000}
+			config.Signers = []uint32{identities[0], identities[1], identities[2], identities[3] + 1000}
 		}},
 		{name: "foreign key", mutate: func(config *SigningExecutorPartyConfig) {
 			config.Request = signingExecutorTestForeignKeyRequest(fixture)
@@ -683,7 +698,7 @@ func TestSigningExecutorPartyRejectsInvalidBindings(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			config := base
 			testCase.mutate(&config)
-			if _, err := newSigningExecutorParty(config, point); !errors.Is(err, errInvalidSigningAttempt) {
+			if _, err := newSigningExecutorParty(config, params, point); !errors.Is(err, errInvalidSigningAttempt) {
 				t.Fatalf("error = %v, want %v", err, errInvalidSigningAttempt)
 			}
 		})

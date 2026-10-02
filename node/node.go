@@ -3508,7 +3508,7 @@ func (n *Node) initRPC() error {
 
 	// Initialize WebSocket server if enabled
 	if n.config.WSEnabled {
-		// P2P-CONF-FIX (2026-10-02): an empty WSAddr previously reached the
+		// P2P-CONF-FIX (2026-10-02): an empty WSAddr would reach the
 		// listener without a port (observed binding ":80" from a legacy
 		// localnet config). Treat an empty address as misconfiguration:
 		// skip the WS server instead of binding a well-known port.

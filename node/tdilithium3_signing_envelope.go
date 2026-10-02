@@ -29,7 +29,7 @@ type tdilithium3SigningContext struct {
 	SessionID        [32]byte
 	KeyGeneration    uint64
 	CommitteeVersion uint64
-	Signers          [4]uint32
+	Signers          []uint32
 }
 
 // tdilithium3SigningIdentityVerifier verifies one sender's identity signature

@@ -209,7 +209,10 @@ func marshalUncheckedTDilithium3Seed(message dilithium3v1.GroupSeedMessage) []by
 	valid := message
 	valid.RecipientPosition = 1
 	encoded, _ := valid.MarshalBinary()
-	encoded[76] = message.RecipientPosition
+	// Wire layout: magic(8) + version(2) + sessionDigest(32) +
+	// committeeDigest(32) + groupMask(2) + leader(1) + recipient(1) + ...
+	// The RECIPIENT field sits at offset 77 (76 is the leader field).
+	encoded[77] = message.RecipientPosition
 	digest := sha3.Sum256(encoded[:len(encoded)-32])
 	copy(encoded[len(encoded)-32:], digest[:])
 	return encoded

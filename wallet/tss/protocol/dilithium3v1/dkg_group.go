@@ -97,7 +97,8 @@ func (message GroupSeedMessage) SeedCommitmentDigest() ([32]byte, error) {
 	encoded = append(encoded, groupSeedCommitmentDomain...)
 	encoded = append(encoded, message.SessionDigest[:]...)
 	encoded = append(encoded, message.CommitteeDigest[:]...)
-	encoded = append(encoded, byte(message.GroupMask), message.LeaderPosition, message.Attempt)
+	encoded = binary.BigEndian.AppendUint16(encoded, uint16(message.GroupMask))
+	encoded = append(encoded, message.LeaderPosition, message.Attempt)
 	encoded = append(encoded, message.Seed[:]...)
 	return sha3.Sum256(encoded), nil
 }
@@ -136,8 +137,8 @@ func UnmarshalGroupSeedMessage(encoded []byte) (GroupSeedMessage, error) {
 	offset += 32
 	copy(message.CommitteeDigest[:], encoded[offset:offset+32])
 	offset += 32
-	message.GroupMask = RSSGroupMask(encoded[offset])
-	offset++
+	message.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+	offset += 2
 	message.LeaderPosition = encoded[offset]
 	offset++
 	message.RecipientPosition = encoded[offset]
@@ -155,15 +156,16 @@ func (message GroupSeedMessage) canonicalPayload() ([]byte, error) {
 	if err := message.Validate(); err != nil {
 		return nil, err
 	}
-	payload := make([]byte, 0, 100)
+	payload := make([]byte, 0, 101)
 	payload = append(payload, message.SessionDigest[:]...)
 	payload = append(payload, message.CommitteeDigest[:]...)
-	payload = append(payload, byte(message.GroupMask), message.LeaderPosition, message.RecipientPosition, message.Attempt)
+	payload = binary.BigEndian.AppendUint16(payload, uint16(message.GroupMask))
+	payload = append(payload, message.LeaderPosition, message.RecipientPosition, message.Attempt)
 	payload = append(payload, message.Seed[:]...)
 	return payload, nil
 }
 
-func groupSeedMessageEncodedSize() int { return 8 + 2 + 100 + 32 }
+func groupSeedMessageEncodedSize() int { return 8 + 2 + 101 + 32 }
 
 // ContributionAcknowledgement reports one member's agreed public contribution digest.
 type ContributionAcknowledgement struct {
@@ -243,8 +245,8 @@ func UnmarshalContributionAcknowledgement(encoded []byte) (ContributionAcknowled
 	offset += 32
 	copy(acknowledgement.CommitteeDigest[:], encoded[offset:offset+32])
 	offset += 32
-	acknowledgement.GroupMask = RSSGroupMask(encoded[offset])
-	offset++
+	acknowledgement.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+	offset += 2
 	acknowledgement.LeaderPosition = encoded[offset]
 	offset++
 	acknowledgement.ParticipantPosition = encoded[offset]
@@ -266,17 +268,18 @@ func (acknowledgement ContributionAcknowledgement) canonicalPayload() ([]byte, e
 	if err := acknowledgement.Validate(); err != nil {
 		return nil, err
 	}
-	payload := make([]byte, 0, 164)
+	payload := make([]byte, 0, 165)
 	payload = append(payload, acknowledgement.SessionDigest[:]...)
 	payload = append(payload, acknowledgement.CommitteeDigest[:]...)
-	payload = append(payload, byte(acknowledgement.GroupMask), acknowledgement.LeaderPosition, acknowledgement.ParticipantPosition, acknowledgement.Attempt)
+	payload = binary.BigEndian.AppendUint16(payload, uint16(acknowledgement.GroupMask))
+	payload = append(payload, acknowledgement.LeaderPosition, acknowledgement.ParticipantPosition, acknowledgement.Attempt)
 	payload = append(payload, acknowledgement.SeedCommitmentDigest[:]...)
 	payload = append(payload, acknowledgement.SeedMessageDigest[:]...)
 	payload = append(payload, acknowledgement.ContributionDigest[:]...)
 	return payload, nil
 }
 
-func groupAcknowledgementEncodedSize() int { return 8 + 2 + 164 + 32 }
+func groupAcknowledgementEncodedSize() int { return 8 + 2 + 165 + 32 }
 
 // GroupAcknowledgementSet rejects duplicates and contribution equivocation.
 type GroupAcknowledgementSet struct {
@@ -287,8 +290,10 @@ type GroupAcknowledgementSet struct {
 	attempt              uint8
 	seedCommitmentDigest [32]byte
 	contributionDigest   [32]byte
-	seen                 [6]bool
-	count                uint8
+	// Acknowledgements are deduplicated per member position; a map keeps the
+	// R76 family sizes (positions up to 11) without a fixed-width array.
+	seen  map[uint8]bool
+	count uint8
 }
 
 // NewGroupAcknowledgementSet creates the exact context for three group acknowledgements.
@@ -325,7 +330,7 @@ func NewGroupAcknowledgementSetFromContext(
 	if err != nil || leader != leaderPosition {
 		return nil, ErrInvalidGroupAcknowledgement
 	}
-	return &GroupAcknowledgementSet{sessionDigest: sessionDigest, committeeDigest: committeeDigest, groupMask: group, leaderPosition: leaderPosition, attempt: attempt, seedCommitmentDigest: seedCommitmentDigest, contributionDigest: contributionDigest}, nil
+	return &GroupAcknowledgementSet{sessionDigest: sessionDigest, committeeDigest: committeeDigest, groupMask: group, leaderPosition: leaderPosition, attempt: attempt, seedCommitmentDigest: seedCommitmentDigest, contributionDigest: contributionDigest, seen: make(map[uint8]bool, 3)}, nil
 }
 
 // Add records one unique matching group acknowledgement.
@@ -351,7 +356,22 @@ func (set *GroupAcknowledgementSet) Add(acknowledgement ContributionAcknowledgem
 }
 
 // Complete reports whether all three group members acknowledged one contribution.
-func (set *GroupAcknowledgementSet) Complete() bool { return set != nil && set.count == 3 }
+// Complete reports whether every group member acknowledged one contribution.
+// Groups are g positions wide with g == GroupSizeForParticipants(participants),
+// and the acknowledgement set is built only for group members, so the width of
+// the mask itself is the quorum the protocol binds.
+func (set *GroupAcknowledgementSet) Complete() bool {
+	if set == nil {
+		return false
+	}
+	width := uint8(0)
+	for position := uint8(0); position < 16; position++ {
+		if set.groupMask.Contains(position) {
+			width++
+		}
+	}
+	return set.count == width && width > 0
+}
 
 // GroupAttemptState tracks one group's monotonic leader replacement state.
 type GroupAttemptState struct {

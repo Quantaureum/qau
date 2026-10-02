@@ -117,10 +117,12 @@ func (complaint Complaint) MarshalBinary() ([]byte, error) {
 	encoded = binary.BigEndian.AppendUint16(encoded, complaintVersion)
 	encoded = append(encoded, complaint.SessionDigest[:]...)
 	encoded = append(encoded, complaint.CommitteeDigest[:]...)
-	encoded = append(encoded, byte(complaint.GroupMask), complaint.LeaderPosition, complaint.ComplainantPosition, complaint.Attempt, byte(complaint.Reason))
+	encoded = binary.BigEndian.AppendUint16(encoded, uint16(complaint.GroupMask))
+	encoded = append(encoded, complaint.LeaderPosition, complaint.ComplainantPosition, complaint.Attempt, byte(complaint.Reason))
 	encoded = append(encoded, complaint.Evidence.SessionDigest[:]...)
 	encoded = append(encoded, complaint.Evidence.CommitteeDigest[:]...)
-	encoded = append(encoded, byte(complaint.Evidence.GroupMask), complaint.Evidence.LeaderPosition, complaint.Evidence.Attempt)
+	encoded = binary.BigEndian.AppendUint16(encoded, uint16(complaint.Evidence.GroupMask))
+	encoded = append(encoded, complaint.Evidence.LeaderPosition, complaint.Evidence.Attempt)
 	encoded = append(encoded, complaint.Evidence.MessageDigest[:]...)
 	encoded = append(encoded, complaint.Evidence.RevealedSeed[:]...)
 	digest := sha3.Sum256(encoded)
@@ -147,8 +149,8 @@ func UnmarshalComplaint(encoded []byte) (Complaint, error) {
 	offset += 32
 	copy(complaint.CommitteeDigest[:], encoded[offset:offset+32])
 	offset += 32
-	complaint.GroupMask = RSSGroupMask(encoded[offset])
-	offset++
+	complaint.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+	offset += 2
 	complaint.LeaderPosition = encoded[offset]
 	offset++
 	complaint.ComplainantPosition = encoded[offset]
@@ -161,8 +163,8 @@ func UnmarshalComplaint(encoded []byte) (Complaint, error) {
 	offset += 32
 	copy(complaint.Evidence.CommitteeDigest[:], encoded[offset:offset+32])
 	offset += 32
-	complaint.Evidence.GroupMask = RSSGroupMask(encoded[offset])
-	offset++
+	complaint.Evidence.GroupMask = RSSGroupMask(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+	offset += 2
 	complaint.Evidence.LeaderPosition = encoded[offset]
 	offset++
 	complaint.Evidence.Attempt = encoded[offset]
@@ -176,7 +178,7 @@ func UnmarshalComplaint(encoded []byte) (Complaint, error) {
 	return complaint, nil
 }
 
-func complaintEncodedSize() int { return 8 + 2 + 32 + 32 + 5 + 32 + 32 + 3 + 32 + 32 + 32 }
+func complaintEncodedSize() int { return 8 + 2 + 32 + 32 + 6 + 32 + 32 + 4 + 32 + 32 + 32 }
 
 // ApplyComplaint burns the current seed and advances to the next group leader.
 // It may only be called with a complaint whose evidence has already been verified

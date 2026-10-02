@@ -33,13 +33,26 @@ const (
 	signingTestAttemptLimit = 1 << 12
 )
 
-// signingTestAttemptRandomness draws one attempt's four ball points from the
-// caller's deterministic source.
-func signingTestAttemptRandomness(t *testing.T, source *rand.Rand) [4]*signingRandomness {
+// signingTestParameters returns the pinned C=6 signing row for the test
+// fixtures; tests that need a different row call SigningParametersForParticipants
+// directly.
+func signingTestParameters(t *testing.T) SigningParameters {
 	t.Helper()
-	var points [4]*signingRandomness
+	params, err := SigningParametersForParticipants(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return params
+}
+
+// signingTestAttemptRandomness draws one attempt's ball points for the
+// pinned C=6 row from the caller's deterministic source.
+func signingTestAttemptRandomness(t *testing.T, source *rand.Rand) []*signingRandomness {
+	t.Helper()
+	params := signingTestParameters(t)
+	points := make([]*signingRandomness, params.Threshold)
 	for index := range points {
-		point, err := sampleSigningRandomness(source)
+		point, err := sampleSigningRandomness(source, params)
 		if err != nil {
 			t.Fatalf("sampleSigningRandomness(): %v", err)
 		}
@@ -50,7 +63,7 @@ func signingTestAttemptRandomness(t *testing.T, source *rand.Rand) [4]*signingRa
 
 // signingTestRandomnessFor returns four ball points seeded from a label for the
 // tests that only need valid, deterministic attempt input.
-func signingTestRandomnessFor(t *testing.T, label byte) [4]*signingRandomness {
+func signingTestRandomnessFor(t *testing.T, label byte) []*signingRandomness {
 	t.Helper()
 	return signingTestAttemptRandomness(t, rand.New(rand.NewSource(int64(label))))
 }
@@ -67,7 +80,7 @@ func signingTestAttemptRecord(t *testing.T, slot int) *PreprocessingRecord {
 type signingTestSlot struct {
 	signature  []byte
 	attempt    *signingAttempt
-	randomness [4]*signingRandomness
+	randomness []*signingRandomness
 }
 
 // signingTestSign drives the reference rejection loop: fresh randomness, a

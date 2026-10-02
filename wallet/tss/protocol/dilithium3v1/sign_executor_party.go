@@ -45,8 +45,9 @@ type SigningExecutorPartyConfig struct {
 	// secret from it and never accepts another signer's share.
 	Share *LocalShare
 
-	// Signers are the four active signer identities in ascending order.
-	Signers [4]uint32
+	// Signers are the active signer identities in ascending order (the
+	// pinned row threshold count).
+	Signers []uint32
 
 	// Slot is the one-based slot index of the schedule.
 	Slot uint16
@@ -115,18 +116,28 @@ type SigningExecutorParty struct {
 // happens inside the signer's own process (design note, Open Obligations
 // item 1); the point is never serialized and never returned.
 func NewSigningExecutorParty(config SigningExecutorPartyConfig) (*SigningExecutorParty, error) {
-	point, err := sampleSigningExecutorPartyRandomness(config.Entropy)
+	if config.Share == nil {
+		return nil, fmt.Errorf("%w: missing share", errInvalidSigningAttempt)
+	}
+	params, err := SigningParametersForParticipants(len(config.Share.Committee.Participants))
+	if err != nil {
+		return nil, ErrUnsupportedSigningCommitteeSize
+	}
+	if len(config.Signers) != params.Threshold {
+		return nil, fmt.Errorf("%w: %d signers, want %d", errInvalidSigningAttempt, len(config.Signers), params.Threshold)
+	}
+	point, err := sampleSigningExecutorPartyRandomness(config.Entropy, params)
 	if err != nil {
 		return nil, err
 	}
-	return newSigningExecutorParty(config, point)
+	return newSigningExecutorParty(config, params, point)
 }
 
 // sampleSigningExecutorPartyRandomness draws one uniform ball point from the
 // caller's source: eight bytes seed the deterministic stream the sampler
 // consumes. A production caller passes a cryptographic source, so the seed is
 // unpredictable; the stream itself is deterministic given the seed.
-func sampleSigningExecutorPartyRandomness(entropy io.Reader) (*signingRandomness, error) {
+func sampleSigningExecutorPartyRandomness(entropy io.Reader, params SigningParameters) (*signingRandomness, error) {
 	if entropy == nil {
 		return nil, fmt.Errorf("%w: missing entropy source", ErrInvalidSigningRandomness)
 	}
@@ -134,7 +145,7 @@ func sampleSigningExecutorPartyRandomness(entropy io.Reader) (*signingRandomness
 	if _, err := io.ReadFull(entropy, seed[:]); err != nil {
 		return nil, fmt.Errorf("%w: entropy: %v", ErrInvalidSigningRandomness, err)
 	}
-	point, err := sampleSigningRandomness(rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed[:])))))
+	point, err := sampleSigningRandomness(rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed[:])))), params)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +158,7 @@ func sampleSigningExecutorPartyRandomness(entropy io.Reader) (*signingRandomness
 // inputs; NewSigningExecutorParty samples it from the config's entropy source.
 func newSigningExecutorParty(
 	config SigningExecutorPartyConfig,
+	params SigningParameters,
 	point *signingRandomness,
 ) (*SigningExecutorParty, error) {
 	if config.Slot == 0 || config.Slot > signingExecutorSlotLimit {
@@ -163,7 +175,12 @@ func newSigningExecutorParty(
 	if err := config.Share.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 	}
-	if err := validateSigningRandomness(point); err != nil {
+	if int(config.Share.Committee.Threshold) != params.Threshold {
+		return nil, fmt.Errorf(
+			"%w: share threshold %d, want %d", errInvalidSigningAttempt, config.Share.Committee.Threshold, params.Threshold,
+		)
+	}
+	if err := validateSigningRandomness(point, params); err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 	}
 	slotRequest := signingExecutorSlotRequest(config.Request, config.Slot)
@@ -182,7 +199,7 @@ func newSigningExecutorParty(
 			"%w: share of participant %d is not an active signer", errInvalidSigningAttempt, config.Share.ParticipantID,
 		)
 	}
-	activeMask := uint8(0)
+	activeMask := uint16(0)
 	for _, identity := range config.Signers {
 		signerPosition, found := committeePosition(config.Share.Committee, identity)
 		if !found {
@@ -190,23 +207,36 @@ func newSigningExecutorParty(
 		}
 		activeMask |= 1 << signerPosition
 	}
-	allocation, err := AllocateRSSGroups(activeMask)
+	allocation, err := AllocateRSSGroupsFor(activeMask, len(config.Share.Committee.Participants))
 	if err != nil {
-		return nil, fmt.Errorf("%w: active set %06b: %v", errInvalidSigningAttempt, activeMask, err)
+		return nil, fmt.Errorf("%w: active set %012b: %v", errInvalidSigningAttempt, activeMask, err)
 	}
 	var rho [32]byte
 	copy(rho[:], slotRequest.Key.PublicKey[:32])
 	if config.Share.Rho != rho {
 		return nil, fmt.Errorf("%w: local share rho does not match the key", errInvalidSigningAttempt)
 	}
-	partialFirst, partialSecond := localPartialSecrets(config.Share, allocation)
-	owned := 0
-	for _, owner := range allocation {
-		if owner == config.Share.ParticipantPosition {
-			owned++
+	partialFirst, partialSecond := localPartialSecrets(config.Share, len(config.Share.Committee.Participants), allocation)
+	// The partial's norm bound tracks the underlying contribution count, not
+	// the raw group count: after an R77 rotation a folded group carries the
+	// multiplicity the rotation history assigned to it (public via the
+	// committee lineage), so the bound is the true reconstruction bound.
+	canonical, err := CanonicalRSSGroupsFor(len(config.Share.Committee.Participants))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
+	}
+	ownedMultiplicity := 0
+	for groupIndex, owner := range allocation {
+		if owner != config.Share.ParticipantPosition {
+			continue
+		}
+		for componentIndex := range config.Share.Components {
+			if config.Share.Components[componentIndex].GroupMask == canonical[groupIndex] {
+				ownedMultiplicity += componentMultiplicity(config.Share.Components[componentIndex])
+			}
 		}
 	}
-	bound := owned * RSSComponentEta
+	bound := ownedMultiplicity * RSSComponentEta
 	for row := 0; row < L; row++ {
 		if err := validatePartialBound("s1", position, row, partialFirst[row], bound); err != nil {
 			return nil, err
@@ -223,13 +253,16 @@ func newSigningExecutorParty(
 	}
 	return &SigningExecutorParty{
 		sessionID: sessionID,
+		// The threshold count bounds every per-signer mask and slice.
 		signer: &signingExecutorSigner{
 			gate:           gate,
 			position:       position,
 			slot:           config.Slot,
 			sessionID:      sessionID,
 			participantID:  config.Share.ParticipantID,
-			identities:     config.Signers,
+			identities:     append([]uint32(nil), config.Signers...),
+			fullMask:       uint8(1<<params.Threshold) - 1,
+			params:         params,
 			randomness:     point,
 			partialFirst:   partialFirst,
 			partialSecond:  partialSecond,
@@ -239,6 +272,10 @@ func newSigningExecutorParty(
 			representative: representative,
 			key:            slotRequest.Key.Clone(),
 			message:        append([]byte(nil), slotRequest.Message...),
+			commits:        make([][32]byte, params.Threshold),
+			reveals:        make([]VectorK, params.Threshold),
+			acceptances:    make([]bool, params.Threshold),
+			parts:          make([][L]SignedPoly, params.Threshold),
 		},
 	}, nil
 }

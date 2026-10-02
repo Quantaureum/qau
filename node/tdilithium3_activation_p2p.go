@@ -85,8 +85,8 @@ func assembleTDilithium3DKGActivationCertificate(
 	if err := session.Validate(); err != nil {
 		return empty, err
 	}
-	if len(packets) != int(protocol.ThresholdV1ParticipantCount) || transcriptDigest == ([32]byte{}) || verifier == nil {
-		return empty, fmt.Errorf("Dilithium3 DKG activation requires six verified receipts")
+	if len(packets) != len(session.Committee.Participants) || transcriptDigest == ([32]byte{}) || verifier == nil {
+		return empty, fmt.Errorf("Dilithium3 DKG activation requires a receipt from every committee member")
 	}
 	sessionDigest, err := session.Digest()
 	if err != nil {

@@ -218,7 +218,7 @@ func TestTDilithium3DKGGroupNetworkSixNodes(t *testing.T) {
 			t.Fatal(err)
 		}
 		for index, group := range groups {
-			groupIndex, err := tdilithium3DKGGroupIndex(group)
+			groupIndex, err := tdilithium3DKGGroupIndex(group, 6)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -249,7 +249,7 @@ func TestTDilithium3DKGGroupNetworkSurvivesRestart(t *testing.T) {
 	var digests [6][completed][32]byte
 	for position, runner := range harness.runners {
 		for index := range groups[:completed] {
-			groupIndex, err := tdilithium3DKGGroupIndex(groups[index])
+			groupIndex, err := tdilithium3DKGGroupIndex(groups[index], 6)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -260,7 +260,7 @@ func TestTDilithium3DKGGroupNetworkSurvivesRestart(t *testing.T) {
 	harness.runners = restartTDilithium3DKGRunners(t, harness.runners)
 	for position, runner := range harness.runners {
 		for index := range groups[:completed] {
-			groupIndex, err := tdilithium3DKGGroupIndex(groups[index])
+			groupIndex, err := tdilithium3DKGGroupIndex(groups[index], 6)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -336,7 +336,7 @@ func TestTDilithium3DKGGroupNetworkRejectsFalseContribution(t *testing.T) {
 			t.Fatalf("node %d completed a group with a false partial public key", position)
 		}
 	}
-	groupIndex, err := tdilithium3DKGGroupIndex(group)
+	groupIndex, err := tdilithium3DKGGroupIndex(group, 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestTDilithium3DKGGroupNetworkRejectsMissingSeed(t *testing.T) {
 			t.Fatalf("node %d stalled group reported %v instead of the context outcome", position, err)
 		}
 	}
-	groupIndex, err := tdilithium3DKGGroupIndex(group)
+	groupIndex, err := tdilithium3DKGGroupIndex(group, 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestTDilithium3DKGGroupNetworkLaggingNodeFailsClosed(t *testing.T) {
 	harness.mustCompleteRandomness(t, ctx)
 
 	group := dilithium3v1.CanonicalRSSGroups()[0]
-	groupIndex, err := tdilithium3DKGGroupIndex(group)
+	groupIndex, err := tdilithium3DKGGroupIndex(group, 6)
 	if err != nil {
 		t.Fatal(err)
 	}

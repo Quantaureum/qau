@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/quantaureum/qau/types"
@@ -53,7 +54,7 @@ func TestTDilithium3SealSigningSignersForRoster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("signers: %v", err)
 	}
-	if signers != [4]uint32{1, 2, 3, 4} {
+	if !slices.Equal(signers, []uint32{1, 2, 3, 4}) {
 		t.Fatalf("signers = %v, want the first four participants", signers)
 	}
 	if !localSigner {
@@ -182,20 +183,20 @@ func TestThresholdActiveSharePublicIdentity(t *testing.T) {
 	store := newThresholdShareStore(base)
 	password := []byte("DEVNET ONLY seal executor activation epoch probe")
 	share := testThresholdStoreShare(t, 2)
-	if _, _, err := store.ActiveSharePublicIdentity(password); !os.IsNotExist(err) {
+	if _, _, _, err := store.ActiveSharePublicIdentity(password); !os.IsNotExist(err) {
 		t.Fatalf("probe without an active share: %v, want os.ErrNotExist", err)
 	}
 	if err := store.Store(share, password); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.ActiveSharePublicIdentity(password); !os.IsNotExist(err) {
+	if _, _, _, err := store.ActiveSharePublicIdentity(password); !os.IsNotExist(err) {
 		t.Fatalf("probe of a stored but unactivated share: %v, want os.ErrNotExist", err)
 	}
 	certificate, sessionDigest, verifier := testThresholdActivationCertificate(t, share)
 	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, password); err != nil {
 		t.Fatal(err)
 	}
-	epoch, publicKey, err := store.ActiveSharePublicIdentity(password)
+	epoch, publicKey, threshold, err := store.ActiveSharePublicIdentity(password)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -205,10 +206,13 @@ func TestThresholdActiveSharePublicIdentity(t *testing.T) {
 	if !bytes.Equal(publicKey, share.Key.PublicKey) {
 		t.Fatal("public identity reported another group key")
 	}
-	if _, _, err := store.ActiveSharePublicIdentity([]byte("wrong password")); err == nil {
+	if threshold != share.Committee.Threshold {
+		t.Fatalf("threshold = %d, want %d", threshold, share.Committee.Threshold)
+	}
+	if _, _, _, err := store.ActiveSharePublicIdentity([]byte("wrong password")); err == nil {
 		t.Fatal("probe accepted a wrong password")
 	}
-	if _, _, err := store.ActiveSharePublicIdentity(nil); err == nil {
+	if _, _, _, err := store.ActiveSharePublicIdentity(nil); err == nil {
 		t.Fatal("probe accepted an empty password")
 	}
 }

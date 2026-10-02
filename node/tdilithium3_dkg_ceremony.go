@@ -2,6 +2,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -175,6 +177,34 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 		peerByPosition[uint8(binding.ParticipantID-1)] = peer
 	}
 
+	sign := func(message []byte) ([]byte, error) {
+		return localKey.Sign(message)
+	}
+	broadcast := func(messageType uint8, payload []byte) error {
+		return n.p2pHost.BroadcastTSS(messageType, payload)
+	}
+	sendPrivate := func(messageType uint8, recipientPosition uint8, payload []byte) error {
+		peer, found := peerByPosition[recipientPosition]
+		if !found {
+			return fmt.Errorf("Dilithium3 v1 DKG private send to unknown position %d", recipientPosition)
+		}
+		return n.p2pHost.SendTSSToPeer(peer, messageType, payload)
+	}
+
+	// R77: if the epoch committee equals the active share's committee minus
+	// one member, run the same-key remove rotation instead of the fresh-key
+	// ceremony. Any other roster shape (growth by one, several-position churn)
+	// falls through to the fresh-key ceremony below; single-member removal is
+	// the only shape whose rotated shares respect the signer's pinning
+	// (spec R77c gates the add shape's signing acceptance).
+	rotated, rotatedKey, rotationErr := n.tryTDilithium3ReshareRemoveRotation(
+		ctx, activationEpoch, rosterEpoch, committee, position,
+		peerForValidator, sign, broadcast, sendPrivate,
+	)
+	if rotated || rotationErr != nil {
+		return rotatedKey, rotationErr
+	}
+
 	// The runner owns the encrypted journal. Its session digest keys the journal
 	// directory, so a crash mid-ceremony resumes the same session with the same
 	// recorded randomness instead of starting a conflicting one (design, D3).
@@ -200,22 +230,9 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 	if err != nil {
 		return publicKey, err
 	}
-	nodeLog.Info("Dilithium3 v1 DKG ceremony starting (activation epoch %d, roster epoch %d, session %x, position %d)",
-		activationEpoch, rosterEpoch, diff[:8], position)
+	nodeLog.Info("Dilithium3 v1 DKG ceremony starting (activation epoch %d, roster epoch %d, session %x, position %d, committee size %d)",
+		activationEpoch, rosterEpoch, diff[:8], position, len(committee.Participants))
 
-	sign := func(message []byte) ([]byte, error) {
-		return localKey.Sign(message)
-	}
-	broadcast := func(messageType uint8, payload []byte) error {
-		return n.p2pHost.BroadcastTSS(messageType, payload)
-	}
-	sendPrivate := func(messageType uint8, recipientPosition uint8, payload []byte) error {
-		peer, found := peerByPosition[recipientPosition]
-		if !found {
-			return fmt.Errorf("Dilithium3 v1 DKG private send to unknown position %d", recipientPosition)
-		}
-		return n.p2pHost.SendTSSToPeer(peer, messageType, payload)
-	}
 	// One exchange for the whole ceremony: a message for a group the local node
 	// has not reached yet is retained instead of being lost, and early group
 	// traffic that arrives during the randomness round is retained too.
@@ -228,7 +245,13 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 		return publicKey, fmt.Errorf("Dilithium3 v1 DKG randomness round: %w", err)
 	}
 
-	for _, group := range dilithium3v1.CanonicalRSSGroups() {
+	// R76b: the group round list comes from the session's own committee size,
+	// not the legacy six-member constant (which C != 6 rosters never persist).
+	groups, err := dilithium3v1.CanonicalRSSGroupsFor(len(runner.session.Committee.Participants))
+	if err != nil {
+		return publicKey, fmt.Errorf("Dilithium3 v1 DKG ceremony: %w", err)
+	}
+	for _, group := range groups {
 		if err := ctx.Err(); err != nil {
 			return publicKey, fmt.Errorf("Dilithium3 v1 DKG ceremony: %w", err)
 		}
@@ -263,11 +286,11 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 	// activation epoch is already on disk, register the finality surface
 	// directly and skip the exchange.
 	if store := newThresholdShareStore(n.config.DataDir); store != nil {
-		activeEpoch, activeKey, activeErr := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+		activeEpoch, activeKey, activeThreshold, activeErr := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
 		if activeErr == nil && activeEpoch == activationEpoch {
 			nodeLog.Info("Dilithium3 v1 DKG ceremony: active share already adopted for epoch %d (group key prefix %x); skipping activation exchange",
 				activationEpoch, activeKey[:4])
-			if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, activeKey); err != nil {
+			if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, activeKey, int(activeThreshold)); err != nil {
 				nodeLog.Warn("Dilithium3 v1 DKG finality surface registration deferred (adopted path): %v", err)
 			}
 			nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x, adoption short-circuit)",
@@ -281,13 +304,117 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 	if err != nil {
 		return publicKey, fmt.Errorf("Dilithium3 v1 DKG activation exchange: %w", err)
 	}
-	if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, result.PublicKey[:]); err != nil {
+	if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, result.PublicKey[:], int(runner.session.Committee.Threshold)); err != nil {
 		// The active share is already persisted, so the startup refresh or the
 		// next share-bound call rebinds the surface; the ceremony still
 		// succeeded.
 		nodeLog.Warn("Dilithium3 v1 DKG finality surface registration deferred: %v", err)
 	}
-	nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x)",
-		activationEpoch, diff[:8], result.TranscriptDigest[:8])
+	nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x, group key prefix %x, committee size %d)",
+		activationEpoch, diff[:8], result.TranscriptDigest[:8], result.PublicKey[:4], len(committee.Participants))
 	return result.PublicKey, nil
+}
+
+// tryTDilithium3ReshareRemoveRotation decides whether epoch activationEpoch
+// is served by the same-key remove rotation (R77): the epoch committee must
+// equal the active share's committee minus exactly one member. All indecisive
+// probes (no active share, no roster history, another committee shape) return
+// (false, nil key, nil error) so the caller runs the fresh-key ceremony; a
+// rotation whose plan matches runs fully here and any rotation-internal
+// failure is returned as an error because burning a same-key epoch silently
+// into a fresh key would split the finality surface.
+func (n *Node) tryTDilithium3ReshareRemoveRotation(
+	ctx context.Context,
+	activationEpoch uint64,
+	rosterEpoch uint64,
+	committee protocol.CommitteeID,
+	position uint8,
+	peerForValidator func(types.Address) (p2p.PeerID, bool),
+	sign func(message []byte) ([]byte, error),
+	broadcast func(messageType uint8, payload []byte) error,
+	sendPrivate func(messageType uint8, recipientPosition uint8, payload []byte) error,
+) (bool, [1952]byte, error) {
+	var publicKey [1952]byte
+	password := []byte(n.config.ValidatorKeyPassword)
+	store := newThresholdShareStore(n.config.DataDir)
+	activeEpoch, activeKey, _, activeErr := store.ActiveSharePublicIdentity(password)
+	if activeErr != nil || activeEpoch == 0 {
+		// No active v1 share: the epoch transition is a bootstrap.
+		return false, publicKey, nil
+	}
+	oldRosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activeEpoch)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	oldRoster, err := n.capturedEpochValidatorRoster(oldRosterEpoch)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	oldCommittee, _, err := n.tdilithium3DKGCommitteeForRoster(oldRoster)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	oldBindings, err := tdilithium3DKGRosterBindings(oldRoster, oldCommittee)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	oldVerifier, err := tdilithium3SigningShareVerifier(oldBindings)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	oldShare, err := store.LoadActiveAtEpoch(activationEpoch, oldVerifier, password)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	defer oldShare.Zeroize()
+
+	plan, err := tdilithium3ReshareRotationFor(oldShare.Committee, committee)
+	if err != nil || plan == nil || !plan.HasLeaver || plan.HasWeaver {
+		// Not a remove rotation (growth or multi-position churn): fresh-key.
+		return false, publicKey, nil
+	}
+	if oldShare.ParticipantID != committee.Participants[position] {
+		// This node was the leaver iteslf: it carries no reshared share; the
+		// epoch transition skips it anyway because position lookups for the
+		// leaver fail earlier in tdilithium3DKGCommitteeForRoster.
+		return false, publicKey, nil
+	}
+
+	genesis, err := n.tdilithium3DKGChainGenesisHash()
+	if err != nil {
+		return false, publicKey, nil
+	}
+	sessionShape, err := n.deriveTDilithium3DKGSession(activationEpoch)
+	if err != nil {
+		return false, publicKey, nil
+	}
+	session, err := tdilithium3ReshareSessionFor(
+		n.config.NetworkID, genesis, activationEpoch,
+		oldShare.Committee, activeKey, committee, sessionShape.IdentityRosterDigest,
+	)
+	if err != nil {
+		return false, publicKey, fmt.Errorf("Dilithium3 v1 reshare session: %w", err)
+	}
+	nodeLog.Info("Dilithium3 v1 reshare rotation: epoch committee is the active committee minus position %d; running same-key ceremony (activation epoch %d, position %d)",
+		plan.Leaver, activationEpoch, position)
+
+	rotatedKey, err := n.runTDilithium3ReshareRemoveCeremony(ctx, tdilithium3ReshareRemoveConfig{
+		Session:          session,
+		Position:         position,
+		RosterEpoch:      rosterEpoch,
+		OldShare:         oldShare,
+		Store:            store,
+		Password:         password,
+		PeerForValidator: peerForValidator,
+		Sign:             sign,
+		Broadcast:        broadcast,
+		SendPrivate:      sendPrivate,
+	})
+	if err != nil {
+		return true, publicKey, fmt.Errorf("Dilithium3 v1 reshare rotation failed: %w", err)
+	}
+	if !bytes.Equal(rotatedKey[:], activeKey) {
+		return true, publicKey, fmt.Errorf("Dilithium3 v1 reshare rotation produced a divergent group key")
+	}
+	return true, rotatedKey, nil
 }

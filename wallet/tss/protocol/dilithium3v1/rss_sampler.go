@@ -30,7 +30,7 @@ func DeriveRSSComponent(
 	if err := group.Validate(); err != nil {
 		return VectorL{}, VectorK{}, fmt.Errorf("%w: group: %v", ErrInvalidRSSComponentSampling, err)
 	}
-	if leaderPosition >= 6 || !group.Contains(leaderPosition) {
+	if leaderPosition >= 12 || !group.Contains(leaderPosition) {
 		return VectorL{}, VectorK{}, fmt.Errorf("%w: leader %d is outside group", ErrInvalidRSSComponentSampling, leaderPosition)
 	}
 	if globalRandomness == ([64]byte{}) {
@@ -43,7 +43,7 @@ func DeriveRSSComponent(
 	shake := sha3.NewSHAKE256()
 	_, _ = shake.Write([]byte(rssComponentDomain))
 	_, _ = shake.Write(sessionDigest[:])
-	_, _ = shake.Write([]byte{byte(group), leaderPosition})
+	_, _ = shake.Write([]byte{byte(uint16(group) >> 8), byte(uint16(group)), leaderPosition})
 	_, _ = shake.Write(globalRandomness[:])
 	_, _ = shake.Write(groupSeed[:])
 	reader := bufio.NewReaderSize(shake, 512)

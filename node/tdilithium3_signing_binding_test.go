@@ -25,7 +25,7 @@ import (
 type tdilithium3SigningBindingTestFixture struct {
 	roster      *tdilithium3DKGEpochRoster
 	committee   protocol.CommitteeID
-	signers     [4]uint32
+	signers     []uint32
 	peers       map[types.Address]p2p.PeerID
 	privateKeys map[types.Address]*mode3.PrivateKey
 }
@@ -52,7 +52,7 @@ func tdilithium3SigningBindingTestFixtureFor(t *testing.T) *tdilithium3SigningBi
 			Epoch: 2, BoundaryHash: types.Hash{0x51}, Entries: entries, Digest: [32]byte{0x52},
 		},
 		committee:   committee,
-		signers:     [4]uint32{1, 2, 3, 4},
+		signers:     []uint32{1, 2, 3, 4},
 		peers:       peers,
 		privateKeys: privateKeys,
 	}
@@ -106,7 +106,7 @@ func TestTDilithium3SigningIdentitiesForRoster(t *testing.T) {
 		t.Fatalf("projected snapshot refused by the inbox: %v", err)
 	}
 	if _, err := tdilithium3SigningIdentitiesForRoster(
-		fixture.roster, fixture.committee, [4]uint32{1, 2, 3, 9}, fixture.resolver(types.Address{}),
+		fixture.roster, fixture.committee, []uint32{1, 2, 3, 9}, fixture.resolver(types.Address{}),
 	); err == nil {
 		t.Fatal("signer outside the roster accepted")
 	}
@@ -140,7 +140,7 @@ func TestTDilithium3SigningIdentitiesForRoster(t *testing.T) {
 // store path needs a p2p host, a block producer, a captured epoch roster, and a
 // stored share, so the development-network integration covers it.
 func TestNewTDilithium3SigningBindingFailsClosed(t *testing.T) {
-	signers := [4]uint32{1, 2, 3, 4}
+	signers := []uint32{1, 2, 3, 4}
 	var unconfigured *Node
 	if _, err := unconfigured.newTDilithium3SigningBinding(1, signers, rand.Reader); err == nil {
 		t.Fatal("unconfigured node accepted")

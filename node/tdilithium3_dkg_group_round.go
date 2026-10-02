@@ -87,7 +87,7 @@ type tdilithium3DKGGroupRound struct {
 
 // newTDilithium3DKGGroupRound prepares one group round from the durable journal.
 func newTDilithium3DKGGroupRound(runner *tdilithium3DKGRunner, group dilithium3v1.RSSGroupMask) (*tdilithium3DKGGroupRound, error) {
-	if runner == nil || runner.journal == nil || runner.participantPosition >= 6 || runner.record.ParticipantPosition != runner.participantPosition {
+	if runner == nil || runner.journal == nil || int(runner.participantPosition) >= len(runner.session.Committee.Participants) || runner.record.ParticipantPosition != runner.participantPosition {
 		return nil, errTDilithium3DKGInvalidCluster
 	}
 	if runner.record.Stage < tdilithium3DKGStageRandomnessComplete || runner.record.GlobalRandomness == ([64]byte{}) || runner.record.Rho == ([32]byte{}) {
@@ -104,7 +104,7 @@ func newTDilithium3DKGGroupRound(runner *tdilithium3DKGRunner, group dilithium3v
 	if err != nil {
 		return nil, err
 	}
-	groupIndex, err := tdilithium3DKGGroupIndex(group)
+	groupIndex, err := tdilithium3DKGGroupIndex(group, len(runner.session.Committee.Participants))
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +322,7 @@ func (round *tdilithium3DKGGroupRound) persistSeedLocked() error {
 	} else {
 		digest = tdilithium3DKGPublicSeedDigest(round.group, round.leader, round.attempt)
 	}
-	updated := runner.record
+	updated := runner.record.Clone()
 	if round.isMember() {
 		updated.Groups[round.groupIndex].Seed = seed
 	}
@@ -370,7 +370,7 @@ func (round *tdilithium3DKGGroupRound) deriveComponentLocked() error {
 		}
 		return nil
 	}
-	updated := runner.record
+	updated := runner.record.Clone()
 	var digest [32]byte
 	if round.isMember() {
 		if round.seed == ([32]byte{}) {
@@ -380,7 +380,7 @@ func (round *tdilithium3DKGGroupRound) deriveComponentLocked() error {
 		if err != nil {
 			return err
 		}
-		component := dilithium3v1.RSSComponent{GroupMask: round.group, DealerPosition: round.leader, S1: s1, S2: s2}
+		component := dilithium3v1.RSSComponent{GroupMask: round.group, DealerPosition: round.leader, Multiplicity: 1, S1: s1, S2: s2}
 		computed, err := dilithium3v1.NewPublicContribution(round.sessionDigest, round.group, round.leader, runner.record.Rho, s1, s2)
 		if err != nil {
 			return err
@@ -471,7 +471,7 @@ func (round *tdilithium3DKGGroupRound) accumulateAcknowledgementsLocked() error 
 	if !round.ackSet.Complete() {
 		return nil
 	}
-	updated := round.runner.record
+	updated := round.runner.record.Clone()
 	if updated.Groups[round.groupIndex].Stage < tdilithium3DKGGroupComponentDerived {
 		return errTDilithium3DKGJournalTransition
 	}
@@ -588,7 +588,8 @@ func (round *tdilithium3DKGGroupRound) outboundLocked(sign func([]byte) ([]byte,
 
 func (round *tdilithium3DKGGroupRound) outboundSeedLocked(sign func([]byte) ([]byte, error)) ([]tdilithium3DKGGroupOutbound, error) {
 	var outbound []tdilithium3DKGGroupOutbound
-	for recipient := uint8(0); recipient < 6; recipient++ {
+	participants := uint8(len(round.runner.session.Committee.Participants))
+	for recipient := uint8(0); recipient < participants; recipient++ {
 		if !round.group.Contains(recipient) || recipient == round.leader {
 			continue
 		}

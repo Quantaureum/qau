@@ -72,8 +72,13 @@ func TestLocalShareEncodingRoundTripAndTamperRejection(t *testing.T) {
 	if restored.Protocol != share.Protocol || restored.ParticipantID != share.ParticipantID || restored.ParticipantPosition != share.ParticipantPosition || restored.TranscriptDigest != share.TranscriptDigest {
 		t.Fatal("restored metadata mismatch")
 	}
-	if restored.Components != share.Components {
-		t.Fatal("restored RSS components mismatch")
+	if len(restored.Components) != len(share.Components) {
+		t.Fatal("restored RSS components count mismatch")
+	}
+	for i := range share.Components {
+		if restored.Components[i] != share.Components[i] {
+			t.Fatalf("restored RSS component %d mismatch", i)
+		}
 	}
 
 	tampered := append([]byte(nil), encoded...)
@@ -81,7 +86,10 @@ func TestLocalShareEncodingRoundTripAndTamperRejection(t *testing.T) {
 	if _, err := UnmarshalLocalShare(tampered); !errors.Is(err, ErrShareDigestMismatch) {
 		t.Fatalf("tamper error = %v", err)
 	}
-	if _, err := UnmarshalLocalShare(append(encoded, 0)); !errors.Is(err, ErrInvalidLocalShareEncoding) {
+	// A trailing byte now fails the payload digest check first (the encoding
+	// length is committee-dependent since R76a; the digest check is the
+	// tamper-proof guard).
+	if _, err := UnmarshalLocalShare(append(encoded, 0)); !errors.Is(err, ErrShareDigestMismatch) {
 		t.Fatalf("trailing byte error = %v", err)
 	}
 	wrongMagic := append([]byte(nil), encoded...)
@@ -145,6 +153,7 @@ func testLocalShare(t *testing.T) *LocalShare {
 	if err != nil {
 		t.Fatal(err)
 	}
+	share.Components = make([]RSSComponent, len(groups))
 	for index, group := range groups {
 		dealer, err := group.Leader(uint8(index % 3))
 		if err != nil {
@@ -154,6 +163,7 @@ func testLocalShare(t *testing.T) *LocalShare {
 			GroupMask:          group,
 			DealerPosition:     dealer,
 			ContributionDigest: [32]byte{byte(index + 1), byte(group)},
+			Multiplicity:       1,
 		}
 		share.Components[index].S1[0][0] = Coefficient(index + 1)
 		share.Components[index].S2[0][0] = Q - Coefficient(index+1)

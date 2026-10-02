@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
@@ -53,7 +54,7 @@ func TestTDilithium3DKGMemoryTransportAuthenticatesAndDeduplicates(t *testing.T)
 		t.Fatal(err)
 	}
 	packet := tdilithium3DKGPacket{Kind: 1, SessionDigest: sessionDigest, CommitteeDigest: committeeDigest, GroupMask: group, SenderPosition: leader, RecipientPosition: 1, Payload: payload}
-	transport := newTDilithium3DKGMemoryTransport()
+	transport := newTDilithium3DKGMemoryTransport(6)
 	if err := transport.deliver(packet, true); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func TestTDilithium3DKGSixNodeHappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("runner %d load candidate: %v", index, err)
 		}
-		if loaded.Components != result.Share.Components {
+		if !slices.Equal(loaded.Components, result.Share.Components) {
 			t.Fatalf("runner %d persisted components mismatch", index)
 		}
 		loaded.Zeroize()
@@ -162,7 +163,7 @@ func TestTDilithium3DKGCrashRecoveryAtEveryBoundary(t *testing.T) {
 				t.Fatalf("injected crash error = %v", err)
 			}
 			restarted := restartTDilithium3DKGRunners(t, runners)
-			results, err := runTDilithium3DKGCluster(context.Background(), restarted, newTDilithium3DKGMemoryTransport(), tdilithium3DKGFaultPlan{DelayedPackets: true, ReorderedPackets: true, DuplicatePackets: true})
+			results, err := runTDilithium3DKGCluster(context.Background(), restarted, newTDilithium3DKGMemoryTransport(6), tdilithium3DKGFaultPlan{DelayedPackets: true, ReorderedPackets: true, DuplicatePackets: true})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -9,22 +9,22 @@ import (
 func TestDKGRandomnessRequiresSixUniqueContributions(t *testing.T) {
 	session := testDKGSession()
 	contributions := testDKGRandomnessContributions()
-	if _, _, err := DeriveDKGRandomness(session, contributions); err != nil {
+	if _, _, err := DeriveDKGRandomness(session, contributions[:]); err != nil {
 		t.Fatalf("valid contributions rejected: %v", err)
 	}
 	missing := contributions
 	missing[4] = [32]byte{}
-	if _, _, err := DeriveDKGRandomness(session, missing); !errors.Is(err, ErrInvalidDKGRandomness) {
+	if _, _, err := DeriveDKGRandomness(session, missing[:]); !errors.Is(err, ErrInvalidDKGRandomness) {
 		t.Fatalf("missing contribution error = %v", err)
 	}
 	duplicate := contributions
 	duplicate[4] = duplicate[1]
-	if _, _, err := DeriveDKGRandomness(session, duplicate); !errors.Is(err, ErrInvalidDKGRandomness) {
+	if _, _, err := DeriveDKGRandomness(session, duplicate[:]); !errors.Is(err, ErrInvalidDKGRandomness) {
 		t.Fatalf("duplicate contribution error = %v", err)
 	}
 	invalidSession := session.Clone()
 	invalidSession.Nonce = [32]byte{}
-	if _, _, err := DeriveDKGRandomness(invalidSession, contributions); !errors.Is(err, ErrInvalidDKGSession) {
+	if _, _, err := DeriveDKGRandomness(invalidSession, contributions[:]); !errors.Is(err, ErrInvalidDKGSession) {
 		t.Fatalf("invalid session error = %v", err)
 	}
 }
@@ -32,11 +32,11 @@ func TestDKGRandomnessRequiresSixUniqueContributions(t *testing.T) {
 func TestDKGRandomnessIsDeterministicAndDomainSeparated(t *testing.T) {
 	session := testDKGSession()
 	contributions := testDKGRandomnessContributions()
-	global, rho, err := DeriveDKGRandomness(session, contributions)
+	global, rho, err := DeriveDKGRandomness(session, contributions[:])
 	if err != nil {
 		t.Fatal(err)
 	}
-	repeatedGlobal, repeatedRho, err := DeriveDKGRandomness(session, contributions)
+	repeatedGlobal, repeatedRho, err := DeriveDKGRandomness(session, contributions[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestDKGRandomnessIsDeterministicAndDomainSeparated(t *testing.T) {
 	for position := range contributions {
 		mutated := contributions
 		mutated[position][31] ^= 1
-		changedGlobal, changedRho, err := DeriveDKGRandomness(session, mutated)
+		changedGlobal, changedRho, err := DeriveDKGRandomness(session, mutated[:])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -56,7 +56,7 @@ func TestDKGRandomnessIsDeterministicAndDomainSeparated(t *testing.T) {
 	}
 	otherSession := session.Clone()
 	otherSession.Nonce[0] ^= 1
-	changedGlobal, changedRho, err := DeriveDKGRandomness(otherSession, contributions)
+	changedGlobal, changedRho, err := DeriveDKGRandomness(otherSession, contributions[:])
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -204,25 +204,25 @@ func dispatchTDilithium3DKGGroupOutbound(
 // share. It is purely local, idempotent, and mirrors the tail of
 // runTDilithium3DKGCluster.
 func tdilithium3DKGFinalize(runner *tdilithium3DKGRunner) (tdilithium3DKGResult, error) {
-	if runner == nil || runner.journal == nil || runner.participantPosition >= 6 || runner.record.ParticipantPosition != runner.participantPosition {
+	if runner == nil || runner.journal == nil || int(runner.participantPosition) >= len(runner.session.Committee.Participants) || runner.record.ParticipantPosition != runner.participantPosition {
 		return tdilithium3DKGResult{}, errTDilithium3DKGInvalidCluster
 	}
 	if runner.record.Stage < tdilithium3DKGStageGroupsInProgress {
 		return tdilithium3DKGResult{}, errTDilithium3DKGJournalTransition
 	}
-	var contributions [20]dilithium3v1.PublicContribution
+	contributions := make([]dilithium3v1.PublicContribution, len(runner.record.Groups))
 	for index, state := range runner.record.Groups {
 		if state.Stage != tdilithium3DKGGroupContributionVerified || state.Contribution.GroupMask != state.GroupMask {
 			return tdilithium3DKGResult{}, errTDilithium3DKGJournalTransition
 		}
 		contributions[index] = state.Contribution
 	}
-	publicKey, transcriptDigest, err := dilithium3v1.AssembleMode3PublicKey(runner.record.Rho, contributions)
+	publicKey, transcriptDigest, err := dilithium3v1.AssembleMode3PublicKey(runner.record.Rho, contributions, len(runner.session.Committee.Participants))
 	if err != nil {
 		return tdilithium3DKGResult{}, err
 	}
 	if runner.record.Stage < tdilithium3DKGStageAllGroupsComplete {
-		record := runner.record
+		record := runner.record.Clone()
 		if err := record.MarkAllGroupsComplete(publicKey, transcriptDigest); err != nil {
 			return tdilithium3DKGResult{}, err
 		}
@@ -242,7 +242,7 @@ func tdilithium3DKGFinalize(runner *tdilithium3DKGRunner) (tdilithium3DKGResult,
 			share.Zeroize()
 			return tdilithium3DKGResult{}, err
 		}
-		record := runner.record
+		record := runner.record.Clone()
 		if err := record.MarkShareInstalled(); err != nil {
 			share.Zeroize()
 			return tdilithium3DKGResult{}, err
@@ -254,7 +254,7 @@ func tdilithium3DKGFinalize(runner *tdilithium3DKGRunner) (tdilithium3DKGResult,
 		runner.record = record
 	}
 	if runner.record.Stage < tdilithium3DKGStageAcknowledgementPersisted {
-		record := runner.record
+		record := runner.record.Clone()
 		if err := record.MarkAcknowledgementPersisted(); err != nil {
 			share.Zeroize()
 			return tdilithium3DKGResult{}, err

@@ -45,7 +45,7 @@ func TestSigningExecutorScheduleDifferentialValues(t *testing.T) {
 	active := fixture.activeShares(t, mask)
 	source := rand.New(rand.NewSource(0x5EED))
 	const slots = 6
-	var randomness [][4]*signingRandomness
+	var randomness [][]*signingRandomness
 	for slot := 1; slot <= slots; slot++ {
 		randomness = append(randomness, signingTestAttemptRandomness(t, source))
 	}
@@ -100,11 +100,9 @@ func TestSigningExecutorScheduleDifferentialValues(t *testing.T) {
 		if emitted != recorded {
 			t.Fatalf("slot %d: schedule counted %d messages, the harness recorded %d", slot, emitted, recorded)
 		}
-		var (
-			bits     [4]bool
-			parts    [4][L]SignedPoly
-			partsSum [L]SignedPoly
-		)
+		bits := make([]bool, len(session.signers))
+		parts := make([][L]SignedPoly, len(session.signers))
+		var partsSum [L]SignedPoly
 		for index, signer := range session.signers {
 			envelopes := run.outbound[signer.participantID]
 			if len(envelopes) != 3 && len(envelopes) != 4 {
@@ -128,7 +126,7 @@ func TestSigningExecutorScheduleDifferentialValues(t *testing.T) {
 			}
 			bits[index] = bit
 			shiftFirst, shiftSecond := signingExecutorTestReferenceShift(t, attempt, index)
-			wantBit, err := signingRejectionTest(attempt.randomness[index], shiftFirst, shiftSecond)
+			wantBit, err := signingRejectionTest(attempt.randomness[index], shiftFirst, shiftSecond, SigningRandomnessRadius)
 			if err != nil {
 				t.Fatalf("slot %d signer %d reference rejection test: %v", slot, signer.participantID, err)
 			}
@@ -148,7 +146,10 @@ func TestSigningExecutorScheduleDifferentialValues(t *testing.T) {
 		}
 		// A response part is released only when every acceptance bit is true, so
 		// the published bit vector decides the message count of the slot.
-		responses := bits[0] && bits[1] && bits[2] && bits[3]
+		responses := true
+		for _, bit := range bits {
+			responses = responses && bit
+		}
 		for index, signer := range session.signers {
 			wantCount := 3
 			if responses {
@@ -341,7 +342,7 @@ func TestSigningExecutorScheduleRejectsMalformedInput(t *testing.T) {
 	if _, err := newSigningExecutorSchedule(request, active, journals, tooMany); !errors.Is(err, errInvalidSigningAttempt) {
 		t.Fatalf("too many candidates: error = %v", err)
 	}
-	missingJournal := journals
+	missingJournal := append([]*SigningJournal(nil), journals...)
 	missingJournal[1] = nil
 	if _, err := newSigningExecutorSchedule(
 		request, active, missingJournal, []signingExecutorCandidate{candidate},

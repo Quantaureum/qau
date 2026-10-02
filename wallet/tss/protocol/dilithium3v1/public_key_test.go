@@ -23,7 +23,7 @@ type mode3PublicKeyFixture struct {
 func TestAssembleMode3PublicKeyRequiresCanonicalTwentyContributions(t *testing.T) {
 	rho := [32]byte{1, 2, 3}
 	contributions := testPublicKeyContributions()
-	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions)
+	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions[:], 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestAssembleMode3PublicKeyRequiresCanonicalTwentyContributions(t *testing.T
 	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
 		reversed[left], reversed[right] = reversed[right], reversed[left]
 	}
-	reorderedKey, reorderedTranscript, err := AssembleMode3PublicKey(rho, reversed)
+	reorderedKey, reorderedTranscript, err := AssembleMode3PublicKey(rho, reversed[:], 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestAssembleMode3PublicKeyRequiresCanonicalTwentyContributions(t *testing.T
 	}
 	changedDealer := contributions
 	changedDealer[0].DealerPosition, _ = changedDealer[0].GroupMask.Leader(1)
-	dealerKey, dealerTranscript, err := AssembleMode3PublicKey(rho, changedDealer)
+	dealerKey, dealerTranscript, err := AssembleMode3PublicKey(rho, changedDealer[:], 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestAssembleMode3PublicKeyRequiresCanonicalTwentyContributions(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			mutated := contributions
 			test.mutate(&mutated)
-			if _, _, err := AssembleMode3PublicKey(rho, mutated); !errors.Is(err, ErrInvalidPublicKeyAssembly) {
+			if _, _, err := AssembleMode3PublicKey(rho, mutated[:], 6); !errors.Is(err, ErrInvalidPublicKeyAssembly) {
 				t.Fatalf("invalid assembly error = %v", err)
 			}
 		})
@@ -92,7 +92,7 @@ func TestAssembleMode3PublicKeyMatchesOfflineCIRCLVector(t *testing.T) {
 			t.Fatalf("contribution %d has foreign fixture session", index)
 		}
 	}
-	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions)
+	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributions[:], 6)
 	if err != nil {
 		t.Fatal(err)
 	}

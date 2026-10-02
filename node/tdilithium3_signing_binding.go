@@ -38,7 +38,7 @@ import (
 func tdilithium3SigningIdentitiesForRoster(
 	roster *tdilithium3DKGEpochRoster,
 	committee protocol.CommitteeID,
-	signers [4]uint32,
+	signers []uint32,
 	peerForValidator func(types.Address) (p2p.PeerID, bool),
 ) (map[uint32]tdilithium3SigningIdentity, error) {
 	if peerForValidator == nil {
@@ -111,7 +111,7 @@ func tdilithium3SigningShareVerifier(
 // the request-long journal, and the callbacks the request schedule drives.
 type tdilithium3SigningBinding struct {
 	Share      *dilithium3v1.LocalShare
-	Signers    [4]uint32
+	Signers    []uint32
 	Identities map[uint32]tdilithium3SigningIdentity
 	Sign       func([]byte) ([]byte, error)
 	Broadcast  func(uint8, []byte) error
@@ -180,7 +180,7 @@ func (n *Node) closeTDilithium3SigningJournals() {
 // the mainnet.
 func (n *Node) newTDilithium3SigningBinding(
 	activationEpoch uint64,
-	signers [4]uint32,
+	signers []uint32,
 	entropy io.Reader,
 ) (*tdilithium3SigningBinding, error) {
 	if n == nil || n.config == nil {

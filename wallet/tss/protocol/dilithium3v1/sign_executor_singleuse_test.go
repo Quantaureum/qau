@@ -115,11 +115,11 @@ func TestSigningExecutorSingleUseRefusesReuse(t *testing.T) {
 
 // materialFor assembles one slot's per-signer material from the given records.
 func materialFor(
-	randomness [4]*signingRandomness,
-	journals [4]*SigningJournal,
-	records [4]*PreprocessingRecord,
-) [4]signingExecutorSlotMaterial {
-	var material [4]signingExecutorSlotMaterial
+	randomness []*signingRandomness,
+	journals []*SigningJournal,
+	records []*PreprocessingRecord,
+) []signingExecutorSlotMaterial {
+	material := make([]signingExecutorSlotMaterial, 4)
 	for index := range material {
 		material[index] = signingExecutorSlotMaterial{
 			randomness: randomness[index],
@@ -138,7 +138,7 @@ func TestSigningExecutorSingleUseRestartFailClosed(t *testing.T) {
 	fixture := signingTestFixtureFor(t)
 	directory := t.TempDir()
 	var paths [4]string
-	var journals [4]*SigningJournal
+	journals := make([]*SigningJournal, 4)
 	for index := range journals {
 		paths[index] = filepath.Join(directory, fmt.Sprintf("signer-%d", index))
 		journals[index] = signingTestJournalAt(t, paths[index])

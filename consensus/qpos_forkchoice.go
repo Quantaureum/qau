@@ -742,10 +742,11 @@ func (q *QPOS) SetEpochVRFAccumulator(epoch uint64, accOnChain types.Hash) {
 	delete(q.shuffleCache, epoch+1)
 	delete(q.shuffleCache, epoch+2)
 
-	// VDF seed reorg note (stage-2): the hardened-seed cache is keyed by
-	// (srcEpoch, acc), so a reorg writing a different accumulator for this
-	// epoch cannot reuse a stale entry — the new accumulator gets its own
-	// computation (see TestVDFSeedReorgSafety).
+	// VDF seed hardening (stage-2): the cache is keyed by (srcEpoch, acc),
+	// so a reorg that changes the accumulator for this epoch leaves a stale
+	// entry only for the OLD accumulator — harmless (different key). The
+	// new accumulator gets its own cache entry. No explicit invalidation
+	// needed: the key collision is impossible.
 
 	// R45-PoA-FIX (2026-08-12): The accumulator for THIS epoch just got
 	// populated from the on-chain header. Epochs that depend on it

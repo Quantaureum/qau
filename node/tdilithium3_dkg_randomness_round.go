@@ -12,16 +12,16 @@ import (
 type tdilithium3DKGRandomnessRound struct {
 	mu            sync.Mutex
 	runner        *tdilithium3DKGRunner
-	commitments   [6][32]byte
-	committed     [6]bool
-	pending       [6][32]byte
-	pendingSeen   [6]bool
-	contributions [6][32]byte
-	seen          [6]bool
+	commitments   [][32]byte
+	committed     []bool
+	pending       [][32]byte
+	pendingSeen   []bool
+	contributions [][32]byte
+	seen          []bool
 }
 
 func newTDilithium3DKGRandomnessRound(runner *tdilithium3DKGRunner) (*tdilithium3DKGRandomnessRound, error) {
-	if runner == nil || runner.journal == nil || runner.participantPosition >= 6 || runner.record.ParticipantPosition != runner.participantPosition || runner.record.Stage != tdilithium3DKGStagePrepared || runner.record.LocalRandomness == ([32]byte{}) {
+	if runner == nil || runner.journal == nil || int(runner.participantPosition) >= len(runner.session.Committee.Participants) || runner.record.ParticipantPosition != runner.participantPosition || runner.record.Stage != tdilithium3DKGStagePrepared || runner.record.LocalRandomness == ([32]byte{}) {
 		return nil, fmt.Errorf("Dilithium3 DKG randomness requires a prepared local runner")
 	}
 	if err := runner.session.Validate(); err != nil {
@@ -31,7 +31,16 @@ func newTDilithium3DKGRandomnessRound(runner *tdilithium3DKGRunner) (*tdilithium
 	if err != nil || sessionDigest != runner.record.SessionDigest {
 		return nil, errTDilithium3DKGJournalSession
 	}
-	round := &tdilithium3DKGRandomnessRound{runner: runner}
+	participantCount := len(runner.session.Committee.Participants)
+	round := &tdilithium3DKGRandomnessRound{
+		runner:        runner,
+		commitments:   make([][32]byte, participantCount),
+		committed:     make([]bool, participantCount),
+		pending:       make([][32]byte, participantCount),
+		pendingSeen:   make([]bool, participantCount),
+		contributions: make([][32]byte, participantCount),
+		seen:          make([]bool, participantCount),
+	}
 	round.contributions[runner.participantPosition] = runner.record.LocalRandomness
 	round.seen[runner.participantPosition] = true
 	localCommitment, err := dilithium3v1.DKGRandomnessCommitment(runner.session, runner.participantPosition, runner.record.LocalRandomness)
@@ -42,7 +51,7 @@ func newTDilithium3DKGRandomnessRound(runner *tdilithium3DKGRunner) (*tdilithium
 		if runner.record.RandomnessCommitments[runner.participantPosition] != localCommitment {
 			return nil, errTDilithium3DKGJournalSession
 		}
-		round.commitments = runner.record.RandomnessCommitments
+		round.commitments = append([][32]byte(nil), runner.record.RandomnessCommitments...)
 		for position := range round.committed {
 			round.committed[position] = true
 		}
@@ -134,8 +143,8 @@ func (round *tdilithium3DKGRandomnessRound) observe(message tdilithium3DKGVerifi
 				return false, nil
 			}
 		}
-		updated := round.runner.record
-		if err := updated.MarkRandomnessCommitments(round.commitments); err != nil {
+		updated := round.runner.record.Clone()
+		if err := updated.MarkRandomnessCommitments(append([][32]byte(nil), round.commitments...)); err != nil {
 			return false, err
 		}
 		if err := round.runner.journal.Store(updated); err != nil {
@@ -188,7 +197,7 @@ func (round *tdilithium3DKGRandomnessRound) observeRevealLocked(position uint8, 
 	if err != nil {
 		return false, err
 	}
-	updated := round.runner.record
+	updated := round.runner.record.Clone()
 	if err := updated.MarkRandomnessComplete(global, rho); err != nil {
 		return false, err
 	}

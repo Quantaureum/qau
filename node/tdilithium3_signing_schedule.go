@@ -81,10 +81,10 @@ func newTDilithium3SigningRequestSchedule(
 	if node == nil || factory == nil {
 		return nil, fmt.Errorf("Dilithium3 signing request schedule requires a node and a slot factory")
 	}
-	if slots == 0 || slots > dilithium3v1.SigningParallelSlots {
+	if slots == 0 || slots > dilithium3v1.SigningMaxParallelSlots {
 		return nil, fmt.Errorf(
-			"%w: %d candidate slots, want [1, %d]",
-			errTDilithium3SigningRequestExhausted, slots, dilithium3v1.SigningParallelSlots,
+			"%w: %d candidate slots, want [0, %d]",
+			errTDilithium3SigningRequestExhausted, slots, dilithium3v1.SigningMaxParallelSlots,
 		)
 	}
 	if slotTimeout <= 0 {
@@ -195,14 +195,14 @@ type tdilithium3SigningPartyConfig struct {
 	Share *dilithium3v1.LocalShare
 
 	// Signers are the four active signer identities in ascending order.
-	Signers [4]uint32
+	Signers []uint32
 
 	// Journal is this signer's durable signing journal, which lives across the
 	// whole request; every candidate slot adds its own burned or finalized
 	// entry.
 	Journal *dilithium3v1.SigningJournal
 
-	// Identities is the identity snapshot of the four active signers.
+	// Identities is the identity snapshot of the active signers.
 	Identities map[uint32]tdilithium3SigningIdentity
 
 	// Sign signs one outbound envelope with this signer's identity key.
@@ -230,8 +230,19 @@ func newTDilithium3SigningSchedule(
 	node *Node,
 	config tdilithium3SigningPartyConfig,
 ) (*tdilithium3SigningRequestSchedule, error) {
+	if config.Share == nil {
+		return nil, fmt.Errorf("Dilithium3 signing request config requires a local share")
+	}
+	params, rowErr := dilithium3v1.SigningParametersForParticipants(len(config.Share.Committee.Participants))
+	if rowErr != nil {
+		return nil, rowErr
+	}
 	if config.Slots == 0 {
-		config.Slots = dilithium3v1.SigningParallelSlots
+		config.Slots = uint16(params.ParallelSlots)
+	} else if uint16(params.ParallelSlots) < config.Slots {
+		return nil, fmt.Errorf(
+			"Dilithium3 signing request config slots %d exceed the pinned row count %d", config.Slots, params.ParallelSlots,
+		)
 	}
 	if config.SlotTimeout == 0 {
 		config.SlotTimeout = tdilithium3SigningSlotTimeout

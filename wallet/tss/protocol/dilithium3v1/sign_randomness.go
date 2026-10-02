@@ -39,7 +39,7 @@ type signingRandomness struct {
 // nearest integer. The source is the caller's: the reference driver seeds it
 // deterministically, and a signer process must supply a cryptographic source
 // (design note, Open Obligations item 1).
-func sampleSigningRandomness(source *rand.Rand) (*signingRandomness, error) {
+func sampleSigningRandomness(source *rand.Rand, params SigningParameters) (*signingRandomness, error) {
 	if source == nil {
 		return nil, fmt.Errorf("%w: missing source", ErrInvalidSigningRandomness)
 	}
@@ -54,7 +54,7 @@ func sampleSigningRandomness(source *rand.Rand) (*signingRandomness, error) {
 	if !(norm > 0) || math.IsInf(norm, 0) {
 		return nil, fmt.Errorf("%w: degenerate ball sample", ErrInvalidSigningRandomness)
 	}
-	scale := SigningRandomnessSampleRadius / math.Sqrt(norm)
+	scale := params.SampleRadius / math.Sqrt(norm)
 	point := &signingRandomness{}
 	for index := 0; index < signingRandomnessDimension; index++ {
 		point.raw[index] = buffer[index] * scale
@@ -83,7 +83,7 @@ func (point *signingRandomness) roundFromRaw() {
 // whose rounded expansion is exactly round(nu*x1, x2). The reference driver
 // holds the point in one process, so recomputing the expansion is cheap and
 // keeps a caller-supplied point from diverging from the published values.
-func validateSigningRandomness(point *signingRandomness) error {
+func validateSigningRandomness(point *signingRandomness, params SigningParameters) error {
 	if point == nil {
 		return fmt.Errorf("%w: missing point", ErrInvalidSigningRandomness)
 	}
@@ -95,7 +95,7 @@ func validateSigningRandomness(point *signingRandomness) error {
 		}
 		total += value * value
 	}
-	if total > SigningRandomnessSampleRadius*SigningRandomnessSampleRadius {
+	if total > params.SampleRadius*params.SampleRadius {
 		return fmt.Errorf("%w: point outside the sampling ball", ErrInvalidSigningRandomness)
 	}
 	rounded := &signingRandomness{raw: point.raw}
@@ -114,6 +114,7 @@ func signingRejectionTest(
 	point *signingRandomness,
 	shiftFirst [L]SignedPoly,
 	shiftSecond [K]SignedPoly,
+	radius float64,
 ) (bool, error) {
 	if point == nil {
 		return false, fmt.Errorf("%w: missing point", ErrInvalidSigningRandomness)
@@ -131,7 +132,7 @@ func signingRejectionTest(
 			total += value * value
 		}
 	}
-	return total <= SigningRandomnessRadius*SigningRandomnessRadius, nil
+	return total <= radius*radius, nil
 }
 
 // signingResponsePart returns z_i^(1) = shiftFirst + round(nu*x1) as centered

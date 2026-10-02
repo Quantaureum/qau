@@ -167,7 +167,7 @@ func (inbox *tdilithium3DKGInbox) accept(message p2p.PeerMessage) error {
 		return fmt.Errorf("Dilithium3 DKG source peer is not bound to a participant")
 	}
 	var recipient *uint8
-	if message.Type == p2p.MsgTypeTDilithium3DKGGroupSeed {
+	if message.Type == p2p.MsgTypeTDilithium3DKGGroupSeed || message.Type == p2p.MsgTypeTDilithium3ReshareDelta {
 		recipient = &inbox.recipientPosition
 	}
 	envelope, err := validateTDilithium3DKGInbound(message.Type, message.Payload, inbox.session, recipient, inbox.verifyIdentity)
@@ -203,6 +203,12 @@ func (inbox *tdilithium3DKGInbox) accept(message p2p.PeerMessage) error {
 			return err
 		}
 		key.groupMask = contribution.GroupMask
+	case p2p.MsgTypeTDilithium3ReshareDelta:
+		delta, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+		if err != nil {
+			return err
+		}
+		key.groupMask, key.attempt = delta.TargetGroup, delta.Kind^byte(uint16(delta.SourceGroup))
 	}
 	digest := sha3.Sum256(envelope.Payload)
 	inbox.mu.Lock()

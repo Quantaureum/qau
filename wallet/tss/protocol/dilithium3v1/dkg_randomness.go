@@ -34,8 +34,12 @@ func DKGRandomnessCommitment(session DKGSession, position uint8, contribution [3
 	return sha3.Sum256(preimage), nil
 }
 
-// DeriveDKGRandomness binds six ordered contributions to global randomness and rho.
-func DeriveDKGRandomness(session DKGSession, contributions [6][32]byte) (global [64]byte, rho [32]byte, err error) {
+// DeriveDKGRandomness binds the committee's ordered contributions (one per
+// participant) to global randomness and rho.
+func DeriveDKGRandomness(session DKGSession, contributions [][32]byte) (global [64]byte, rho [32]byte, err error) {
+	if len(contributions) != len(session.Committee.Participants) {
+		return [64]byte{}, [32]byte{}, fmt.Errorf("%w: %d contributions, want %d", ErrInvalidDKGRandomness, len(contributions), len(session.Committee.Participants))
+	}
 	sessionDigest, err := session.Digest()
 	if err != nil {
 		return [64]byte{}, [32]byte{}, err

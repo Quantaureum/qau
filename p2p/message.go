@@ -202,6 +202,13 @@ const (
 	// peers that did not finish their own collection can adopt the identical
 	// group key instead of deriving a fresh divergent session next epoch.
 	MsgTypeTDilithium3DKGActivationCertificate uint8 = 101
+
+	// Dilithium3 v1 same-key committee rotation (R77): the private fold and
+	// correction delta one member owes specific recipients during a remove or
+	// add resharing. Point-to-point only; the payload is a versioned
+	// threshold envelope whose body is a reshare delta message
+	// (wallet/tss/protocol/dilithium3v1: ReshareDeltaWire).
+	MsgTypeTDilithium3ReshareDelta uint8 = 102
 )
 
 // Message flags
@@ -1223,7 +1230,8 @@ func ValidateMessage(msg *Message) error {
 		MsgTypeTDilithium3DKGAcknowledgement,
 		MsgTypeTDilithium3DKGComplaint,
 		MsgTypeTDilithium3DKGContribution,
-		MsgTypeTDilithium3DKGActivation:
+		MsgTypeTDilithium3DKGActivation,
+		MsgTypeTDilithium3ReshareDelta:
 		if err := ValidateTDilithium3DKGEnvelope(msg.Type, msg.Payload); err != nil {
 			return ErrMalformedMessage
 		}

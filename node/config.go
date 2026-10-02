@@ -176,8 +176,8 @@ type Config struct {
 	// it explicitly is a governance decision; divergent values fork the
 	// chain.
 	VDFSeedCRSSeedHex string `json:"vdfSeedCRSSeedHex,omitempty"`
-	DevBlocks                     bool   `json:"devBlocks"`     // Enable block production in dev mode (replaces QAU_DEV_MODE_BLOCKS env var)
-	BlockInterval                 int    `json:"blockInterval"` // Block production interval in seconds (dev mode only)
+	DevBlocks                bool   `json:"devBlocks"`     // Enable block production in dev mode (replaces QAU_DEV_MODE_BLOCKS env var)
+	BlockInterval            int    `json:"blockInterval"` // Block production interval in seconds (dev mode only)
 	BlockProducer                 bool   `json:"blockProducer"` // Enable block production (default true in dev mode, set false for sync-only nodes)
 	SyncOnlyMode                  bool   `json:"syncOnlyMode"`  // If true, only sync blocks from peers, don't produce
 	// audit-fix M-2: DevAutoUnlockAccounts requires explicit opt-in for auto-unlock in dev mode

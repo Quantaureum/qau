@@ -1198,7 +1198,8 @@ func isTDilithium3DKGMessageType(msgType uint8) bool {
 		MsgTypeTDilithium3DKGAcknowledgement,
 		MsgTypeTDilithium3DKGComplaint,
 		MsgTypeTDilithium3DKGContribution,
-		MsgTypeTDilithium3DKGActivation:
+		MsgTypeTDilithium3DKGActivation,
+		MsgTypeTDilithium3ReshareDelta:
 		return true
 	default:
 		return false
@@ -1349,6 +1350,11 @@ func ValidateTDilithium3DKGEnvelope(messageType uint8, encoded []byte) error {
 		if len(envelope.Payload) != 64 || len(envelope.IdentitySignature) != protocol.Dilithium3V1Profile().Algorithm.SignatureSize() ||
 			bytes.Equal(envelope.Payload[:32], make([]byte, 32)) || bytes.Equal(envelope.Payload[32:], make([]byte, 32)) {
 			return fmt.Errorf("%w: activation acknowledgement", ErrInvalidMessageFormat)
+		}
+	case MsgTypeTDilithium3ReshareDelta:
+		message, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+		if err != nil || message.SessionDigest != envelope.SessionID {
+			return fmt.Errorf("%w: reshare delta", ErrInvalidMessageFormat)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported Dilithium3 v1 DKG message type", ErrInvalidMessageType)

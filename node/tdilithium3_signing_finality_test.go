@@ -28,7 +28,7 @@ func tdilithium3SigningFinalityTestKey(t *testing.T) (*mode3.PublicKey, *mode3.P
 func TestTDilithium3SigningFinalitySignerVerifiesAndRefuses(t *testing.T) {
 	publicKey, privateKey := tdilithium3SigningFinalityTestKey(t)
 	groupKey := publicKey.Bytes()
-	signer, err := newTDilithium3SigningFinalitySigner(groupKey)
+	signer, err := newTDilithium3SigningFinalitySigner(groupKey, 4)
 	if err != nil {
 		t.Fatalf("signer: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestTDilithium3SigningFinalitySignerVerifiesAndRefuses(t *testing.T) {
 		"short":     []byte("QAU-TDILITHIUM3-V1"),
 		"all zeros": make([]byte, qcrypto.Dilithium3PublicKeySize),
 	} {
-		if _, err := newTDilithium3SigningFinalitySigner(key); err == nil {
+		if _, err := newTDilithium3SigningFinalitySigner(key, 4); err == nil {
 			t.Fatalf("%s group key accepted", name)
 		}
 	}
@@ -113,23 +113,23 @@ func TestRegisterTDilithium3SigningFinalitySigner(t *testing.T) {
 	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "0")
 	producer, qpos, _, _ := newEpochTransitionTestBlockProducer(t)
 	node := &Node{config: &Config{NetworkID: TestnetNetworkID}, blockProducer: producer}
-	if err := node.registerTDilithium3SigningFinalitySigner(7, groupKey); err == nil {
+	if err := node.registerTDilithium3SigningFinalitySigner(7, groupKey, 4); err == nil {
 		t.Fatal("registration succeeded with the gate closed")
 	}
 
 	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "1")
 	if err := (&Node{config: &Config{NetworkID: TestnetNetworkID}}).
-		registerTDilithium3SigningFinalitySigner(7, groupKey); err == nil {
+		registerTDilithium3SigningFinalitySigner(7, groupKey, 4); err == nil {
 		t.Fatal("registration succeeded without a consensus engine")
 	}
-	if err := node.registerTDilithium3SigningFinalitySigner(0, groupKey); err == nil {
+	if err := node.registerTDilithium3SigningFinalitySigner(0, groupKey, 4); err == nil {
 		t.Fatal("registration succeeded with a zero activation epoch")
 	}
-	if err := node.registerTDilithium3SigningFinalitySigner(7, []byte("short")); err == nil {
+	if err := node.registerTDilithium3SigningFinalitySigner(7, []byte("short"), 4); err == nil {
 		t.Fatal("registration succeeded with a malformed group key")
 	}
 	mainnet := &Node{config: &Config{NetworkID: MainnetNetworkID}, blockProducer: producer}
-	if err := mainnet.registerTDilithium3SigningFinalitySigner(7, groupKey); err == nil {
+	if err := mainnet.registerTDilithium3SigningFinalitySigner(7, groupKey, 4); err == nil {
 		t.Fatal("registration succeeded on the mainnet")
 	}
 
@@ -138,7 +138,7 @@ func TestRegisterTDilithium3SigningFinalitySigner(t *testing.T) {
 	if status := qfs.GetQTDFinalityStatus(); status["hasQTDSigner"] == true {
 		t.Fatal("signer was not cleared before registration")
 	}
-	if err := node.registerTDilithium3SigningFinalitySigner(7, groupKey); err != nil {
+	if err := node.registerTDilithium3SigningFinalitySigner(7, groupKey, 4); err != nil {
 		t.Fatalf("registration: %v", err)
 	}
 	status := qfs.GetQTDFinalityStatus()
