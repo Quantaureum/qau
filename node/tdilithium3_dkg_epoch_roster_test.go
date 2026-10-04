@@ -17,6 +17,7 @@ import (
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/qaudb/block"
+	"github.com/quantaureum/qau/qaudb/db"
 	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
@@ -623,4 +624,123 @@ func TestTDilithium3DKGCaptureHookRecordsOnlyEpochBoundaries(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(disabled.config.DataDir, tdilithium3DKGEpochRosterFileName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the capture hook touched the disk with the gate closed: %v", err)
 	}
+}
+
+// TestTDilithium3DKGCaptureHookCoversMissedBoundarySlot covers the R101
+// missed-boundary-slot rule: when the boundary slot produced no block, the
+// epoch's first canonical block captures the roster anchored at the
+// epoch-boundary chain tip (its parent hash); a mid-epoch block captures
+// nothing, a fully skipped epoch is never captured, and a block whose parent
+// is unavailable fails closed. Devnet acceptance showed missed boundary slots
+// are routine on real networks, and without this rule every rotation anchored
+// on the uncaptured epoch bricked itself (fail closed) permanently.
+func TestTDilithium3DKGCaptureHookCoversMissedBoundarySlot(t *testing.T) {
+	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "1")
+
+	validators, entries := tdilithium3DKGRosterTestValidators(t, 6)
+	validatorSet, err := consensus.NewValidatorSet(validators)
+	if err != nil {
+		t.Fatalf("validator set: %v", err)
+	}
+	qpos, err := consensus.NewQPOS(validatorSet)
+	if err != nil {
+		t.Fatalf("QPOS: %v", err)
+	}
+	newNode := func(bs *block.BlockStore) *Node {
+		return &Node{
+			config:        &Config{DataDir: t.TempDir(), NetworkID: TestnetNetworkID},
+			blockProducer: &BlockProducer{qpos: qpos},
+			blockStore:    bs,
+		}
+	}
+	storeBlock := func(t *testing.T, bs *block.BlockStore, header *encoding.BlockHeader) {
+		t.Helper()
+		if err := bs.PutBlockWithIndex(&encoding.Block{Header: header}); err != nil {
+			t.Fatalf("PutBlockWithIndex height=%d: %v", header.Height, err)
+		}
+	}
+
+	t.Run("missed boundary slot captures at the first block anchored at the tip", func(t *testing.T) {
+		bs := block.NewBlockStore(db.NewMemDB())
+		node := newNode(bs)
+		// Parent: height 62 at slot 63, the last slot of epoch 1. Boundary
+		// slot 64 produced no block; the epoch-2 first block is slot 66.
+		parent := &encoding.BlockHeader{Height: 62, Slot: 63, Epoch: 63 / consensus.SlotsPerEpoch}
+		storeBlock(t, bs, parent)
+		first := &encoding.BlockHeader{Height: 63, Slot: 66, Epoch: 66 / consensus.SlotsPerEpoch, ParentHash: block.ComputeBlockHash(parent)}
+		storeBlock(t, bs, first)
+		node.captureTDilithium3DKGEpochRosterFromBlock(&encoding.Block{Header: first})
+
+		store := node.tdilithium3DKGEpochRosterStore
+		if store == nil {
+			t.Fatal("the epoch's first block did not create the roster sidecar")
+		}
+		store.mu.Lock()
+		roster := store.epochs[2]
+		bootstrap, bootstrapSet := store.bootstrap, store.bootstrapSet
+		store.mu.Unlock()
+		if roster == nil {
+			t.Fatal("a missed boundary slot left epoch 2 uncaptured")
+		}
+		if roster.BoundaryHash != first.ParentHash {
+			t.Fatal("the anchor is not the epoch-boundary chain tip (the first block's parent hash)")
+		}
+		if roster.BoundaryHash == block.ComputeBlockHash(first) {
+			t.Fatal("a non-boundary first block anchored the roster at its own hash")
+		}
+		if !bootstrapSet || bootstrap != 2 {
+			t.Fatalf("the first captured epoch did not become the bootstrap boundary: %d", bootstrap)
+		}
+		if !reflect.DeepEqual(roster.Entries, entries) {
+			t.Fatal("the captured roster entries are not the canonical live entries")
+		}
+
+		// A mid-epoch block is not the epoch's first block: it captures
+		// nothing and must not overwrite the first-block capture.
+		mid := &encoding.BlockHeader{Height: 64, Slot: 70, Epoch: 70 / consensus.SlotsPerEpoch, ParentHash: block.ComputeBlockHash(first)}
+		storeBlock(t, bs, mid)
+		node.captureTDilithium3DKGEpochRosterFromBlock(&encoding.Block{Header: mid})
+		store.mu.Lock()
+		again := store.epochs[2]
+		count := len(store.epochs)
+		store.mu.Unlock()
+		if count != 1 || again == nil || again.BoundaryHash != first.ParentHash {
+			t.Fatal("a mid-epoch block overwrote the first-block capture")
+		}
+	})
+
+	t.Run("fully skipped epoch is never captured", func(t *testing.T) {
+		bs := block.NewBlockStore(db.NewMemDB())
+		node := newNode(bs)
+		parent := &encoding.BlockHeader{Height: 100, Slot: 95, Epoch: 95 / consensus.SlotsPerEpoch}
+		storeBlock(t, bs, parent)
+		// Epoch 3 has no block at all; the next canonical block opens epoch 4
+		// and anchors epoch 4 at the tip, while epoch 3 stays uncapturable.
+		first := &encoding.BlockHeader{Height: 101, Slot: 130, Epoch: 130 / consensus.SlotsPerEpoch, ParentHash: block.ComputeBlockHash(parent)}
+		node.captureTDilithium3DKGEpochRosterFromBlock(&encoding.Block{Header: first})
+
+		store := node.tdilithium3DKGEpochRosterStore
+		if store == nil {
+			t.Fatal("the epoch-4 first block did not create the roster sidecar")
+		}
+		store.mu.Lock()
+		epochThree, epochFour := store.epochs[3], store.epochs[4]
+		store.mu.Unlock()
+		if epochThree != nil {
+			t.Fatal("an epoch with no canonical block was captured")
+		}
+		if epochFour == nil || epochFour.BoundaryHash != first.ParentHash {
+			t.Fatal("the epoch after a fully skipped epoch was not captured at the tip anchor")
+		}
+	})
+
+	t.Run("missing parent fails closed without touching the disk", func(t *testing.T) {
+		bs := block.NewBlockStore(db.NewMemDB())
+		node := newNode(bs)
+		orphan := &encoding.BlockHeader{Height: 500, Slot: 200, Epoch: 200 / consensus.SlotsPerEpoch, ParentHash: tdilithium3DKGRosterTestHash(0x99)}
+		node.captureTDilithium3DKGEpochRosterFromBlock(&encoding.Block{Header: orphan})
+		if node.tdilithium3DKGEpochRosterStore != nil {
+			t.Fatal("a block whose parent is unavailable created the roster sidecar")
+		}
+	})
 }

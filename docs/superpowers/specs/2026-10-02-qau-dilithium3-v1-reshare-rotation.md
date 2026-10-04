@@ -203,14 +203,87 @@ aborted.
   acknowledgement activation exchange before the finality surface
   re-registers. Growth and multi-position churn still fail closed to the
   fresh-key ceremony.
-- **Devnet acceptance (`r77net*`):** start six validators, form the chamber
-  under R76, then onboard validator 7 so the epoch-(e+1) roster has seven
-  members; reshare the key to the seven-member committee; verify the group
-  public key is identical across the boundary; observe the four-of-six
-  committee cease to suffice and the five-of-seven committee sign seals
-  with the *same* group key. Then rotate validator 7 out: the threshold
-  falls back to four-of-six with the key still identical. The run asserts
-  that no share store ever holds two adopted generations of the key.
+- **Devnet acceptance (`r77net*`, PASSED 2026-10-04):**
+  six-genesis-validator chain, seventh account staked at runtime
+  (`qau_stake`), committee-7 DKG completed on all seven nodes
+  (activation epoch 5, group key prefix `7082d70f`); validator 7 then
+  unstaked in full, the remove rotation completed on the six survivors
+  (activation epoch 7, **same group key prefix `7082d70f`**, committee
+  size 6) — deduping across both events the join+remove round trip
+  preserved the group key exactly as R77 requires. Node roster captures
+  covered every epoch of the chain (entries 6,6,7,7,7,6,6), including
+  the epochs whose boundary slot produced no block (captured at the
+  epoch's first canonical block per the R101 anchor rule).
+
+  `.local-only/scripts/_r77net_*.ps1` drives a six-genesis-validator chain,
+  stakes a seventh funded account at runtime (`qau_stake`, self-signed), and
+  later fully unstakes it. The runtime-join path surfaced and fixed one real
+  integration gap (this section's R76 follow-up): the staking-tx sync
+  registered the validator in QPOS/ValidatorManager but left the QPOS
+  validator's base Dilithium3 identity bytes empty, so every subsequent
+  epoch roster capture failed closed with "no usable Dilithium3 identity
+  key". `syncStakingFromBlock` now mirrors the transaction's public key
+  into the consensus validator set (`QPOS.AttachValidatorPublicKey`,
+  first-key-wins, malformed lengths refused;
+  `consensus/r77_runtime_join_pubkey_test.go`). With that, the committee-7
+  fresh DKG completes on all seven nodes on the live chain
+  (`.local-only/tmp/r77net` evidence buckets).
+  A second integration defect found by the same run: the remove-rotation
+  probe compared the stored share's OLD participant id against the NEW
+  committee's numbering, so only survivors whose roster position did not
+  shift (members before the leaver in sorted order) ran the rotation while
+  everyone else fell through to the fresh-key ceremony. The probe now tests
+  membership by validator address against the old committee's identity
+  bindings (`tryTDilithium3ReshareRemoveRotation`).
+  A third integration defect: the remove plan itself picked the leaver off
+  the *numeric* participant ids, and committee participants are
+  (roster-position + 1) per committee — so a removed address was always
+  mislabelled as the highest id when any survivor's numbering shifted. The
+  probe now computes the leaver by address intersection over the old/new
+  rosters and hands the same plan to the ceremony runner
+  (`tdilithium3ReshareRemoveConfig.Plan`), which no longer recomputes it.
+  A fourth integration defect (2026-10-04, found on the leave segment):
+  the epoch-roster capture hook fired only on blocks whose slot was the exact
+  epoch boundary, so every missed boundary slot permanently skipped that
+  epoch's snapshot and every session anchored on it failed closed with
+  "no snapshot captured" — the devnet missed 16 of 31 boundary slots on a
+  degraded chain. The hook now follows the R101 epoch-boundary-root rule:
+  when the boundary slot produced no block, the epoch's FIRST canonical block
+  captures the roster anchored at that block's parent hash (the chain tip at
+  the boundary), byte-compatible with the root rule
+  (`node/tdilithium3_dkg_epoch_roster.go`,
+  `TestTDilithium3DKGCaptureHookCoversMissedBoundarySlot`).
+  A fifth integration defect (same rerun): the threshold share store pinned
+  the numeric participant id at the candidate head, the ledger head, and the
+  activation path, so a membership change in front of a survivor in canonical
+  roster order bricked both admissible renumberings — the fresh-key rekey
+  ("threshold candidate identity or generation rollback") and, one layer
+  later, the same-key rotation. The id is roster-position-derived, not an
+  identity primitive; the store now enforces only generation/committee-version
+  rollback, in-generation group-key changes, and equal-version byte conflicts
+  (`node/threshold_share_store.go`, `node/threshold_activation.go`,
+  `TestThresholdShareStoreRenumbersParticipantOnCommitteeChurn`).
+  A sixth integration defect (the acceptance-blocking livelock, found on
+  the 21:19Z chain): the activation path re-verified the ALREADY-STORED
+  certificate against the CURRENT roster-bound verifier. After any committee
+  change the old acks are signed by the OLD committee's numbering, so the
+  re-verification refused every new-certificate adoption with "invalid
+  Dilithium3 v1 DKG activation certificate", stranding all incumbents while
+  the freshly-joined member completed alone. The stored certificate is only
+  re-verified now when its committee digest equals the incoming one
+  (`node/threshold_activation.go`); the epoch-monotonicity and lineage
+  guards are unchanged. A seventh, exchange-reliability cluster: the
+  activation-ack collection sink was sized for the fixed six-member
+  committee, so a seven-member ack burst overflowed and stranded collectors
+  at 6/7; the sink scales with the committee now, stale/foreign-session
+  envelopes are dropped with a diagnostic instead of aborting assembly, and
+  the acknowledgement re-broadcasts every second until the quorum forms
+  (`node/tdilithium3_dkg_activation_exchange.go`).
+  The previously bare certificate sentinel
+  (`ErrInvalidDKGActivationCertificate`) now reports which structural or
+  per-acknowledgement check failed
+  (`wallet/tss/protocol/dilithium3v1/activation_certificate.go`), which is
+  how the sixth defect was identified from the node logs.
 
 ## 7. Out of scope (explicit)
 
@@ -218,9 +291,72 @@ aborted.
 - Committees built from discontinuous roster positions (the sampler keeps
   the roster's leading slice; see R76 section 8).
 - Multi-position membership deltas within one epoch (fresh-key fallback).
-- **R77c (open):** the signing-parameter row for rotated committees in the
-  add shape. The correction component's multiplicity is
-  binom(C-1, g)-1 = 19 at C=7, so the per-signer challenge-shift bound and
-  HRej radius must be re-derived for the hybrid multiplicity profile
-  (carried 1 + fresh 1 + correction 19). The wallet and runner layers are
-  already multiplicity-exact; only the acceptance path is gated.
+- **R77c (resolved 2026-10-05 as measured-infeasible, not pinnable):** the
+  signing-parameter row for rotated committees in the add shape cannot be
+  pinned within the mode3 envelope. The derivation script
+  (`node/.local-only/scripts/r77c_rotated_row.go`, the multiplicity-aware
+  generalization of the R76b family procedure) reproduces the pinned C=7
+  fresh row bit-for-bit at fold=1 (B=779.31, r=402748.8, r'=402847.0,
+  Phint≈0.50, J=43) and then measures the add-rotated bearer party. The
+  correction component's true multiplicity in the shipped plan is the number
+  of NON-correction joiner groups, binom(6,2)-1 = 14 (the earlier "19" in
+  this text was a topology miscount: weave groups are the 3-member groups
+  containing the joiner). With profile owned=7 and one multiplicity-14
+  component the bearer's aggregate coefficient mass is sqrt(20/7) = 1.69
+  times the fresh profile (B=779.31 -> ~1317). Across the exponent grid the
+  required HRej ball either breaches the z-bound headroom (P1=0.05 at the
+  pinned exponent 4.95, r≈680k) or starves the fixed hint channel
+  (expo 7.2: P1=0.987 but Phint=0.265; expo 8.4: P1=1.0, Phint=0.50 but
+  pSession=0.003, J≈467 slots, ~3.5 MB of wire per party per request) — past
+  the C=8 row already rejected as non-operational at J≈265 / 2 MB.
+  The mass is structural: WeaverCorrection replaces one group's component
+  with the negated aggregate of the other joiner groups so the family sums
+  to zero, and every five-of-seven quorum hosts a correction-group member,
+  so no parameter row of this family carries the add shape's signing.
+  Same-key ADD signing therefore needs a resharing-level redesign, and the
+  natural one is also measured: cycle-difference spreading (replace every
+  weave component k by the difference fresh_k - fresh_{pi(k)} along a
+  permutation of the weave family, so the family still sums to zero but no
+  component exceeds multiplicity 2) puts the worst party at mass ratio
+  sqrt(2) = 1.41x fresh (owned=7 at multiplicity 2 each), and that row still
+  fails the family's own gates: at expo 5.85 the hint channel measures
+  Phint=0.22 (health band requires >=0.4 and the C=7 fresh row sits at
+  0.505), with J≈183 slots at degraded margin and ~1.4 MB per party — and
+  the trend only worsens inside the healthy band. The blocker is not the
+  correction's placement but the C=7 family's radius sensitivity: any
+  unfold-shaped multiplicity mass inflates the ball past what the fixed
+  gamma2/omega hint channel tolerates. A genuinely additive same-key
+  rotation would need a topology where joiner-family mass stays at
+  multiplicity 1 (e.g. joiner components derived from rehearsal-carried
+  material rather than freshly woven values) — a protocol-level change,
+  not a parameter row. That is beyond this line's scope. What ships instead: joins run the fresh-key ceremony (new key, fully
+  supported), and the remove shape's same-key rotation signs under the
+  pinned fresh rows because its fold multiplicity stays <= 2, which the
+  measured geometry tolerates. The wallet and runner layers stay
+  multiplicity-exact; the acceptance path remains gated and now fails with
+  the measurement cited here.
+
+  Addendum, same day: the obvious "spread the correction across the weave
+  groups instead of concentrating it" variants are ruled out, by
+  conservation AND by measurement. The correction's value is the negated
+  sum of the 14 non-correction weave components (an earlier draft of this
+  note said 19 from a topology miscount), so 14 units of coefficient mass
+  exist no matter how they are divided. Every weave group contains the
+  joiner, so every piece of the correction lives on the joiner's share and
+  its per-share total is invariant at 28 (14 fresh + correction) — but the
+  signing-relevant bound runs on the per-attempt allocation (at most 7 owned
+  groups per party), under which the measured best spread variant
+  (cycle-difference, every component at multiplicity <= 2) tops the worst
+  party at mass ratio sqrt(2) = 1.41x fresh — and the grid measures even
+  that row outside the families gates (at expo 5.85: Phint 0.22 against the
+  >=0.4 health band of the C=6/C=7 pinned rows, J ≈ 183 slots at ~1.4 MB of
+  wire per party; stricter acceptance only drives J up). Neither placement
+  nor parameter choices rescue the add row inside this topology. The remaining exits are protocol-level and carry new
+  proof obligations: a weave family whose components are jointly sampled
+  zero-sum at the value level (e.g. telescoped pairwise differences keep
+  every component at difference-of-two mass BUT make adjacent components
+  correlated, which the CNF access-structure privacy argument does not
+  presently cover), or a different add construction altogether. Either is a
+  construction spec of its own, with an independence/privacy analysis, not a
+  parameter row — until then the add shape routes to the fresh-key ceremony
+  by design and the remove shape carries the same-key property alone.

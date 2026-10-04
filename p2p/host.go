@@ -813,8 +813,12 @@ func NewHost(cfg *Config) (*Host, error) {
 		// ETHEREUM-PARITY SYNC (2026-08-13)
 		syncRespCh:           make(chan PeerMessage, 256),
 		checkpointCh:         make(chan []byte, 50),
-		tssCh:                make(chan PeerMessage, 100),
-		qtdSealCh:            make(chan PeerMessage, 100),
+		// TSS/Dilithium3 protocol channels: bursts are committee-sized but
+		// loss is not recoverable (no retransmission; a dropped round
+		// message strands the whole ceremony on timeout). Size the buffer
+		// for a several-round burst, not for steady state.
+		tssCh:     make(chan PeerMessage, 4096),
+		qtdSealCh: make(chan PeerMessage, 4096),
 		dasReqCh:             make(chan PeerMessage, 100),
 		dasPending:           make(map[uint64]chan PeerMessage),
 		shardBlockCh:         make(chan []byte, 200),
@@ -3958,6 +3962,10 @@ func (h *Host) routeMessage(msg *Message) {
 		h.handleGossipSubMessage(msg.From, msg.Payload)
 	default:
 		if err := h.protocolRegistry.RouteMessage(msg); err != nil {
+			if msg.Type == MsgTypeTDilithium3ReshareDelta {
+				logging.Global().Warn("reshare delta routing failed", map[string]any{"from": msg.From, "error": err.Error()})
+				return
+			}
 			logging.Global().Debug("Protocol routing failed", map[string]any{
 				"msgType": msg.Type,
 				"from":    msg.From,
@@ -4107,6 +4115,7 @@ func (h *Host) registerProtocols() {
 			MsgTypeTDilithium3SigningAcceptance:       true,
 			MsgTypeTDilithium3SigningResponse:         true,
 			MsgTypeTDilithium3DKGActivationCertificate: true,
+			MsgTypeTDilithium3ReshareDelta:             true,
 		},
 		Handler: h.handleTSSProtocol,
 	})
@@ -4577,6 +4586,9 @@ func (h *Host) handleExpertProtocol(msg *Message) error {
 // layer can route responses (e.g., Round2 reveals) back to the correct peer.
 func (h *Host) handleTSSProtocol(msg *Message) error {
 	pm := PeerMessage{From: msg.From, Type: msg.Type, Payload: msg.Payload}
+	if msg.Type == MsgTypeTDilithium3ReshareDelta {
+		logging.Global().Info("handleTSSProtocol: reshare delta inbound", map[string]any{"from": msg.From})
+	}
 	select {
 	case h.tssCh <- pm:
 	default:
@@ -6469,8 +6481,11 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 
 	sent := 0
 	skipped := 0
+	skippedPeers := make([]PeerID, 0, 4)
+	absent := 0
 	for _, peer := range h.peers {
 		if !peer.Connected {
+			absent++
 			continue
 		}
 		select {
@@ -6478,6 +6493,7 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 			sent++
 		default:
 			skipped++
+			skippedPeers = append(skippedPeers, peer.ID)
 		}
 	}
 	if msgType == MsgTypeBatch || msgType == MsgTypeTransaction {
@@ -6503,8 +6519,45 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 				msgType, len(data), sent, skipped, len(h.peers))
 		}
 	}
+	// TSS/Dilithium3 protocol messages carry no retransmission: a message
+	// that never reaches a recipient looks identical to a silent peer, and
+	// the receiving side cannot distinguish the two. Record the fanout
+	// outcome so delivery gaps are visible. The family is committee-sized
+	// and infrequent, so per-broadcast logging is bounded.
+	if tssProtocolMessageType(msgType) {
+		if skipped > 0 {
+			ids := make([]string, 0, len(skippedPeers))
+			for _, id := range skippedPeers {
+				ids = append(ids, string(id))
+			}
+			hostLog.Warnf("broadcast(TSS type=%d bytes=%d): send channel full, skipped %d peer(s) [%s] (absent=%d total_peers=%d sent=%d)",
+				msgType, len(data), skipped, strings.Join(ids, ","), absent, len(h.peers), sent)
+		} else {
+			hostLog.Infof("broadcast(TSS type=%d bytes=%d): sent=%d absent=%d total_peers=%d",
+				msgType, len(data), sent, absent, len(h.peers))
+		}
+	}
 
 	return nil
+}
+
+// tssProtocolMessageType reports whether a message type belongs to the
+// retransmission-free TSS/Dilithium3 protocol family whose broadcasts must
+// be logged (Dilithium3 DKG rounds 90-96, signing rounds 97-100, activation
+// certificate 101, reshare deltas 102, legacy distributed-DKG 77-79).
+func tssProtocolMessageType(msgType uint8) bool {
+	switch msgType {
+	case MsgTypeTSSDKGCommitment, MsgTypeTSSDKGAck, MsgTypeTSSDKGReshare,
+		MsgTypeTDilithium3DKGRandomness, MsgTypeTDilithium3DKGGroupSeed,
+		MsgTypeTDilithium3DKGAcknowledgement, MsgTypeTDilithium3DKGComplaint,
+		MsgTypeTDilithium3DKGContribution, MsgTypeTDilithium3DKGActivation,
+		MsgTypeTDilithium3DKGRandomnessCommitment,
+		MsgTypeTDilithium3SigningCommit, MsgTypeTDilithium3SigningReveal,
+		MsgTypeTDilithium3SigningAcceptance, MsgTypeTDilithium3SigningResponse,
+		MsgTypeTDilithium3DKGActivationCertificate, MsgTypeTDilithium3ReshareDelta:
+		return true
+	}
+	return false
 }
 
 // Broadcaster returns the broadcaster

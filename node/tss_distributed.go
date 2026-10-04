@@ -334,7 +334,8 @@ func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 	switch msg.Type {
 	case p2p.MsgTypeTDilithium3DKGRandomness, p2p.MsgTypeTDilithium3DKGRandomnessCommitment, p2p.MsgTypeTDilithium3DKGGroupSeed,
 		p2p.MsgTypeTDilithium3DKGAcknowledgement, p2p.MsgTypeTDilithium3DKGComplaint,
-		p2p.MsgTypeTDilithium3DKGContribution, p2p.MsgTypeTDilithium3DKGActivation:
+		p2p.MsgTypeTDilithium3DKGContribution, p2p.MsgTypeTDilithium3DKGActivation,
+		p2p.MsgTypeTDilithium3ReshareDelta:
 		// Activation envelopes bypass the authenticated inbox (it refuses
 		// them by design) and go to the running ceremony's activation
 		// exchange while one is collecting receipts; the assembler verifies
@@ -344,10 +345,19 @@ func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 		}
 		inbox := n.tdilithium3DKGInboxSnapshot()
 		if !n.tdilithium3DKGInboxAdmissible(inbox) {
+			if msg.Type == p2p.MsgTypeTDilithium3ReshareDelta {
+				// Echoes before this node opens its rotation attempt sit in
+				// retention; the session digest inside the envelope pins them.
+				n.retainTDilithium3ReshareDelta(msg)
+			}
 			return
 		}
 		if err := inbox.accept(msg); err != nil {
-			nodeLog.Debug("Dilithium3 DKG inbound rejected: %v", err)
+			if msg.Type == p2p.MsgTypeTDilithium3ReshareDelta {
+				nodeLog.Info("Dilithium3 reshare delta inbound rejected: %v", err)
+			} else {
+				nodeLog.Debug("Dilithium3 DKG inbound rejected: %v", err)
+			}
 		}
 		return
 	case p2p.MsgTypeTDilithium3DKGActivationCertificate:

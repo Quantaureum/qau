@@ -64,19 +64,20 @@ fixes a rule that has no obvious default.
 identity roster is read from `ActivationEpoch - 1`.
 
 Why not `ActivationEpoch`: the epoch roster is captured while applying the
-boundary block of that epoch (`node/tdilithium3_dkg_epoch_roster.go:486-526`),
-and `lookup` refuses an epoch that is not finalized
-(`node/tdilithium3_dkg_epoch_roster.go:358`). The Three Chambers transition
-fires the runner while entering epoch `N`, at which point epoch `N`'s boundary
-is applied but almost certainly not finalized. An exact-match rule would refuse
-every session.
+epoch's anchor block (`node/tdilithium3_dkg_epoch_roster.go:486-526`) — the
+boundary block when the boundary slot produced one, otherwise the epoch's
+first canonical block per the R101 missed-slot rule — and `lookup` refuses an
+epoch that is not finalized (`node/tdilithium3_dkg_epoch_roster.go:358`). The
+Three Chambers transition fires the runner while entering epoch `N`, at which
+point epoch `N`'s anchor block is applied but almost certainly not finalized.
+An exact-match rule would refuse every session.
 
-Why `ActivationEpoch - 1` is deterministic: the boundary block of `N-1` is an
+Why `ActivationEpoch - 1` is deterministic: the anchor block of `N-1` is an
 ancestor of the head when epoch `N` begins, so every node at the same head
-reads the same boundary hash and the same active validator set, and therefore
+reads the same anchor hash and the same active validator set, and therefore
 the same roster digest. `capture` already refuses to replace a finalized
-epoch's boundary and lets a not-yet-finalized epoch be replaced by the newer
-canonical boundary (`node/tdilithium3_dkg_epoch_roster.go:281-295`), so a reorg
+epoch's anchor and lets a not-yet-finalized epoch be replaced by the newer
+canonical anchor (`node/tdilithium3_dkg_epoch_roster.go:281-295`), so a reorg
 before finality is handled by the existing code.
 
 Consequence to accept explicitly: the DKG session binding is **captured-boundary

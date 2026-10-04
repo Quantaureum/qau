@@ -293,8 +293,8 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 			if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, activeKey, int(activeThreshold)); err != nil {
 				nodeLog.Warn("Dilithium3 v1 DKG finality surface registration deferred (adopted path): %v", err)
 			}
-			nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x, adoption short-circuit)",
-				activationEpoch, diff[:8], result.TranscriptDigest[:8])
+			nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x, group key prefix %x, committee size %d, adoption short-circuit)",
+				activationEpoch, diff[:8], result.TranscriptDigest[:8], activeKey[:4], len(committee.Participants))
 			return result.PublicKey, nil
 		}
 	}
@@ -340,43 +340,115 @@ func (n *Node) tryTDilithium3ReshareRemoveRotation(
 	activeEpoch, activeKey, _, activeErr := store.ActiveSharePublicIdentity(password)
 	if activeErr != nil || activeEpoch == 0 {
 		// No active v1 share: the epoch transition is a bootstrap.
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, activeErr)
 		return false, publicKey, nil
 	}
 	oldRosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activeEpoch)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, err)
 		return false, publicKey, nil
 	}
 	oldRoster, err := n.capturedEpochValidatorRoster(oldRosterEpoch)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d, roster epoch %d): %v", activationEpoch, oldRosterEpoch, err)
 		return false, publicKey, nil
 	}
 	oldCommittee, _, err := n.tdilithium3DKGCommitteeForRoster(oldRoster)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, err)
 		return false, publicKey, nil
 	}
 	oldBindings, err := tdilithium3DKGRosterBindings(oldRoster, oldCommittee)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, err)
 		return false, publicKey, nil
 	}
 	oldVerifier, err := tdilithium3SigningShareVerifier(oldBindings)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, err)
 		return false, publicKey, nil
 	}
 	oldShare, err := store.LoadActiveAtEpoch(activationEpoch, oldVerifier, password)
 	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): %v", activationEpoch, err)
 		return false, publicKey, nil
 	}
 	defer oldShare.Zeroize()
 
-	plan, err := tdilithium3ReshareRotationFor(oldShare.Committee, committee)
-	if err != nil || plan == nil || !plan.HasLeaver || plan.HasWeaver {
-		// Not a remove rotation (growth or multi-position churn): fresh-key.
+	// Plan by identity, not by managed participant ids: committee bindings
+	// place participants at (roster order index + 1) per committee, so the
+	// numeric id of a surviving address shifts after a removal of a lower-
+	// ordered member (which is exactly the family this rotation exists for).
+	// PlanReshareRotationForCommittees can therefore mislabel the leaver when
+	// the survivor numbering changes; derive the leaver's position by address
+	// intersection of the OLD and NEW rosters instead.
+	newRoster, err := n.capturedEpochValidatorRoster(rosterEpoch)
+	if err != nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d, roster epoch %d): %v", activationEpoch, rosterEpoch, err)
 		return false, publicKey, nil
 	}
-	if oldShare.ParticipantID != committee.Participants[position] {
-		// This node was the leaver iteslf: it carries no reshared share; the
-		// epoch transition skips it anyway because position lookups for the
-		// leaver fail earlier in tdilithium3DKGCommitteeForRoster.
+	oldSet := make(map[types.Address]int, len(oldRoster.Entries))
+	for index, entry := range oldRoster.Entries {
+		oldSet[entry.Address] = index
+	}
+	var leaverPosition int
+	leavers := 0
+	for oldAddress, oldIndex := range oldSet {
+		present := false
+		for _, entry := range newRoster.Entries {
+			if entry.Address == oldAddress {
+				present = true
+				break
+			}
+		}
+		if !present {
+			leavers++
+			leaverPosition = oldIndex
+		}
+	}
+	if leavers != 1 || len(newRoster.Entries) != len(oldRoster.Entries)-1 {
+		// Growth or multi-position churn: the fresh-key ceremony handles it.
+		return false, publicKey, nil
+	}
+	plan, err := dilithium3v1.PlanReshareRotation(len(oldRoster.Entries), len(newRoster.Entries), uint8(leaverPosition))
+	if err != nil {
+		return false, publicKey, fmt.Errorf("Dilithium3 v1 reshare rotation plan: %w", err)
+	}
+	if plan.HasWeaver {
+		// The add shape signs only after R77c; remove-only here.
+		return false, publicKey, nil
+	}
+	// Survivor check by identity, not by position: the canonical resharing
+	// re-numbers participants of the reduced committee (positions above the
+	// leaver shift down), so comparing the OLD share's numeric ParticipantID
+	// against the NEW committee's numbering would wrongly skip every node
+	// whose position shifted. A node is a survivor exactly when its validator
+	// address is bound in the OLD committee AND the stored share's participant
+	// identity matches that binding.
+	localKey := n.blockProducer.ValidatorKey()
+	if localKey == nil {
+		nodeLog.Info("Dilithium3 v1 reshare rotation probe skipped (activation epoch %d): no local validator key", activationEpoch)
+		return false, publicKey, nil
+	}
+	var localAddress types.Address
+	if pub := localKey.PublicKey(); pub != nil {
+		localAddress = pub.Address()
+	}
+	var oldParticipantID uint32
+	survivor := false
+	for _, binding := range oldBindings {
+		if binding.ValidatorAddress == localAddress {
+			survivor = true
+			oldParticipantID = binding.ParticipantID
+			break
+		}
+	}
+	if !survivor {
+		// This node is the leaver: it carries no reshared share.
+		return false, publicKey, nil
+	}
+	if oldShare.ParticipantID != oldParticipantID {
+		nodeLog.Warn("Dilithium3 v1 reshare rotation probe %d: stored share participant %d does not match the old committee binding %d", activationEpoch, oldShare.ParticipantID, oldParticipantID)
 		return false, publicKey, nil
 	}
 
@@ -384,13 +456,38 @@ func (n *Node) tryTDilithium3ReshareRemoveRotation(
 	if err != nil {
 		return false, publicKey, nil
 	}
-	sessionShape, err := n.deriveTDilithium3DKGSession(activationEpoch)
+	// The rotated committee preserves the survivors' participant identities:
+	// reshare rotation folds components of THEIR shares, so positions carry
+	// the old ids with the leaver dropped and everyone above renumbered down.
+	// The roster-derived committee would renumber every member to 1..N and
+	// ResharedShare would refuse ("participant lost its position").
+	rotatedCommittee := oldShare.Committee.Clone()
+	rotatedCommittee.Participants = make([]uint32, 0, len(oldCommittee.Participants)-1)
+	for index, participant := range oldCommittee.Participants {
+		if uint8(index) == plan.Leaver {
+			continue
+		}
+		rotatedCommittee.Participants = append(rotatedCommittee.Participants, participant)
+	}
+	rotatedCommittee.Threshold = committee.Threshold
+	// The committee version steps forward so the rotated share does not
+	// collide with the survivor's old share in the threshold share store
+	// (same generation, same participant id, different rotated share bytes).
+	rotatedCommittee.Version = oldShare.Committee.Version + 1
+	// The identity roster digest must be recomputed against the ROTATED
+	// committee (survivor ids preserved): the inbox rebuilds it from the
+	// session committee and this roster, and rejects on mismatch.
+	rotatedBindings, err := tdilithium3DKGRosterBindings(newRoster, rotatedCommittee)
 	if err != nil {
-		return false, publicKey, nil
+		return false, publicKey, fmt.Errorf("Dilithium3 v1 reshare rotation bindings: %w", err)
+	}
+	rotatedDigest, err := dilithium3v1.DKGIdentityRosterDigest(rotatedCommittee, rotatedBindings)
+	if err != nil {
+		return false, publicKey, fmt.Errorf("Dilithium3 v1 reshare rotation roster digest: %w", err)
 	}
 	session, err := tdilithium3ReshareSessionFor(
 		n.config.NetworkID, genesis, activationEpoch,
-		oldShare.Committee, activeKey, committee, sessionShape.IdentityRosterDigest,
+		oldShare.Committee, activeKey, rotatedCommittee, rotatedDigest,
 	)
 	if err != nil {
 		return false, publicKey, fmt.Errorf("Dilithium3 v1 reshare session: %w", err)
@@ -403,6 +500,7 @@ func (n *Node) tryTDilithium3ReshareRemoveRotation(
 		Position:         position,
 		RosterEpoch:      rosterEpoch,
 		OldShare:         oldShare,
+		Plan:             plan,
 		Store:            store,
 		Password:         password,
 		PeerForValidator: peerForValidator,
@@ -418,3 +516,4 @@ func (n *Node) tryTDilithium3ReshareRemoveRotation(
 	}
 	return true, rotatedKey, nil
 }
+

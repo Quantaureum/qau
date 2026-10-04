@@ -3,12 +3,14 @@ package node
 
 import (
 	"context"
+	"crypto/sha3"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -103,19 +105,56 @@ func (n *Node) runTDilithium3ActivationExchange(
 	// collected, so late-starting nodes still converge on the full set.
 	memberCount := len(session.Committee.Participants)
 	colslected := map[string][]byte{string(own): own}
-	sink := make(chan []byte, tdilithium3DKGActivationSinkCapacity)
+	// R76: size the buffer for the whole committee, not a fixed six. The legacy
+	// tdilithium3DKGActivationSinkCapacity of 6 is enough only for the fixed
+	// six-member committee. A burst that lands every member's distinct
+	// acknowledgement while the collection loop is between reads overflows a
+	// cap that is smaller than memberCount, and the overflow packet is dropped
+	// (delivery sees a full sink and, with an exchange already running, does
+	// not retain it), which strands the exchange at memberCount-1 for any
+	// committee larger than six.
+	sinkCap := memberCount + 2
+	if sinkCap < tdilithium3DKGActivationSinkCapacity {
+		sinkCap = tdilithium3DKGActivationSinkCapacity
+	}
+	sink := make(chan []byte, sinkCap)
 	n.installTDilithium3DKGActivationSink(sink)
 	defer n.clearTDilithium3DKGActivationSink()
-	deadline, cancel := context.WithTimeout(ctx, tdilithium3DKGActivationExchangeTimeout)
-	defer cancel()
+	// The caller passes an already-bounded context: fresh-key ceremonies pass
+	// the default 30-second exchange window while rotation passes a longer
+	// one (rotation members start staggered, so their exchanges straddle the
+	// fold-delta deadline). Use the caller's deadline directly.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	// R77: the exchange's session is fixed for the whole run. During a
+	// committee transition (add/remove) a lagging member may still be
+	// gossiping its prior-epoch activation acknowledgement, and that
+	// foreign-session envelope must not count toward this committee's quorum:
+	// once it does, the collection loop reaches memberCount with a stale
+	// packet, assembly aborts on "belongs to another session", and the chamber
+	// is stranded in DKGRunning (the JOIN livelock). Precompute the session
+	// digest so every dropped packet is attributed cheaply. Use a distinct
+	// name (sessDigest) because the post-assembly code reuses sessionDigest.
+	sessDigest, sessDigestErr := session.Digest()
 	for len(colslected) < memberCount {
 		select {
 		case packet := <-sink:
-			// Dedup by content; a retransmitted packet is identical.
-			// Invalid or foreign packets are dropped by the verifier at
-			// assembly time, so we do not reject them here.
+			// Drop a stale/foreign-session envelope so it cannot inflate the
+			// quorum or abort assembly (the JOIN livelock described above).
+			if sessDigestErr == nil {
+				if env, derr := protocol.DecodeEnvelope(packet); derr == nil &&
+					(env.SessionID != sessDigest ||
+						env.KeyGeneration != session.KeyGeneration ||
+						env.CommitteeVersion != session.Committee.Version) {
+					nodeLog.Warn("R77 activation exchange: dropping stale/foreign-session envelope senderID=%d keyGen=%d(committeeV=%d) session=%x vs current keyGen=%d(committeeV=%d) session=%x",
+						env.SenderID, env.KeyGeneration, env.CommitteeVersion, env.SessionID[:4],
+						session.KeyGeneration, session.Committee.Version, sessDigest[:4])
+					continue
+				}
+			}
+			// Dedup by content; a retransmitted packet is identical. Packets
+			// from another session are dropped above; an invalid same-session
+			// packet is rejected by the verifier at assembly time.
 			if _, exists := colslected[string(packet)]; !exists {
 				colslected[string(packet)] = packet
 			}
@@ -135,7 +174,26 @@ func (n *Node) runTDilithium3ActivationExchange(
 			if err := broadcast(p2p.MsgTypeTDilithium3DKGActivation, own); err != nil {
 				return fmt.Errorf("rebroadcast activation envelope: %w", err)
 			}
-		case <-deadline.Done():
+		case <-ctx.Done():
+			// R77-DIAG: attribute a N-1/7 stall to the specific missing peer id.
+			// The exchange re-broadcasts its own ack every second for the whole
+			// window, so a stable N-1 means exactly one committee member's
+			// acknowledgement never reaches this node; name that id so a
+			// committee-change JOIN devnet stall pins down which peer is lost.
+			got := map[uint32]bool{}
+			for _, pkt := range colslected {
+				if env, derr := protocol.DecodeEnvelope(pkt); derr == nil {
+					got[env.SenderID] = true
+				}
+			}
+			var missing []string
+			for _, wantID := range session.Committee.Participants {
+				if !got[wantID] {
+					missing = append(missing, fmt.Sprintf("%d", wantID))
+				}
+			}
+			nodeLog.Warn("R77-DIAG activation exchange timeout: collected %d/%d, missing peerIDs=%v session=%x keyGen=%d(committeeV=%d)",
+				len(colslected), memberCount, missing, sessDigest[:4], session.KeyGeneration, session.Committee.Version)
 			return fmt.Errorf("Dilithium3 v1 activation exchange collected %d/%d acknowledgements before the deadline",
 				len(colslected), memberCount)
 		}
@@ -153,6 +211,15 @@ func (n *Node) runTDilithium3ActivationExchange(
 	sessionDigest, err := session.Digest()
 	if err != nil {
 		return fmt.Errorf("session digest: %w", err)
+	}
+	// R77-DIAG: log the in-memory share this certificate was built over so a
+	// devnet stall can diff it against the on-disk candidate ActivateCandidate
+	// verifies (a divergence means the candidate was not persisted before the
+	// exchange, or a stale candidate from a prior epoch is on disk).
+	if encoded, merr := share.MarshalBinary(); merr == nil {
+		memDigest := sha3.Sum256(encoded)
+		nodeLog.Warn("R77-DIAG activation exchange: in-memory share pos=%d id=%d epoch=%d transcript=%x pub=%x candDigest=%x acks=%d",
+			share.ParticipantPosition, share.ParticipantID, session.ActivationEpoch, share.TranscriptDigest[:4], share.Key.PublicKey[:4], memDigest[:4], len(certificate.Acknowledgements))
 	}
 	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, password); err != nil {
 		return fmt.Errorf("commit active share: %w", err)
@@ -217,6 +284,19 @@ func (n *Node) installTDilithium3DKGActivationSink(sink chan []byte) {
 	n.tdilithium3DKGActivationMu.Lock()
 	defer n.tdilithium3DKGActivationMu.Unlock()
 	n.tdilithium3DKGActivationSink = sink
+	if sink != nil && len(n.tdilithium3DKGActivationPending) > 0 {
+		// Drain retained packets: they arrived before this exchange installed
+		// its sink (members start staggered; mirrors the reshare-delta
+		// retention in tdilithium3_reshare_ceremony.go). Dedup by content —
+		// the collection loop keys on the packet bytes.
+		for _, packet := range n.tdilithium3DKGActivationPending {
+			select {
+			case sink <- packet:
+			default:
+			}
+		}
+		n.tdilithium3DKGActivationPending = nil
+	}
 }
 
 func (n *Node) clearTDilithium3DKGActivationSink() {
@@ -234,10 +314,25 @@ func (n *Node) deliverTDilithium3DKGActivation(packet []byte) bool {
 	}
 	n.tdilithium3DKGActivationMu.Lock()
 	sink := n.tdilithium3DKGActivationSink
-	n.tdilithium3DKGActivationMu.Unlock()
 	if sink == nil {
+		// No exchange running: retain so a later exchange start (staggered
+		// members) still sees the acknowledgement. Bounded and content
+		// deduplicated; drained by installTDilithium3DKGActivationSink.
+		const maxPending = 32
+		duplicate := false
+		for _, p := range n.tdilithium3DKGActivationPending {
+			if string(p) == string(packet) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && len(n.tdilithium3DKGActivationPending) < maxPending {
+			n.tdilithium3DKGActivationPending = append(n.tdilithium3DKGActivationPending, append([]byte(nil), packet...))
+		}
+		n.tdilithium3DKGActivationMu.Unlock()
 		return false
 	}
+	n.tdilithium3DKGActivationMu.Unlock()
 	select {
 	case sink <- append([]byte(nil), packet...):
 		return true
@@ -262,6 +357,10 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 	if n == nil || n.config == nil {
 		return
 	}
+	// R77-DIAG: confirm the type-101 gossip actually reached this node's
+	// adoption handler so a JOIN stall can be attributed to either "not
+	// delivered" vs "delivered but rejected".
+	nodeLog.Warn("Dilithium3 v1 activation certificate received for adoption (bytes=%d)", len(payload))
 	certificate, err := decodeThresholdActivationCertificate(payload)
 	if err != nil {
 		nodeLog.Debug("Dilithium3 v1 activation certificate decode rejected: %v", err)
@@ -343,7 +442,11 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 	password := []byte(n.config.ValidatorKeyPassword)
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.ActivateCandidate(certificate, sessionDigest, activationEpoch, verifier, password); err != nil {
-		nodeLog.Debug("Dilithium3 v1 activation certificate adoption rejected: %v", err)
+		// R77-DIAG: adoption rejection is the decisive reason a straggler
+		// node cannot converge on a peer's committed group key; surface it at
+		// Warn so devnet acceptance can attribute the JOIN stall precisely.
+		nodeLog.Warn("Dilithium3 v1 activation certificate adoption rejected (activation epoch %d, acks=%d): %v",
+			activationEpoch, len(certificate.Acknowledgements), err)
 		return
 	}
 

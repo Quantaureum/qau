@@ -217,7 +217,12 @@ func validateTDilithium3DKGStructure(messageType uint8, encoded []byte, session 
 		if message.CommitteeDigest != committeeDigest || senderPosition != message.AnchorPosition ||
 			recipientPosition == nil || *recipientPosition >= uint8(len(session.Committee.Participants)) ||
 			message.RecipientPosition != *recipientPosition {
-			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 v1 reshare delta identity mismatch")
+			localRecipient := uint8(255)
+			if recipientPosition != nil {
+				localRecipient = *recipientPosition
+			}
+			return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 v1 reshare delta identity mismatch (digestEq=%v senderPos=%d anchorPos=%d wireRecipient=%d localRecipient=%d)",
+				message.CommitteeDigest == committeeDigest, senderPosition, message.AnchorPosition, message.RecipientPosition, localRecipient)
 		}
 	default:
 		return protocol.ThresholdEnvelope{}, fmt.Errorf("unsupported Dilithium3 DKG message type %d", messageType)

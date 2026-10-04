@@ -43,6 +43,9 @@ func (store *thresholdShareStore) Store(share *dilithium3v1.LocalShare, password
 	if err := share.Validate(); err != nil {
 		return err
 	}
+	// R77: the rotated share's candidate record is keyed by (protocol,
+	// generation, committee version, participant) while its ledger record is
+	// keyed by activation epoch; the validation above keeps both consistent.
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	lock, err := store.lockFile()
@@ -69,10 +72,22 @@ func (store *thresholdShareStore) Store(share *dilithium3v1.LocalShare, password
 			return fmt.Errorf("decode threshold candidate head: %w", err)
 		}
 		defer candidateShare.Zeroize()
-		if share.ParticipantID != candidateShare.ParticipantID || share.Key.Generation < candidateShare.Key.Generation ||
+		if share.Key.Generation < candidateShare.Key.Generation ||
 			(share.Key.Generation == candidateShare.Key.Generation && share.Committee.Version < candidateShare.Committee.Version) {
-			return fmt.Errorf("threshold candidate identity or generation rollback")
+			return fmt.Errorf("threshold candidate generation or committee-version rollback (participant %d -> %d, generation %d -> %d, committee version %d -> %d)",
+				candidateShare.ParticipantID, share.ParticipantID,
+				candidateShare.Key.Generation, share.Key.Generation,
+				candidateShare.Committee.Version, share.Committee.Version)
 		}
+		// The participant id deliberately does NOT participate in the rollback
+		// identity: R76/R77 derive participant ids from the epoch roster
+		// position, so surviving validators are renumbered whenever membership
+		// churns before them in the canonical order ("plan by identity, not by
+		// managed participant ids"). A renumbered write is admissible only with
+		// a strictly newer generation (fresh-key ceremony) or a same-generation
+		// committee-version bump, and the same-generation checks below still
+		// refuse any group-key change and any equal-version byte conflict, so
+		// the admissible renumbering is exactly the committee-rotation family.
 		if share.Key.Generation == candidateShare.Key.Generation {
 			if share.Key.Algorithm != candidateShare.Key.Algorithm || !bytes.Equal(share.Key.PublicKey, candidateShare.Key.PublicKey) {
 				return fmt.Errorf("threshold candidate changed the group public key")
@@ -94,10 +109,13 @@ func (store *thresholdShareStore) Store(share *dilithium3v1.LocalShare, password
 			return fmt.Errorf("decode threshold ledger head: %w", err)
 		}
 		defer ledgerShare.Zeroize()
-		if share.ParticipantID != ledgerShare.ParticipantID || share.Key.Generation < ledgerShare.Key.Generation ||
+		if share.Key.Generation < ledgerShare.Key.Generation ||
 			(share.Key.Generation == ledgerShare.Key.Generation && share.Committee.Version < ledgerShare.Committee.Version) {
 			return fmt.Errorf("threshold share generation rollback: %d behind %d", share.Key.Generation, ledgerShare.Key.Generation)
 		}
+		// Same R77 rationale as the candidate head above: the participant id is
+		// roster-position-derived and legitimately shifts on committee churn, so
+		// it is not part of the ledger rollback identity either.
 		if share.Key.Generation == ledgerShare.Key.Generation {
 			if share.Key.Algorithm != ledgerShare.Key.Algorithm || !bytes.Equal(share.Key.PublicKey, ledgerShare.Key.PublicKey) {
 				return fmt.Errorf("threshold share changed the group public key")

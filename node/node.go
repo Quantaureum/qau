@@ -247,6 +247,11 @@ type Node struct {
 	// tdilithium3DKGInboxSnapshot / installTDilithium3DKGInbox.
 	tdilithium3DKGInbox   *tdilithium3DKGInbox
 	tdilithium3DKGInboxMu sync.RWMutex
+	// tdilithium3ResharePending keeps inbound R77 reshare deltas that arrive
+	// while no ceremony inbox is installed; each rotation attempt replays the
+	// ones matching its session digest.
+	tdilithium3ResharePending   map[[32]byte]p2p.PeerMessage
+	tdilithium3ResharePendingMu sync.Mutex
 	// tdilithium3SigningInboxes holds the authenticated inboxes of every signing
 	// executor session currently running on this node, keyed by session id. The
 	// seal executor drives its candidate sessions concurrently (the protocol's
@@ -289,6 +294,11 @@ type Node struct {
 	// collecting receipts and every delivered packet is re-verified there.
 	tdilithium3DKGActivationMu   sync.Mutex
 	tdilithium3DKGActivationSink chan []byte
+	// tdilithium3DKGActivationPending retains inbound activation
+	// acknowledgements that arrive while no exchange has its sink installed
+	// (members start staggered; mirrors tdilithium3ResharePending on the
+	// reshare path). Drained by installTDilithium3DKGActivationSink.
+	tdilithium3DKGActivationPending [][]byte
 	// tdilithium3DKGEpochRosterStore is the lazily created finalized-epoch
 	// validator roster sidecar (Dilithium3 v1 CNF-RSS "Finalized-Epoch
 	// Validator Snapshot", option 2). It is nil until an epoch-boundary capture
@@ -5377,35 +5387,56 @@ func (n *Node) syncStakingFromBlock(blk *encoding.Block) {
 				}
 
 				// Register validator in ValidatorManager so blocks they produce are accepted
-				// by BlockValidator (which uses ValidatorLookup to check IsValidator/GetValidatorPublicKey)
-				if n.validatorManager != nil && !n.validatorManager.IsValidator(tx.From) {
-					if len(tx.PublicKey) > 0 {
-						pubKey, pkErr := crypto.PublicKeyFromBytes(tx.PublicKey)
-						if pkErr != nil {
-							nodeLog.Error("Failed to parse validator public key from staking tx: addr=%x, err=%v",
-								tx.From[:8], pkErr)
+				// by BlockValidator (which uses ValidatorLookup to check IsValidator/GetValidatorPublicKey).
+				// Registration only happens when the address is not yet known to the VM: a re-stake
+				// after a full unstake leaves the address in the set (as inactive), so re-registering
+				// would race with the deactivation. The QPOS key-attach below is deliberately NOT
+				// gated on this — see R77-KEY-ATTACH-FIX.
+				if n.validatorManager != nil && !n.validatorManager.IsValidator(tx.From) && len(tx.PublicKey) > 0 {
+					pubKey, pkErr := crypto.PublicKeyFromBytes(tx.PublicKey)
+					if pkErr != nil {
+						nodeLog.Error("Failed to parse validator public key from staking tx: addr=%x, err=%v",
+							tx.From[:8], pkErr)
+					} else {
+						// Use self-registration (caller == addr), same as genesis validators
+						commission := uint32(100) // 1% default, same as genesis validators
+						if vmErr := n.validatorManager.AddValidator(tx.From, tx.From, pubKey, totalStake, commission, blk.Header.Height); vmErr != nil {
+							nodeLog.Error("Failed to add validator to ValidatorManager: addr=%x, err=%v",
+								tx.From[:8], vmErr)
 						} else {
-							// Use self-registration (caller == addr), same as genesis validators
-							commission := uint32(100) // 1% default, same as genesis validators
-							if vmErr := n.validatorManager.AddValidator(tx.From, tx.From, pubKey, totalStake, commission, blk.Header.Height); vmErr != nil {
-								nodeLog.Error("Failed to add validator to ValidatorManager: addr=%x, err=%v",
-									tx.From[:8], vmErr)
+							nodeLog.Info("🔐 New validator registered in ValidatorManager: addr=%x, stake=%s",
+								tx.From[:8], totalStake.String())
+							// Activate the validator so it can produce blocks
+							if saErr := n.validatorManager.SetActive(tx.From, tx.From, true); saErr != nil {
+								nodeLog.Error("Failed to activate validator: addr=%x, err=%v",
+									tx.From[:8], saErr)
 							} else {
-								nodeLog.Info("🔐 New validator registered in ValidatorManager: addr=%x, stake=%s",
-									tx.From[:8], totalStake.String())
-								// Activate the validator so it can produce blocks
-								if saErr := n.validatorManager.SetActive(tx.From, tx.From, true); saErr != nil {
-									nodeLog.Error("Failed to activate validator: addr=%x, err=%v",
-										tx.From[:8], saErr)
-								} else {
-									nodeLog.Info("✅ Validator activated: addr=%x", tx.From[:8])
-								}
+								nodeLog.Info("✅ Validator activated: addr=%x", tx.From[:8])
 							}
 						}
-					} else {
-						nodeLog.Warn("Staking tx has no public key, cannot register validator in ValidatorManager: addr=%x",
-							tx.From[:8])
 					}
+				}
+
+				// R77-KEY-ATTACH-FIX: mirror the on-chain identity key into the QPOS validator
+				// set UNCONDITIONALLY on every staking-tx application, whether the address is a
+				// fresh join or a re-add after a full unstake. The original code nested this call
+				// inside the !IsValidator registration guard above, so a validator that was
+				// already known to the VM (a validator's own node, or one that re-staked after a
+				// full unstake that only deactivated it, not removed it) got its re-added QPOS
+				// entry left keyless. A keyless active validator makes every subsequent DKG
+				// epoch-roster capture fail closed ("no usable Dilithium3 identity key"),
+				// permanently stalling committee growth from that epoch on. AttachValidatorPublicKey
+				// is idempotent and at-most-once (an existing key wins), so calling it on an
+				// already-bound entry is a safe no-op.
+				if len(tx.PublicKey) > 0 {
+					if qpos := n.blockProducer.QPOS(); qpos != nil {
+						if qpos.AttachValidatorPublicKey(tx.From, tx.PublicKey) {
+							nodeLog.Info("🔏 Validator identity key attached to QPOS set: addr=%x", tx.From[:8])
+						}
+					}
+				} else if n.validatorManager != nil && !n.validatorManager.IsValidator(tx.From) {
+					nodeLog.Warn("Staking tx has no public key, cannot register validator in ValidatorManager: addr=%x",
+						tx.From[:8])
 				}
 			}
 		}

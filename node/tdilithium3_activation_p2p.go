@@ -99,6 +99,18 @@ func assembleTDilithium3DKGActivationCertificate(
 	acknowledgements := make([]dilithium3v1.DKGActivationAcknowledgement, len(packets))
 	seen := make([]bool, len(packets))
 	for _, packet := range packets {
+		// R77-DIAG: before the strict session check, surface a stale/foreign
+		// envelope so a "belongs to another session" assembly failure shows the
+		// leaking packet's identity vs the current session. A retention of a
+		// prior activation epoch's acknowledgement (staggered members) is the
+		// committee-change signature.
+		if env, derr := protocol.DecodeEnvelope(packet); derr == nil {
+			if sessDigest, derr2 := session.Digest(); derr2 == nil &&
+				(env.SessionID != sessDigest || env.KeyGeneration != session.KeyGeneration || env.CommitteeVersion != session.Committee.Version) {
+				nodeLog.Warn("R77-DIAG assembly: stale/foreign envelope senderID=%d keyGen=%d(committeeV=%d) session=%x vs current keyGen=%d(committeeV=%d) session=%x",
+					env.SenderID, env.KeyGeneration, env.CommitteeVersion, env.SessionID[:4], session.KeyGeneration, session.Committee.Version, sessDigest[:4])
+			}
+		}
 		envelope, err := validateTDilithium3DKGStructure(p2p.MsgTypeTDilithium3DKGActivation, packet, session, nil)
 		if err != nil {
 			return empty, err

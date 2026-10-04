@@ -565,7 +565,14 @@ func TestTDilithium3DKGActivationExchangeNetwork(t *testing.T) {
 	}
 
 	for position, runner := range harness.runners {
-		runnerCtx, stop := context.WithTimeout(ctx, tdilithium3DKGActivationExchangeTimeout)
+		// Derive each node's exchange deadline from background, not from the
+		// shared pre-work ctx: the six exchanges run sequentially, and the
+		// combined randomness+group+exchange wall-clock exceeds the shared
+		// 120s pre-work budget, so a later node's deadline would already be
+		// expired when it starts and it would report a starved collection.
+		// The per-node 30-second window (and the test loop's matching
+		// deadline) still bounds each exchange independently.
+		runnerCtx, stop := context.WithTimeout(context.Background(), tdilithium3DKGActivationExchangeTimeout)
 		n := harness.nodes[position]
 
 		// Run the exchange in a goroutine so the test can deliver peer
@@ -587,30 +594,41 @@ func TestTDilithium3DKGActivationExchangeNetwork(t *testing.T) {
 			)
 		}()
 
-		// Let the exchange install its sink and enter the collection
-		// loop, then deliver the five peer envelopes directly to the
-		// sink via deliverTDilithium3DKGActivation (which bypasses
-		// handleTSSMessage and writes to the sink channel directly).
-		time.Sleep(200 * time.Millisecond)
-		for peer := range harness.nodes {
-			if peer == position {
-				continue
+		// Deliver peer envelopes directly to the sink via
+		// deliverTDilithium3DKGActivation (which bypasses handleTSSMessage
+		// and writes to the sink channel directly). The test's broadcast
+		// closure is a no-op, so the exchange's own per-second
+		// re-broadcasts never reach this node's sink; re-delivering the
+		// peer envelopes across the exchange window models P2P
+		// retransmission and keeps the test deterministic even when a
+		// node's sink installs after the first delivery. This mirrors the
+		// live pubsub retransmit path. The exchange's own packet is
+		// pre-seeded in its local map, so re-delivery is deduplicated by
+		// content and is a no-op.
+		redeliver := time.NewTicker(500 * time.Millisecond)
+		deadline := time.After(tdilithium3DKGActivationExchangeTimeout)
+		waitPosition:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					redeliver.Stop()
+					t.Fatalf("node %d activation exchange: %v", position, err)
+				}
+				break waitPosition
+			case <-redeliver.C:
+				for peer := range harness.nodes {
+					if peer == position {
+						continue
+					}
+					n.deliverTDilithium3DKGActivation(envelopes[peer])
+				}
+			case <-deadline:
+				redeliver.Stop()
+				t.Fatalf("node %d activation exchange deadline exceeded", position)
 			}
-			// Deliver each peer's pre-encoded envelope to this node's sink.
-			// The exchange's own packet is already pre-seeded in its local
-			// map, so delivering it again is a no-op (deduplicated by
-			// content).
-			n.deliverTDilithium3DKGActivation(envelopes[peer])
 		}
-
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("node %d activation exchange: %v", position, err)
-			}
-		case <-time.After(tdilithium3DKGActivationExchangeTimeout):
-			t.Fatalf("node %d activation exchange deadline exceeded", position)
-		}
+		redeliver.Stop()
 		stop()
 	}
 

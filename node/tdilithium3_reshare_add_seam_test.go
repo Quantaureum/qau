@@ -211,17 +211,20 @@ func TestTDilithium3ReshareAddAssemblesSameKeyShares(t *testing.T) {
 // TestTDilithium3ReshareAddSeamSignsUnderSameKey adds the five-of-seven
 // signing seam under the unchanged key.
 //
-// R77c open item: the add correction concentrates the joiner-group zero-sum
-// into one component with multiplicity binom(C-1, g)-1 = 19 (C=7). The
-// per-signer partial-norm bound scales correctly (R77b), but the R57 HRej
-// radius parameters were pinned for per-component eta=1 over C(6,3)=20
-// fresh groups, so a quorum hosting the correction group aborts with
-// overwhelming probability and the schedule exhausts its requests. Until
-// the signing parameter table gains the rotated row, this test is
-// time-gated rather than green-by-default.
+// R77c resolution (2026-10-05, spec section 7): the rotated signing row is
+// measured INFEASIBLE inside the mode3 envelope — the add correction
+// concentrates the joiner-group zero-sum into one component with
+// multiplicity binom(6,2)-1 = 14 (C=7), the bearer party's aggregate
+// coefficient mass is sqrt(25/7) = 1.89 times the fresh profile, and across
+// the exponent grid the required HRej ball either breaches the z-bound
+// headroom (P1=0.0002 at the pinned radii scale) or the hint channel
+// (Phint=0.119 at expo 7.2, J≈948 slots, ~7.2 MB wire per party) — past the
+// C=8 row that was already rejected as non-operational. The row stays
+// unpinned and this test gated; same-key add signing needs a distributed
+// (not concentrated) correction construction, not new parameters.
 func TestTDilithium3ReshareAddSeamSignsUnderSameKey(t *testing.T) {
 	if os.Getenv("QAU_ENABLE_R77C_SIGNING_ROW") != "1" {
-		t.Skip("R77c: add-shape correction multiplicity requires the rotated signing parameter row")
+		t.Skip("R77c: the rotated signing row is measured infeasible for the concentrated correction (spec section 7); a distributed correction construction is required")
 	}
 	fixture, rotated, newCommittee := tdilithium3ReshareAddRotatedShares(t)
 

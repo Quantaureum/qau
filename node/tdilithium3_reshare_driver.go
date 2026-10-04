@@ -3,6 +3,8 @@ package node
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
@@ -186,6 +188,32 @@ func (runner *tdilithium3ReshareRemoveRunner) Receive(delivery tdilithium3Reshar
 	runner.received[delivery.Delta.Target] = delivery.Delta
 	delete(runner.pending, delivery.Delta.Target)
 	return nil
+}
+
+// Pending reports how many fold deltas this member still awaits.
+func (runner *tdilithium3ReshareRemoveRunner) Pending() int { return len(runner.pending) }
+
+// PendingDetail renders the still-outstanding fold targets and the
+// new-coordinate position of each supplying anchor, for timeout diagnostics.
+// An empty pending set renders as "complete".
+func (runner *tdilithium3ReshareRemoveRunner) PendingDetail() string {
+	if len(runner.pending) == 0 {
+		return "complete"
+	}
+	anchorFor := map[dilithium3v1.RSSGroupMask]uint8{}
+	for _, fold := range runner.plan.FoldAssignments {
+		anchor := fold.AnchorPosition
+		if anchor > runner.plan.Leaver {
+			anchor--
+		}
+		anchorFor[fold.Target] = anchor
+	}
+	parts := make([]string, 0, len(runner.pending))
+	for target := range runner.pending {
+		parts = append(parts, fmt.Sprintf("%06b/anchor=%d", uint16(target), anchorFor[target]))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 // Ready reports whether every fold targeted at this member has arrived.

@@ -31,12 +31,13 @@ import (
 // ValidatorSet cannot supply this — it is mutable in-memory state whose
 // membership changes carry no epoch tag.
 //
-// This file captures the roster while processing blocks: at each epoch
-// boundary the node records the active validator set (address + Dilithium3
-// identity key, canonically ordered) together with that boundary block's hash
-// and a digest over (chain id, genesis hash, epoch, boundary hash, entries).
-// The record is persisted to a bounded sidecar so a restarted node serves the
-// same value.
+// This file captures the roster while processing blocks: once per epoch the
+// node records the active validator set (address + Dilithium3 identity key,
+// canonically ordered) together with the epoch's anchor block hash — the
+// boundary block itself, or, when the boundary slot was missed, the parent of
+// the epoch's first canonical block (the R101 rule) — and a digest over
+// (chain id, genesis hash, epoch, anchor hash, entries). The record is
+// persisted to a bounded sidecar so a restarted node serves the same value.
 //
 // This is not evidence. It gives no arbitration: a node that captured a wrong
 // roster cannot prove it wrong to a peer without replaying. It only guarantees
@@ -512,30 +513,71 @@ func (n *Node) tdilithium3DKGCurrentFinalizedEpoch() uint64 {
 
 // captureTDilithium3DKGEpochRosterFromBlock is the epoch-boundary hook. It is
 // called on every path that applies a block's side effects (local production,
-// sync import, live P2P import) and records the roster exactly at boundaries.
+// sync import, live P2P import) and records the roster once per epoch.
+//
+// Anchor rule — byte-compatible with the R101 epoch boundary root rule, which
+// handles the same missed-slot case for headers:
+//   - the boundary slot (slot % SlotsPerEpoch == 0) produced a block → the
+//     anchor is that block's own hash;
+//   - the boundary slot was missed → the anchor is the epoch's FIRST canonical
+//     block's parent hash (the chain tip at the epoch boundary), and the
+//     capture fires on that first block, not on the missing boundary block.
+//
+// The missed-slot branch is load-bearing, not cosmetic: the DKG/reshare session
+// derivation fails closed on a missing snapshot, and devnet acceptance runs
+// showed real devnets miss boundary slots regularly (proposer downtime), which
+// permanently bricked every rotation anchored on the uncaptured epoch. An epoch
+// whose slots were ALL missed is never captured — there is no canonical block
+// to anchor on — and sessions referencing it fail closed, identically on every
+// node.
 func (n *Node) captureTDilithium3DKGEpochRosterFromBlock(blk *encoding.Block) {
 	if n == nil || blk == nil || blk.Header == nil || !experimentalTDilithium3V1Enabled() {
 		return
 	}
 	header := blk.Header
-	if header.Slot == 0 || header.Slot%consensus.SlotsPerEpoch != 0 {
+	if header.Slot == 0 {
 		return
 	}
 	epoch := header.Slot / consensus.SlotsPerEpoch
 	if header.Epoch != epoch {
-		nodeLog.Warn("Dilithium3 DKG epoch roster: refusing boundary block %d with header epoch %d (slot-derived %d)",
+		nodeLog.Warn("Dilithium3 DKG epoch roster: refusing block %d with header epoch %d (slot-derived %d)",
 			header.Height, header.Epoch, epoch)
 		return
 	}
+	anchor := block.ComputeBlockHash(header)
+	if header.Slot%consensus.SlotsPerEpoch != 0 {
+		// Missed boundary slot: only the epoch's first canonical block may
+		// trigger the capture, anchored at the chain tip of the epoch boundary
+		// (its parent) so every node derives the same digest for the epoch.
+		if header.Height == 0 || n.blockStore == nil {
+			return
+		}
+		parent, err := n.blockStore.GetBlockByHeight(header.Height - 1)
+		if err != nil || parent == nil || parent.Header == nil {
+			nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: parent block %d unavailable: %v",
+				epoch, header.Height-1, err)
+			return
+		}
+		if parent.Header.Slot/consensus.SlotsPerEpoch >= epoch {
+			// Not the epoch's first canonical block (or a non-monotonic
+			// parent); a boundary block or an earlier first block owns this
+			// epoch's capture.
+			return
+		}
+		anchor = header.ParentHash
+	}
 	if n.blockProducer == nil {
+		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: no block producer", epoch)
 		return
 	}
 	qpos := n.blockProducer.QPOS()
 	if qpos == nil {
+		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: no QPOS engine", epoch)
 		return
 	}
 	set := qpos.GetValidatorSet()
 	if set == nil {
+		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: no validator set", epoch)
 		return
 	}
 	entries, err := tdilithium3DKGActiveRosterEntries(set.Validators())
@@ -544,15 +586,19 @@ func (n *Node) captureTDilithium3DKGEpochRosterFromBlock(blk *encoding.Block) {
 		return
 	}
 	if len(entries) == 0 {
+		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: active roster is empty", epoch)
 		return
 	}
 	store := n.tdilithium3DKGEpochRosterStoreForUse()
 	if store == nil {
 		return
 	}
-	if err := store.capture(epoch, block.ComputeBlockHash(header), entries, qpos.GetFinalizedEpoch()); err != nil {
+	if err := store.capture(epoch, anchor, entries, qpos.GetFinalizedEpoch()); err != nil {
 		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: %v", epoch, err)
+		return
 	}
+	nodeLog.Info("Dilithium3 DKG epoch roster: epoch %d captured (%d entries, anchor %s, block %d slot %d)",
+		epoch, len(entries), anchor.String(), header.Height, header.Slot)
 }
 
 // finalizedEpochValidatorRoster returns the captured roster of a finalized

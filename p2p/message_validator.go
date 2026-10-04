@@ -419,6 +419,7 @@ func NewMessageValidator() *MessageValidator {
 		MsgTypeTDilithium3DKGComplaint,
 		MsgTypeTDilithium3DKGContribution,
 		MsgTypeTDilithium3DKGActivation,
+		MsgTypeTDilithium3ReshareDelta,
 	} {
 		v.RegisterValidator(messageType, &tdilithium3DKGMessageValidator{messageType: messageType})
 	}

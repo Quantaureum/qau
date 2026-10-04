@@ -18,6 +18,7 @@ import (
 
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -37,6 +38,92 @@ var (
 	errTDilithium3ReshareTimeout = errors.New("Dilithium3 v1 reshare rotation timed out waiting for fold deltas")
 )
 
+// reshare-delta retention holds inbound delta envelopes that arrive while no
+// ceremony inbox is installed (committee members enter the rotation at
+// different block heights). The envelope's own signed session digest keys
+// retention, so a stale session can never satisfy a future inbox.
+
+// retainTDilithium3ReshareDelta stores one inbound reshare delta that no
+// admissible inbox consumed, keyed by the envelope's payload digest.
+func (n *Node) retainTDilithium3ReshareDelta(msg p2p.PeerMessage) {
+	if n == nil {
+		return
+	}
+	n.tdilithium3ResharePendingMu.Lock()
+	defer n.tdilithium3ResharePendingMu.Unlock()
+	if n.tdilithium3ResharePending == nil {
+		n.tdilithium3ResharePending = make(map[[32]byte]p2p.PeerMessage)
+	}
+	key := sha3.Sum256(append([]byte{msg.Type}, msg.Payload...))
+	if _, exists := n.tdilithium3ResharePending[key]; exists {
+		return
+	}
+	nodeLog.Warn("Dilithium3 v1 reshare delta retained (no admissible inbox), peer=%s: %s",
+		msg.From, pendingTDilithium3ReshareDeltaDiag(msg.Payload))
+	if len(n.tdilithium3ResharePending) >= 256 {
+		nodeLog.Warn("Dilithium3 v1 reshare delta retention full; dropping the oldest delta is not safe, refusing new delta")
+		return
+	}
+	n.tdilithium3ResharePending[key] = p2p.PeerMessage{From: msg.From, Type: msg.Type, Payload: append([]byte(nil), msg.Payload...)}
+}
+
+// pendingTDilithium3ReshareSessions returns the retained envelope session
+// digest of a raw payload, or false if the packet does not parse.
+func pendingTDilithium3ReshareSession(payload []byte) ([32]byte, bool) {
+	envelope, err := protocol.DecodeEnvelope(payload)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	wire, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return wire.SessionDigest, true
+}
+
+// pendingTDilithium3ReshareDeltaDiag renders one retained envelope as a short
+// diagnostic string for retention logging. Best effort: unparsable payloads
+// are reported as such rather than failing the retain.
+func pendingTDilithium3ReshareDeltaDiag(payload []byte) string {
+	envelope, err := protocol.DecodeEnvelope(payload)
+	if err != nil {
+		return "unparsable envelope: " + err.Error()
+	}
+	wire, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+	if err != nil {
+		return "unparsable delta wire: " + err.Error()
+	}
+	return fmt.Sprintf("session=%x anchor=%d recipient=%d target=%06b kind=%d",
+		wire.SessionDigest[:4], wire.AnchorPosition, wire.RecipientPosition,
+		uint16(wire.TargetGroup), wire.Kind)
+}
+
+// replayTDilithium3ReshareDeltas feeds every retained reshare delta matching
+// the session digest back through the installed inbox (identity checks and
+// replay dedup run inside accept).
+func (inbox *tdilithium3DKGInbox) replayTDilithium3ReshareDeltas(n *Node, sessionDigest [32]byte) {
+	if inbox == nil || n == nil {
+		return
+	}
+	n.tdilithium3ResharePendingMu.Lock()
+	msgs := make([]p2p.PeerMessage, 0, len(n.tdilithium3ResharePending))
+	for key, msg := range n.tdilithium3ResharePending {
+		if digest, ok := pendingTDilithium3ReshareSession(msg.Payload); ok && digest == sessionDigest {
+			msgs = append(msgs, msg)
+			delete(n.tdilithium3ResharePending, key)
+		}
+	}
+	n.tdilithium3ResharePendingMu.Unlock()
+	if len(msgs) > 0 {
+		nodeLog.Info("Dilithium3 v1 reshare rotation: replaying %d retained fold delta(s) into session %x", len(msgs), sessionDigest[:8])
+	}
+	for _, msg := range msgs {
+		if err := inbox.accept(msg); err != nil {
+			nodeLog.Debug("reshare fold delta replay rejected: %v", err)
+		}
+	}
+}
+
 // tdilithium3ReshareRemoveConfig carries the ceremony's explicit inputs so
 // the in-process choreography tests drive exactly the production path.
 type tdilithium3ReshareRemoveConfig struct {
@@ -44,6 +131,7 @@ type tdilithium3ReshareRemoveConfig struct {
 	Position         uint8                    // this node's position in the NEW committee
 	RosterEpoch      uint64                   // roster epoch the session is anchored on
 	OldShare         *dilithium3v1.LocalShare // active share of the previous committee
+	Plan             *dilithium3v1.ReshareRotationPlan // address-derived plan from the probe; nil recomputes by committees
 	Store            *thresholdShareStore     // candidate + activation persistence
 	Password         []byte                   // share-store password
 	PeerForValidator func(types.Address) (p2p.PeerID, bool)
@@ -83,9 +171,17 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	if err := config.Session.Validate(); err != nil {
 		return publicKey, err
 	}
-	plan, err := tdilithium3ReshareRotationFor(config.OldShare.Committee, config.Session.Committee)
-	if err != nil {
-		return publicKey, err
+	// The caller (tryTDilithium3ReshareRemoveRotation) derives the plan by
+	// address intersection of the old and new rosters and passes it through:
+	// participant ids are renumbered by committee, so committee-based plan
+	// reconstruction can disagree across nodes.
+	plan := config.Plan
+	if plan == nil {
+		var planErr error
+		plan, planErr = tdilithium3ReshareRotationFor(config.OldShare.Committee, config.Session.Committee)
+		if planErr != nil {
+			return publicKey, planErr
+		}
 	}
 	if plan == nil || !plan.HasLeaver {
 		return publicKey, fmt.Errorf("%w: committee pair is not a remove rotation", errTDilithium3ReshareNotApplicable)
@@ -116,6 +212,7 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	}
 	n.installTDilithium3DKGInbox(inbox)
 	defer n.installTDilithium3DKGInbox(nil)
+	inbox.replayTDilithium3ReshareDeltas(n, sessionDigest)
 
 	runner, err := newTDilithium3ReshareRemoveRunner(plan, config.OldShare, config.Session.Committee, transcriptDigest)
 	if err != nil {
@@ -126,6 +223,7 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	// the wire is the SENDER's new-committee position (the delivery list
 	// contains only this member's own anchor duties), which the inbox checks
 	// against the envelope's committee position.
+	sent := 0
 	for _, delivery := range runner.OutgoingDeltas() {
 		wire := dilithium3v1.ReshareDeltaWire{
 			SessionDigest:     sessionDigest,
@@ -146,10 +244,19 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 		if err != nil {
 			return publicKey, err
 		}
-		if err := config.SendPrivate(p2p.MsgTypeTDilithium3ReshareDelta, delivery.RecipientPosition, encoded); err != nil {
-			return publicKey, fmt.Errorf("reshare delta to position %d: %w", delivery.RecipientPosition, err)
+		// Broadcast rather than direct-send: the envelope's RecipientPosition
+		// and the signed-anchor identity are verified at the inbox, so peers
+		// not named by the delta simply discard it. The TSS broadcast path is
+		// the same one the DKG randomness/commitment rounds use, which the
+		// point-to-point SendTSSToPeer routing does not traverse.
+		if err := config.Broadcast(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
+			return publicKey, fmt.Errorf("reshare delta broadcast for position %d: %w", delivery.RecipientPosition, err)
 		}
+		sent++
+		nodeLog.Info("reshare delta sent: anchor=%d -> recipient=%d target=%06b", config.Position, delivery.RecipientPosition, uint16(delivery.Delta.Target))
 	}
+	nodeLog.Info("Dilithium3 v1 reshare rotation: published %d fold delta(s), awaiting %d more (activation epoch %d, session %x, missing: %s)",
+		sent, runner.Pending(), config.Session.ActivationEpoch, sessionDigest[:8], runner.PendingDetail())
 
 	// Collect addressed deltas until the runner is complete.
 	deadline := time.NewTimer(tdilithium3ReshareRoundTimeout)
@@ -158,6 +265,8 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 		var message tdilithium3DKGVerifiedMessage
 		select {
 		case <-deadline.C:
+			nodeLog.Warn("Dilithium3 v1 reshare rotation: delivery window elapsed, missing deltas (session %x, activation epoch %d): %s",
+				sessionDigest[:8], config.Session.ActivationEpoch, runner.PendingDetail())
 			return publicKey, errTDilithium3ReshareTimeout
 		case <-ctx.Done():
 			return publicKey, ctx.Err()
@@ -183,6 +292,9 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 			},
 		}); err != nil {
 			nodeLog.Debug("reshare fold delta rejected: %v", err)
+		} else {
+			nodeLog.Info("reshare fold delta accepted (target %06b, pending %d, session %x)",
+				uint16(wire.TargetGroup), runner.Pending(), sessionDigest[:8])
 		}
 	}
 
@@ -191,14 +303,54 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 		return publicKey, err
 	}
 	defer rotatedShare.Zeroize()
+	// Align the rotated share's identity fields with the rotation session:
+	// the store's candidate/ledger invariants and the activation exchange's
+	// share-vs-session check all require generation, activation epoch, and
+	// committee version to equal the session's values.
+	//
+	// The session id (Committee canonical digest) is part of the share's
+	// canonical encoding, so every aligned field is re-encoded BEFORE the
+	// share is verified and stored: re-encode, re-validate, store.
+	rotatedShare.Key.Generation = config.Session.KeyGeneration
+	rotatedShare.ActivationEpoch = config.Session.ActivationEpoch
+	rotatedShare.Committee.Version = config.Session.Committee.Version
+	encodedShare, err := rotatedShare.MarshalBinary()
+	if err != nil {
+		return publicKey, fmt.Errorf("reshare rotation share encoding: %w", err)
+	}
+	canonical, err := dilithium3v1.UnmarshalLocalShare(encodedShare)
+	if err != nil {
+		return publicKey, fmt.Errorf("reshare rotation share decode: %w", err)
+	}
+	if err := canonical.Validate(); err != nil {
+		return publicKey, fmt.Errorf("reshare rotation share validation: %w", err)
+	}
+	*rotatedShare = *canonical
 	if err := config.Store.Store(rotatedShare, config.Password); err != nil {
 		return publicKey, err
 	}
 	copy(publicKey[:], rotatedShare.Key.PublicKey)
 
+	// Adoption short-circuit: a faster peer's exchange may have gossiped the
+	// activation certificate already; the share store is the source of truth.
+	if activeEpoch, activeKey, activeThreshold, activeErr := config.Store.ActiveSharePublicIdentity(config.Password); activeErr == nil && activeEpoch == config.Session.ActivationEpoch {
+		nodeLog.Info("Dilithium3 v1 reshare rotation: active share already adopted for epoch %d (group key prefix %x); skipping activation exchange",
+			config.Session.ActivationEpoch, activeKey[:4])
+		if err := n.registerTDilithium3SigningFinalitySigner(config.Session.ActivationEpoch, activeKey, int(activeThreshold)); err != nil {
+			nodeLog.Warn("Dilithium3 v1 reshare finality surface registration deferred (adopted path): %v", err)
+		}
+		copy(publicKey[:], activeKey)
+		nodeLog.Info("Dilithium3 v1 reshare rotation completed (activation epoch %d, session digest %x, transcript %x, group key prefix %x, committee size %d)",
+			config.Session.ActivationEpoch, sessionDigest[:8], transcriptDigest[:8], publicKey[:4], len(config.Session.Committee.Participants))
+		return publicKey, nil
+	}
+
 	// Activation exchange identical to the fresh-key ceremony's: unanimous
 	// signed acknowledgements, certificate assembly, adopt-and-gossip.
-	activationContext, cancelActivation := context.WithTimeout(ctx, tdilithium3DKGActivationExchangeTimeout)
+	// Rotation members start their ceremonies at staggered times (their
+	// per-slot produce loops retry independently), so the exchange gets a
+	// wider window than the fresh-key ceremony's single round.
+	activationContext, cancelActivation := context.WithTimeout(ctx, 4*tdilithium3DKGActivationExchangeTimeout)
 	exchangeErr := n.runTDilithium3ActivationExchange(
 		activationContext, config.Session, rotatedShare, config.Store, config.Password,
 		inbox.verifyIdentity, config.Sign, config.Broadcast,

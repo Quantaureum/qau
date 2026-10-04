@@ -3,6 +3,7 @@ package node
 
 import (
 	"bytes"
+	"crypto/sha3"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +63,80 @@ func decodeThresholdActivationCertificate(encoded []byte) (dilithium3v1.DKGActiv
 	return record.Certificate, nil
 }
 
+// R77-DIAG: break down a threshold-activation verification failure into the
+// single byte-level check that actually fails. A committee-change JOIN leaves
+// a straggler unable to adopt or self-commit a certificate, and the opaque
+// "invalid Dilithium3 v1 DKG activation certificate" sentinel does not say
+// which of (per-ack signature / position / participant id / activation epoch /
+// transcript / key digest / committee digest / candidate digest) is broken;
+// this logs each one so a devnet stall is attributed to one cause.
+//
+// `stored` is the on-disk candidate share ActivateCandidate verifies against;
+// it is nil when the pure per-ack verification (certificate.Verify) is being
+// diagnosed before the disk share is loaded.
+func diagnoseTDilithium3ActivationCertificate(
+	caller string,
+	certificate dilithium3v1.DKGActivationCertificate,
+	stored *dilithium3v1.LocalShare,
+	sessionDigest [32]byte,
+	verifier dilithium3v1.DKGIdentityVerifier,
+) {
+	// R77-DIAG: structural + ordering + signature view, logged unconditionally
+	// (even when stored is nil on the verify-failed path) so a committee-change
+	// JOIN that leaves a straggler unable to adopt a peer's certificate shows
+	// exactly which check and which participant id diverges. A cert is only
+	// admissible when it is internally consistent (each ack at index i carries
+	// Committee.Participants[i]) AND every signature verifies against the
+	// local roster-bound verifier.
+	if len(certificate.Acknowledgements) > 0 {
+		first := certificate.Acknowledgements[0]
+		nodeLog.Warn("R77-DIAG activation [%s] nacks=%d threshold=%d nParticipants=%d storedNil=%v sessionDigest=%x certSession=%x",
+			caller, len(certificate.Acknowledgements), int(first.Committee.Threshold), len(first.Committee.Participants), stored == nil, sessionDigest[:4], first.SessionDigest[:4])
+		for i, ack := range certificate.Acknowledgements {
+			var wantID uint32
+			if i < len(first.Committee.Participants) {
+				wantID = first.Committee.Participants[i]
+			}
+			sigOK := ack.Verify(verifier) == nil
+			nodeLog.Warn("R77-DIAG activation [%s] ack[%d] gotID=%d wantID=%d orderingOK=%v sigOK=%v epoch=%d transcript=%x",
+				caller, i, ack.ParticipantID, wantID, ack.ParticipantID == wantID, sigOK, ack.ActivationEpoch, ack.TranscriptDigest[:4])
+		}
+	}
+	if stored == nil {
+		return
+	}
+	if err := stored.Validate(); err != nil {
+		nodeLog.Warn("R77-DIAG activation [%s] stored share.Validate: %v", caller, err)
+		return
+	}
+	if int(stored.ParticipantPosition) >= len(certificate.Acknowledgements) {
+		nodeLog.Warn("R77-DIAG activation [%s] stored.ParticipantPosition=%d out of range for %d acks",
+			caller, stored.ParticipantPosition, len(certificate.Acknowledgements))
+		return
+	}
+	ack := certificate.Acknowledgements[stored.ParticipantPosition]
+	nodeLog.Warn("R77-DIAG activation [%s] stored(pos=%d id=%d epoch=%d transcript=%x pub=%x) ackAtPos(id=%d epoch=%d transcript=%x cand=%x session=%x)",
+		caller,
+		stored.ParticipantPosition, stored.ParticipantID, stored.ActivationEpoch, stored.TranscriptDigest[:4], stored.Key.PublicKey[:4],
+		ack.ParticipantID, ack.ActivationEpoch, ack.TranscriptDigest[:4], ack.CandidateDigest[:4], sessionDigest[:4])
+	if encoded, err := stored.MarshalBinary(); err == nil {
+		digest := sha3.Sum256(encoded)
+		ackKey, _ := ack.Key.CanonicalDigest()
+		stKey, _ := stored.Key.CanonicalDigest()
+		ackCommittee, _ := ack.Committee.CanonicalDigest()
+		stCommittee, _ := stored.Committee.CanonicalDigest()
+		nodeLog.Warn("R77-DIAG activation [%s] check: participantID=%v activationEpoch=%v transcript=%v candidateDigest=%v keyDigest=%v committeeDigest=%v sessionDigest=%v",
+			caller,
+			ack.ParticipantID == stored.ParticipantID,
+			ack.ActivationEpoch == stored.ActivationEpoch,
+			ack.TranscriptDigest == stored.TranscriptDigest,
+			digest == ack.CandidateDigest,
+			ackKey == stKey,
+			ackCommittee == stCommittee,
+			ack.SessionDigest == sessionDigest)
+	}
+}
+
 func (store *thresholdShareStore) ActivateCandidate(
 	certificate dilithium3v1.DKGActivationCertificate,
 	sessionDigest [32]byte,
@@ -73,6 +148,7 @@ func (store *thresholdShareStore) ActivateCandidate(
 		return fmt.Errorf("threshold activation is not configured")
 	}
 	if err := certificate.Verify(verifier); err != nil {
+		diagnoseTDilithium3ActivationCertificate("verify-failed", certificate, nil, sessionDigest, verifier)
 		return err
 	}
 	first := certificate.Acknowledgements[0]
@@ -109,6 +185,7 @@ func (store *thresholdShareStore) ActivateCandidate(
 	}
 	defer stored.Zeroize()
 	if err := certificate.VerifyCandidate(stored, sessionDigest, verifier); err != nil {
+		diagnoseTDilithium3ActivationCertificate("verifyCandidate-failed", certificate, stored, sessionDigest, verifier)
 		return err
 	}
 	paths, err = newThresholdProtocolPaths(store.basePath, candidate.Protocol, candidate.Key.Generation, candidate.Committee.Version, candidate.ParticipantID)
@@ -131,8 +208,12 @@ func (store *thresholdShareStore) ActivateCandidate(
 			return err
 		}
 		defer previous.Zeroize()
-		if previous.ParticipantID != candidate.ParticipantID ||
-			previous.Key.Generation > candidate.Key.Generation ||
+		// The participant id is not part of the identity check: R76/R77
+		// committee churn renumbers surviving validators (roster-position ids),
+		// so a legitimate rotation candidate can carry a new participant id.
+		// What stays forbidden: generation or committee-version rollback, an
+		// in-generation group-key change, and an equal-version byte conflict.
+		if previous.Key.Generation > candidate.Key.Generation ||
 			(previous.Key.Generation == candidate.Key.Generation &&
 				(previous.Committee.Version > candidate.Committee.Version ||
 					!bytes.Equal(previous.Key.PublicKey, candidate.Key.PublicKey) ||
@@ -155,8 +236,37 @@ func (store *thresholdShareStore) ActivateCandidate(
 		return err
 	}
 	if certificateExists {
-		if err := previousCertificate.Verify(verifier); err != nil {
-			return err
+		// R77-DIAG: a certificate is already persisted for this candidate path.
+		// If it belongs to an earlier (stale) session the re-verification below
+		// rejects the incoming adoption; compare the two up front so a devnet
+		// JOIN stall names the divergence instead of returning a bare sentinel.
+		if len(certificate.Acknowledgements) > 0 && len(previousCertificate.Acknowledgements) > 0 {
+			nodeLog.Warn("R77-DIAG activation stored-cert present: stored(ackEpoch=%d session=%x nacks=%d pub=%x) vs incoming(session=%x nacks=%d)",
+				previousCertificate.Acknowledgements[0].ActivationEpoch,
+				previousCertificate.Acknowledgements[0].SessionDigest[:4], len(previousCertificate.Acknowledgements),
+				previousCertificate.Acknowledgements[0].Key.PublicKey[:4],
+				certificate.Acknowledgements[0].SessionDigest[:4], len(certificate.Acknowledgements))
+		}
+		// The stored certificate was verified against ITS OWN session when it
+		// was written. Re-verifying it against the CURRENT roster-bound verifier
+		// cannot survive committee churn: participant ids are roster-position-
+		// derived (R76/R77), so after any membership change the old acks verify
+		// only against the OLD committee's bindings — which the store does not
+		// keep. Gate the re-verification on an unchanged committee; a churned
+		// committee relies on the epoch-monotonicity and lineage checks below.
+		sameCommittee := false
+		if len(previousCertificate.Acknowledgements) > 0 && len(certificate.Acknowledgements) > 0 {
+			previousCommitteeDigest, previousErr := previousCertificate.Acknowledgements[0].Committee.CanonicalDigest()
+			incomingCommitteeDigest, incomingErr := certificate.Acknowledgements[0].Committee.CanonicalDigest()
+			sameCommittee = previousErr == nil && incomingErr == nil && previousCommitteeDigest == incomingCommitteeDigest
+		}
+		if sameCommittee {
+			if err := previousCertificate.Verify(verifier); err != nil {
+				diagnoseTDilithium3ActivationCertificate("storedCert-verify-failed", previousCertificate, nil, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
+				return err
+			}
+		} else {
+			nodeLog.Info("Dilithium3 v1 activation: stored certificate belongs to a previous committee; skipping signature re-verification (lineage checks below still apply)")
 		}
 		previousEncoding, err := encodeThresholdActivationCertificate(previousCertificate)
 		if err != nil {
@@ -166,14 +276,19 @@ func (store *thresholdShareStore) ActivateCandidate(
 			if previousCertificate.Acknowledgements[0].ActivationEpoch >= currentEpoch || !ledgerExists {
 				return fmt.Errorf("conflicting threshold activation certificate")
 			}
-			previousShare, err := dilithium3v1.UnmarshalLocalShare(ledger)
-			if err != nil {
-				return err
-			}
-			previousErr := previousCertificate.VerifyCandidate(previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
-			previousShare.Zeroize()
-			if previousErr != nil {
-				return previousErr
+			if sameCommittee {
+				previousShare, err := dilithium3v1.UnmarshalLocalShare(ledger)
+				if err != nil {
+					return err
+				}
+				previousErr := previousCertificate.VerifyCandidate(previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
+				if previousErr != nil {
+					diagnoseTDilithium3ActivationCertificate("storedCert-candidate-failed", previousCertificate, previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
+				}
+				previousShare.Zeroize()
+				if previousErr != nil {
+					return previousErr
+				}
 			}
 		}
 	}

@@ -547,10 +547,17 @@ Option 2 is implemented in the node layer (`node/tdilithium3_dkg_epoch_roster.go
 and the consumer helpers in `node/tdilithium3_dkg_validator_snapshot.go`):
 
 - **Capture.** The hook runs on every path that applies a block's side effects —
-  local production, sync import, and live P2P import. It acts only on a block
-  whose slot is a non-zero multiple of `SlotsPerEpoch` and whose header epoch
-  equals `slot/SlotsPerEpoch`; any other block is ignored before the sidecar is
-  touched.
+  local production, sync import, and live P2P import. It records one roster per
+  epoch. The boundary block (slot a non-zero multiple of `SlotsPerEpoch`, header
+  epoch equal to `slot/SlotsPerEpoch`) captures with its own block hash as the
+  anchor. When the boundary slot was missed, the epoch's FIRST canonical block
+  captures instead and the anchor is that block's parent hash — the chain tip at
+  the epoch boundary, byte-compatible with the R101 epoch-boundary-root rule
+  (devnet evidence: without this rule a missed boundary slot permanently
+  bricked every session anchored on the uncaptured epoch; see the R77 spec,
+  section 6). An epoch whose slots were ALL missed has no canonical block to
+  anchor on, stays uncaptured, and sessions referencing it fail closed
+  identically on every node.
 - **Content.** The captured roster is the active validator set projected to
   `(address, Dilithium3 identity key)` pairs, then sorted by address so insertion
   order cannot change the digest. An inactive validator, an empty or duplicate

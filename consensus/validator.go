@@ -931,6 +931,46 @@ func (q *QPOS) RemoveStakingValidator(addr types.Address) bool {
 	return removed
 }
 
+// AttachValidatorPublicKey records the base Dilithium3 identity key for a
+// validator that joined through the staking-tx path (which carries the key
+// in the transaction itself, mirroring the genesis-validator flow where the
+// public key is part of the genesis allocation). R76 follow-up: without this
+// the epoch roster builder (tdilithium3DKGActiveRosterEntries) fails closed
+// with "no usable Dilithium3 identity key" as soon as such a validator is
+// active, which would stall every committee ceremony from then on.
+//
+// The key is attached only when it is a well-formed Dilithium3 public key
+// and is attached at most once: a later stake (top-up) from the same account
+// cannot silently re-key a validator. A mismatching key is ignored rather
+// than failing, because staking execution is already consensus-final by the
+// time this hook runs (post-block sync) and keeping SetActive parity across
+// nodes matters more than flagging a malformed optional attachment.
+func (q *QPOS) AttachValidatorPublicKey(addr types.Address, pubKey []byte) bool {
+	if q == nil {
+		return false
+	}
+	if len(pubKey) != crypto.Dilithium3PublicKeySize {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.validators == nil {
+		return false
+	}
+	validator, ok := q.validators.validatorMap[addr]
+	if !ok || validator == nil {
+		return false
+	}
+	if len(validator.PublicKeyBytes) != 0 {
+		// Existing key wins; runtime keys are immutable once bound.
+		return false
+	}
+	keyCopy := make([]byte, len(pubKey))
+	copy(keyCopy, pubKey)
+	validator.PublicKeyBytes = keyCopy
+	return true
+}
+
 // validatorsCapExceeded is the single source of truth for the
 // R39-P1-03 MaxValidators invariant. It is a package-level helper (rather
 // than inlined) so the regression test can pin the boundary directly

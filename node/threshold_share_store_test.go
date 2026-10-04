@@ -281,6 +281,133 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	}
 }
 
+// testThresholdStoreShareWithCommittee is testThresholdStoreShare generalized
+// over the committee: the share's identity fields and RSS components are
+// rebuilt for the given committee membership so the result stays
+// Validate()-clean under a renumbered participant.
+func testThresholdStoreShareWithCommittee(t *testing.T, generation uint64, participantID uint32, participants []uint32) *dilithium3v1.LocalShare {
+	t.Helper()
+	share := testThresholdStoreShare(t, generation)
+	share.Committee.Participants = append([]uint32(nil), participants...)
+	share.Committee.Threshold = protocol.Dilithium3V1ThresholdFor(uint32(len(participants)))
+	position := -1
+	for index, id := range participants {
+		if id == participantID {
+			position = index
+			break
+		}
+	}
+	if position < 0 {
+		t.Fatalf("participant %d is not in committee %v", participantID, participants)
+	}
+	share.ParticipantID = participantID
+	share.ParticipantPosition = uint8(position)
+	groups, err := dilithium3v1.GroupsForPositionN(uint8(position), len(participants))
+	if err != nil {
+		t.Fatal(err)
+	}
+	share.Components = make([]dilithium3v1.RSSComponent, len(groups))
+	for index, group := range groups {
+		dealer, err := group.Leader(uint8(index % 3))
+		if err != nil {
+			t.Fatal(err)
+		}
+		coefficient := dilithium3v1.Coefficient(generation + uint64(index) + 1)
+		share.Components[index] = dilithium3v1.RSSComponent{
+			GroupMask:          group,
+			DealerPosition:     dealer,
+			ContributionDigest: [32]byte{byte(generation), byte(index + 1), byte(group)},
+			Multiplicity:       1,
+		}
+		share.Components[index].S1[0][0] = coefficient
+		share.Components[index].S2[0][0] = dilithium3v1.Q - coefficient
+	}
+	if err := share.Validate(); err != nil {
+		t.Fatalf("fixture share is not valid: %v", err)
+	}
+	return share
+}
+
+// TestThresholdShareStoreRenumbersParticipantOnCommitteeChurn pins the R77
+// rule: participant ids are roster-position-derived, so a membership change
+// in front of a survivor in the canonical order shifts its numeric id. Two
+// admissible renumberings must both stage: a fresh-key ceremony (generation
+// increase) and a same-key rotation (same generation, committee version bump,
+// unchanged group key). Same-version conflicts and in-generation key changes
+// must still fail closed.
+func TestThresholdShareStoreRenumbersParticipantOnCommitteeChurn(t *testing.T) {
+	password := []byte("DEVNET ONLY renumbered rotation password")
+
+	t.Run("fresh-key rekey accepts a renumbered participant", func(t *testing.T) {
+		store := newThresholdShareStore(filepath.Join(t.TempDir(), "shares.enc"))
+		current := testThresholdStoreShare(t, 2)
+		if err := store.Store(current, password); err != nil {
+			t.Fatal(err)
+		}
+		// A seventh validator joined in front of this node's roster position:
+		// id 3 -> 4 under the seven-member committee.
+		rekeyed := testThresholdStoreShareWithCommittee(t, 3, 4, []uint32{1, 2, 3, 4, 5, 6, 7})
+		rekeyed.ActivationEpoch = current.ActivationEpoch + 1
+		if err := store.Store(rekeyed, password); err != nil {
+			t.Fatalf("fresh-key rekey with a renumbered participant was refused: %v", err)
+		}
+	})
+
+	t.Run("same-key rotation accepts a renumbered participant", func(t *testing.T) {
+		store := newThresholdShareStore(filepath.Join(t.TempDir(), "shares.enc"))
+		// Seven-member committee; this node is id 4 (position 3).
+		current := testThresholdStoreShareWithCommittee(t, 2, 4, []uint32{1, 2, 3, 4, 5, 6, 7})
+		if err := store.Store(current, password); err != nil {
+			t.Fatal(err)
+		}
+		// Participant 2 left; this node renumbers 4 -> 3 in the six-member
+		// rotated committee, same generation, version bump, same group key.
+		rotated := testThresholdStoreShareWithCommittee(t, current.Key.Generation, 3, []uint32{1, 3, 4, 5, 6, 7})
+		rotated.Committee.Version = current.Committee.Version + 1
+		rotated.ActivationEpoch = current.ActivationEpoch + 1
+		rotated.TranscriptDigest = current.TranscriptDigest
+		if err := store.Store(rotated, password); err != nil {
+			t.Fatalf("same-key rotation with a renumbered participant was refused: %v", err)
+		}
+		loaded, err := store.LoadCandidate(rotated.Key.Generation, rotated.ParticipantID, password)
+		if err != nil {
+			t.Fatalf("load renumbered rotated candidate: %v", err)
+		}
+		if loaded.Committee.Version != rotated.Committee.Version || loaded.Key.Generation != current.Key.Generation {
+			t.Fatal("rotated candidate changed the key identity")
+		}
+		loaded.Zeroize()
+	})
+
+	t.Run("in-generation guards still refuse conflicts and key changes", func(t *testing.T) {
+		store := newThresholdShareStore(filepath.Join(t.TempDir(), "shares.enc"))
+		current := testThresholdStoreShare(t, 2)
+		if err := store.Store(current, password); err != nil {
+			t.Fatal(err)
+		}
+		conflict := current.Clone()
+		conflict.TranscriptDigest[0] ^= 1
+		if err := store.Store(conflict, password); err == nil {
+			t.Fatal("same-version conflicting write was accepted")
+		}
+		renumberedConflict := testThresholdStoreShareWithCommittee(t, current.Key.Generation, 4, []uint32{1, 2, 3, 4, 5, 6, 7})
+		if err := store.Store(renumberedConflict, password); err == nil {
+			t.Fatal("same-version renumbered write was accepted")
+		}
+		keyChange := current.Clone()
+		keyChange.Committee.Version++
+		keyChange.Key.PublicKey[0] ^= 1
+		if err := store.Store(keyChange, password); err == nil {
+			t.Fatal("in-generation group key change was accepted")
+		}
+		generationRollback := current.Clone()
+		generationRollback.Key.Generation = 1
+		if err := store.Store(generationRollback, password); err == nil {
+			t.Fatal("generation rollback was accepted")
+		}
+	})
+}
+
 func TestThresholdShareStoreStagesSameKeyCommitteeRotation(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "shares.enc")
 	store := newThresholdShareStore(base)

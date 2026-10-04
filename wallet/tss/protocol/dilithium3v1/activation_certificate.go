@@ -81,13 +81,19 @@ func (acknowledgement DKGActivationAcknowledgement) validateUnsigned() error {
 }
 
 func (acknowledgement DKGActivationAcknowledgement) Verify(verifier DKGIdentityVerifier) error {
-	if verifier == nil || len(acknowledgement.IdentitySignature) == 0 ||
+	if verifier == nil {
+		return fmt.Errorf("%w: no identity verifier", ErrInvalidDKGActivationCertificate)
+	}
+	if len(acknowledgement.IdentitySignature) == 0 ||
 		len(acknowledgement.IdentitySignature) > protocol.MaxThresholdIdentitySignature {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: identity signature length %d", ErrInvalidDKGActivationCertificate, len(acknowledgement.IdentitySignature))
 	}
 	message, err := acknowledgement.SigningBytes()
-	if err != nil || !verifier(acknowledgement.ParticipantID, message, acknowledgement.IdentitySignature) {
-		return ErrInvalidDKGActivationCertificate
+	if err != nil {
+		return fmt.Errorf("%w: signing bytes: %v", ErrInvalidDKGActivationCertificate, err)
+	}
+	if !verifier(acknowledgement.ParticipantID, message, acknowledgement.IdentitySignature) {
+		return fmt.Errorf("%w: identity signature does not verify for participant %d", ErrInvalidDKGActivationCertificate, acknowledgement.ParticipantID)
 	}
 	return nil
 }
@@ -108,81 +114,120 @@ func (certificate DKGActivationCertificate) Verify(verifier DKGIdentityVerifier)
 }
 
 func (certificate DKGActivationCertificate) VerifyCandidate(share *LocalShare, sessionDigest [32]byte, verifier DKGIdentityVerifier) error {
-	if sessionDigest == ([32]byte{}) || share == nil || share.Validate() != nil {
-		return ErrInvalidDKGActivationCertificate
+	if sessionDigest == ([32]byte{}) {
+		return fmt.Errorf("%w: empty session digest", ErrInvalidDKGActivationCertificate)
+	}
+	if share == nil || share.Validate() != nil {
+		return fmt.Errorf("%w: local share invalid", ErrInvalidDKGActivationCertificate)
 	}
 	if err := certificate.Verify(verifier); err != nil {
 		return err
 	}
+	if int(share.ParticipantPosition) >= len(certificate.Acknowledgements) {
+		return fmt.Errorf("%w: share position %d outside %d acknowledgements",
+			ErrInvalidDKGActivationCertificate, share.ParticipantPosition, len(certificate.Acknowledgements))
+	}
 	acknowledgement := certificate.Acknowledgements[share.ParticipantPosition]
 	shareKeyDigest, err := share.Key.CanonicalDigest()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: share key digest: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	certificateKeyDigest, err := acknowledgement.Key.CanonicalDigest()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: certificate key digest: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	shareCommitteeDigest, err := share.Committee.CanonicalDigest()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: share committee digest: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	certificateCommitteeDigest, err := acknowledgement.Committee.CanonicalDigest()
-	if err != nil || acknowledgement.SessionDigest != sessionDigest ||
-		acknowledgement.ParticipantID != share.ParticipantID ||
-		acknowledgement.ActivationEpoch != share.ActivationEpoch ||
-		acknowledgement.TranscriptDigest != share.TranscriptDigest ||
-		certificateKeyDigest != shareKeyDigest || certificateCommitteeDigest != shareCommitteeDigest {
-		return ErrInvalidDKGActivationCertificate
+	if err != nil {
+		return fmt.Errorf("%w: certificate committee digest: %v", ErrInvalidDKGActivationCertificate, err)
+	}
+	switch {
+	case acknowledgement.SessionDigest != sessionDigest:
+		return fmt.Errorf("%w: acknowledgement session %x != %x",
+			ErrInvalidDKGActivationCertificate, acknowledgement.SessionDigest[:8], sessionDigest[:8])
+	case acknowledgement.ParticipantID != share.ParticipantID:
+		return fmt.Errorf("%w: acknowledgement participant %d != share participant %d",
+			ErrInvalidDKGActivationCertificate, acknowledgement.ParticipantID, share.ParticipantID)
+	case acknowledgement.ActivationEpoch != share.ActivationEpoch:
+		return fmt.Errorf("%w: acknowledgement epoch %d != share epoch %d",
+			ErrInvalidDKGActivationCertificate, acknowledgement.ActivationEpoch, share.ActivationEpoch)
+	case acknowledgement.TranscriptDigest != share.TranscriptDigest:
+		return fmt.Errorf("%w: acknowledgement transcript %x != share transcript %x",
+			ErrInvalidDKGActivationCertificate, acknowledgement.TranscriptDigest[:8], share.TranscriptDigest[:8])
+	case certificateKeyDigest != shareKeyDigest:
+		return fmt.Errorf("%w: certificate key digest differs from the share's", ErrInvalidDKGActivationCertificate)
+	case certificateCommitteeDigest != shareCommitteeDigest:
+		return fmt.Errorf("%w: certificate committee digest differs from the share's", ErrInvalidDKGActivationCertificate)
 	}
 	encoded, err := share.MarshalBinary()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: share encoding: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	defer clear(encoded)
-	if sha3.Sum256(encoded) != acknowledgement.CandidateDigest {
-		return ErrInvalidDKGActivationCertificate
+	if digest := sha3.Sum256(encoded); digest != acknowledgement.CandidateDigest {
+		return fmt.Errorf("%w: candidate digest %x != acknowledgement's %x",
+			ErrInvalidDKGActivationCertificate, digest[:8], acknowledgement.CandidateDigest[:8])
 	}
 	return nil
 }
 
 func (certificate DKGActivationCertificate) validateStructure() error {
 	if len(certificate.Acknowledgements) == 0 {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: no acknowledgements", ErrInvalidDKGActivationCertificate)
 	}
 	first := certificate.Acknowledgements[0]
 	// The acknowledgement set must cover the certificate's whole committee
 	// (R76: the family size, not the legacy six).
-	if int(first.Committee.Threshold) == 0 ||
-		len(certificate.Acknowledgements) != len(first.Committee.Participants) {
-		return ErrInvalidDKGActivationCertificate
+	if int(first.Committee.Threshold) == 0 {
+		return fmt.Errorf("%w: zero committee threshold", ErrInvalidDKGActivationCertificate)
+	}
+	if len(certificate.Acknowledgements) != len(first.Committee.Participants) {
+		return fmt.Errorf("%w: %d acknowledgements for %d committee participants",
+			ErrInvalidDKGActivationCertificate, len(certificate.Acknowledgements), len(first.Committee.Participants))
 	}
 	if err := first.validateUnsigned(); err != nil {
 		return err
 	}
 	firstKeyDigest, err := first.Key.CanonicalDigest()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: key digest: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	firstCommitteeDigest, err := first.Committee.CanonicalDigest()
 	if err != nil {
-		return ErrInvalidDKGActivationCertificate
+		return fmt.Errorf("%w: committee digest: %v", ErrInvalidDKGActivationCertificate, err)
 	}
 	for index, acknowledgement := range certificate.Acknowledgements {
 		if err := acknowledgement.validateUnsigned(); err != nil {
-			return err
+			return fmt.Errorf("%w: acknowledgement %d: %v", ErrInvalidDKGActivationCertificate, index, err)
 		}
 		keyDigest, keyErr := acknowledgement.Key.CanonicalDigest()
 		committeeDigest, committeeErr := acknowledgement.Committee.CanonicalDigest()
-		if keyErr != nil || committeeErr != nil ||
-			acknowledgement.ParticipantID != first.Committee.Participants[index] ||
-			acknowledgement.SessionDigest != first.SessionDigest ||
-			acknowledgement.ActivationEpoch != first.ActivationEpoch ||
-			acknowledgement.TranscriptDigest != first.TranscriptDigest ||
-			keyDigest != firstKeyDigest || committeeDigest != firstCommitteeDigest ||
-			len(acknowledgement.IdentitySignature) == 0 ||
-			len(acknowledgement.IdentitySignature) > protocol.MaxThresholdIdentitySignature {
-			return ErrInvalidDKGActivationCertificate
+		switch {
+		case keyErr != nil || committeeErr != nil:
+			return fmt.Errorf("%w: acknowledgement %d digests: %v / %v", ErrInvalidDKGActivationCertificate, index, keyErr, committeeErr)
+		case acknowledgement.ParticipantID != first.Committee.Participants[index]:
+			return fmt.Errorf("%w: acknowledgement %d has participant %d, want %d",
+				ErrInvalidDKGActivationCertificate, index, acknowledgement.ParticipantID, first.Committee.Participants[index])
+		case acknowledgement.SessionDigest != first.SessionDigest:
+			return fmt.Errorf("%w: acknowledgement %d session %x != %x",
+				ErrInvalidDKGActivationCertificate, index, acknowledgement.SessionDigest[:8], first.SessionDigest[:8])
+		case acknowledgement.ActivationEpoch != first.ActivationEpoch:
+			return fmt.Errorf("%w: acknowledgement %d activation epoch %d != %d",
+				ErrInvalidDKGActivationCertificate, index, acknowledgement.ActivationEpoch, first.ActivationEpoch)
+		case acknowledgement.TranscriptDigest != first.TranscriptDigest:
+			return fmt.Errorf("%w: acknowledgement %d transcript %x != %x",
+				ErrInvalidDKGActivationCertificate, index, acknowledgement.TranscriptDigest[:8], first.TranscriptDigest[:8])
+		case keyDigest != firstKeyDigest:
+			return fmt.Errorf("%w: acknowledgement %d key digest differs", ErrInvalidDKGActivationCertificate, index)
+		case committeeDigest != firstCommitteeDigest:
+			return fmt.Errorf("%w: acknowledgement %d committee digest differs", ErrInvalidDKGActivationCertificate, index)
+		case len(acknowledgement.IdentitySignature) == 0:
+			return fmt.Errorf("%w: acknowledgement %d has no identity signature", ErrInvalidDKGActivationCertificate, index)
+		case len(acknowledgement.IdentitySignature) > protocol.MaxThresholdIdentitySignature:
+			return fmt.Errorf("%w: acknowledgement %d identity signature oversized (%d)", ErrInvalidDKGActivationCertificate, index, len(acknowledgement.IdentitySignature))
 		}
 	}
 	return nil
