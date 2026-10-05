@@ -52,39 +52,36 @@ func tdilithium3DKGSessionRosterEpoch(activationEpoch uint64) (uint64, error) {
 // roster and returns the local node's position in it.
 //
 // R76a: the committee is the whole epoch roster in canonical order and
-// participant IDs are position+1, with the family shape (C = roster size,
-// threshold = ceil(2C/3)). Rosters smaller than the family minimum or larger
-// than the family maximum fail closed; subsetting a larger set is R76b, which
-// requires a consensus-anchored sampling rule to stay deterministic.
+// participant IDs are position+1 over the selected committee, with the family
+// shape (threshold = ceil(2C/3)). Rosters smaller than the family minimum fail
+// closed; rosters larger than the pinned committee row (7) go through the D1
+// deterministic sampled-committee rule (node/tdilithium3_dkg_committee_sampling.go),
+// which is consensus-anchored by the roster record's captured seed and stakes.
 func (n *Node) tdilithium3DKGCommitteeForRoster(roster *tdilithium3DKGEpochRoster) (protocol.CommitteeID, uint8, error) {
 	if roster == nil {
 		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: roster is missing", errTDilithium3DKGSessionUnavailable)
 	}
-	count := len(roster.Entries)
-	threshold := protocol.Dilithium3V1ThresholdFor(uint32(count))
-	if threshold == 0 {
-		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: epoch %d roster has %d members, outside the Dilithium3 v1 committee family [%d, %d]",
-			errTDilithium3DKGSessionUnavailable, roster.Epoch, count,
-			protocol.Dilithium3V1MinParticipants, protocol.Dilithium3V1MaxParticipants)
+	// D1: a roster larger than the pinned committee row is sampled
+	// deterministically; smaller-or-equal rosters keep the whole set, so
+	// committees for n <= 7 are bit-identical to the pre-sampling rule.
+	selection, err := tdilithium3DKGCommitteeSelection(roster)
+	if err != nil {
+		return protocol.CommitteeID{}, 0, err
 	}
-	participants := make([]uint32, count)
-	for position := range participants {
-		participants[position] = uint32(position) + 1
-	}
-	committee := protocol.CommitteeID{Version: 1, Threshold: threshold, Participants: participants}
-	if err := protocol.ValidateDilithium3V1Committee(committee); err != nil {
-		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: committee: %v", errTDilithium3DKGSessionUnavailable, err)
+	committee, err := tdilithium3DKGCommitteeForSelectedRoster(roster, selection)
+	if err != nil {
+		return protocol.CommitteeID{}, 0, err
 	}
 	if n == nil || n.blockProducer == nil {
 		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator identity is not available", errTDilithium3DKGSessionUnavailable)
 	}
 	address := n.blockProducer.ValidatorAddr()
-	for position, entry := range roster.Entries {
-		if entry.Address == address {
+	for position, index := range selection {
+		if roster.Entries[index].Address == address {
 			return committee, uint8(position), nil
 		}
 	}
-	return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator %s is not in the epoch %d roster",
+	return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator %s is not in the epoch %d committee",
 		errTDilithium3DKGSessionUnavailable, address.String(), roster.Epoch)
 }
 

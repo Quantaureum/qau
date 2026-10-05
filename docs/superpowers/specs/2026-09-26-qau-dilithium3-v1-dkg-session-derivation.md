@@ -113,13 +113,15 @@ commits that pairing in `DKGIdentityRosterDigest`
 (`node/tdilithium3_dkg_validator_snapshot.go:86-101`). Building the committee
 any other way would make the pairing depend on state outside the snapshot.
 
-The roster must contain between six and twelve entries (R76a; originally
-"exactly six"). A different size fails closed
-(`node/tdilithium3_dkg_validator_snapshot.go`→`tdilithium3DKGCommitteeForRoster`);
-there is no subsetting, because the committee-selection rule is consensus
-state and is not reproduced in the node layer (see the dynamic-committee spec
-`2026-10-01-qau-dilithium3-v1-dynamic-committee.md`: subsetting beyond 12
-validators is R76b's sampling problem).
+The roster must contain between six and seven entries after the D1 sampling
+accessor is applied: rosters above 7 are sampled down to the committee row
+deterministically at lookup time, and the same sampled committee
+— paired positionally with the sampled entries — is what
+`tdilithium3DKGRosterBindings` binds into `DKGIdentityRosterDigest`
+(`node/tdilithium3_dkg_validator_snapshot.go`; see the dynamic-committee
+spec's D1 revision note, 2026-10-05). The pre-accessor text here said
+"between six and twelve" because the sampler had not landed; it has, so this
+passage now describes the live rule.
 
 Note on the existing convention: the legacy TSS path treats a participant ID as
 a 1-based index into the **live** validator set

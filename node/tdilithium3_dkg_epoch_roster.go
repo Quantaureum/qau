@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,8 +50,12 @@ import (
 // (see errConsensusStakeMutationNotBlockDerived in adapters.go).
 
 const (
-	tdilithium3DKGEpochRosterFileVersion = 1
-	tdilithium3DKGEpochRosterFileName    = "tdilithium3_epoch_roster.json"
+	// v2: entries carry stake and each record carries the sampling seed
+	// (epoch-2 VRF accumulator at capture time). See the D1 sampler in
+	// node/tdilithium3_dkg_committee_sampling.go.
+	tdilithium3DKGEpochRosterFileVersion    = 2
+	tdilithium3DKGEpochRosterFileVersionMin = 2
+	tdilithium3DKGEpochRosterFileName       = "tdilithium3_epoch_roster.json"
 
 	// tdilithium3DKGEpochRosterEpochBudget bounds the sidecar by epoch count.
 	tdilithium3DKGEpochRosterEpochBudget = 64
@@ -68,23 +73,36 @@ const (
 var errTDilithium3DKGEpochRosterUnavailable = errors.New("Dilithium3 DKG finalized-epoch validator roster unavailable")
 
 // tdilithium3DKGEpochRosterEntry is one committee/validator identity: the
-// validator address and its legacy Dilithium3 identity public key.
+// validator address, its legacy Dilithium3 identity public key, and — from
+// sidecar format v2 on — the stake it entered the epoch with. The stake is
+// absent in v1 records; the committee sampler (D1) refuses a roster whose
+// entries carry no weights instead of sampling them unweighted.
 type tdilithium3DKGEpochRosterEntry struct {
 	Address   types.Address
 	PublicKey []byte
+	Stake     *big.Int
 }
 
-// tdilithium3DKGEpochRoster is the captured roster of one epoch.
+// tdilithium3DKGEpochRoster is the captured roster of one epoch. SampleSeed
+// is the VRF accumulator of epoch (Epoch-2) recorded at capture time — the
+// R88-F-grind-resistant randomness the D1 committee sampler draws from when
+// the roster exceeds the pinned committee row. SampleSeedSet is false when
+// the accumulator was unavailable at capture time (cold start); sampling
+// against such a record fails closed.
 type tdilithium3DKGEpochRoster struct {
-	Epoch        uint64
-	BoundaryHash types.Hash
-	Entries      []tdilithium3DKGEpochRosterEntry
-	Digest       [32]byte
+	Epoch         uint64
+	BoundaryHash  types.Hash
+	Entries       []tdilithium3DKGEpochRosterEntry
+	Digest        [32]byte
+	SampleSeed    types.Hash
+	SampleSeedSet bool
 }
 
 type tdilithium3DKGEpochRosterEntryJSON struct {
 	Address   string `json:"address"`
 	PublicKey string `json:"public_key"`
+	// v2 only; omitted in v1 records.
+	Stake string `json:"stake,omitempty"`
 }
 
 type tdilithium3DKGEpochRosterRecordJSON struct {
@@ -92,6 +110,10 @@ type tdilithium3DKGEpochRosterRecordJSON struct {
 	BoundaryHash string                               `json:"boundary_hash"`
 	Digest       string                               `json:"digest"`
 	Entries      []tdilithium3DKGEpochRosterEntryJSON `json:"entries"`
+	// v2 only: hex-encoded VRF accumulator of epoch (Epoch-2) sampled at
+	// capture time; SampleSeedSet flags whether the value was available.
+	SampleSeed    string `json:"sample_seed,omitempty"`
+	SampleSeedSet bool   `json:"sample_seed_set,omitempty"`
 }
 
 type tdilithium3DKGEpochRosterFileJSON struct {
@@ -128,8 +150,10 @@ func newTDilithium3DKGEpochRosterStore(path string, chainID uint64, genesis type
 
 // tdilithium3DKGEpochRosterDigest is the canonical digest of one captured
 // roster. The chain id and genesis hash are committed so the same epoch and
-// boundary hash on another chain cannot produce the same digest.
-func tdilithium3DKGEpochRosterDigest(chainID uint64, genesis types.Hash, epoch uint64, boundary types.Hash, entries []tdilithium3DKGEpochRosterEntry) [32]byte {
+// boundary hash on another chain cannot produce the same digest; the v2 form
+// additionally commits every entry's stake and the record's sampling seed,
+// because both steer the D1 committee sample for n > 7.
+func tdilithium3DKGEpochRosterDigest(chainID uint64, genesis types.Hash, epoch uint64, boundary types.Hash, seed types.Hash, seedSet bool, entries []tdilithium3DKGEpochRosterEntry) [32]byte {
 	hash := sha3.New256()
 	hash.Write([]byte(tdilithium3DKGEpochRosterDomain))
 	var field [8]byte
@@ -139,6 +163,12 @@ func tdilithium3DKGEpochRosterDigest(chainID uint64, genesis types.Hash, epoch u
 	binary.BigEndian.PutUint64(field[:], epoch)
 	hash.Write(field[:])
 	hash.Write(boundary[:])
+	hash.Write(seed[:])
+	var flag [1]byte
+	if seedSet {
+		flag[0] = 1
+	}
+	hash.Write(flag[:])
 	binary.BigEndian.PutUint64(field[:], uint64(len(entries)))
 	hash.Write(field[:])
 	for _, entry := range entries {
@@ -146,6 +176,24 @@ func tdilithium3DKGEpochRosterDigest(chainID uint64, genesis types.Hash, epoch u
 		binary.BigEndian.PutUint64(field[:], uint64(len(entry.PublicKey)))
 		hash.Write(field[:])
 		hash.Write(entry.PublicKey)
+		stake := uint64(0)
+		over64 := false
+		if entry.Stake != nil {
+			if entry.Stake.IsUint64() {
+				stake = entry.Stake.Uint64()
+			} else {
+				over64 = true
+			}
+		}
+		if over64 {
+			blob := entry.Stake.Bytes()
+			binary.BigEndian.PutUint64(field[:], uint64(len(blob)))
+			hash.Write(field[:])
+			hash.Write(blob)
+		} else {
+			binary.BigEndian.PutUint64(field[:], stake)
+			hash.Write(field[:])
+		}
 	}
 	var digest [32]byte
 	copy(digest[:], hash.Sum(nil))
@@ -175,10 +223,17 @@ func tdilithium3DKGActiveRosterEntries(validators []*consensus.Validator) ([]tdi
 		if _, err := qcrypto.PublicKeyFromBytes(validator.PublicKeyBytes); err != nil {
 			return nil, fmt.Errorf("active validator %s has an invalid Dilithium3 identity key: %w", validator.Address.String(), err)
 		}
+		if validator.Stake == nil || validator.Stake.Sign() <= 0 {
+			// First seen with the D1 sampler support: the committee sample is
+			// stake-weighted, so an active entry without a positive stake would
+			// be dead weight the sampler must not guess around.
+			return nil, fmt.Errorf("active validator %s has no positive stake", validator.Address.String())
+		}
 		seen[validator.Address] = true
 		entries = append(entries, tdilithium3DKGEpochRosterEntry{
 			Address:   validator.Address,
 			PublicKey: append([]byte(nil), validator.PublicKeyBytes...),
+			Stake:     new(big.Int).Set(validator.Stake),
 		})
 	}
 	// Canonical order is ascending address order, independent of the validator
@@ -209,7 +264,7 @@ func (s *tdilithium3DKGEpochRosterStore) loadLocked() error {
 	if err := json.Unmarshal(blob, &file); err != nil {
 		return fmt.Errorf("%w: parse %s: %v", errTDilithium3DKGEpochRosterUnavailable, s.path, err)
 	}
-	if file.Version != tdilithium3DKGEpochRosterFileVersion {
+	if file.Version < tdilithium3DKGEpochRosterFileVersionMin || file.Version > tdilithium3DKGEpochRosterFileVersion {
 		return fmt.Errorf("%w: unsupported sidecar version %d", errTDilithium3DKGEpochRosterUnavailable, file.Version)
 	}
 	if file.ChainID != s.chainID {
@@ -239,6 +294,13 @@ func (s *tdilithium3DKGEpochRosterStore) recordFromJSON(record tdilithium3DKGEpo
 	if err != nil {
 		return nil, fmt.Errorf("%w: epoch %d boundary hash: %v", errTDilithium3DKGEpochRosterUnavailable, record.Epoch, err)
 	}
+	var seed types.Hash
+	if record.SampleSeedSet {
+		seed, err = parseTDilithium3DKGRosterHash(record.SampleSeed)
+		if err != nil {
+			return nil, fmt.Errorf("%w: epoch %d sample seed: %v", errTDilithium3DKGEpochRosterUnavailable, record.Epoch, err)
+		}
+	}
 	entries := make([]tdilithium3DKGEpochRosterEntry, 0, len(record.Entries))
 	for _, raw := range record.Entries {
 		addressBytes, err := hex.DecodeString(raw.Address)
@@ -252,25 +314,35 @@ func (s *tdilithium3DKGEpochRosterStore) recordFromJSON(record tdilithium3DKGEpo
 		if _, err := qcrypto.PublicKeyFromBytes(publicKey); err != nil {
 			return nil, fmt.Errorf("%w: epoch %d has an invalid roster identity key: %v", errTDilithium3DKGEpochRosterUnavailable, record.Epoch, err)
 		}
+		stake, ok := new(big.Int).SetString(raw.Stake, 10)
+		if !ok || stake.Sign() <= 0 {
+			return nil, fmt.Errorf("%w: epoch %d has a missing or non-positive roster stake", errTDilithium3DKGEpochRosterUnavailable, record.Epoch)
+		}
 		var address types.Address
 		copy(address[:], addressBytes)
-		entries = append(entries, tdilithium3DKGEpochRosterEntry{Address: address, PublicKey: publicKey})
+		entries = append(entries, tdilithium3DKGEpochRosterEntry{Address: address, PublicKey: publicKey, Stake: stake})
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("%w: epoch %d has an empty roster", errTDilithium3DKGEpochRosterUnavailable, record.Epoch)
 	}
-	digest := tdilithium3DKGEpochRosterDigest(s.chainID, s.genesis, record.Epoch, boundary, entries)
+	digest := tdilithium3DKGEpochRosterDigest(s.chainID, s.genesis, record.Epoch, boundary, seed, record.SampleSeedSet, entries)
 	claimed, err := parseTDilithium3DKGRosterHash(record.Digest)
 	if err != nil || claimed != digest {
 		return nil, fmt.Errorf("%w: epoch %d sidecar digest does not match its contents", errTDilithium3DKGEpochRosterUnavailable, record.Epoch)
 	}
-	return &tdilithium3DKGEpochRoster{Epoch: record.Epoch, BoundaryHash: boundary, Entries: entries, Digest: digest}, nil
+	return &tdilithium3DKGEpochRoster{
+		Epoch: record.Epoch, BoundaryHash: boundary, Entries: entries, Digest: digest,
+		SampleSeed: seed, SampleSeedSet: record.SampleSeedSet,
+	}, nil
 }
 
 // capture records the roster of one epoch boundary and persists the sidecar.
 // Re-delivering the same boundary is a no-op. A different boundary block for an
 // already-finalized epoch is refused (a finalized epoch cannot change).
-func (s *tdilithium3DKGEpochRosterStore) capture(epoch uint64, boundary types.Hash, entries []tdilithium3DKGEpochRosterEntry, finalized uint64) error {
+// sampleSeed/sampleSeedSet carry the VRF accumulator reading used by the D1
+// committee sampler for rosters above the pinned committee row; a record may
+// legitimately lack it (cold start) and sampling then fails closed on lookup.
+func (s *tdilithium3DKGEpochRosterStore) capture(epoch uint64, boundary types.Hash, sampleSeed types.Hash, sampleSeedSet bool, entries []tdilithium3DKGEpochRosterEntry, finalized uint64) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("%w: refusing to capture an empty roster for epoch %d", errTDilithium3DKGEpochRosterUnavailable, epoch)
 	}
@@ -279,9 +351,9 @@ func (s *tdilithium3DKGEpochRosterStore) capture(epoch uint64, boundary types.Ha
 	if err := s.loadLocked(); err != nil {
 		return err
 	}
-	digest := tdilithium3DKGEpochRosterDigest(s.chainID, s.genesis, epoch, boundary, entries)
+	digest := tdilithium3DKGEpochRosterDigest(s.chainID, s.genesis, epoch, boundary, sampleSeed, sampleSeedSet, entries)
 	if prior, exists := s.epochs[epoch]; exists {
-		if prior.BoundaryHash == boundary {
+		if prior.BoundaryHash == boundary && prior.SampleSeed == sampleSeed && prior.SampleSeedSet == sampleSeedSet {
 			if finalized > s.finalized {
 				s.finalized = finalized
 				return s.persistLocked()
@@ -306,7 +378,10 @@ func (s *tdilithium3DKGEpochRosterStore) capture(epoch uint64, boundary types.Ha
 	}
 	s.epochs[epoch] = &tdilithium3DKGEpochRoster{
 		Epoch: epoch, BoundaryHash: boundary,
-		Entries: append([]tdilithium3DKGEpochRosterEntry(nil), entries...), Digest: digest,
+		Entries:       append([]tdilithium3DKGEpochRosterEntry(nil), entries...),
+		Digest:        digest,
+		SampleSeed:    sampleSeed,
+		SampleSeedSet: sampleSeedSet,
 	}
 	if finalized > s.finalized {
 		s.finalized = finalized
@@ -369,7 +444,10 @@ func (s *tdilithium3DKGEpochRosterStore) lookup(epoch uint64, liveFinalized uint
 	}
 	return &tdilithium3DKGEpochRoster{
 		Epoch: roster.Epoch, BoundaryHash: roster.BoundaryHash,
-		Entries: append([]tdilithium3DKGEpochRosterEntry(nil), roster.Entries...), Digest: roster.Digest,
+		Entries:       append([]tdilithium3DKGEpochRosterEntry(nil), roster.Entries...),
+		Digest:        roster.Digest,
+		SampleSeed:    roster.SampleSeed,
+		SampleSeedSet: roster.SampleSeedSet,
 	}, nil
 }
 
@@ -395,7 +473,10 @@ func (s *tdilithium3DKGEpochRosterStore) lookupCaptured(epoch uint64) (*tdilithi
 	}
 	return &tdilithium3DKGEpochRoster{
 		Epoch: roster.Epoch, BoundaryHash: roster.BoundaryHash,
-		Entries: append([]tdilithium3DKGEpochRosterEntry(nil), roster.Entries...), Digest: roster.Digest,
+		Entries:       append([]tdilithium3DKGEpochRosterEntry(nil), roster.Entries...),
+		Digest:        roster.Digest,
+		SampleSeed:    roster.SampleSeed,
+		SampleSeedSet: roster.SampleSeedSet,
 	}, nil
 }
 
@@ -422,10 +503,19 @@ func (s *tdilithium3DKGEpochRosterStore) persistLocked() error {
 			Digest:       hex.EncodeToString(roster.Digest[:]),
 			Entries:      make([]tdilithium3DKGEpochRosterEntryJSON, 0, len(roster.Entries)),
 		}
+		if roster.SampleSeedSet {
+			record.SampleSeed = hex.EncodeToString(roster.SampleSeed[:])
+			record.SampleSeedSet = true
+		}
 		for _, entry := range roster.Entries {
+			stake := "0"
+			if entry.Stake != nil {
+				stake = entry.Stake.String()
+			}
 			record.Entries = append(record.Entries, tdilithium3DKGEpochRosterEntryJSON{
 				Address:   hex.EncodeToString(entry.Address[:]),
 				PublicKey: hex.EncodeToString(entry.PublicKey),
+				Stake:     stake,
 			})
 		}
 		file.Epochs = append(file.Epochs, record)
@@ -593,7 +683,18 @@ func (n *Node) captureTDilithium3DKGEpochRosterFromBlock(blk *encoding.Block) {
 	if store == nil {
 		return
 	}
-	if err := store.capture(epoch, anchor, entries, qpos.GetFinalizedEpoch()); err != nil {
+	// The committee sampler's seed is the VRF accumulator of epoch-2
+	// (provinces' R88-F convention, two epochs of anti-grinding delay). It may
+	// be missing at cold start; then the record stores an unset seed and any
+	// later sample attempt against this record fails closed.
+	var sampleSeed types.Hash
+	sampleSeedSet := false
+	if epoch >= 2 {
+		if acc := qpos.GetEpochVRFAccumulator(epoch - 2); acc != (types.Hash{}) {
+			sampleSeed, sampleSeedSet = acc, true
+		}
+	}
+	if err := store.capture(epoch, anchor, sampleSeed, sampleSeedSet, entries, qpos.GetFinalizedEpoch()); err != nil {
 		nodeLog.Warn("Dilithium3 DKG epoch roster: epoch %d not captured: %v", epoch, err)
 		return
 	}

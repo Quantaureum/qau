@@ -2,6 +2,7 @@
 package node
 
 import (
+	"math/big"
 	"fmt"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestTDilithium3DKGValidatorSnapshotRejectsMissingAndConflictingBindings(t *
 		publicKey, _ := mode3.NewKeyFromSeed(&seed)
 		address := types.AddressFromPublicKey(publicKey.Bytes())
 		addresses[participantID] = address
-		validators[position] = &consensus.Validator{Address: address, Active: true, PublicKeyBytes: publicKey.Bytes()}
+		validators[position] = &consensus.Validator{Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: publicKey.Bytes()}
 		peers[address] = p2p.PeerID(fmt.Sprintf("peer-%d", position))
 	}
 	resolve := func(address types.Address) (p2p.PeerID, bool) {

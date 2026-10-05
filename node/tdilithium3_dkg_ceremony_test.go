@@ -92,10 +92,10 @@ func captureTDilithium3DKGCeremonyRoster(t *testing.T, node *Node, entries []tdi
 	if store == nil {
 		t.Fatal("the roster sidecar was not created with the gates open and a data dir")
 	}
-	if err := store.capture(5, tdilithium3DKGRosterTestHash(0x90), entries, 4); err != nil {
+	if err := tdil3TestCapture(store, 5, tdilithium3DKGRosterTestHash(0x90), entries, 4); err != nil {
 		t.Fatalf("capture epoch 5: %v", err)
 	}
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x91), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x91), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestTDilithium3DKGSessionDerivationIsDeterministicAndChainBound(t *testing.
 
 	// A different activation epoch reads a different roster epoch and therefore a
 	// different session, so an aborted attempt is never retried as the same one.
-	if err := first.tdilithium3DKGEpochRosterStore.capture(7, tdilithium3DKGRosterTestHash(0x92), entries, 6); err != nil {
+	if err := tdil3TestCapture(first.tdilithium3DKGEpochRosterStore, 7, tdilithium3DKGRosterTestHash(0x92), entries, 6); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 	later, err := first.deriveTDilithium3DKGSession(8)
@@ -196,7 +196,7 @@ func TestTDilithium3DKGSessionDerivationIsDeterministicAndChainBound(t *testing.
 	swapped[0] = tdilithium3DKGCeremonyTestIdentities(t, 1)[0].Entry
 	replaced := tdilithium3DKGCeremonyTestNode(t, identities, 2)
 	captureTDilithium3DKGCeremonyRoster(t, replaced, entries)
-	if err := replaced.tdilithium3DKGEpochRosterStore.capture(6, tdilithium3DKGRosterTestHash(0x93), swapped, 5); err != nil {
+	if err := tdil3TestCapture(replaced.tdilithium3DKGEpochRosterStore, 6, tdilithium3DKGRosterTestHash(0x93), swapped, 5); err != nil {
 		t.Fatalf("replace the epoch 6 roster: %v", err)
 	}
 	replacedSession, err := replaced.deriveTDilithium3DKGSession(7)

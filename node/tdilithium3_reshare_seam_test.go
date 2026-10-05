@@ -7,6 +7,8 @@ package node
 // presents to consensus never changes when membership does.
 
 import (
+	"strconv"
+	"strings"
 	"bytes"
 	"context"
 	"fmt"
@@ -103,6 +105,16 @@ func tdilithium3ReshareFixtureFor(t *testing.T) *tdilithium3ReshareFixture {
 // the seven-member committee, assembles every survivor's rotated share via
 // the remove runner, and makes a four-of-six quorum of the SURVIVORS sign
 // under the never-changed group public key.
+
+// joinIDs formats ids for the seam diagnostics line.
+func joinIDs(ids []uint32) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatUint(uint64(id), 10)
+	}
+	return strings.Join(parts, ",")
+}
+
 func TestTDilithium3ReshareRemoveSeamSignsUnderSameKey(t *testing.T) {
 	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "1")
 	fixture := tdilithium3ReshareFixtureFor(t)
@@ -196,6 +208,22 @@ func TestTDilithium3ReshareRemoveSeamSignsUnderSameKey(t *testing.T) {
 		}
 	}
 	share := rotated[signers[0]]
+
+	// R77-DIAG-SEAM: dump the rotated committee / share identity view the
+	// executor will consume, so a recuring silence points at the identity,
+	// not at a random stack line.
+	{
+		ids := make([]uint32, 0, len(rotated))
+		for pid := range rotated {
+			ids = append(ids, pid)
+		}
+		line := "rotated share identities: repo NewCommittee=" + fmt.Sprintf("%v", newCommittee.Participants) + " rotatedIDs=[" + joinIDs(ids) + "]"
+		for _, pid := range signers {
+			s := rotated[pid]
+			line += fmt.Sprintf(" signer=%d sharePid=%d sharePos=%d", pid, s.ParticipantID, s.ParticipantPosition)
+		}
+		t.Logf("%s", line)
+	}
 
 	seamFixture := &tdilithium3SeamFixture{
 		session:     fixture.session.Clone(),

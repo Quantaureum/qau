@@ -56,6 +56,18 @@ func tdilithium3DKGRosterTestValidators(t *testing.T, count int) ([]*consensus.V
 	return validators, entries
 }
 
+// tdil3TestCapture calls capture with an unset sampling seed: every test
+// written before the v2 sidecar used that contract (the sampler never reads
+// the seed for rosters within the pinned committee row).
+func tdil3TestCapture(store *tdilithium3DKGEpochRosterStore, epoch uint64, boundary types.Hash, entries []tdilithium3DKGEpochRosterEntry, finalized uint64) error {
+	return store.capture(epoch, boundary, types.Hash{}, false, entries, finalized)
+}
+
+// tdil3TestDigest is the v2 digest of a record with no sampling seed.
+func tdil3TestDigest(chainID uint64, genesis types.Hash, epoch uint64, boundary types.Hash, entries []tdilithium3DKGEpochRosterEntry) [32]byte {
+	return tdilithium3DKGEpochRosterDigest(chainID, genesis, epoch, boundary, types.Hash{}, false, entries)
+}
+
 func tdilithium3DKGRosterTestHash(seed byte) types.Hash {
 	var hash types.Hash
 	hash[0] = seed
@@ -99,16 +111,16 @@ func TestTDilithium3DKGEpochRosterEntriesAreCanonicalAndChainBound(t *testing.T)
 
 	genesis := tdilithium3DKGRosterTestHash(0x11)
 	boundary := tdilithium3DKGRosterTestHash(0x22)
-	digest := tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, boundary, entries)
+	digest := tdil3TestDigest(TestnetNetworkID, genesis, 7, boundary, entries)
 
 	for name, other := range map[string][32]byte{
-		"chain id":       tdilithium3DKGEpochRosterDigest(TestnetNetworkID+1, genesis, 7, boundary, entries),
-		"genesis hash":   tdilithium3DKGEpochRosterDigest(TestnetNetworkID, tdilithium3DKGRosterTestHash(0x12), 7, boundary, entries),
-		"epoch":          tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 8, boundary, entries),
-		"boundary hash":  tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, tdilithium3DKGRosterTestHash(0x23), entries),
-		"roster length":  tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, boundary, entries[:5]),
-		"identity key":   tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, boundary, append(append([]tdilithium3DKGEpochRosterEntry(nil), entries[:5]...), tdilithium3DKGEpochRosterEntry{Address: entries[5].Address, PublicKey: entries[0].PublicKey})),
-		"member address": tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, boundary, append(append([]tdilithium3DKGEpochRosterEntry(nil), entries[:5]...), tdilithium3DKGEpochRosterEntry{Address: entries[0].Address, PublicKey: entries[5].PublicKey})),
+		"chain id":       tdil3TestDigest(TestnetNetworkID+1, genesis, 7, boundary, entries),
+		"genesis hash":   tdil3TestDigest(TestnetNetworkID, tdilithium3DKGRosterTestHash(0x12), 7, boundary, entries),
+		"epoch":          tdil3TestDigest(TestnetNetworkID, genesis, 8, boundary, entries),
+		"boundary hash":  tdil3TestDigest(TestnetNetworkID, genesis, 7, tdilithium3DKGRosterTestHash(0x23), entries),
+		"roster length":  tdil3TestDigest(TestnetNetworkID, genesis, 7, boundary, entries[:5]),
+		"identity key":   tdil3TestDigest(TestnetNetworkID, genesis, 7, boundary, append(append([]tdilithium3DKGEpochRosterEntry(nil), entries[:5]...), tdilithium3DKGEpochRosterEntry{Address: entries[5].Address, PublicKey: entries[0].PublicKey})),
+		"member address": tdil3TestDigest(TestnetNetworkID, genesis, 7, boundary, append(append([]tdilithium3DKGEpochRosterEntry(nil), entries[:5]...), tdilithium3DKGEpochRosterEntry{Address: entries[0].Address, PublicKey: entries[5].PublicKey})),
 	} {
 		if other == digest {
 			t.Fatalf("digest did not change when the %s changed", name)
@@ -170,14 +182,14 @@ func TestTDilithium3DKGEpochRosterStorePersistsAndReloads(t *testing.T) {
 	_, entries := tdilithium3DKGRosterTestValidators(t, 6)
 
 	store := newTDilithium3DKGEpochRosterStore(path, TestnetNetworkID, genesis)
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x41), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x41), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x41), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x41), entries, 5); err != nil {
 		t.Fatalf("re-capturing the same boundary must be idempotent: %v", err)
 	}
 	boundary := tdilithium3DKGRosterTestHash(0x42)
-	if err := store.capture(7, boundary, entries, 7); err != nil {
+	if err := tdil3TestCapture(store, 7, boundary, entries, 7); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 	info, err := os.Stat(path)
@@ -193,7 +205,7 @@ func TestTDilithium3DKGEpochRosterStorePersistsAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup after reload: %v", err)
 	}
-	want := tdilithium3DKGEpochRosterDigest(TestnetNetworkID, genesis, 7, boundary, entries)
+	want := tdil3TestDigest(TestnetNetworkID, genesis, 7, boundary, entries)
 	if roster.Digest != want || roster.BoundaryHash != boundary || roster.Epoch != 7 {
 		t.Fatal("reloaded roster does not reproduce the captured epoch")
 	}
@@ -223,7 +235,7 @@ func TestTDilithium3DKGEpochRosterStoreIsBoundedByEpochBudget(t *testing.T) {
 
 	store := newTDilithium3DKGEpochRosterStore(path, TestnetNetworkID, genesis)
 	for epoch := uint64(1); epoch <= uint64(tdilithium3DKGEpochRosterEpochBudget)+6; epoch++ {
-		if err := store.capture(epoch, tdilithium3DKGRosterTestHash(byte(epoch)), entries, epoch); err != nil {
+		if err := tdil3TestCapture(store, epoch, tdilithium3DKGRosterTestHash(byte(epoch)), entries, epoch); err != nil {
 			t.Fatalf("capture epoch %d: %v", epoch, err)
 		}
 	}
@@ -252,15 +264,15 @@ func TestTDilithium3DKGEpochRosterStoreReorgAndFinality(t *testing.T) {
 	_, entries := tdilithium3DKGRosterTestValidators(t, 3)
 
 	store := newTDilithium3DKGEpochRosterStore(path, TestnetNetworkID, genesis)
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x51), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x51), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
-	if err := store.capture(7, tdilithium3DKGRosterTestHash(0x52), entries, 6); err != nil {
+	if err := tdil3TestCapture(store, 7, tdilithium3DKGRosterTestHash(0x52), entries, 6); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 	// Epoch 7 is not finalized, so the reorged boundary replaces the old one.
 	reorged := tdilithium3DKGRosterTestHash(0x53)
-	if err := store.capture(7, reorged, entries, 6); err != nil {
+	if err := tdil3TestCapture(store, 7, reorged, entries, 6); err != nil {
 		t.Fatalf("unfinalized epoch must accept the new canonical boundary: %v", err)
 	}
 	roster, err := store.lookup(7, 7)
@@ -271,10 +283,10 @@ func TestTDilithium3DKGEpochRosterStoreReorgAndFinality(t *testing.T) {
 		t.Fatal("the reorged boundary did not replace the unfinalized boundary")
 	}
 	// Re-delivering the same boundary only advances the finalized floor.
-	if err := store.capture(7, reorged, entries, 7); err != nil {
+	if err := tdil3TestCapture(store, 7, reorged, entries, 7); err != nil {
 		t.Fatalf("re-delivering the same boundary must be idempotent: %v", err)
 	}
-	if err := store.capture(7, tdilithium3DKGRosterTestHash(0x54), entries, 7); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
+	if err := tdil3TestCapture(store, 7, tdilithium3DKGRosterTestHash(0x54), entries, 7); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
 		t.Fatalf("a finalized epoch was rewritten: %v", err)
 	}
 }
@@ -287,13 +299,13 @@ func TestTDilithium3DKGEpochRosterStoreFailsClosed(t *testing.T) {
 	_, entries := tdilithium3DKGRosterTestValidators(t, 3)
 
 	store := newTDilithium3DKGEpochRosterStore(path, TestnetNetworkID, genesis)
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x61), nil, 6); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x61), nil, 6); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
 		t.Fatalf("an empty roster was captured: %v", err)
 	}
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x61), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x61), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
-	if err := store.capture(7, tdilithium3DKGRosterTestHash(0x62), entries, 6); err != nil {
+	if err := tdil3TestCapture(store, 7, tdilithium3DKGRosterTestHash(0x62), entries, 6); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 	if _, err := store.lookup(7, 6); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
@@ -337,10 +349,10 @@ func TestTDilithium3DKGEpochRosterStoreRefusesTamperedSidecar(t *testing.T) {
 	_, entries := tdilithium3DKGRosterTestValidators(t, 3)
 
 	store := newTDilithium3DKGEpochRosterStore(path, TestnetNetworkID, genesis)
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x71), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x71), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
-	if err := store.capture(7, tdilithium3DKGRosterTestHash(0x72), entries, 7); err != nil {
+	if err := tdil3TestCapture(store, 7, tdilithium3DKGRosterTestHash(0x72), entries, 7); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 
@@ -423,13 +435,13 @@ func TestTDilithium3DKGEpochRosterBindingsFollowFinalizedRoster(t *testing.T) {
 	if store == nil {
 		t.Fatal("the roster sidecar was not created with the gates open and a data dir")
 	}
-	if err := store.capture(5, tdilithium3DKGRosterTestHash(0x80), entries, 4); err != nil {
+	if err := tdil3TestCapture(store, 5, tdilithium3DKGRosterTestHash(0x80), entries, 4); err != nil {
 		t.Fatalf("capture epoch 5: %v", err)
 	}
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x81), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x81), entries, 5); err != nil {
 		t.Fatalf("capture epoch 6: %v", err)
 	}
-	if err := store.capture(7, tdilithium3DKGRosterTestHash(0x82), entries, 7); err != nil {
+	if err := tdil3TestCapture(store, 7, tdilithium3DKGRosterTestHash(0x82), entries, 7); err != nil {
 		t.Fatalf("capture epoch 7: %v", err)
 	}
 
@@ -508,7 +520,7 @@ func TestTDilithium3DKGEpochRosterBindingsFollowFinalizedRoster(t *testing.T) {
 	// A roster whose size differs from the committee is refused rather than
 	// subsetted, because the committee-selection rule is consensus state.
 	_, fewerEntries := tdilithium3DKGRosterTestValidators(t, 3)
-	if err := store.capture(8, tdilithium3DKGRosterTestHash(0x83), fewerEntries, 8); err != nil {
+	if err := tdil3TestCapture(store, 8, tdilithium3DKGRosterTestHash(0x83), fewerEntries, 8); err != nil {
 		t.Fatalf("capture epoch 8: %v", err)
 	}
 	if _, err := node.tdilithium3DKGEpochRosterBindings(unavailable, 8); !errors.Is(err, errTDilithium3DKGEpochRosterUnavailable) {
@@ -591,7 +603,7 @@ func TestTDilithium3DKGCaptureHookRecordsOnlyEpochBoundaries(t *testing.T) {
 	if roster.BoundaryHash != boundaryHash {
 		t.Fatal("the captured roster is not bound to the boundary block hash")
 	}
-	if want := tdilithium3DKGEpochRosterDigest(TestnetNetworkID, store.genesis, 7, boundaryHash, entries); roster.Digest != want {
+	if want := tdil3TestDigest(TestnetNetworkID, store.genesis, 7, boundaryHash, entries); roster.Digest != want {
 		t.Fatal("the captured roster digest does not match the canonical entries")
 	}
 	if !reflect.DeepEqual(roster.Entries, entries) {

@@ -192,6 +192,28 @@ var signingParameterFamily = map[int]SigningParameters{
 	},
 }
 
+// signingParameterFamilyRotated pins the R77d row for six-member committees
+// produced by a remove rotation: every share carries folded components of
+// multiplicity 2, so each signer's per-coefficient secret mass is sqrt(2) times
+// the fresh profile and the fresh row's radius margin (r'-r = 82.9 against a
+// fresh shift bound 658.64/6) is exhausted — every candidate slot rejects.
+// The row is measured through r77c_rotated_row.go on the all-components-fold-2
+// profile: fresh-family checks reproduce (P1=1, P2=1, Phint=0.5995 above the
+// 0.4 band), the per-request success rate matches the fresh row, and J=26
+// stays within the transport budget (SigningMaxParallelSlots).
+var signingParameterFamilyRotated = map[int]SigningParameters{
+	6: {
+		Participants: 6, Threshold: 4, OwnedPerOwner: 5,
+		Exponent:      4.50,
+		Divergence:    math.Pow(2, 4.50/4),
+		ShiftBound:    931.45,
+		Radius:        424037.5,
+		SampleRadius:  424155.0,
+		HintCheckProb: 0.5995,
+		ParallelSlots: 26,
+	},
+}
+
 // SigningParametersForParticipants returns the pinned signing-MPC row for a
 // committee size; any other size fails closed.
 func SigningParametersForParticipants(participants int) (SigningParameters, error) {
@@ -200,6 +222,54 @@ func SigningParametersForParticipants(participants int) (SigningParameters, erro
 		return SigningParameters{}, fmt.Errorf("%w: committee size %d", ErrNoSigningRow, participants)
 	}
 	return row, nil
+}
+
+// shareCarriesRotationFold reports whether any component of the share carries
+// fold multiplicity above 1: the marker every remove-rotated share gets. Such
+// shares cannot sign under the fresh row (the radius margin is sized for
+// eta=1 fresh secrets), so rotation state becomes the row selector.
+func shareCarriesRotationFold(share *LocalShare) bool {
+	if share == nil {
+		return false
+	}
+	for index := range share.Components {
+		if componentMultiplicity(share.Components[index]) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// SigningParametersForShares returns the pinned row for the session's share
+// profile: every active share must agree on the committee size or the request
+// fails closed; if any active share carries a rotation fold, the rotated row is
+// selected. All signers of one session rotate together, so the row choice is
+// identical on every member.
+func SigningParametersForShares(shares []*LocalShare) (SigningParameters, error) {
+	if len(shares) == 0 || shares[0] == nil {
+		return SigningParameters{}, fmt.Errorf("%w: no active shares", ErrNoSigningRow)
+	}
+	participants := len(shares[0].Committee.Participants)
+	rotated := false
+	for _, share := range shares {
+		if share == nil {
+			continue
+		}
+		if len(share.Committee.Participants) != participants {
+			return SigningParameters{}, fmt.Errorf("%w: shares disagree on the committee size", ErrNoSigningRow)
+		}
+		if shareCarriesRotationFold(share) {
+			rotated = true
+		}
+	}
+	if rotated {
+		row, ok := signingParameterFamilyRotated[participants]
+		if !ok {
+			return SigningParameters{}, fmt.Errorf("%w: rotated committee size %d", ErrNoSigningRow, participants)
+		}
+		return row, nil
+	}
+	return SigningParametersForParticipants(participants)
 }
 
 // SigningParametersForThresholdCount returns the unique pinned row whose

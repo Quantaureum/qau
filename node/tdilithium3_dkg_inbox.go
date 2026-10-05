@@ -38,9 +38,26 @@ type tdilithium3DKGInbox struct {
 	rosterBound       bool
 	verifyIdentity    dilithium3v1.DKGIdentityVerifier
 	resolvePeer       func(p2p.PeerID) (uint32, bool)
+	// bindings is the pid -> identity map this inbox's verifier was built from
+	// (nil before they were introduced): persisting them alongside the
+	// activation record is what lets a later session re-verify it after a
+	// rotation renumbers the committee.
+	bindings          []dilithium3v1.DKGIdentityBinding
 	messages          chan tdilithium3DKGVerifiedMessage
 	mu                sync.Mutex
 	seen              map[tdilithium3DKGReplayKey][32]byte
+}
+
+// IdentityBindings returns the pid -> identity binding the inbox's verifier was
+// constructed from, or nil for an inbox whose construction predates binding
+// capture (unreachable in production paths).
+func (inbox *tdilithium3DKGInbox) IdentityBindings() []dilithium3v1.DKGIdentityBinding {
+	if inbox == nil || len(inbox.bindings) == 0 {
+		return nil
+	}
+	out := make([]dilithium3v1.DKGIdentityBinding, len(inbox.bindings))
+	copy(out, inbox.bindings)
+	return out
 }
 
 type tdilithium3DKGIdentity struct {
@@ -100,6 +117,7 @@ func newTDilithium3DKGInboxFromIdentitySnapshot(session dilithium3v1.DKGSession,
 		return nil, err
 	}
 	inbox.rosterBound = true
+	inbox.bindings = bindings
 	return inbox, nil
 }
 

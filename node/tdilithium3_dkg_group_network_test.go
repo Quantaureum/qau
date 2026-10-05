@@ -2,6 +2,7 @@
 package node
 
 import (
+	"math/big"
 	"bytes"
 	"context"
 	"errors"
@@ -55,7 +56,7 @@ func newTDilithium3DKGNetworkHarness(t *testing.T) *tdilithium3DKGNetworkHarness
 		harness.privateKeys[position] = privateKey
 		address := types.AddressFromPublicKey(publicKey.Bytes())
 		addresses[runner.session.Committee.Participants[position]] = address
-		validators[position] = &consensus.Validator{Address: address, Active: true, PublicKeyBytes: publicKey.Bytes()}
+		validators[position] = &consensus.Validator{Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: publicKey.Bytes()}
 		peers[address] = p2p.PeerID(fmt.Sprintf("peer-%d", position))
 		harness.exchanges[position] = newTDilithium3DKGGroupExchange()
 	}
@@ -581,12 +582,13 @@ func TestTDilithium3DKGActivationExchangeNetwork(t *testing.T) {
 		// delivered during broadcast are dropped (sink is nil). After
 		// a short delay the sink is installed and the collection loop
 		// is running; packets delivered at that point are consumed.
-		done := make(chan error, 1)
-		go func() {
-			done <- n.runTDilithium3DKGActivationExchange(
-				runnerCtx, harness.session, runner, results[position],
-				n.tdilithium3DKGInbox.verifyIdentity,
-				harness.sign(position),
+			done := make(chan error, 1)
+			go func() {
+				done <- n.runTDilithium3DKGActivationExchange(
+					runnerCtx, harness.session, runner, results[position],
+					n.tdilithium3DKGInbox.verifyIdentity,
+					n.tdilithium3DKGInbox.IdentityBindings(),
+					harness.sign(position),
 				// The broadcast is a no-op: in the test the harness
 				// pre-encoded every envelope, so the P2P routing is
 				// simulated by delivering directly to the sink.
@@ -688,6 +690,7 @@ func TestTDilithium3DKGActivationExchangeTimesOutOnMissingPeer(t *testing.T) {
 	err := harness.nodes[0].runTDilithium3DKGActivationExchange(
 		shortCtx, harness.session, harness.runners[0], results[0],
 		harness.nodes[0].tdilithium3DKGInbox.verifyIdentity,
+		harness.nodes[0].tdilithium3DKGInbox.IdentityBindings(),
 		harness.sign(0),
 		func(kind uint8, encoded []byte) error {
 			for recipient := range harness.nodes {

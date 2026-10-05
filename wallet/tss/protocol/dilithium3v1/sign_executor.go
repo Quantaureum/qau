@@ -39,6 +39,8 @@ package dilithium3v1
 // ball points are caller-supplied here.
 
 import (
+	"math"
+	"os"
 	"bytes"
 	"crypto/sha3"
 	"encoding/binary"
@@ -62,6 +64,20 @@ var (
 	// slot never arrived.
 	errSigningExecutorSilence = errors.New("silent participant in the Dilithium3 v1 signing executor")
 )
+
+// ErrSigningExecutorSilence exports the silence sentinel of the slot abort
+// (errSigningExecutorSilence): a slot that ends with a participant's message
+// never arriving is a statistical outcome of the construction — the seal path
+// and test harnesses retry it with a fresh request instead of treating it as
+// a structural failure. Exported so callers outside this package can classify
+// it via errors.Is without parsing message text.
+var ErrSigningExecutorSilence = errSigningExecutorSilence
+
+// ErrSigningRejected exports the rejection sentinel (errSigningRejected): a
+// signer's rejection-test outcome is an ordinary abort of the attempt, burned
+// and retried with a fresh request by the seal path, not a correctness bell.
+var ErrSigningRejected = errSigningRejected
+
 
 // signingExecutorAbort is the bounded abort of one slot: a reason code, the
 // attributable evidence, and a short detail. It never carries a secret-derived
@@ -676,6 +692,24 @@ func (signer *signingExecutorSigner) computeChallengeLocked() error {
 	if err != nil {
 		return fmt.Errorf("%w: signer %d rejection test: %v", errInvalidSigningAttempt, signer.participantID, err)
 	}
+	if os.Getenv("QAU_DEBUG_SIGNING_NORM") == "1" {
+		var debugTotal float64
+		for row := 0; row < L; row++ {
+			for index := 0; index < N; index++ {
+				v := float64(shiftFirst[row][index])/SigningRandomnessNu + signer.randomness.raw[row*N+index]
+				debugTotal += v * v
+			}
+		}
+		for row := 0; row < K; row++ {
+			for index := 0; index < N; index++ {
+				v := float64(shiftSecond[row][index]) + signer.randomness.raw[(L+row)*N+index]
+				debugTotal += v * v
+			}
+		}
+		fmt.Printf("QAU_DEBUG_NORM signer=%d norm=%.0f radius=%.0f ratio=%.3f pass=%v\n",
+			signer.participantID, math.Sqrt(debugTotal), signer.params.Radius,
+			math.Sqrt(debugTotal)/signer.params.Radius, passes)
+	}
 	signer.w = w
 	signer.highBits = highBits
 	signer.seed = seed
@@ -765,7 +799,7 @@ func newSigningExecutorSession(
 		return nil, fmt.Errorf("%w: no active shares", errInvalidSigningAttempt)
 	}
 	participants := len(activeShares[0].Committee.Participants)
-	params, err := SigningParametersForParticipants(participants)
+	params, err := SigningParametersForShares(activeShares)
 	if err != nil {
 		return nil, ErrUnsupportedSigningCommitteeSize
 	}

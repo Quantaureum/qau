@@ -64,12 +64,21 @@ func tdilithium3DKGRosterBindings(roster *tdilithium3DKGEpochRoster, committee p
 	if roster == nil {
 		return nil, fmt.Errorf("%w: roster is missing", errTDilithium3DKGEpochRosterUnavailable)
 	}
-	if len(roster.Entries) != len(committee.Participants) {
-		return nil, fmt.Errorf("%w: epoch %d roster has %d members but the committee has %d",
-			errTDilithium3DKGEpochRosterUnavailable, roster.Epoch, len(roster.Entries), len(committee.Participants))
+	// D1: when the roster exceeds the pinned committee row, the committee is a
+	// deterministic sample of it — the binding pairs committee position i with
+	// the i-th selected roster entry (selection is derived from the roster
+	// record itself, so recomputing it here cannot diverge).
+	selection, err := tdilithium3DKGCommitteeSelection(roster)
+	if err != nil {
+		return nil, err
 	}
-	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(roster.Entries))
-	for position, entry := range roster.Entries {
+	if len(selection) != len(committee.Participants) {
+		return nil, fmt.Errorf("%w: epoch %d committee selection has %d members but the committee has %d",
+			errTDilithium3DKGEpochRosterUnavailable, roster.Epoch, len(selection), len(committee.Participants))
+	}
+	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(selection))
+	for position, index := range selection {
+		entry := roster.Entries[index]
 		bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
 			ParticipantID:    committee.Participants[position],
 			ValidatorAddress: [20]byte(entry.Address),

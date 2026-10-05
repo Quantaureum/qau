@@ -9,6 +9,7 @@ import (
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
+	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -42,6 +43,15 @@ func TestTDilithium3DKGSignedActivationReceipts(t *testing.T) {
 		publicKey := keys[participantID]
 		return publicKey != nil && mode3.Verify(publicKey, message, signature)
 	})
+	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(keys))
+	for _, participantID := range session.Committee.Participants {
+		publicKey := keys[participantID]
+		bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+			ParticipantID:    participantID,
+			ValidatorAddress: types.AddressFromPublicKey(publicKey.Bytes()),
+			PublicKey:        publicKey.Bytes(),
+		})
+	}
 	certificate, err := assembleTDilithium3DKGActivationCertificate(session, results[0].PublicKey, results[0].TranscriptDigest, packets, verifier)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +61,7 @@ func TestTDilithium3DKGSignedActivationReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	for position, runner := range runners {
-		if err := runner.shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, runner.password); err != nil {
+		if err := runner.shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, runner.password); err != nil {
 			t.Fatalf("participant %d activation: %v", position, err)
 		}
 		loaded, err := newThresholdShareStore(runner.basePath).LoadActiveAtEpoch(session.ActivationEpoch, verifier, runner.password)

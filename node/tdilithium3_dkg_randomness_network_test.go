@@ -2,6 +2,7 @@
 package node
 
 import (
+	"math/big"
 	"bytes"
 	"context"
 	"fmt"
@@ -33,7 +34,7 @@ func TestTDilithium3DKGRandomnessNetworkSixNodes(t *testing.T) {
 		privateKeys[position] = privateKey
 		address := types.AddressFromPublicKey(publicKey.Bytes())
 		addresses[runner.session.Committee.Participants[position]] = address
-		validators[position] = &consensus.Validator{Address: address, Active: true, PublicKeyBytes: publicKey.Bytes()}
+		validators[position] = &consensus.Validator{Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: publicKey.Bytes()}
 		peers[address] = p2p.PeerID(fmt.Sprintf("peer-%d", position))
 		contributions[position] = runner.record.LocalRandomness
 	}

@@ -353,7 +353,7 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	activationContext, cancelActivation := context.WithTimeout(ctx, 4*tdilithium3DKGActivationExchangeTimeout)
 	exchangeErr := n.runTDilithium3ActivationExchange(
 		activationContext, config.Session, rotatedShare, config.Store, config.Password,
-		inbox.verifyIdentity, config.Sign, config.Broadcast,
+		inbox.verifyIdentity, inbox.IdentityBindings(), config.Sign, config.Broadcast,
 	)
 	cancelActivation()
 	if exchangeErr != nil {

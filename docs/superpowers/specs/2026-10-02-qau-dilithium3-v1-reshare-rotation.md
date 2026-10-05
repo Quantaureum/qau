@@ -179,11 +179,13 @@ aborted.
   signing acceptance (`TestTDilithium3ReshareAddSeamSignsUnderSameKey`)
   is one flag away (`QAU_ENABLE_R77C_SIGNING_ROW=1`) and is gated pending
   R77c: the add-shape correction concentrates the joiner-group zero-sum
-  into one component with multiplicity 19, so the pinning of the R57
-  HRej radius (`eta=1`, C(6,3)=20 fresh groups) must gain its rotated row
-  before a quorum hosting the correction group signs at acceptable odds.
-  Remove-shape signing is unaffected (fold multiplicity <= 2) and fully
-  accepted.
+  into one component with multiplicity 14 in the shipped plan (14
+  non-correction weave groups), so the pinning of the R57 HRej radius
+  (`eta=1`, C(6,3)=20 fresh groups) would have needed a rotated row the
+  envelope measured out — see section 7. Remove-shape signing needed its
+  own row after all (the acceptance radius margin is sized for eta=1
+  material and folded secrets exhaust it deterministically): it now has
+  one — the R77d rotated C=6 row, see section 7.
 - **Wire + ceremony driver (landed 2026-10-04, remove shape):**
   `MsgTypeTDilithium3ReshareDelta` (102) carries the versioned threshold
   envelope around `dilithium3v1.ReshareDeltaWire` (kind fold/correction,
@@ -284,6 +286,79 @@ aborted.
   per-acknowledgement check failed
   (`wallet/tss/protocol/dilithium3v1/activation_certificate.go`), which is
   how the sixth defect was identified from the node logs.
+  An eighth finding from the R77d round (open; it is a design decision, not
+  a bug): the remove rotation's stored share KEEPS old participant ids
+  (`ResharedShare` does `ParticipantID: old.ParticipantID` because delta
+  targeting references new positions but identity continuity matters for
+  the ack chain), while every later epoch derives committee ids as
+  roster-position+1 per session-derivation D2 — after a 7->6 rotation the
+  stored committee {1,3,4,5,6,7} and the derived committee {1,2,3,4,5,6}
+  disagree, and `LoadActiveAtEpoch`'s identity-bindings verifier rejects
+  pid 3 (the persisted evidence carried a collision worth one id shift).
+  Devnet evidence: on the first R77d-clean chain the rotation completed but
+  `identity signature does not verify for participant 3` appears whenever a
+  post-rotation session tries to source its own committee roster. Fix
+  candidates recorded here as an explicit fork; RESOLVED 2026-05 same day by
+  option (a), realised as: the activation record is now self-describing (v2)
+  and stores the pid -> identity-key bindings it was verified under, so a
+  post-rotation session verifies any stored certificate against the recorded
+  map instead of re-deriving a verifier from the current roster view.
+  Implementation at `node/threshold_activation.go` (v2 record),
+  `node/threshold_protocol_paths.go` (unchanged file layout), and the two
+  exchange commit points (`node/tdilithium3_dkg_activation_exchange.go`),
+  whose callers now pass the session's identity bindings straight through.
+  Option (b) — session-scoped preserved pids — stays dismissible: continuity
+  lives at the address layer, and every chain state stays derivable from the
+  roster alone.
+ (a) identities-preserving normalization — activation commits
+  the rotated share with fresh position-derived ids and the certificate
+  path re-binds acks by validator address; (b) identity continuity — the
+  session layer treats the active committee's id set as the committee
+  source of truth and the D2 list becomes {position's preserved id}. The
+  seam-level same-key signing evidence is unaffected either way; the fork
+  only decides rotation-COMMITTEE durability across epochs.
+
+
+## 6a. R77c follow-up — the topology redesign a same-key ADD needs **DESIGN NOTE**
+
+The measured closure in section 7 proves the concentrated weave correction
+cannot sign under any parameter row of the C=7 family. The one redesign
+family that stays inside the CNF-RSS construction is to stop weaving the
+joiner's groups fresh at all:
+
+- **Rehearsal-carried components.** Delay the join by one epoch: during the
+  pre-join epoch the incumbent committee runs the reshare folds from the
+  CURRENT committee into the PHANTOM groups that a candidate joiner would
+  occupy (the group masks are public knowledge as soon as the candidate's
+  stake is in the activation queue, which is deterministic one epoch ahead).
+  Every folded component lands at multiplicity 2 — the same profile the
+  remove rotation already signs under — so the add rotation reuses the
+  proven fresh rows instead of carrying a new halo.
+- The joiner never holds fresh secrets in this shape: its components are
+  inherited through the same fold-delta exchange the remove rotation uses,
+  and the incumbent majority's zero-knowledge statement is unchanged (the
+  fold's privacy argument is the one already reviewed for R77b, because the
+  correction mass per component is 1+1, not 1+19).
+
+Open proof obligations before this becomes a parameter row:
+
+1. The CNF access-structure privacy argument assumes components are iid at
+   fold time; a rehearsal-carried family derives them from the prior epoch's
+   transcript, so the joiner's view of its own woven pieces needs an explicit
+   independence lemma (the same caveat noted for telescoped pairwise
+   differences in section 7).
+2. The weaving correction becomes unnecessary by construction, which removes
+   the correction group's special-case role — the plan verifier and the
+   assembler get simpler, not more complex, which is the direction a lasting
+   design should keep.
+3. Joining becomes a two-epoch march (stake-finalized at epoch E-2, rehearsed
+   at E-1, served at E+1); the queue already tolerates epoch-granularity
+   activation, so this changes nothing user-visible.
+
+Status: not scheduled; this section exists so the next design round starts
+from a measured feasibility envelope instead of folklore. The fresh-key join
+path shipped in R77 is the supported route and carries none of these
+obligations.
 
 ## 7. Out of scope (explicit)
 
@@ -313,6 +388,24 @@ aborted.
   with the negated aggregate of the other joiner groups so the family sums
   to zero, and every five-of-seven quorum hosts a correction-group member,
   so no parameter row of this family carries the add shape's signing.
+  R77d addendum (the missing row the remove shape needed): the acceptance
+  evidence folded into the driver above asserted key preservation, and the
+  rotation seam then kept failing at the signing step until the signing
+  family gained the rotated profile row. Measured mechanism: the pinned
+  fresh row's radius margin (r'-r ≈ 82.9 at the C=6 row) is exactly sized
+  for the eta=1 fresh shift; a rotated share's fold mass sqrt(2)-scales the
+  per-signer challenge shift so every candidate overshoots and all 11 slots
+  reject — deterministic starvation, not flake. The rotated C=6 row repins
+  (expo 4.50 → M=2.1810, B=931.45, r=424037.5, r'=424155.0, Phint=0.5995,
+  J=26 within the 43-slot transport budget; P1=1.0/P2=1.0), selected by the
+  share profile — any active share carrying fold multiplicity > 1 selects
+  it, all rotated shares of one rotation carry the marks identically, so the
+  session never splits (`dilithium3v1.SigningParametersForShares`, pinned in
+  `wallet/tss/protocol/dilithium3v1/params.go`, covered by
+  family_r77d_test.go). The remove-rotation seam's end-to-end signature
+  (produced on rotated shares, verified under the never-rotated group key)
+  then passes with the row in place.
+
   Same-key ADD signing therefore needs a resharing-level redesign, and the
   natural one is also measured: cycle-difference spreading (replace every
   weave component k by the difference fresh_k - fresh_{pi(k)} along a

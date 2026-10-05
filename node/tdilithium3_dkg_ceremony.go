@@ -299,7 +299,7 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 		}
 	}
 	activationContext, cancelActivation := context.WithTimeout(ctx, tdilithium3DKGCeremonyRoundTimeout)
-	err = n.runTDilithium3DKGActivationExchange(activationContext, session, runner, result, inbox.verifyIdentity, sign, broadcast)
+	err = n.runTDilithium3DKGActivationExchange(activationContext, session, runner, result, inbox.verifyIdentity, inbox.IdentityBindings(), sign, broadcast)
 	cancelActivation()
 	if err != nil {
 		return publicKey, fmt.Errorf("Dilithium3 v1 DKG activation exchange: %w", err)

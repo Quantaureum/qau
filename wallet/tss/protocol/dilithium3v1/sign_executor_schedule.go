@@ -103,7 +103,7 @@ func newSigningExecutorSchedule(
 	if len(activeShares) == 0 || activeShares[0] == nil {
 		return nil, fmt.Errorf("%w: missing active shares", errInvalidSigningAttempt)
 	}
-	params, err := SigningParametersForParticipants(len(activeShares[0].Committee.Participants))
+	params, err := SigningParametersForShares(activeShares)
 	if err != nil {
 		return nil, ErrUnsupportedSigningCommitteeSize
 	}

@@ -119,7 +119,7 @@ func NewSigningExecutorParty(config SigningExecutorPartyConfig) (*SigningExecuto
 	if config.Share == nil {
 		return nil, fmt.Errorf("%w: missing share", errInvalidSigningAttempt)
 	}
-	params, err := SigningParametersForParticipants(len(config.Share.Committee.Participants))
+	params, err := SigningParametersForShares([]*LocalShare{config.Share})
 	if err != nil {
 		return nil, ErrUnsupportedSigningCommitteeSize
 	}

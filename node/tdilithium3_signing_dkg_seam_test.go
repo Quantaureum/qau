@@ -320,16 +320,23 @@ func (harness *tdilithium3SeamHarness) run(ctx context.Context) ([][]byte, []err
 
 // signOne runs one seam request and requires every signer to return the same
 // signature, which the mode3 verifier must accept under the ceremony's group
-// public key. An exhausted request is reported to the caller, which retries
-// with a fresh request.
+// public key. Statistical slot outcomes — an exhausted request, a signer that
+// rejected the attempt, or a slot that went silent — burn their one-time
+// material by design, so they are reported to the caller as a no-signature
+// retry, not as test failures. Only structural errors stay fatal.
 func (harness *tdilithium3SeamHarness) signOne(t *testing.T) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	signatures, failures := harness.run(ctx)
+	retryable := func(err error) bool {
+		return errors.Is(err, errTDilithium3SigningRequestExhausted) ||
+			errors.Is(err, dilithium3v1.ErrSigningExecutorSilence) ||
+			errors.Is(err, dilithium3v1.ErrSigningRejected)
+	}
 	for index, failure := range failures {
 		if failure != nil {
-			if errors.Is(failure, errTDilithium3SigningRequestExhausted) {
+			if retryable(failure) {
 				return nil
 			}
 			t.Fatalf("signer %d: %v", index, failure)

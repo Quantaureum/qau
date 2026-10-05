@@ -175,8 +175,8 @@ func TestRefreshTDilithium3SigningFinalitySigner(t *testing.T) {
 	if err := store.Store(share, []byte(password)); err != nil {
 		t.Fatal(err)
 	}
-	certificate, sessionDigest, verifier := testThresholdActivationCertificate(t, share)
-	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, []byte(password)); err != nil {
+	certificate, sessionDigest, verifier, bindings := testThresholdActivationCertificate(t, share)
+	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, bindings, []byte(password)); err != nil {
 		t.Fatal(err)
 	}
 	node.refreshTDilithium3SigningFinalitySigner()

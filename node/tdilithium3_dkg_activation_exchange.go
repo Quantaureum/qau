@@ -54,6 +54,7 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 	runner *tdilithium3DKGRunner,
 	result tdilithium3DKGResult,
 	verifier dilithium3v1.DKGIdentityVerifier,
+	bindings []dilithium3v1.DKGIdentityBinding,
 	sign func([]byte) ([]byte, error),
 	broadcast func(messageType uint8, payload []byte) error,
 ) error {
@@ -62,7 +63,7 @@ func (n *Node) runTDilithium3DKGActivationExchange(
 	}
 	return n.runTDilithium3ActivationExchange(
 		ctx, session, result.Share, runner.shareStore, runner.password,
-		verifier, sign, broadcast,
+		verifier, bindings, sign, broadcast,
 	)
 }
 
@@ -76,6 +77,7 @@ func (n *Node) runTDilithium3ActivationExchange(
 	shareStore *thresholdShareStore,
 	password []byte,
 	verifier dilithium3v1.DKGIdentityVerifier,
+	bindings []dilithium3v1.DKGIdentityBinding,
 	sign func([]byte) ([]byte, error),
 	broadcast func(messageType uint8, payload []byte) error,
 ) error {
@@ -221,7 +223,10 @@ func (n *Node) runTDilithium3ActivationExchange(
 		nodeLog.Warn("R77-DIAG activation exchange: in-memory share pos=%d id=%d epoch=%d transcript=%x pub=%x candDigest=%x acks=%d",
 			share.ParticipantPosition, share.ParticipantID, session.ActivationEpoch, share.TranscriptDigest[:4], share.Key.PublicKey[:4], memDigest[:4], len(certificate.Acknowledgements))
 	}
-	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, password); err != nil {
+	// Rotation-era fix: the activation record also stores the identity
+	// bindings the session was verified under (v2), so a later lookup never
+	// needs to re-derive them from a renumbered roster view.
+	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, password); err != nil {
 		return fmt.Errorf("commit active share: %w", err)
 	}
 	nodeLog.Info("Dilithium3 v1 activation committed (activation epoch %d, session %x, group key prefix %x)",
@@ -441,7 +446,32 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 
 	password := []byte(n.config.ValidatorKeyPassword)
 	store := newThresholdShareStore(n.config.DataDir)
-	if err := store.ActivateCandidate(certificate, sessionDigest, activationEpoch, verifier, password); err != nil {
+	// Rotation-era record writing: the verifier just built above is bound to the
+	// incoming certificate's committed committee — persist the pid->identity
+	// bindings alongside so a later session never needs to re-derive them from a
+	// renumbered roster view.
+	//
+	// Bindings pairing: every ack in the certificate was authenticated at the
+	// winner's commit against its own session's id map; the roster gives the
+	// matching public keys positionally at index i for committee.Participants[i].
+	var bindings []dilithium3v1.DKGIdentityBinding
+	if rosterEpoch, scopeErr := tdilithium3DKGSessionRosterEpoch(activationEpoch); scopeErr == nil {
+		if roster, rosterErr := n.capturedEpochValidatorRoster(rosterEpoch); rosterErr == nil && len(certificate.Acknowledgements) > 0 {
+			committee := certificate.Acknowledgements[0].Committee
+			if len(committee.Participants) == len(roster.Entries) {
+				bindings = make([]dilithium3v1.DKGIdentityBinding, 0, len(roster.Entries))
+				for position, participantID := range committee.Participants {
+					entry := roster.Entries[position]
+					bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+						ParticipantID:    participantID,
+						ValidatorAddress: [20]byte(entry.Address),
+						PublicKey:        append([]byte(nil), entry.PublicKey...),
+					})
+				}
+			}
+		}
+	}
+	if err := store.ActivateCandidate(certificate, sessionDigest, activationEpoch, verifier, bindings, password); err != nil {
 		// R77-DIAG: adoption rejection is the decisive reason a straggler
 		// node cannot converge on a peer's committed group key; surface it at
 		// Warn so devnet acceptance can attribute the JOIN stall precisely.

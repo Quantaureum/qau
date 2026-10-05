@@ -4,12 +4,15 @@ package node
 import (
 	"bytes"
 	"crypto/sha3"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	qcrypto "github.com/quantaureum/qau/crypto"
+	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
@@ -18,14 +21,32 @@ import (
 const (
 	thresholdActivationMagic   = "QTD3ACT1"
 	thresholdActivationVersion = 1
-	thresholdActivationMaxSize = 128 << 10
+	// thresholdActivationVersionV2 records carry the pid->identity-key binding
+	// the certificate was verified under at write time. Rotation committees
+	// keep old participant ids while later roster-derived committees renumber,
+	// so a v1 record cannot be re-verified via a currently-derived verifier —
+	// the bindings must be self-describing.
+	thresholdActivationVersionV2 = 2
+	thresholdActivationMaxSize   = 256 << 10
 )
+
+type thresholdActivationBindingJSON struct {
+	ParticipantID    uint32 `json:"participant_id"`
+	ValidatorAddress string `json:"validator_address"`
+	PublicKey        string `json:"public_key"`
+}
 
 type thresholdActivationRecord struct {
 	Version     int                                   `json:"version"`
 	Certificate dilithium3v1.DKGActivationCertificate `json:"certificate"`
+	// v2 only: the pid -> identity binding the certificate was verified under
+	// when activated. Absent in v1.
+	Bindings []thresholdActivationBindingJSON `json:"bindings,omitempty"`
 }
 
+// encodeThresholdActivationCertificate marshal the certificate alone (v1). The
+// writer that has the verifier's bindings in hand must use
+// encodeThresholdActivationRecord (v2) so the record is self-describing.
 func encodeThresholdActivationCertificate(certificate dilithium3v1.DKGActivationCertificate) ([]byte, error) {
 	if _, err := certificate.CanonicalDigest(); err != nil {
 		return nil, err
@@ -40,27 +61,84 @@ func encodeThresholdActivationCertificate(certificate dilithium3v1.DKGActivation
 	return append([]byte(thresholdActivationMagic), payload...), nil
 }
 
-func decodeThresholdActivationCertificate(encoded []byte) (dilithium3v1.DKGActivationCertificate, error) {
+// encodeThresholdActivationRecord marshal certificate + identity bindings (v2).
+func encodeThresholdActivationRecord(certificate dilithium3v1.DKGActivationCertificate, bindings []dilithium3v1.DKGIdentityBinding) ([]byte, error) {
+	if _, err := certificate.CanonicalDigest(); err != nil {
+		return nil, err
+	}
+	if len(bindings) == 0 {
+		return nil, fmt.Errorf("v2 threshold activation record requires identity bindings")
+	}
+	record := thresholdActivationRecord{Version: thresholdActivationVersionV2, Certificate: certificate}
+	for _, binding := range bindings {
+		record.Bindings = append(record.Bindings, thresholdActivationBindingJSON{
+			ParticipantID:    binding.ParticipantID,
+			ValidatorAddress: hex.EncodeToString(binding.ValidatorAddress[:]),
+			PublicKey:        hex.EncodeToString(binding.PublicKey),
+		})
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload)+len(thresholdActivationMagic) > thresholdActivationMaxSize {
+		return nil, fmt.Errorf("threshold activation certificate exceeds size limit")
+	}
+	return append([]byte(thresholdActivationMagic), payload...), nil
+}
+
+// thresholdActivationRecordFrom decodes a record (v1 or v2) and returns the
+// certificate plus the recorded identity bindings when present.
+func thresholdActivationRecordFrom(encoded []byte) (dilithium3v1.DKGActivationCertificate, []dilithium3v1.DKGIdentityBinding, error) {
 	if len(encoded) > thresholdActivationMaxSize || !bytes.HasPrefix(encoded, []byte(thresholdActivationMagic)) {
-		return dilithium3v1.DKGActivationCertificate{}, fmt.Errorf("invalid threshold activation certificate encoding")
+		return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("invalid threshold activation certificate encoding")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded[len(thresholdActivationMagic):]))
 	decoder.DisallowUnknownFields()
 	var record thresholdActivationRecord
 	if err := decoder.Decode(&record); err != nil {
-		return dilithium3v1.DKGActivationCertificate{}, err
+		return dilithium3v1.DKGActivationCertificate{}, nil, err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return dilithium3v1.DKGActivationCertificate{}, fmt.Errorf("trailing threshold activation certificate data")
+		return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("trailing threshold activation certificate data")
 	}
-	if record.Version != thresholdActivationVersion {
-		return dilithium3v1.DKGActivationCertificate{}, fmt.Errorf("unsupported threshold activation certificate version")
+	if record.Version != thresholdActivationVersion && record.Version != thresholdActivationVersionV2 {
+		return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("unsupported threshold activation certificate version")
 	}
 	if _, err := record.Certificate.CanonicalDigest(); err != nil {
-		return dilithium3v1.DKGActivationCertificate{}, err
+		return dilithium3v1.DKGActivationCertificate{}, nil, err
 	}
-	return record.Certificate, nil
+	if record.Version == thresholdActivationVersionV2 && len(record.Bindings) == 0 {
+		return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("v2 threshold activation record carries no bindings")
+	}
+	var bindings []dilithium3v1.DKGIdentityBinding
+	if record.Version == thresholdActivationVersionV2 {
+		bindings = make([]dilithium3v1.DKGIdentityBinding, 0, len(record.Bindings))
+		for _, raw := range record.Bindings {
+			publicKey, err := hex.DecodeString(raw.PublicKey)
+			if err != nil || len(publicKey) != qcrypto.Dilithium3PublicKeySize {
+				return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("threshold activation record has a malformed binding key")
+			}
+			addressBytes, err := hex.DecodeString(raw.ValidatorAddress)
+			if err != nil || len(addressBytes) != len(types.Address{}) {
+				return dilithium3v1.DKGActivationCertificate{}, nil, fmt.Errorf("threshold activation record has a malformed binding address")
+			}
+			var address types.Address
+			copy(address[:], addressBytes)
+			bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+				ParticipantID:    raw.ParticipantID,
+				ValidatorAddress: [20]byte(address),
+				PublicKey:        publicKey,
+			})
+		}
+	}
+	return record.Certificate, bindings, nil
+}
+
+func decodeThresholdActivationCertificate(encoded []byte) (dilithium3v1.DKGActivationCertificate, error) {
+	certificate, _, err := thresholdActivationRecordFrom(encoded)
+	return certificate, err
 }
 
 // R77-DIAG: break down a threshold-activation verification failure into the
@@ -142,14 +220,20 @@ func (store *thresholdShareStore) ActivateCandidate(
 	sessionDigest [32]byte,
 	currentEpoch uint64,
 	verifier dilithium3v1.DKGIdentityVerifier,
+	bindings []dilithium3v1.DKGIdentityBinding,
 	password []byte,
 ) error {
 	if store == nil || store.basePath == "" || len(password) == 0 || sessionDigest == ([32]byte{}) || verifier == nil {
 		return fmt.Errorf("threshold activation is not configured")
 	}
-	if err := certificate.Verify(verifier); err != nil {
-		diagnoseTDilithium3ActivationCertificate("verify-failed", certificate, nil, sessionDigest, verifier)
-		return err
+	// The bindings argument pins the pid->identity-key pairing this certificate
+	// verified under. It is persisted with the record (v2) so a later session
+	// can verify the certificate against the recorded bindings instead of a
+	// currently-derived verifier — a remove rotation keeps the old participant
+	// ids while a later session re-derives roster-position ids, and only the
+	// recorded bindings distinguish the two views correctly.
+	if len(bindings) == 0 {
+		return fmt.Errorf("threshold activation requires the session identity bindings")
 	}
 	first := certificate.Acknowledgements[0]
 	if currentEpoch != first.ActivationEpoch || sessionDigest != first.SessionDigest {
@@ -184,10 +268,6 @@ func (store *thresholdShareStore) ActivateCandidate(
 		return err
 	}
 	defer stored.Zeroize()
-	if err := certificate.VerifyCandidate(stored, sessionDigest, verifier); err != nil {
-		diagnoseTDilithium3ActivationCertificate("verifyCandidate-failed", certificate, stored, sessionDigest, verifier)
-		return err
-	}
 	paths, err = newThresholdProtocolPaths(store.basePath, candidate.Protocol, candidate.Key.Generation, candidate.Committee.Version, candidate.ParticipantID)
 	if err != nil {
 		return err
@@ -202,44 +282,35 @@ func (store *thresholdShareStore) ActivateCandidate(
 		return err
 	}
 	defer tss.SecureZero(ledger)
-	if ledgerExists {
-		previous, err := dilithium3v1.UnmarshalLocalShare(ledger)
-		if err != nil {
-			return err
-		}
-		defer previous.Zeroize()
-		// The participant id is not part of the identity check: R76/R77
-		// committee churn renumbers surviving validators (roster-position ids),
-		// so a legitimate rotation candidate can carry a new participant id.
-		// What stays forbidden: generation or committee-version rollback, an
-		// in-generation group-key change, and an equal-version byte conflict.
-		if previous.Key.Generation > candidate.Key.Generation ||
-			(previous.Key.Generation == candidate.Key.Generation &&
-				(previous.Committee.Version > candidate.Committee.Version ||
-					!bytes.Equal(previous.Key.PublicKey, candidate.Key.PublicKey) ||
-					(previous.Committee.Version == candidate.Committee.Version && !bytes.Equal(ledger, candidateHead)))) {
-			return fmt.Errorf("threshold activation generation rollback or conflict")
-		}
-	}
-	if (activeExists && !ledgerExists && !bytes.Equal(active, candidateHead)) ||
-		(!activeExists && ledgerExists) ||
-		(activeExists && ledgerExists && !bytes.Equal(active, ledger) && !bytes.Equal(active, candidateHead)) {
-		return fmt.Errorf("active threshold share and ledger are inconsistent")
-	}
 
-	encodedCertificate, err := encodeThresholdActivationCertificate(certificate)
+	var encodedCertificate []byte
+	encodedCertificate, err = encodeThresholdActivationRecord(certificate, bindings)
 	if err != nil {
 		return err
 	}
-	previousCertificate, certificateExists, err := loadThresholdActivationCertificate(paths.ActivationCertificate, password)
+
+	// Idempotence precedes every verifier call: the already-persisted record's
+	// canonical digest is the proof of content; the caller's current-view
+	// verifier is irrelevant to a re-delivery — and after a rotation that view
+	// of the pid space cannot see the preserved ids the record was signed under.
+	previousCertificate, _, certificateExists, err := loadThresholdActivationCertificate(paths.ActivationCertificate, password)
 	if err != nil {
 		return err
 	}
 	if certificateExists {
-		// R77-DIAG: a certificate is already persisted for this candidate path.
-		// If it belongs to an earlier (stale) session the re-verification below
-		// rejects the incoming adoption; compare the two up front so a devnet
-		// JOIN stall names the divergence instead of returning a bare sentinel.
+		previousDigest, prevErr := previousCertificate.CanonicalDigest()
+		incomingDigest, incErr := certificate.CanonicalDigest()
+		if prevErr != nil || incErr != nil {
+			return fmt.Errorf("threshold activation certificate digests: %v / %v", prevErr, incErr)
+		}
+		if previousDigest == incomingDigest {
+			// Equal content: complete the durable write if it was interrupted,
+			// or no-op. Verifier checks are unnecessary noise here.
+			if activeExists && ledgerExists && bytes.Equal(active, candidateHead) && bytes.Equal(ledger, candidateHead) {
+				return nil
+			}
+			goto writeDurable
+		}
 		if len(certificate.Acknowledgements) > 0 && len(previousCertificate.Acknowledgements) > 0 {
 			nodeLog.Warn("R77-DIAG activation stored-cert present: stored(ackEpoch=%d session=%x nacks=%d pub=%x) vs incoming(session=%x nacks=%d)",
 				previousCertificate.Acknowledgements[0].ActivationEpoch,
@@ -247,13 +318,6 @@ func (store *thresholdShareStore) ActivateCandidate(
 				previousCertificate.Acknowledgements[0].Key.PublicKey[:4],
 				certificate.Acknowledgements[0].SessionDigest[:4], len(certificate.Acknowledgements))
 		}
-		// The stored certificate was verified against ITS OWN session when it
-		// was written. Re-verifying it against the CURRENT roster-bound verifier
-		// cannot survive committee churn: participant ids are roster-position-
-		// derived (R76/R77), so after any membership change the old acks verify
-		// only against the OLD committee's bindings — which the store does not
-		// keep. Gate the re-verification on an unchanged committee; a churned
-		// committee relies on the epoch-monotonicity and lineage checks below.
 		sameCommittee := false
 		if len(previousCertificate.Acknowledgements) > 0 && len(certificate.Acknowledgements) > 0 {
 			previousCommitteeDigest, previousErr := previousCertificate.Acknowledgements[0].Committee.CanonicalDigest()
@@ -268,33 +332,52 @@ func (store *thresholdShareStore) ActivateCandidate(
 		} else {
 			nodeLog.Info("Dilithium3 v1 activation: stored certificate belongs to a previous committee; skipping signature re-verification (lineage checks below still apply)")
 		}
-		previousEncoding, err := encodeThresholdActivationCertificate(previousCertificate)
+		if previousCertificate.Acknowledgements[0].ActivationEpoch >= currentEpoch || !ledgerExists {
+			return fmt.Errorf("conflicting threshold activation certificate")
+		}
+		if sameCommittee {
+			previousShare, err := dilithium3v1.UnmarshalLocalShare(ledger)
+			if err != nil {
+				return err
+			}
+			previousErr := previousCertificate.VerifyCandidate(previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
+			if previousErr != nil {
+				diagnoseTDilithium3ActivationCertificate("storedCert-candidate-failed", previousCertificate, previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
+			}
+			previousShare.Zeroize()
+			if previousErr != nil {
+				return previousErr
+			}
+		}
+	}
+	if err := certificate.Verify(verifier); err != nil {
+		diagnoseTDilithium3ActivationCertificate("verify-failed", certificate, nil, sessionDigest, verifier)
+		return err
+	}
+	if err := certificate.VerifyCandidate(stored, sessionDigest, verifier); err != nil {
+		diagnoseTDilithium3ActivationCertificate("verifyCandidate-failed", certificate, stored, sessionDigest, verifier)
+		return err
+	}
+	if ledgerExists {
+		previous, err := dilithium3v1.UnmarshalLocalShare(ledger)
 		if err != nil {
 			return err
 		}
-		if !bytes.Equal(previousEncoding, encodedCertificate) {
-			if previousCertificate.Acknowledgements[0].ActivationEpoch >= currentEpoch || !ledgerExists {
-				return fmt.Errorf("conflicting threshold activation certificate")
-			}
-			if sameCommittee {
-				previousShare, err := dilithium3v1.UnmarshalLocalShare(ledger)
-				if err != nil {
-					return err
-				}
-				previousErr := previousCertificate.VerifyCandidate(previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
-				if previousErr != nil {
-					diagnoseTDilithium3ActivationCertificate("storedCert-candidate-failed", previousCertificate, previousShare, previousCertificate.Acknowledgements[0].SessionDigest, verifier)
-				}
-				previousShare.Zeroize()
-				if previousErr != nil {
-					return previousErr
-				}
-			}
+		defer previous.Zeroize()
+		if previous.Key.Generation > candidate.Key.Generation ||
+			(previous.Key.Generation == candidate.Key.Generation &&
+				(previous.Committee.Version > candidate.Committee.Version ||
+					!bytes.Equal(previous.Key.PublicKey, candidate.Key.PublicKey) ||
+					(previous.Committee.Version == candidate.Committee.Version && !bytes.Equal(ledger, candidateHead)))) {
+			return fmt.Errorf("threshold activation generation rollback or conflict")
 		}
 	}
-	if certificateExists && activeExists && ledgerExists && bytes.Equal(active, candidateHead) && bytes.Equal(ledger, candidateHead) {
-		return nil
+	if (activeExists && !ledgerExists && !bytes.Equal(active, candidateHead)) ||
+		(!activeExists && ledgerExists) ||
+		(activeExists && ledgerExists && !bytes.Equal(active, ledger) && !bytes.Equal(active, candidateHead)) {
+		return fmt.Errorf("active threshold share and ledger are inconsistent")
 	}
+writeDurable:
 	encryptedCertificate, err := thresholdEncryptPersistenceBlob(encodedCertificate, password)
 	if err != nil {
 		return err
@@ -354,13 +437,32 @@ func (store *thresholdShareStore) LoadActiveAtEpoch(currentEpoch uint64, verifie
 		share.Zeroize()
 		return nil, fmt.Errorf("threshold share activation epoch is in the future")
 	}
-	certificate, exists, err := loadThresholdActivationCertificate(paths.ActivationCertificate, password)
+	certificate, storedBindings, exists, err := loadThresholdActivationCertificate(paths.ActivationCertificate, password)
 	if err != nil || !exists {
 		share.Zeroize()
 		if err != nil {
 			return nil, err
 		}
 		return nil, fmt.Errorf("threshold activation certificate is missing")
+	}
+	// Rotation committees keep the previous participant ids across a removal
+	// while every fresh derivation renumbers to roster positions; when the
+	// record carries its write-time bindings (v2), verify against those.
+	// Caller-passed verifiers remain the fallback for v1 records.
+	if len(storedBindings) > 0 {
+		recorded := make(map[uint32]*qcrypto.PublicKey, len(storedBindings))
+		for _, binding := range storedBindings {
+			key, err := qcrypto.PublicKeyFromBytes(binding.PublicKey)
+			if err != nil {
+				share.Zeroize()
+				return nil, fmt.Errorf("stored activation binding has an unusable identity key: %w", err)
+			}
+			recorded[binding.ParticipantID] = key
+		}
+		verifier = func(participantID uint32, message, signature []byte) bool {
+			key, found := recorded[participantID]
+			return found && qcrypto.Verify(key, message, signature)
+		}
 	}
 	if err := certificate.VerifyCandidate(share, certificate.Acknowledgements[0].SessionDigest, verifier); err != nil {
 		share.Zeroize()
@@ -424,22 +526,22 @@ func (store *thresholdShareStore) ActiveSharePublicIdentity(password []byte) (ui
 	return epoch, publicKey, share.Committee.Threshold, nil
 }
 
-func loadThresholdActivationCertificate(path string, password []byte) (dilithium3v1.DKGActivationCertificate, bool, error) {
+func loadThresholdActivationCertificate(path string, password []byte) (dilithium3v1.DKGActivationCertificate, []dilithium3v1.DKGIdentityBinding, bool, error) {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
-		return dilithium3v1.DKGActivationCertificate{}, false, nil
+		return dilithium3v1.DKGActivationCertificate{}, nil, false, nil
 	}
 	if err != nil {
-		return dilithium3v1.DKGActivationCertificate{}, false, err
+		return dilithium3v1.DKGActivationCertificate{}, nil, false, err
 	}
 	if info.Size() > thresholdActivationMaxSize+256 {
-		return dilithium3v1.DKGActivationCertificate{}, false, fmt.Errorf("threshold activation certificate exceeds size limit")
+		return dilithium3v1.DKGActivationCertificate{}, nil, false, fmt.Errorf("threshold activation certificate exceeds size limit")
 	}
 	plaintext, exists, err := loadThresholdPlaintext(path, password)
 	if err != nil || !exists {
-		return dilithium3v1.DKGActivationCertificate{}, exists, err
+		return dilithium3v1.DKGActivationCertificate{}, nil, exists, err
 	}
 	defer tss.SecureZero(plaintext)
-	certificate, err := decodeThresholdActivationCertificate(plaintext)
-	return certificate, true, err
+	certificate, bindings, err := thresholdActivationRecordFrom(plaintext)
+	return certificate, bindings, true, err
 }

@@ -9,6 +9,7 @@ package node
 // here first.
 
 import (
+	"math/big"
 	"bytes"
 	"context"
 	"fmt"
@@ -101,7 +102,7 @@ func newTDilithium3DKGFamilyHarness(t *testing.T) *tdilithium3DKGFamilyHarness {
 		harness.privateKeys[position] = privateKey
 		address := types.AddressFromPublicKey(publicKey.Bytes())
 		addresses[participants[position]] = address
-		validators[position] = &consensus.Validator{Address: address, Active: true, PublicKeyBytes: publicKey.Bytes()}
+		validators[position] = &consensus.Validator{Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: publicKey.Bytes()}
 		peers[address] = p2p.PeerID(fmt.Sprintf("peer-%d", position))
 		harness.exchanges[position] = newTDilithium3DKGGroupExchange()
 		entropy := bytes.NewReader(bytes.Repeat([]byte{byte(position + 1), byte(position + 17), byte(position + 33)}, 1<<16))

@@ -2,6 +2,7 @@
 package node
 
 import (
+	"math/big"
 	"bufio"
 	"bytes"
 	"context"
@@ -521,7 +522,7 @@ func runTDilithium3DKGGroupP2PChild(t *testing.T) {
 			t.Fatal(err)
 		}
 		addresses[session.Committee.Participants[slot]] = address
-		validators = append(validators, &consensus.Validator{Address: address, Active: true, PublicKeyBytes: publicKey.Bytes()})
+		validators = append(validators, &consensus.Validator{Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: publicKey.Bytes()})
 		peerByAddress[address] = peerByPosition[slot]
 		keysByParticipant[session.Committee.Participants[slot]] = key
 	}
@@ -529,6 +530,18 @@ func runTDilithium3DKGGroupP2PChild(t *testing.T) {
 		key := keysByParticipant[participantID]
 		return key != nil && qcrypto.Verify(key, message, signature)
 	})
+	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(session.Committee.Participants))
+	for _, pid := range session.Committee.Participants {
+		key := keysByParticipant[pid]
+		if key == nil {
+			t.Fatalf("missing participant key for %d", pid)
+		}
+		bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+			ParticipantID:    pid,
+			ValidatorAddress: [20]byte(types.AddressFromPublicKey(key.Bytes())),
+			PublicKey:        key.Bytes(),
+		})
+	}
 	inbox, err := newTDilithium3DKGInboxFromValidatorSnapshot(session, position, addresses, validators, func(address types.Address) (p2p.PeerID, bool) {
 		peer, found := peerByAddress[address]
 		return peer, found
@@ -644,7 +657,7 @@ func runTDilithium3DKGGroupP2PChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, runner.password); err != nil {
+	if err := runner.shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, runner.password); err != nil {
 		t.Fatalf("child %d activation commit: %v", index, err)
 	}
 	active, err := newThresholdShareStore(runner.basePath).LoadActiveAtEpoch(session.ActivationEpoch, verifier, runner.password)
@@ -880,8 +893,18 @@ func runTDilithium3DKGCeremonyP2PChild(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), tdilithium3DKGCrossProcessPhaseTimeout)
 	defer cancel()
 	for other := index + 1; other < tdilithium3DKGCrossProcessPositions; other++ {
-		if err := host.Connect(ctx, addrByPosition[other]); err != nil {
-			t.Fatalf("child %d: connect to child %d: %v", index, other, err)
+		// The loopback listener of the peer can still be binding at this point
+		// on a slow box: retry the dial until the phase window closes instead of
+		// dying on a single refused connection and leaving every peer's inbound
+		// side to time out behind it.
+		for {
+			if err := host.Connect(ctx, addrByPosition[other]); err == nil {
+				break
+			} else if ctx.Err() != nil {
+				t.Fatalf("child %d: connect to child %d: %v", index, other, err)
+			} else {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 	}
 	for host.ConnectedPeerCount() != tdilithium3DKGCrossProcessPositions-1 {
@@ -900,7 +923,7 @@ func runTDilithium3DKGCeremonyP2PChild(t *testing.T) {
 		pairs[slot] = tdilithium3DKGCeremonyP2PIdentity(t, slot)
 		address := pairs[slot].Public.Address()
 		validators = append(validators, &consensus.Validator{
-			Address: address, Active: true, PublicKeyBytes: pairs[slot].Public.Bytes(),
+			Address: address, Active: true, Stake: big.NewInt(1_000_000), PublicKeyBytes: pairs[slot].Public.Bytes(),
 		})
 		host.RegisterValidatorPeer(address, peerByPosition[slot])
 	}
@@ -938,10 +961,10 @@ func runTDilithium3DKGCeremonyP2PChild(t *testing.T) {
 	if store == nil {
 		t.Fatal("the roster sidecar is not enabled with the gates open and a data dir")
 	}
-	if err := store.capture(5, tdilithium3DKGRosterTestHash(0x90), entries, 4); err != nil {
+	if err := tdil3TestCapture(store, 5, tdilithium3DKGRosterTestHash(0x90), entries, 4); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.capture(6, tdilithium3DKGRosterTestHash(0x91), entries, 5); err != nil {
+	if err := tdil3TestCapture(store, 6, tdilithium3DKGRosterTestHash(0x91), entries, 5); err != nil {
 		t.Fatal(err)
 	}
 

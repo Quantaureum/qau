@@ -51,27 +51,36 @@ the R74 bootstrap rule), let `R` be the ordered epoch roster (already
 finality-anchored, canonical ascending-address order, size n).
 
 ```text
-C = clamp(n, 6, 12)              // committee size
-t = ceil(2*C/3)                  // signing threshold; t(6)=4, t(12)=8
-committee = (n <= 12) ? R
-          : stakeWeightedSample(R, seed = VRFAccumulator(RE-2), C)
+C = min(n, 7)                  // committee size caps at the largest pinned row
+t = ceil(2*C/3)                // signing threshold; t(6)=4, t(7)=5
+committee = (n <= 7) ? R
+         : stakeWeightedSample(R, seed = VRFAccumulator(RE-2), C = 7)
 ```
 
 Consequences, all deliberate:
 
-- **n ≤ 12 (every chain today):** the committee is the whole roster. No
+- **n ≤ 7 (every chain today):** the committee is the whole roster. No
   sampling randomness enters the derivation; a chain with six validators keeps
   producing exactly the committee it produces now, so nothing observable
   changes at activation epochs ≥ 2.
-- **n > 12:** the committee is a fixed-size epoch sample of the roster. The
-  sampling rule reuses the proven `SelectExecutiveForEpoch` construction:
-  sequential proportional-without-replacement selection seeded by the
-  epoch's VRF accumulator (`consensus/provinces.go`, R88-F cold-start
+- **n > 7:** the committee is the fixed-size 7-member epoch sample of the
+  roster. The sampling rule reuses the proven `SelectExecutiveForEpoch`
+  construction: sequential proportional-without-replacement selection seeded
+  by the epoch's VRF accumulator (`consensus/provinces.go`, R88-F cold-start
   semantics included). Same roster plus same accumulator ⇒ same committee on
-  every node; no consensus message and no new block data is introduced in
-  R76.
+  every node; no consensus message and no new block data is introduced.
 - n < 6 fails closed (`consensus.MinValidatorsForChambers` already enforces
   this boundary for activation; the v1 gate keeps its own check).
+
+Revision note (2026-10-05): this D1 formula originally clamped to 12 because
+the DKG family range is [6, 12]. The signing-MPC reality measured by R76b is
+narrower — only C=6 and C=7 have operational parameter rows (C=8 needs ≈265
+parallel slots / ~2 MB per party per request; C ≥ 9 is provably degenerate
+under the mode3 fixed hint channel) — so the committee family stays at the
+pinning boundary and oversize rosters sample at C=7 instead of stalling past
+12. The sampling inputs (per-entry stake and the VRF accumulator of RE-2,
+both recorded in the v2 epoch-roster sidecar) are committed into that record's
+digest so a tampered weight or seed fails closed on load.
 
 Rejected alternative: committee size from a config value. A config knob splits
 the committee across operators who set it differently; a pure function of the
@@ -179,6 +188,24 @@ actually has more than C_max validators:
 - **R76b (later, before any chain exceeds 12 validators):** the
   stake-weighted sampling accessor of D1/D4, capping the committee at 12
   while the validator set grows unboundedly.
+
+**Update (2026-10-05): the D1 sampling accessor is landed.** With the
+measured signing-family boundary at {6, 7} (see the revision note in D1), the
+accessor samples the 7-member committee the moment the roster exceeds 7 —
+`node/tdilithium3_dkg_committee_sampling.go`: sequential proportional-without-
+replacement draws keyed sha3(domain ‖ roster epoch ‖ captured VRF accumulator
+of epoch−2 ‖ round) over remaining stake, canonical ascending roster order for
+the output. The epoch-roster sidecar went to format v2 (per-entry stake +
+captured seed, both folded into the record digest; pre-accessor records and
+records with no recorded seed refuse to sample instead of guessing). All
+committee-vs-roster pairing now goes through the sampled selection
+(`tdilithium3DKGRosterBindings` and `tdilithium3DKGCommitteeForRoster` agree
+on it byte for byte), so two nodes at the same head derive the identical
+committee for any n. Unit coverage: `TestTDilithium3DKGCommitteeSelection`
+pins whole-roster identity inside {6, 7}, determinism over 8 distinct seeds,
+stake-proportionality of the weighted draws, and fail-closed behavior on
+missing stakes/seeds. A live-chain exercise of an n > 7 validator set remains
+the optional follow-up at devnet scale (no current chain reaches n = 8).
 
 R76a alone removes the "exactly six" restriction for every realistically
 sized network today and for every chain up to 12 validators permanently.

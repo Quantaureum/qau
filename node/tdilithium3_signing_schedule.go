@@ -233,7 +233,7 @@ func newTDilithium3SigningSchedule(
 	if config.Share == nil {
 		return nil, fmt.Errorf("Dilithium3 signing request config requires a local share")
 	}
-	params, rowErr := dilithium3v1.SigningParametersForParticipants(len(config.Share.Committee.Participants))
+	params, rowErr := dilithium3v1.SigningParametersForShares([]*dilithium3v1.LocalShare{config.Share})
 	if rowErr != nil {
 		return nil, rowErr
 	}

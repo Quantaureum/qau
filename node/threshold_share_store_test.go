@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
+	"github.com/quantaureum/qau/types"
 	qcrypto "github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
@@ -154,17 +155,17 @@ func TestThresholdShareStoreRequiresCertificateAtEpoch(t *testing.T) {
 	if err := store.Store(share, password); err != nil {
 		t.Fatal(err)
 	}
-	certificate, sessionDigest, verifier := testThresholdActivationCertificate(t, share)
-	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch-1, verifier, password); err == nil {
+	certificate, sessionDigest, verifier, bindings := testThresholdActivationCertificate(t, share)
+	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch-1, verifier, bindings, password); err == nil {
 		t.Fatal("candidate activated before epoch boundary")
 	}
 	if _, err := store.LoadActiveAtEpoch(share.ActivationEpoch, verifier, password); !os.IsNotExist(err) {
 		t.Fatalf("early activation left an active share: %v", err)
 	}
-	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, nil, password); err == nil {
+	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, nil, bindings, password); err == nil {
 		t.Fatal("candidate activated without signature verification")
 	}
-	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, password); err != nil {
+	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, bindings, password); err != nil {
 		t.Fatalf("exact-epoch activation: %v", err)
 	}
 	if _, err := store.LoadActiveAtEpoch(share.ActivationEpoch-1, verifier, password); err == nil {
@@ -182,7 +183,7 @@ func TestThresholdShareStoreRequiresCertificateAtEpoch(t *testing.T) {
 		t.Fatal("activated share components changed")
 	}
 	loaded.Zeroize()
-	if err := restarted.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, password); err != nil {
+	if err := restarted.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, bindings, password); err != nil {
 		t.Fatalf("idempotent activation: %v", err)
 	}
 	paths, err := newThresholdProtocolPaths(base, share.Protocol, share.Key.Generation, share.Committee.Version, share.ParticipantID)
@@ -210,7 +211,7 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	if err := store.Store(first, password); err != nil {
 		t.Fatal(err)
 	}
-	firstCertificate, firstSession, firstVerifier := testThresholdActivationCertificate(t, first)
+	firstCertificate, firstSession, firstVerifier, firstBindings := testThresholdActivationCertificate(t, first)
 	paths, err := newThresholdProtocolPaths(base, first.Protocol, first.Key.Generation, first.Committee.Version, first.ParticipantID)
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +230,7 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	if _, err := store.LoadActiveAtEpoch(first.ActivationEpoch, firstVerifier, password); !os.IsNotExist(err) {
 		t.Fatalf("certificate without active share was loadable: %v", err)
 	}
-	if err := store.ActivateCandidate(firstCertificate, firstSession, first.ActivationEpoch, firstVerifier, password); err != nil {
+	if err := store.ActivateCandidate(firstCertificate, firstSession, first.ActivationEpoch, firstVerifier, firstBindings, password); err != nil {
 		t.Fatalf("resume after certificate write: %v", err)
 	}
 
@@ -237,7 +238,7 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	if err := store.Store(second, password); err != nil {
 		t.Fatal(err)
 	}
-	secondCertificate, secondSession, secondVerifier := testThresholdActivationCertificate(t, second)
+	secondCertificate, secondSession, secondVerifier, secondBindings := testThresholdActivationCertificate(t, second)
 	secondEncoding, err := encodeThresholdActivationCertificate(secondCertificate)
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +265,7 @@ func TestThresholdActivationRecoversInterruptedDurableWrites(t *testing.T) {
 	if _, err := store.LoadActiveAtEpoch(second.ActivationEpoch, secondVerifier, password); err == nil {
 		t.Fatal("active share without matching ledger was loadable")
 	}
-	if err := store.ActivateCandidate(secondCertificate, secondSession, second.ActivationEpoch, secondVerifier, password); err != nil {
+	if err := store.ActivateCandidate(secondCertificate, secondSession, second.ActivationEpoch, secondVerifier, secondBindings, password); err != nil {
 		t.Fatalf("resume after active write: %v", err)
 	}
 	restarted := newThresholdShareStore(base)
@@ -416,8 +417,8 @@ func TestThresholdShareStoreStagesSameKeyCommitteeRotation(t *testing.T) {
 	if err := store.Store(current, password); err != nil {
 		t.Fatal(err)
 	}
-	currentCertificate, currentSession, currentVerifier := testThresholdActivationCertificate(t, current)
-	if err := store.ActivateCandidate(currentCertificate, currentSession, current.ActivationEpoch, currentVerifier, password); err != nil {
+	currentCertificate, currentSession, currentVerifier, currentBindings := testThresholdActivationCertificate(t, current)
+	if err := store.ActivateCandidate(currentCertificate, currentSession, current.ActivationEpoch, currentVerifier, currentBindings, password); err != nil {
 		t.Fatal(err)
 	}
 
@@ -455,11 +456,11 @@ func TestThresholdShareStoreStagesSameKeyCommitteeRotation(t *testing.T) {
 	if err := store.Store(otherKey, password); err == nil {
 		t.Fatal("same generation candidate changed the group public key")
 	}
-	certificate, session, verifier := testThresholdActivationCertificate(t, next)
+	certificate, session, verifier, nextBindings := testThresholdActivationCertificate(t, next)
 	historicalVerifier := func(participantID uint32, message, signature []byte) bool {
 		return currentVerifier(participantID, message, signature) || verifier(participantID, message, signature)
 	}
-	if err := store.ActivateCandidate(certificate, session, next.ActivationEpoch, historicalVerifier, password); err != nil {
+	if err := store.ActivateCandidate(certificate, session, next.ActivationEpoch, historicalVerifier, nextBindings, password); err != nil {
 		t.Fatalf("activate same-key committee: %v", err)
 	}
 	rotated, err := store.LoadActiveAtEpoch(next.ActivationEpoch, verifier, password)
@@ -472,7 +473,7 @@ func TestThresholdShareStoreStagesSameKeyCommitteeRotation(t *testing.T) {
 	rotated.Zeroize()
 }
 
-func testThresholdActivationCertificate(t *testing.T, share *dilithium3v1.LocalShare) (dilithium3v1.DKGActivationCertificate, [32]byte, dilithium3v1.DKGIdentityVerifier) {
+func testThresholdActivationCertificate(t *testing.T, share *dilithium3v1.LocalShare) (dilithium3v1.DKGActivationCertificate, [32]byte, dilithium3v1.DKGIdentityVerifier, []dilithium3v1.DKGIdentityBinding) {
 	t.Helper()
 	sessionDigest := sha3.Sum256([]byte("DEVNET ONLY threshold activation session"))
 	encoded, err := share.MarshalBinary()
@@ -514,7 +515,19 @@ func testThresholdActivationCertificate(t *testing.T, share *dilithium3v1.LocalS
 		publicKey := publicKeys[participantID]
 		return publicKey != nil && mode3.Verify(publicKey, message, signature)
 	}
-	return certificate, sessionDigest, verifier
+	// The v2 activation record persists the pid->identity binding the
+	// certificate was verified under; the test helper hands the caller the same
+	// material so production write paths can OPT to store exactly what passed.
+	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(publicKeys))
+	for _, participantID := range share.Committee.Participants {
+		publicKey := publicKeys[participantID]
+		bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+			ParticipantID:    participantID,
+			ValidatorAddress: types.AddressFromPublicKey(publicKey.Bytes()),
+			PublicKey:        publicKey.Bytes(),
+		})
+	}
+	return certificate, sessionDigest, verifier, bindings
 }
 
 func testThresholdStoreShare(t *testing.T, generation uint64) *dilithium3v1.LocalShare {
@@ -553,4 +566,79 @@ func testThresholdStoreShare(t *testing.T, generation uint64) *dilithium3v1.Loca
 		share.Components[index].S2[0][0] = dilithium3v1.Q - coefficient
 	}
 	return share
+}
+
+// TestThresholdActivationIdempotentAcrossRenumberedCommittee is the
+// rotation-era durable-identity regression: the same already-persisted
+// certificate must stay idempotent even when the caller hands a verifier built
+// over a DIFFERENT id map (whoever a reshare renumbered the survivors onto),
+// and re-activating it must repair any durable-write trilogy that was cut
+// mid-flight. The previous signature-reverification step refused exactly that
+// situation because the stored pid set no longer matched a derived current
+// view.
+func TestThresholdActivationIdempotentAcrossRenumberedCommittee(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "shares.enc")
+	store := newThresholdShareStore(base)
+	password := []byte("DEVNET ONLY rotation-tolerant activation password")
+	share := testThresholdStoreShare(t, 2)
+	if err := store.Store(share, password); err != nil {
+		t.Fatal(err)
+	}
+	certificate, session, verifier, bindings := testThresholdActivationCertificate(t, share)
+	if err := store.ActivateCandidate(certificate, session, share.ActivationEpoch, verifier, bindings, password); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadActiveAtEpoch(share.ActivationEpoch, verifier, password)
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	loaded.Zeroize()
+
+	// Simulate the reshare-day picture: the caller's verifier is rebuilt over
+	// the renumbered pid map — pid identities point at keys that differ from
+	// every recorded one, exactly what the rotation's pid-preservation produces.
+	foreignBindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		foreign, _, err := mode3.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		foreignBindings = append(foreignBindings, dilithium3v1.DKGIdentityBinding{
+			ParticipantID:    binding.ParticipantID,
+			ValidatorAddress: binding.ValidatorAddress,
+			PublicKey:        foreign.Bytes(),
+		})
+	}
+	foreignVerifier := func(participantID uint32, message, signature []byte) bool {
+		_ = participantID
+		_ = message
+		_ = signature
+		return false
+	}
+	if err := store.ActivateCandidate(certificate, session, share.ActivationEpoch, foreignVerifier, foreignBindings, password); err != nil {
+		t.Fatalf("idempotent re-delivery must not be re-verified by anyone else's map: %v", err)
+	}
+	// Simulate the cut-mid-flight crash the durability test contract covers:
+	// the certificate write survives, the ledger-head write did not land.
+	paths, err := newThresholdProtocolPaths(base, share.Protocol, share.Key.Generation, share.Committee.Version, share.ParticipantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(paths.LedgerHead); err != nil {
+		t.Fatal(err)
+	}
+	// The same-certificate adoption call must repair the cut durable triple:
+	// the digest of an already-persisted record is exactly the safe short-path.
+	if err := store.ActivateCandidate(certificate, session, share.ActivationEpoch, verifier, bindings, password); err != nil {
+		t.Fatalf("resume-side repair: %v", err)
+	}
+	reopened := newThresholdShareStore(base)
+	still, err := reopened.LoadActiveAtEpoch(share.ActivationEpoch, verifier, password)
+	if err != nil {
+		t.Fatalf("ledger repair never fixed an interrupted activation: %v", err)
+	}
+	if still.Key.Generation != share.Key.Generation {
+		t.Fatal("ledger repair served the wrong generation")
+	}
+	still.Zeroize()
 }

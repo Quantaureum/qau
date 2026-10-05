@@ -192,8 +192,8 @@ func TestThresholdActiveSharePublicIdentity(t *testing.T) {
 	if _, _, _, err := store.ActiveSharePublicIdentity(password); !os.IsNotExist(err) {
 		t.Fatalf("probe of a stored but unactivated share: %v, want os.ErrNotExist", err)
 	}
-	certificate, sessionDigest, verifier := testThresholdActivationCertificate(t, share)
-	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, password); err != nil {
+	certificate, sessionDigest, verifier, bindings := testThresholdActivationCertificate(t, share)
+	if err := store.ActivateCandidate(certificate, sessionDigest, share.ActivationEpoch, verifier, bindings, password); err != nil {
 		t.Fatal(err)
 	}
 	epoch, publicKey, threshold, err := store.ActiveSharePublicIdentity(password)

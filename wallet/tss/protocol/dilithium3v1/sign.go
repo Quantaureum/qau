@@ -195,7 +195,7 @@ func newSigningAttempt(
 		return nil, fmt.Errorf("%w: no active shares", errInvalidSigningAttempt)
 	}
 	participants := len(activeShares[0].Committee.Participants)
-	params, err := SigningParametersForParticipants(participants)
+	params, err := SigningParametersForShares(activeShares)
 	if err != nil {
 		// R76b: strict — a committee size with no pinned signing row fails
 		// closed here as ErrUnsupportedSigningCommitteeSize.
