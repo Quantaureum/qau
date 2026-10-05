@@ -15,7 +15,6 @@ package dilithium3v1
 // (TestTDilithium3ReshareRemoveSeamSignsUnderSameKey).
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol"
@@ -81,9 +80,20 @@ func TestSigningParameterRotatedRowSelection(t *testing.T) {
 		// practice; fail-closed there stays.
 		_ = err
 	}
+	// The R77c rotated C=7 row: a folded seven-member committee (the add
+	// rotation's concentrated correction) selects the rotated row, whose
+	// radius/bound sit at the concentrated profile's measured position and
+	// whose slot budget carries the transport headroom the exponent needs.
 	sevenFold, _ := signingTestRotatedShares(t, 7, 5)
-	if _, err := SigningParametersForShares(sevenFold); !errors.Is(err, ErrNoSigningRow) {
-		t.Fatalf("a folded seven-member committee must stay fail-closed (no rotated C=7 row), got: %v", err)
+	sevenRow, err := SigningParametersForShares(sevenFold)
+	if err != nil {
+		t.Fatalf("folded seven-member committee: %v", err)
+	}
+	if sevenRow.ParallelSlots != 466 || sevenRow.Exponent != 8.40 || sevenRow.Threshold != 5 {
+		t.Fatalf("rotated C=7 row drifted: %+v", sevenRow)
+	}
+	if sevenRow.Radius != 403220.3 || sevenRow.SampleRadius != 403387.0 || sevenRow.ShiftBound != 1317.27 {
+		t.Fatalf("rotated C=7 row values drifted: %+v", sevenRow)
 	}
 }
 

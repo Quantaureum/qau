@@ -47,6 +47,10 @@ const tdilithium3SeamTestMessage = "QAU-TDILITHIUM3-V1-DKG-SEAM"
 // cannot converge is closed rather than retried forever.
 const tdilithium3SeamSlotTimeout = 5 * time.Second
 
+// tdilithium3SeamSlotPerSlotBudget bounds one candidate slot's compute at
+// schedule time; rows with large slot counts scale the slot window by it.
+const tdilithium3SeamSlotPerSlotBudget = 50 * time.Millisecond
+
 // tdilithium3SeamSlots is how many candidate slots one seam request runs. The
 // executor rejects a candidate unless every signer accepts it, and the
 // per-slot acceptance rate the sampler parameters predict is about one in
@@ -251,15 +255,31 @@ func tdilithium3SeamHarnessFor(
 	if slotTimeout <= 0 {
 		slotTimeout = tdilithium3SeamSlotTimeout
 	}
+	// The candidate-slot count must come from the row the shares select: a
+	// rotated share's fold mass needs the rotated row's larger slot budget, and
+	// a fresh share needs the fresh row's. Sizing every request at the fresh
+	// base constant starves folded shares (the R77c lesson).
+	shares := make([]*dilithium3v1.LocalShare, 0, len(signers))
+	for _, signer := range signers {
+		signerShare, err := fixture.shareOf(signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shares = append(shares, signerShare)
+	}
+	params, err := dilithium3v1.SigningParametersForShares(shares)
+	if err != nil {
+		t.Fatalf("seam row selection: %v", err)
+	}
+	if slotTimeout < time.Duration(params.ParallelSlots)*tdilithium3SeamSlotPerSlotBudget {
+		slotTimeout = time.Duration(params.ParallelSlots) * tdilithium3SeamSlotPerSlotBudget
+	}
 
 	network := &tdilithium3SeamNetwork{}
 	harness := &tdilithium3SeamHarness{fixture: fixture, network: network, request: request}
 	root := t.TempDir()
 	for index, signer := range signers {
-		signerShare, err := fixture.shareOf(signer)
-		if err != nil {
-			t.Fatal(err)
-		}
+		signerShare := shares[index]
 		journal, err := dilithium3v1.OpenSigningJournal(filepath.Join(root, fmt.Sprintf("signer-%d", signer), "journal.db"))
 		if err != nil {
 			t.Fatalf("signer %d journal: %v", signer, err)

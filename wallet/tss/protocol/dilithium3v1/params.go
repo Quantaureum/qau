@@ -161,8 +161,10 @@ type SigningParameters struct {
 
 // SigningMaxParallelSlots is the largest pinned slot count across the
 // signing rows; transports and schedules must stay within it regardless of the
-// committee row a request actually uses.
-const SigningMaxParallelSlots = 43
+// committee row a request actually uses. The R77c rotated C=7 row (add
+// rotation) needs 466 slots to buy back the radius margin its concentrated
+// correction consumes, so the cap carries headroom for it.
+const SigningMaxParallelSlots = 480
 
 // ErrNoSigningRow rejects a committee size with no pinned signing-MPC row.
 var ErrNoSigningRow = errors.New("no pinned Dilithium3 v1 signing parameter row")
@@ -192,15 +194,28 @@ var signingParameterFamily = map[int]SigningParameters{
 	},
 }
 
-// signingParameterFamilyRotated pins the R77d row for six-member committees
-// produced by a remove rotation: every share carries folded components of
-// multiplicity 2, so each signer's per-coefficient secret mass is sqrt(2) times
-// the fresh profile and the fresh row's radius margin (r'-r = 82.9 against a
-// fresh shift bound 658.64/6) is exhausted — every candidate slot rejects.
-// The row is measured through r77c_rotated_row.go on the all-components-fold-2
-// profile: fresh-family checks reproduce (P1=1, P2=1, Phint=0.5995 above the
-// 0.4 band), the per-request success rate matches the fresh row, and J=26
-// stays within the transport budget (SigningMaxParallelSlots).
+// signingParameterFamilyRotated pins the rows for committees produced by a
+// same-key rotation, whose shares carry folded components the fresh rows
+// cannot serve:
+//
+//   - C=6 (remove rotation): every share carries folded components of
+//     multiplicity 2, so each signer's per-coefficient secret mass is sqrt(2)
+//     times the fresh profile and the fresh row's radius margin (r'-r = 82.9
+//     against a fresh shift bound 658.64/6) is exhausted — every candidate
+//     slot rejects. Measured through r77c_rotated_row.go on the
+//     all-components-fold-2 profile: P1=1, P2=1, Phint=0.5995 above the 0.4
+//     band, per-request success matches the fresh row, J=26.
+//
+//   - C=7 (add rotation, R77c): the weave's correction concentrates the
+//     joiner-group zero-sum into one component of multiplicity 14, putting
+//     the correction-group members at mass ratio sqrt(20/7) = 1.69x fresh.
+//     No exponent inside the fresh budget works (the radius margin collapses
+//     at low expo, the hint channel at high expo); the row buys the margin
+//     back with exponent 8.40 at the cost of 466 parallel slots (~3.5 MB of
+//     one-time material per party per request) and is therefore only selected
+//     for folded shares, never for fresh ones. The wire cost is bounded to
+//     the rotation epoch: the chamber rekeys fresh at the next epoch
+//     boundary, restoring the fresh profile.
 var signingParameterFamilyRotated = map[int]SigningParameters{
 	6: {
 		Participants: 6, Threshold: 4, OwnedPerOwner: 5,
@@ -211,6 +226,16 @@ var signingParameterFamilyRotated = map[int]SigningParameters{
 		SampleRadius:  424155.0,
 		HintCheckProb: 0.5995,
 		ParallelSlots: 26,
+	},
+	7: {
+		Participants: 7, Threshold: 5, OwnedPerOwner: 7,
+		Exponent:      8.40,
+		Divergence:    math.Pow(2, 8.40/5),
+		ShiftBound:    1317.27,
+		Radius:        403220.3,
+		SampleRadius:  403387.0,
+		HintCheckProb: 0.5027,
+		ParallelSlots: 466,
 	},
 }
 

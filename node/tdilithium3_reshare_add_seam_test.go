@@ -11,7 +11,6 @@ package node
 import (
 	"bytes"
 	"context"
-	"os"
 	"testing"
 	"time"
 
@@ -211,21 +210,19 @@ func TestTDilithium3ReshareAddAssemblesSameKeyShares(t *testing.T) {
 // TestTDilithium3ReshareAddSeamSignsUnderSameKey adds the five-of-seven
 // signing seam under the unchanged key.
 //
-// R77c resolution (2026-10-05, spec section 7): the rotated signing row is
-// measured INFEASIBLE inside the mode3 envelope — the add correction
-// concentrates the joiner-group zero-sum into one component with
-// multiplicity binom(6,2)-1 = 14 (C=7), the bearer party's aggregate
-// coefficient mass is sqrt(25/7) = 1.89 times the fresh profile, and across
-// the exponent grid the required HRej ball either breaches the z-bound
-// headroom (P1=0.0002 at the pinned radii scale) or the hint channel
-// (Phint=0.119 at expo 7.2, J≈948 slots, ~7.2 MB wire per party) — past the
-// C=8 row that was already rejected as non-operational. The row stays
-// unpinned and this test gated; same-key add signing needs a distributed
-// (not concentrated) correction construction, not new parameters.
+// R77c resolution (2026-10-05, revised same day): the rotated signing row is
+// feasible once the transport slot budget is sized for it. The add correction
+// concentrates the joiner-group zero-sum into one component of multiplicity
+// binom(6,2)-1 = 14 (C=7), putting the correction-group members at mass ratio
+// sqrt(20/7) = 1.69x fresh; no exponent inside the fresh row's slot budget
+// (J <= 43) works — the radius margin collapses at low expo and the hint
+// channel at high expo. The rotated C=7 row buys the margin back with
+// exponent 8.40 at the cost of 466 parallel slots (~3.5 MB of one-time
+// material per party per request) — a wire-for-feasibility trade bounded to
+// the rotation epoch, since the chamber rekeys fresh at the next boundary.
+// This test is the end-to-end proof: five-of-seven signatures under the
+// unchanged key, on the concentrated-correction shares.
 func TestTDilithium3ReshareAddSeamSignsUnderSameKey(t *testing.T) {
-	if os.Getenv("QAU_ENABLE_R77C_SIGNING_ROW") != "1" {
-		t.Skip("R77c: the rotated signing row is measured infeasible for the concentrated correction (spec section 7); a distributed correction construction is required")
-	}
 	fixture, rotated, newCommittee := tdilithium3ReshareAddRotatedShares(t)
 
 	// Five-of-seven signatures under the unchanged key.
