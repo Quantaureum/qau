@@ -177,14 +177,12 @@ aborted.
   shares, and asserts key invariance
   (`TestTDilithium3ReshareAddAssemblesSameKeyShares`). The five-of-seven
   signing acceptance (`TestTDilithium3ReshareAddSeamSignsUnderSameKey`)
-  is one flag away (`QAU_ENABLE_R77C_SIGNING_ROW=1`) and is gated pending
-  R77c: the add-shape correction concentrates the joiner-group zero-sum
-  into one component with multiplicity 14 in the shipped plan (14
-  non-correction weave groups), so the pinning of the R57 HRej radius
-  (`eta=1`, C(6,3)=20 fresh groups) would have needed a rotated row the
-  envelope measured out — see section 7. Remove-shape signing needed its
+  was gated pending R77c and is now UNGATED AND GREEN: the rotated C=7 row
+  (exponent 8.40, 466 parallel slots) carries the concentrated-correction
+  profile — see section 7 for the measured feasibility envelope and the
+  transport-budget trade it rests on. Remove-shape signing needed its
   own row after all (the acceptance radius margin is sized for eta=1
-  material and folded secrets exhaust it deterministically): it now has
+  material and folded secrets exhaust it deterministically): it has
   one — the R77d rotated C=6 row, see section 7.
 - **Wire + ceremony driver (landed 2026-10-04, remove shape):**
   `MsgTypeTDilithium3ReshareDelta` (102) carries the versioned threshold
@@ -319,12 +317,18 @@ aborted.
   only decides rotation-COMMITTEE durability across epochs.
 
 
-## 6a. R77c follow-up — the topology redesign a same-key ADD needs **DESIGN NOTE**
+## 6a. R77c follow-up — topology redesign **SUPERSEDED by the transport-budget trade (R77c landed)**
 
-The measured closure in section 7 proves the concentrated weave correction
-cannot sign under any parameter row of the C=7 family. The one redesign
-family that stays inside the CNF-RSS construction is to stop weaving the
-joiner's groups fresh at all:
+The first measured closure in section 7 proved the concentrated weave
+correction cannot sign under any parameter row of the C=7 family **that fits
+the fresh row's 43-slot transport budget**. The budget, however, is an
+engineering constant, not a cryptographic one: raising it to 466 slots
+(~3.5 MB of one-time material per party per request, bounded to the rotation
+epoch because the chamber rekeys fresh at the next boundary) buys back the
+full radius margin at exponent 8.40, and the concentrated-correction profile
+signs under the pinned rotated C=7 row — the topology redesign below was the
+escape hatch for a wall that no longer exists. It is retained as the
+reference for a future wire-constrained variant:
 
 - **Rehearsal-carried components.** Delay the join by one epoch: during the
   pre-join epoch the incumbent committee runs the reshare folds from the
@@ -355,10 +359,12 @@ Open proof obligations before this becomes a parameter row:
    at E-1, served at E+1); the queue already tolerates epoch-granularity
    activation, so this changes nothing user-visible.
 
-Status: not scheduled; this section exists so the next design round starts
-from a measured feasibility envelope instead of folklore. The fresh-key join
-path shipped in R77 is the supported route and carries none of these
-obligations.
+Status: superseded — not needed. The landed resolution (rotated C=7 row +
+transport raise) makes the shipped weave topology sufficient; this section's
+obligations apply only if a future wire-budget cut revives the constraint.
+The fresh-key join path also remains fully supported and is the recommended
+route wherever the 3.5 MB-per-party-per-request rotation-epoch wire cost is
+not justified.
 
 ## 7. Out of scope (explicit)
 
@@ -366,9 +372,9 @@ obligations.
 - Committees built from discontinuous roster positions (the sampler keeps
   the roster's leading slice; see R76 section 8).
 - Multi-position membership deltas within one epoch (fresh-key fallback).
-- **R77c (resolved 2026-10-05 as measured-infeasible, not pinnable):** the
-  signing-parameter row for rotated committees in the add shape cannot be
-  pinned within the mode3 envelope. The derivation script
+- **R77c (resolved 2026-10-05, revised same day — see section 6a):** the
+  add-shape rotated row cannot be pinned inside the fresh row's 43-slot
+  budget, and the derivation script
   (`node/.local-only/scripts/r77c_rotated_row.go`, the multiplicity-aware
   generalization of the R76b family procedure) reproduces the pinned C=7
   fresh row bit-for-bit at fold=1 (B=779.31, r=402748.8, r'=402847.0,
