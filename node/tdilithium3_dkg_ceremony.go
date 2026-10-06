@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/quantaureum/qau/p2p"
@@ -25,15 +27,26 @@ import (
 // gates are open and the network is not mainnet, so a production node that has
 // not opted in never touches this path.
 
-const (
-	// tdilithium3DKGCeremonyTimeout bounds one ceremony end to end.
-	tdilithium3DKGCeremonyTimeout = 180 * time.Second
-	// tdilithium3DKGCeremonyRoundTimeout bounds the randomness round and each
-	// individual group round. A round that cannot reach its peers within this
-	// window fails closed with errTDilithium3DKGGroupStalled rather than
-	// blocking the epoch transition forever.
+// Ceremony timeouts: env-tunable (QAU_DKG_CEREMONY_TIMEOUT_MS /
+// QAU_DKG_ROUND_TIMEOUT_MS) so WAN-condition testing can scale them without a
+// rebuild; the defaults target loopback-class latency.
+var (
+	tdilithium3DKGCeremonyTimeout      = 180 * time.Second
 	tdilithium3DKGCeremonyRoundTimeout = 30 * time.Second
 )
+
+func init() {
+	if v := os.Getenv("QAU_DKG_CEREMONY_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tdilithium3DKGCeremonyTimeout = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("QAU_DKG_ROUND_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tdilithium3DKGCeremonyRoundTimeout = time.Duration(n) * time.Millisecond
+		}
+	}
+}
 
 var (
 	// errTDilithium3DKGCeremonyDisabled is returned when the ceremony is asked
@@ -180,15 +193,39 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 	sign := func(message []byte) ([]byte, error) {
 		return localKey.Sign(message)
 	}
+	// Loss hardening (R77 acceptance, WAN-chaos pass): every round message is
+	// re-sent on a 500ms cadence for ~5s. Receivers dedup identical payloads
+	// idempotently (the inbox seen-map returns nil on an exact replay), so the
+	// re-sends can only RESCUE a message lost in transit — they never double-
+	// deliver. Without this, a single lost round message deadlocks the group
+	// until the whole ceremony attempt times out.
+	retrySend := func(send func() error) {
+		go func() {
+			for attempt := 0; attempt < 10; attempt++ {
+				time.Sleep(500 * time.Millisecond)
+				if err := send(); err != nil {
+					return
+				}
+			}
+		}()
+	}
 	broadcast := func(messageType uint8, payload []byte) error {
-		return n.p2pHost.BroadcastTSS(messageType, payload)
+		if err := n.p2pHost.BroadcastTSS(messageType, payload); err != nil {
+			return err
+		}
+		retrySend(func() error { return n.p2pHost.BroadcastTSS(messageType, payload) })
+		return nil
 	}
 	sendPrivate := func(messageType uint8, recipientPosition uint8, payload []byte) error {
 		peer, found := peerByPosition[recipientPosition]
 		if !found {
 			return fmt.Errorf("Dilithium3 v1 DKG private send to unknown position %d", recipientPosition)
 		}
-		return n.p2pHost.SendTSSToPeer(peer, messageType, payload)
+		if err := n.p2pHost.SendTSSToPeer(peer, messageType, payload); err != nil {
+			return err
+		}
+		retrySend(func() error { return n.p2pHost.SendTSSToPeer(peer, messageType, payload) })
+		return nil
 	}
 
 	// R77: if the epoch committee equals the active share's committee minus

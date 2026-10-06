@@ -9,6 +9,7 @@ import (
 	qcrypto "github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
@@ -187,6 +188,18 @@ func (inbox *tdilithium3DKGInbox) accept(message p2p.PeerMessage) error {
 	var recipient *uint8
 	if message.Type == p2p.MsgTypeTDilithium3DKGGroupSeed || message.Type == p2p.MsgTypeTDilithium3ReshareDelta {
 		recipient = &inbox.recipientPosition
+	}
+	if message.Type == p2p.MsgTypeTDilithium3ReshareDelta {
+		// Cheap silent pre-filter: fold deltas are broadcast committee-wide,
+		// but only the named recipient consumes them. Discard foreign-recipient
+		// envelopes before paying for envelope verification — that is the
+		// documented discard path, not a rejection worth logging.
+		if envelope, envErr := protocol.DecodeEnvelope(message.Payload); envErr == nil {
+			if wire, wireErr := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload); wireErr == nil &&
+				wire.RecipientPosition != inbox.recipientPosition {
+				return nil
+			}
+		}
 	}
 	envelope, err := validateTDilithium3DKGInbound(message.Type, message.Payload, inbox.session, recipient, inbox.verifyIdentity)
 	if err != nil {

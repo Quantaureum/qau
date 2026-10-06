@@ -14,19 +14,30 @@ import (
 	"crypto/sha3"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
+	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
-const (
-	// tdilithium3ReshareRoundTimeout bounds the delta-delivery window. It is
-	// a single bounded round, matching the DKG group-round timeout.
-	tdilithium3ReshareRoundTimeout = 30 * time.Second
-)
+// tdilithium3ReshareRoundTimeout bounds the delta-delivery window. It is a
+// single bounded round matching the DKG group-round timeout, env-tunable
+// (QAU_RESHARE_ROUND_TIMEOUT_MS) so WAN-condition testing can scale it
+// without a rebuild.
+var tdilithium3ReshareRoundTimeout = 30 * time.Second
+
+func init() {
+	if v := os.Getenv("QAU_RESHARE_ROUND_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tdilithium3ReshareRoundTimeout = time.Duration(n) * time.Millisecond
+		}
+	}
+}
 
 var (
 	// errTDilithium3ReshareNotApplicable marks committee pairs that are not a
@@ -202,6 +213,35 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 		return publicKey, err
 	}
 
+	// Delivery-window lattice (WAN-chaos hardening): attempts that restart
+	// immediately after a failed window drift tens of seconds apart across
+	// members, so live delta exchange only lands when the drift happens to
+	// overlap. Pin attempt starts to a deterministic lattice derived from
+	// chain constants — activation epoch E's attempt k starts at
+	// epochStart(E) + k*(window+guard) — so every member's delivery window
+	// coincides. Deltas that arrive before the local window opens are caught
+	// by the retention path and replayed at inbox install (the wait below runs
+	// BEFORE installation on purpose, to keep those arrivals on it).
+	if n.genesisBlock != nil && tdilithium3ReshareRoundTimeout > 0 {
+		epochStart := time.Unix(int64(n.genesisBlock.Header.Timestamp), 0).Add(
+			time.Duration(config.Session.ActivationEpoch) * consensus.EpochDuration)
+		step := tdilithium3ReshareRoundTimeout + 30*time.Second
+		if now := time.Now(); now.After(epochStart) {
+			nextTick := epochStart.Add((now.Sub(epochStart)/step + 1) * step)
+			if wait := time.Until(nextTick); wait > 0 {
+				nodeLog.Info("Dilithium3 v1 reshare rotation: aligning to delivery lattice (activation epoch %d, wait %s)",
+					config.Session.ActivationEpoch, wait.Round(time.Second))
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return publicKey, ctx.Err()
+				case <-timer.C:
+				}
+			}
+		}
+	}
+
 	// The reshare flow reuses the same inbox slot as the fresh-key ceremony:
 	// only one ceremony is active at a time behind the caller's mutex.
 	inbox, err := n.newTDilithium3DKGInboxFromCapturedEpochRoster(
@@ -224,6 +264,7 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	// contains only this member's own anchor duties), which the inbox checks
 	// against the envelope's committee position.
 	sent := 0
+	var published [][]byte
 	for _, delivery := range runner.OutgoingDeltas() {
 		wire := dilithium3v1.ReshareDeltaWire{
 			SessionDigest:     sessionDigest,
@@ -252,8 +293,37 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 		if err := config.Broadcast(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
 			return publicKey, fmt.Errorf("reshare delta broadcast for position %d: %w", delivery.RecipientPosition, err)
 		}
+		published = append(published, encoded)
 		sent++
 		nodeLog.Info("reshare delta sent: anchor=%d -> recipient=%d target=%06b", config.Position, delivery.RecipientPosition, uint16(delivery.Delta.Target))
+	}
+	// Loss hardening (R77 acceptance, WAN-chaos pass): re-broadcast every
+	// anchored delta on a 1s cadence for the whole delivery window. Members
+	// enter their rotation windows at slightly different block heights, so a
+	// single-shot publication can land before a peer's window opens (or be
+	// lost in transit); receivers dedup identical envelopes idempotently, so
+	// the re-sends only ever RESCUE a delta, never double-apply one.
+	republishDone := make(chan struct{})
+	defer close(republishDone)
+	if len(published) > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-republishDone:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					for _, encoded := range published {
+						if err := config.Broadcast(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
+							nodeLog.Debug("reshare delta re-broadcast failed: %v", err)
+						}
+					}
+				}
+			}
+		}()
 	}
 	nodeLog.Info("Dilithium3 v1 reshare rotation: published %d fold delta(s), awaiting %d more (activation epoch %d, session %x, missing: %s)",
 		sent, runner.Pending(), config.Session.ActivationEpoch, sessionDigest[:8], runner.PendingDetail())

@@ -124,6 +124,14 @@ func (t *P2PDKGTransport) currentWaitTimeout() time.Duration {
 	return t.waitTimeout
 }
 
+// errTDilithium3DKGForeignSession marks an envelope whose session digest,
+// generation, or committee version does not match the installed inbox's
+// session. During committee transitions members run attempts at different
+// wall-clock offsets, so foreign-session traffic is routine (and heavily
+// re-broadcast under WAN-loss hardening); callers should log it at debug
+// level, not info.
+var errTDilithium3DKGForeignSession = errors.New("Dilithium3 DKG envelope belongs to another session")
+
 func validateTDilithium3DKGInbound(messageType uint8, encoded []byte, session dilithium3v1.DKGSession, recipientPosition *uint8, verifier dilithium3v1.DKGIdentityVerifier) (protocol.ThresholdEnvelope, error) {
 	if messageType == p2p.MsgTypeTDilithium3DKGActivation || verifier == nil {
 		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG inbound requires an identity verifier")
@@ -162,7 +170,7 @@ func validateTDilithium3DKGStructure(messageType uint8, encoded []byte, session 
 		return protocol.ThresholdEnvelope{}, err
 	}
 	if envelope.SessionID != sessionDigest || envelope.KeyGeneration != session.KeyGeneration || envelope.CommitteeVersion != session.Committee.Version {
-		return protocol.ThresholdEnvelope{}, fmt.Errorf("Dilithium3 DKG envelope belongs to another session")
+		return protocol.ThresholdEnvelope{}, errTDilithium3DKGForeignSession
 	}
 	senderPosition, ok := tdilithium3DKGCommitteePosition(session.Committee, envelope.SenderID)
 	if !ok {

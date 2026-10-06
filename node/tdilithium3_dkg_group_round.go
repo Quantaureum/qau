@@ -74,6 +74,10 @@ type tdilithium3DKGGroupRound struct {
 	seed         [32]byte
 	receivedSeed *[32]byte
 
+	// DEBUG-TRACKER (stall diagnosis): count of observed messages per sender
+	// position, dumped when the round stalls.
+	observedFrom map[uint8]int
+
 	component          dilithium3v1.RSSComponent
 	computed           *dilithium3v1.PublicContribution
 	computedDigest     [32]byte
@@ -163,6 +167,12 @@ func (round *tdilithium3DKGGroupRound) stalledError(cause error) error {
 	}
 	round.mu.Lock()
 	defer round.mu.Unlock()
+	dump := "no-observations"
+	if round.observedFrom != nil {
+		dump = fmt.Sprintf("%v", round.observedFrom)
+	}
+	nodeLog.Warn("R77-STALL-DIAG group %06b attempt %d seedPersisted=%v componentDerived=%v verified=%v observedFrom=%v cause=%v",
+		round.group, round.attempt, round.seedPersisted, round.componentDerived, round.verified, dump, cause)
 	return fmt.Errorf("%w: group %06b leader %d attempt %d: %w", errTDilithium3DKGGroupStalled, round.group, round.leader, round.attempt, cause)
 }
 
@@ -175,6 +185,10 @@ func (round *tdilithium3DKGGroupRound) observe(message tdilithium3DKGVerifiedMes
 	}
 	round.mu.Lock()
 	defer round.mu.Unlock()
+	if round.observedFrom == nil {
+		round.observedFrom = make(map[uint8]int)
+	}
+	round.observedFrom[uint8(message.SenderID)]++
 	if round.verified {
 		return false, nil
 	}

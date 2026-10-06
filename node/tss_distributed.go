@@ -353,7 +353,12 @@ func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 			return
 		}
 		if err := inbox.accept(msg); err != nil {
-			if msg.Type == p2p.MsgTypeTDilithium3ReshareDelta {
+			if errors.Is(err, errTDilithium3DKGForeignSession) {
+				// Routine committee-transition crossfire between members'
+				// staggered attempts; heavily re-broadcast under WAN-loss
+				// hardening, so keep it out of the info log.
+				nodeLog.Debug("Dilithium3 DKG inbound foreign-session: %v", err)
+			} else if msg.Type == p2p.MsgTypeTDilithium3ReshareDelta {
 				nodeLog.Info("Dilithium3 reshare delta inbound rejected: %v", err)
 			} else {
 				nodeLog.Debug("Dilithium3 DKG inbound rejected: %v", err)

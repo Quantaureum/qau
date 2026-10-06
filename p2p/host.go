@@ -16,6 +16,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -328,6 +329,14 @@ func DefaultConfig() (*Config, error) {
 
 // Host represents a P2P network host
 type Host struct {
+	// --- WAN-condition injection (test instrument, default off) ---
+	// chaosLatencyMS adds a one-way send delay; chaosLossPct drops messages
+	// with this probability (per-mille). Both are read once from the
+	// QAU_P2P_LATENCY_MS / QAU_P2P_LOSS_PCT environment variables at
+	// construction. Zero when unset — production paths are unaffected.
+	chaosLatencyMS int
+	chaosLossPct   int
+
 	config *Config
 	id     PeerID
 
@@ -841,6 +850,22 @@ func NewHost(cfg *Config) (*Host, error) {
 		protocolRegistry:     NewProtocolRegistry(),
 		ctx:                  ctx,
 		cancel:               cancel,
+	}
+	// WAN-condition injection (test instrument): QAU_P2P_LATENCY_MS adds a
+	// one-way send delay, QAU_P2P_LOSS_PCT (per-mille) drops messages. Both
+	// default to zero (off) — production nodes are unaffected unless the
+	// operator sets the variables explicitly.
+	if v := os.Getenv("QAU_P2P_LATENCY_MS"); v != "" {
+		if n, convErr := strconv.Atoi(v); convErr == nil && n > 0 {
+			h.chaosLatencyMS = n
+			hostLog.Warnf("P2P chaos injection ENABLED: latency=%dms", n)
+		}
+	}
+	if v := os.Getenv("QAU_P2P_LOSS_PCT"); v != "" {
+		if n, convErr := strconv.Atoi(v); convErr == nil && n > 0 && n < 1000 {
+			h.chaosLossPct = n
+			hostLog.Warnf("P2P chaos injection ENABLED: loss=%d per-mille", n)
+		}
 	}
 
 	h.broadcaster = NewBroadcaster(h)
@@ -6461,6 +6486,32 @@ func (h *Host) SendRaw(peerID PeerID, data []byte) error {
 		return fmt.Errorf("peer %s not found or not connected", peerID)
 	}
 
+	if h.chaosLossPct > 0 || h.chaosLatencyMS > 0 {
+		if h.chaosLossPct > 0 && mathrand.Intn(1000) < h.chaosLossPct {
+			return nil // WAN loss simulation: silently dropped
+		}
+		delay := time.Duration(0)
+		if h.chaosLatencyMS > 0 {
+			delay = time.Duration(h.chaosLatencyMS) * time.Millisecond
+		}
+		if delay > 0 {
+			go func(peerID PeerID, data []byte) {
+				time.Sleep(delay)
+				h.peersMu.RLock()
+				peer, exists := h.peers[peerID]
+				h.peersMu.RUnlock()
+				if !exists || !peer.Connected {
+					return
+				}
+				select {
+				case peer.sendCh <- data:
+				default:
+				}
+			}(peerID, data)
+			return nil
+		}
+	}
+
 	select {
 	case peer.sendCh <- data:
 		return nil
@@ -6483,10 +6534,29 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 	skipped := 0
 	skippedPeers := make([]PeerID, 0, 4)
 	absent := 0
+	chaosActive := h.chaosLossPct > 0 || h.chaosLatencyMS > 0
 	for _, peer := range h.peers {
 		if !peer.Connected {
 			absent++
 			continue
+		}
+		if chaosActive {
+			if h.chaosLossPct > 0 && mathrand.Intn(1000) < h.chaosLossPct {
+				continue // WAN loss simulation
+			}
+			if h.chaosLatencyMS > 0 {
+				msgCopy := append([]byte(nil), msg...)
+				delay := time.Duration(h.chaosLatencyMS) * time.Millisecond
+				go func(p *Peer, m []byte) {
+					time.Sleep(delay)
+					select {
+					case p.sendCh <- m:
+					default:
+					}
+				}(peer, msgCopy)
+				sent++
+				continue
+			}
 		}
 		select {
 		case peer.sendCh <- msg:
