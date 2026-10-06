@@ -59,8 +59,15 @@ jobs:
       # 93 tests) sum to >=700s under -race on 2-core CI runners, easily
       # exceeding the 10m -timeout of fast packages. Pulled out to its
       # own 30m step matching simulation.
+      # R77-CI-SPLIT (2026-10-07): Also exclude node — the Dilithium3 v1
+      # ceremony/reshare/seam suites brought real PQ crypto costs into the
+      # package, and under -race the suite now measurably exceeds the 10m
+      # fast-packages timeout. It gets its own 45m step, same budget class
+      # as core.
       - name: Test (fast packages)
-        run: go test $(go list ./... | grep -vE '/(core|encoding|consensus|simulation|p2p)(/|$)') -timeout 10m -race
+        run: go test $(go list ./... | grep -vE '/(core|encoding|consensus|simulation|p2p|node)(/|$)') -timeout 10m -race
+      - name: Test (node)
+        run: go test ./node/... -timeout 45m -race
       - name: Test (encoding)
         run: go test ./encoding/... -timeout 30m -race
       - name: Test (consensus)
