@@ -66,11 +66,14 @@ func (n *Node) tdilithium3DKGCommitteeForRoster(roster *tdilithium3DKGEpochRoste
 	// committees for n <= 7 are bit-identical to the pre-sampling rule.
 	selection, err := tdilithium3DKGCommitteeSelection(roster)
 	if err != nil {
-		return protocol.CommitteeID{}, 0, err
+		// A roster the sampler cannot serve leaves the epoch without a usable
+		// committee: surface it under the session-unavailable sentinel so
+		// callers (and the refusal contract) see the documented outcome.
+		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: %v", errTDilithium3DKGSessionUnavailable, err)
 	}
 	committee, err := tdilithium3DKGCommitteeForSelectedRoster(roster, selection)
 	if err != nil {
-		return protocol.CommitteeID{}, 0, err
+		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: %v", errTDilithium3DKGSessionUnavailable, err)
 	}
 	if n == nil || n.blockProducer == nil {
 		return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator identity is not available", errTDilithium3DKGSessionUnavailable)

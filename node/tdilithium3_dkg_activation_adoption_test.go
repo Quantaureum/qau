@@ -10,6 +10,7 @@ import (
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/quantaureum/qau/p2p"
+	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
@@ -19,7 +20,7 @@ import (
 // activation epoch. It mirrors testThresholdActivationCertificate but takes the
 // session digest from the caller, because the adoption path derives the digest
 // from the live inbox's session rather than from a fixed test vector.
-func testAdoptionCertificate(t *testing.T, share *dilithium3v1.LocalShare, sessionDigest [32]byte) (dilithium3v1.DKGActivationCertificate, dilithium3v1.DKGIdentityVerifier) {
+func testAdoptionCertificate(t *testing.T, share *dilithium3v1.LocalShare, sessionDigest [32]byte) (dilithium3v1.DKGActivationCertificate, dilithium3v1.DKGIdentityVerifier, []dilithium3v1.DKGIdentityBinding) {
 	t.Helper()
 	encoded, err := share.MarshalBinary()
 	if err != nil {
@@ -62,7 +63,20 @@ func testAdoptionCertificate(t *testing.T, share *dilithium3v1.LocalShare, sessi
 		publicKey := publicKeys[participantID]
 		return publicKey != nil && mode3.Verify(publicKey, message, signature)
 	}
-	return certificate, verifier
+	// The v2 activation record persists the pid->identity binding the
+	// certificate was verified under; hand the same material back so the
+	// installing inbox can carry exactly what passed (mirrors
+	// testThresholdActivationCertificate).
+	bindings := make([]dilithium3v1.DKGIdentityBinding, 0, len(publicKeys))
+	for _, participantID := range share.Committee.Participants {
+		publicKey := publicKeys[participantID]
+		bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+			ParticipantID:    participantID,
+			ValidatorAddress: types.AddressFromPublicKey(publicKey.Bytes()),
+			PublicKey:        publicKey.Bytes(),
+		})
+	}
+	return certificate, verifier, bindings
 }
 
 // testAdoptionNode builds the minimal node the adoption path touches: a config
@@ -100,13 +114,14 @@ func testAdoptionSession(t *testing.T, share *dilithium3v1.LocalShare) dilithium
 
 // installTestAdoptionInbox installs a roster-bound live inbox for the session
 // on the node, using the certificate verifier as its identity verifier.
-func installTestAdoptionInbox(t *testing.T, n *Node, session dilithium3v1.DKGSession, recipientPosition uint8, verifier dilithium3v1.DKGIdentityVerifier) *tdilithium3DKGInbox {
+func installTestAdoptionInbox(t *testing.T, n *Node, session dilithium3v1.DKGSession, recipientPosition uint8, verifier dilithium3v1.DKGIdentityVerifier, bindings []dilithium3v1.DKGIdentityBinding) *tdilithium3DKGInbox {
 	t.Helper()
 	inbox, err := newTDilithium3DKGInbox(session, recipientPosition, verifier, func(p2p.PeerID) (uint32, bool) { return 0, false })
 	if err != nil {
 		t.Fatal(err)
 	}
 	inbox.rosterBound = true
+	inbox.bindings = append([]dilithium3v1.DKGIdentityBinding(nil), bindings...)
 	n.installTDilithium3DKGInbox(inbox)
 	return inbox
 }
@@ -132,8 +147,8 @@ func TestAdoptTDilithium3DKGActivationCertificateLiveInboxAdopts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, verifier := testAdoptionCertificate(t, share, sessionDigest)
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier)
+	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
+	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {
@@ -173,9 +188,9 @@ func TestAdoptTDilithium3DKGActivationCertificateRejectsTamperedSignature(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, verifier := testAdoptionCertificate(t, share, sessionDigest)
+	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
 	certificate.Acknowledgements[4].IdentitySignature[0] ^= 1
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier)
+	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {
@@ -199,8 +214,8 @@ func TestAdoptTDilithium3DKGActivationCertificateRejectsWithoutCandidate(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, verifier := testAdoptionCertificate(t, share, sessionDigest)
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier)
+	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
+	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
 
 	// Deliberately no candidate share on disk: only a node that ran the same
 	// DKG round holds one, so adoption without it must fail closed.
@@ -225,7 +240,7 @@ func TestAdoptTDilithium3DKGActivationCertificateRejectsUnknownSession(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, _ := testAdoptionCertificate(t, share, sessionDigest)
+	certificate, _, _ := testAdoptionCertificate(t, share, sessionDigest)
 
 	// No live inbox: adoption must derive the session from captured chain
 	// state, which an unbootstrapped node does not have. The certificate is
@@ -254,14 +269,14 @@ func TestAdoptTDilithium3DKGActivationCertificateInboxEpochMismatch(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, verifier := testAdoptionCertificate(t, share, sessionDigest)
+	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
 
 	// The live inbox belongs to a different activation epoch than the
 	// certificate, so it must not be reused; the derived path has no roster
 	// on this bare node, so the adoption fails closed.
 	mismatch := session.Clone()
 	mismatch.ActivationEpoch = share.ActivationEpoch + 1
-	installTestAdoptionInbox(t, n, mismatch, uint8(share.ParticipantPosition), verifier)
+	installTestAdoptionInbox(t, n, mismatch, uint8(share.ParticipantPosition), verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {

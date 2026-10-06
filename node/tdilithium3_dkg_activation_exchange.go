@@ -387,6 +387,7 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 	// same session digest and the same roster-bound identity verifier.
 	var sessionDigest [32]byte
 	var verifier dilithium3v1.DKGIdentityVerifier
+	var bindings []dilithium3v1.DKGIdentityBinding
 	if inbox := n.tdilithium3DKGInboxSnapshot(); inbox != nil &&
 		n.tdilithium3DKGInboxAdmissible(inbox) &&
 		inbox.session.ActivationEpoch == activationEpoch {
@@ -397,6 +398,10 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 		}
 		sessionDigest = digest
 		verifier = inbox.verifyIdentity
+		// The live inbox carries the pid->identity bindings its session
+		// verified under; reuse them as-is. The roster rebuild below is only
+		// the fallback for a certificate arriving after the inbox was dropped.
+		bindings = inbox.IdentityBindings()
 	} else {
 		session, err := n.deriveTDilithium3DKGSession(activationEpoch)
 		if err != nil {
@@ -454,19 +459,21 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 	// Bindings pairing: every ack in the certificate was authenticated at the
 	// winner's commit against its own session's id map; the roster gives the
 	// matching public keys positionally at index i for committee.Participants[i].
-	var bindings []dilithium3v1.DKGIdentityBinding
-	if rosterEpoch, scopeErr := tdilithium3DKGSessionRosterEpoch(activationEpoch); scopeErr == nil {
-		if roster, rosterErr := n.capturedEpochValidatorRoster(rosterEpoch); rosterErr == nil && len(certificate.Acknowledgements) > 0 {
-			committee := certificate.Acknowledgements[0].Committee
-			if len(committee.Participants) == len(roster.Entries) {
-				bindings = make([]dilithium3v1.DKGIdentityBinding, 0, len(roster.Entries))
-				for position, participantID := range committee.Participants {
-					entry := roster.Entries[position]
-					bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
-						ParticipantID:    participantID,
-						ValidatorAddress: [20]byte(entry.Address),
-						PublicKey:        append([]byte(nil), entry.PublicKey...),
-					})
+	// Skipped when the live inbox already supplied them above.
+	if len(bindings) == 0 {
+		if rosterEpoch, scopeErr := tdilithium3DKGSessionRosterEpoch(activationEpoch); scopeErr == nil {
+			if roster, rosterErr := n.capturedEpochValidatorRoster(rosterEpoch); rosterErr == nil && len(certificate.Acknowledgements) > 0 {
+				committee := certificate.Acknowledgements[0].Committee
+				if len(committee.Participants) == len(roster.Entries) {
+					bindings = make([]dilithium3v1.DKGIdentityBinding, 0, len(roster.Entries))
+					for position, participantID := range committee.Participants {
+						entry := roster.Entries[position]
+						bindings = append(bindings, dilithium3v1.DKGIdentityBinding{
+							ParticipantID:    participantID,
+							ValidatorAddress: [20]byte(entry.Address),
+							PublicKey:        append([]byte(nil), entry.PublicKey...),
+						})
+					}
 				}
 			}
 		}
