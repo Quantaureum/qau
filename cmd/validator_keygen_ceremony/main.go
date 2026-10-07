@@ -19,7 +19,7 @@
 //     words can always regenerate the exact key offline.
 //
 // Self-check: after generation, the tool signs and verifies a fixed message
-// with the new master key and refuses to emit any artefacts on failure.
+// with the new master key and refuses to emit any artifacts on failure.
 //
 // SECURITY contract:
 //   - passwords come from QAU_KEYSTORE_PASSWORD env or interactive prompt,
@@ -50,7 +50,7 @@ import (
 
 const DefaultDerivationPath = "m/44'/1668'/0'/0/0"
 
-// ceremonyPublic is the safe-to-carry-online artefact.
+// ceremonyPublic is the safe-to-carry-online artifact.
 type ceremonyPublic struct {
 	Kind           string `json:"kind"` // "random" | "mnemonic"
 	DerivationPath string `json:"derivation_path,omitempty"`
@@ -242,7 +242,7 @@ func main() {
 		fatal("self-check sign", err)
 	}
 	if !crypto.Verify(kpPub, probe, sig) {
-		fatal("self-check verify", fmt.Errorf("signature verification failed — refusing to emit artefacts"))
+		fatal("self-check verify", fmt.Errorf("signature verification failed — refusing to emit artifacts"))
 	}
 	crypto.ZeroBytesSecure(sig)
 	fmt.Fprintln(os.Stderr, "Self-check passed (sign+verify OK).")
@@ -266,7 +266,7 @@ func main() {
 		fatal("marshal keystore", err)
 	}
 
-	// --- 5. Emit artefacts ---
+	// --- 5. Emit artifacts ---
 	if err := os.MkdirAll(*outDir, 0o700); err != nil {
 		fatal("mkdir", err)
 	}
