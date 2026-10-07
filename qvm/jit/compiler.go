@@ -69,7 +69,9 @@ const (
 
 // memoryExpansionCost calculates the additional gas cost for expanding memory.
 // audit-fix P3-1: Equivalent implementation to qvm.MemoryExpansionCost to avoid circular import. N2 FIX (2026-07-06 R2): Fixed garbled comment.
-//  SYNC NOTE: This implementation MUST stay identical to
+//
+//	SYNC NOTE: This implementation MUST stay identical to
+//
 // qvm.MemoryExpansionCost (qvm/memory.go:336). The JIT package cannot import
 // qvm (circular dependency: qvm imports qvm/jit). Any change to either
 // implementation MUST be mirrored in the other to prevent consensus

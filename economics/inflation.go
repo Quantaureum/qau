@@ -70,7 +70,8 @@ type InflationModel struct {
 // every network. Only the initialSupply input differs, and it is derived by
 // the caller (node) by summing the genesis allocations.
 //
-//  [P2] NOTE (testnet vs mainnet supply consistency): The genesis
+//	[P2] NOTE (testnet vs mainnet supply consistency): The genesis
+//
 // allocations intentionally differ by network, so initialSupply -- and
 // therefore the absolute per-block reward -- differs as well:
 //   - mainnet (ChainID 1668): 20,000,000 QAU  (genesis allocation)

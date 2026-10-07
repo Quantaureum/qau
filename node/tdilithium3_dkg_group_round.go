@@ -271,7 +271,7 @@ func (round *tdilithium3DKGGroupRound) observe(message tdilithium3DKGVerifiedMes
 		return true, nil
 	default:
 		// Randomness messages (and any other phase) are replayed traffic from a
-		// neighbouring phase; they belong to no group and are dropped here.
+		// neighboring phase; they belong to no group and are dropped here.
 		return false, nil
 	}
 }

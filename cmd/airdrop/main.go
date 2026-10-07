@@ -357,7 +357,7 @@ func rpcJSON(url, method string, params []any, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(buf))
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(buf)) // #nosec G107 -- URL comes from operator flags, not request input
 	if err != nil {
 		return err
 	}

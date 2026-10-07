@@ -26,6 +26,7 @@ type HintVector [6][Degree]uint8
 func EncodeHighBits(polynomial HighBitsPoly) ([highBitsEncodedSize]byte, error) {
 	var encoded [highBitsEncodedSize]byte
 	for index := 0; index < Degree; index += 2 {
+		// #nosec G602 -- Degree is even and index steps by 2, so index+1 < Degree.
 		if polynomial[index] > highBitsMask || polynomial[index+1] > highBitsMask {
 			return [highBitsEncodedSize]byte{}, ErrInvalidHighBits
 		}
@@ -40,6 +41,7 @@ func EncodeZ(polynomial SignedPoly) ([zEncodedSize]byte, error) {
 	const gamma1 = 1 << 19
 	for coefficientIndex, byteIndex := 0, 0; coefficientIndex < Degree; coefficientIndex, byteIndex = coefficientIndex+2, byteIndex+5 {
 		left := polynomial[coefficientIndex]
+		// #nosec G602 -- Degree is even and the step is 2; byteIndex+4 < zEncodedSize.
 		right := polynomial[coefficientIndex+1]
 		if left <= -gamma1 || left > gamma1 || right <= -gamma1 || right > gamma1 {
 			return [zEncodedSize]byte{}, ErrInvalidZCoefficient

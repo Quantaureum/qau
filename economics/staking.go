@@ -465,7 +465,9 @@ func NewStakingManager(config *StakingConfig) *StakingManager {
 // state mutators). Negative values are rejected (rewards should never be
 // negative — a negative APY would drain staker stake rather than reward
 // it, a financial invariant violation). Zero is allowed (preserves the
-//  "double rewards avoidance" sema — set to 0 when the consensus
+//
+//	"double rewards avoidance" sema — set to 0 when the consensus
+//
 // layer is already paying attestation rewards, and re-enable only
 // for explicit incentive programs via governance).
 //

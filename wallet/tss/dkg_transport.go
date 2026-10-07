@@ -37,10 +37,10 @@ type DKGTransport interface {
 	// SendShare sends the Round1OpenMessage (containing the recipient's dedicated share) to peerID.
 	SendShare(peerID int, msg *qtd.Round1OpenMessage) error
 	// WaitCommitments blocks until all total-1 commitments from others have
-	// arrived, the wait times out, or ctx is cancelled (whichever comes first).
+	// arrived, the wait times out, or ctx is canceled (whichever comes first).
 	WaitCommitments(ctx context.Context, total int) (map[int]*qtd.Round1CommitmentMessage, error)
 	// WaitShares blocks until all total-1 share messages from others have
-	// arrived, the wait times out, or ctx is cancelled (whichever comes first).
+	// arrived, the wait times out, or ctx is canceled (whichever comes first).
 	WaitShares(ctx context.Context, total int) (map[int]*qtd.Round1OpenMessage, error)
 }
 
@@ -78,7 +78,7 @@ func (m *TSSManager) SetDKGTransport(t DKGTransport) {
 //
 // REQUIRES dkgTransport to be injected; otherwise returns a clear error saying to inject a DKGTransport.
 //
-// ctx bounds the network waits: when it is cancelled (e.g. the node layer's
+// ctx bounds the network waits: when it is canceled (e.g. the node layer's
 // per-attempt round-window deadline elapses), WaitCommitments/WaitShares return
 // promptly so this function returns and releases m.mu instead of leaking a
 // goroutine that holds the manager lock and wedges the next attempt (TSS-R7-12).

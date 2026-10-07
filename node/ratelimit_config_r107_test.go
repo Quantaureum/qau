@@ -17,7 +17,7 @@ import (
 // per-IP ban had no lever short of patching the binary — and clearing an active
 // ban required restarting the validator.
 //
-// These tests pin the config plumbing: startup and hot-reload must both honour
+// These tests pin the config plumbing: startup and hot-reload must both honor
 // the new fields, unset fields must keep the safe defaults, and a malformed or
 // over-broad exemption must be rejected loudly instead of silently ignored.
 

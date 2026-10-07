@@ -54,7 +54,8 @@ func TestDecomposeReconstructRoundTrip(t *testing.T) {
 }
 
 // TestExecuteVDFSelfConsistent mirrors the reference test_vdf invariants:
-//   G·w[0] = y,  G·w[i] + A·w[i-1] = 0 for 0 < i < time,  A·w[time-1] = output.
+//
+//	G·w[0] = y,  G·w[i] + A·w[i-1] = 0 for 0 < i < time,  A·w[time-1] = output.
 func TestExecuteVDFSelfConsistent(t *testing.T) {
 	q := QBC
 	time, rep := 8, 2

@@ -43,10 +43,10 @@ type tdilithium3DKGInbox struct {
 	// (nil before they were introduced): persisting them alongside the
 	// activation record is what lets a later session re-verify it after a
 	// rotation renumbers the committee.
-	bindings          []dilithium3v1.DKGIdentityBinding
-	messages          chan tdilithium3DKGVerifiedMessage
-	mu                sync.Mutex
-	seen              map[tdilithium3DKGReplayKey][32]byte
+	bindings []dilithium3v1.DKGIdentityBinding
+	messages chan tdilithium3DKGVerifiedMessage
+	mu       sync.Mutex
+	seen     map[tdilithium3DKGReplayKey][32]byte
 }
 
 // IdentityBindings returns the pid -> identity binding the inbox's verifier was

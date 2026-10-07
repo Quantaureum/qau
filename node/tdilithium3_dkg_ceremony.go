@@ -553,4 +553,3 @@ func (n *Node) tryTDilithium3ReshareRemoveRotation(
 	}
 	return true, rotatedKey, nil
 }
-

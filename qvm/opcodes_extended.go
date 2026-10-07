@@ -601,14 +601,14 @@ func (i *Interpreter) opAuth(env *Environment) error {
 // (authorizedAddress is nil), AUTHCALL behaves like a normal CALL, using
 // env.ctx.Address as the caller.
 //
-//  Rewritten to follow the opCall pattern for consistency:
-//   - EVM-compatible stack pop order
-//   - Zero address check (L10-020)
-//   - Reentrancy guard gas (R5-P3-3)
-//   - Precompiled contract detection
-//   - Depth check using >= ()
-//   - EVMCompatible flag in call context
-//   - L5-003 log propagation guard
+//	Rewritten to follow the opCall pattern for consistency:
+//	 - EVM-compatible stack pop order
+//	 - Zero address check (L10-020)
+//	 - Reentrancy guard gas (R5-P3-3)
+//	 - Precompiled contract detection
+//	 - Depth check using >= ()
+//	 - EVMCompatible flag in call context
+//	 - L5-003 log propagation guard
 func (i *Interpreter) opAuthCall(env *Environment) error {
 	// Pop arguments from stack (same order as CALL)
 	// EVM order (gas on top): gas, addr, value, argsOffset, argsSize, retOffset, retSize

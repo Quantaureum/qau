@@ -73,14 +73,11 @@ func AssembleMode3PublicKey(
 	for polynomialIndex := range t1 {
 		encoded, err := encodeMode3T1(t1[polynomialIndex])
 		if err != nil {
-			t0 = VectorK{}
 			return [1952]byte{}, [32]byte{}, err
 		}
 		copy(publicKey[offset:offset+len(encoded)], encoded[:])
 		offset += len(encoded)
 	}
-	t0 = VectorK{}
-
 	transcript := make([]byte, 0, len(publicKeyTranscriptDomain)+32+32+len(publicKey)+20*(1+1+32))
 	transcript = append(transcript, publicKeyTranscriptDomain...)
 	transcript = append(transcript, sessionDigest[:]...)
@@ -128,6 +125,7 @@ func encodeMode3T1(polynomial Poly) ([320]byte, error) {
 		first := polynomial[coefficientIndex]
 		second := polynomial[coefficientIndex+1]
 		third := polynomial[coefficientIndex+2]
+		// #nosec G602 -- N is even and divisible by 4; the step is 4.
 		fourth := polynomial[coefficientIndex+3]
 		if first < 0 || first >= 1<<10 || second < 0 || second >= 1<<10 || third < 0 || third >= 1<<10 || fourth < 0 || fourth >= 1<<10 {
 			return [320]byte{}, fmt.Errorf("%w: t1 coefficient outside ten-bit range", ErrInvalidPublicKeyAssembly)

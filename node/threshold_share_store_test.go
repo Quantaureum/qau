@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
-	"github.com/quantaureum/qau/types"
 	qcrypto "github.com/quantaureum/qau/crypto"
+	"github.com/quantaureum/qau/types"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )

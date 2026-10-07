@@ -215,7 +215,7 @@ func accountFromStdinMnemonic(index int, stdinReader *bufio.Reader) (*accounts.A
 			return nil, fmt.Errorf("failed to read mnemonic: %w", err)
 		}
 		line = string(raw)
-		byteLine := []byte(raw)
+		byteLine := raw
 		for i := range byteLine {
 			byteLine[i] = 0
 		}

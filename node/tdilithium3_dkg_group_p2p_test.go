@@ -2,7 +2,6 @@
 package node
 
 import (
-	"math/big"
 	"bufio"
 	"bytes"
 	"context"
@@ -11,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,7 +57,7 @@ const (
 
 	tdilithium3DKGCrossProcessPositions = 6
 
-	// tdilithium3DKGCrossProcessPhaseTimeout bounds one synchronised protocol
+	// tdilithium3DKGCrossProcessPhaseTimeout bounds one synchronized protocol
 	// phase across all six children.
 	tdilithium3DKGCrossProcessPhaseTimeout = 240 * time.Second
 )
@@ -253,7 +253,7 @@ func TestTDilithium3DKGGroupP2PCrossProcess(t *testing.T) {
 	// so the parent releases the group phase only once all six children have
 	// finished revealing. The group drivers themselves tolerate skew (messages
 	// for a group a node has not reached yet are retained), so the twenty groups
-	// then run unsynchronised on purpose.
+	// then run unsynchronized on purpose.
 	for _, child := range children {
 		child.readLine(t, fmt.Sprintf("randomness %d", child.index), tdilithium3DKGCrossProcessPhaseTimeout)
 	}
@@ -402,7 +402,7 @@ func tdilithium3DKGCrossProcessParseOutcome(t *testing.T, index int, publicKeyHe
 // tdilithium3DKGCrossProcessInProcessReference reproduces the same ceremony with
 // the in-process harness and returns the reference transcript. Both paths share
 // the deterministic session, identities and entropy, so any divergence is a real
-// protocol difference rather than a timing artefact.
+// protocol difference rather than a timing artifact.
 func tdilithium3DKGCrossProcessInProcessReference(t *testing.T) tdilithium3DKGCrossProcessOutcome {
 	t.Helper()
 	session := tdilithium3DKGCrossProcessSession(t)

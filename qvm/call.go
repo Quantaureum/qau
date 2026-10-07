@@ -1003,15 +1003,15 @@ func (i *Interpreter) opStaticCall(env *Environment) error {
 
 // opDelegateCall implements the DELEGATECALL opcode.
 //
-//  (P3): Gas cost calculation for DELEGATECALL mirrors opCall:
-//  1. memExpansionCost —memory growth for input/output buffers (charged once
-//     via MemoryExpansionCost on the union of in/out ranges).
-//  2. reentrancyGuardGas —2300 charged for reentrant calls into a contract
-//     (targetHasCode && callDepth >= 1 && IsAddressActive(ctx.Address)).
-//     DELEGATECALL runs in the caller's storage context, so reentrancy is
-//     detected via ctx.Address (not the target addr).
-//  3. callCost/callGas —base call gas + EIP-2929 cold-access surcharge,
-//     computed by CalculateCallGas against gas remaining after (1)+(2).
+//	(P3): Gas cost calculation for DELEGATECALL mirrors opCall:
+//	1. memExpansionCost —memory growth for input/output buffers (charged once
+//	   via MemoryExpansionCost on the union of in/out ranges).
+//	2. reentrancyGuardGas —2300 charged for reentrant calls into a contract
+//	   (targetHasCode && callDepth >= 1 && IsAddressActive(ctx.Address)).
+//	   DELEGATECALL runs in the caller's storage context, so reentrancy is
+//	   detected via ctx.Address (not the target addr).
+//	3. callCost/callGas —base call gas + EIP-2929 cold-access surcharge,
+//	   computed by CalculateCallGas against gas remaining after (1)+(2).
 //
 // Fixed costs (memory, reentrancy) are reserved first so the gas passed to
 // CalculateCallGas cannot be double-spent.

@@ -1108,19 +1108,19 @@ func (bp *BlockProducer) produceLoop() {
 						if err := bp.threeChambersFlow.SealBlock(prevSlot); err != nil {
 							bpLog.Debug("ThreeChambersFlow.SealBlock(slot=%d): %v", prevSlot, err)
 						} else {
-						// P1-4: Broadcast seal request so executive members submit partial seals.
-						// Use the block hash recorded in the lifecycle (set by ProposeBlock).
-						//
-						// QTD-NOISE-FIX (2026-10-02): only the slot's proposer
-						// broadcasts. Receivers reject non-proposer senders
-						// (B-5), so broadcasting from every node produced a
-						// 5/6 warning-noise storm per slot on 6-validator
-						// devnets without contributing anything.
-						if lc := bp.threeChambersFlow.GetLifecycle(prevSlot); lc != nil {
-							if proposer, err := bp.qpos.GetProposerForSlot(prevSlot); err == nil && proposer != nil && proposer.Address == bp.validatorAddr {
-								bp.node.requestQTDSeal(prevSlot, lc.BlockHash)
+							// P1-4: Broadcast seal request so executive members submit partial seals.
+							// Use the block hash recorded in the lifecycle (set by ProposeBlock).
+							//
+							// QTD-NOISE-FIX (2026-10-02): only the slot's proposer
+							// broadcasts. Receivers reject non-proposer senders
+							// (B-5), so broadcasting from every node produced a
+							// 5/6 warning-noise storm per slot on 6-validator
+							// devnets without contributing anything.
+							if lc := bp.threeChambersFlow.GetLifecycle(prevSlot); lc != nil {
+								if proposer, err := bp.qpos.GetProposerForSlot(prevSlot); err == nil && proposer != nil && proposer.Address == bp.validatorAddr {
+									bp.node.requestQTDSeal(prevSlot, lc.BlockHash)
+								}
 							}
-						}
 						}
 					}
 

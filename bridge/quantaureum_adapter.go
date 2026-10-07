@@ -637,7 +637,9 @@ func (q *QuantaureumChainAdapter) persistLastNoncesLocked() {
 }
 
 // SignMessage signs a message using Dilithium3 and returns the signature.
-//  [HIGH] FIX: Returns error on panic during signing, preventing zeroed
+//
+//	[HIGH] FIX: Returns error on panic during signing, preventing zeroed
+//
 // signature from being blindly assigned and returned as valid.
 func (q *QuantaureumChainAdapter) SignMessage(ctx context.Context, msg *BridgeMessage) ([]byte, error) {
 	// AUDIT (2026 security review) BRDG- Same nil-deref regression as SubmitMessage.

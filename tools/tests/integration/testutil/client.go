@@ -36,10 +36,10 @@ func NewNodeClient(rpcURL, wsURL, healthURL string) *NodeClient {
 
 // RPCRequest represents a JSON-RPC request.
 type RPCRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	Method  string      `json:"method"`
-	Params  any `json:"params,omitempty"`
-	ID      int         `json:"id"`
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+	ID      int    `json:"id"`
 }
 
 // RPCResponse represents a JSON-RPC response.
@@ -293,4 +293,3 @@ func (c *NodeClient) WaitForReady(ctx context.Context, timeout time.Duration) er
 
 	return fmt.Errorf("timeout waiting for node to be ready")
 }
-

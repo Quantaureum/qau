@@ -37,7 +37,7 @@ func rpcPost(rpc string, method string, params []interface{}) (json.RawMessage, 
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.Post(rpc, "application/json", bytes.NewReader(body))
+	resp, err := http.Post(rpc, "application/json", bytes.NewReader(body)) // #nosec G107 -- RPC endpoint comes from operator flags
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func runCalibrate(rpc string, crsSeed [32]byte, workers int) {
 		runtime.GC()
 		runtime.ReadMemStats(&before)
 		start := time.Now()
-		image, whash, err := runEval(seedInput, uint64(height)/uint64(t)+1, t, q, workers, crsSeed)
+		image, whash, err := runEval(seedInput, height/uint64(t)+1, t, q, workers, crsSeed)
 		wall := time.Since(start)
 		runtime.ReadMemStats(&after)
 		if err != nil {
@@ -190,7 +190,7 @@ func runFollow(rpc string, crsSeed [32]byte, tSteps, epochLen, poll, workers int
 		}
 		if epoch > lastEpoch {
 			for e := lastEpoch + 1; e <= epoch; e++ {
-				bh, err := fetchBlockHash(rpc, uint64(e) * uint64(epochLen))
+				bh, err := fetchBlockHash(rpc, uint64(e)*uint64(epochLen))
 				if err != nil {
 					continue
 				}

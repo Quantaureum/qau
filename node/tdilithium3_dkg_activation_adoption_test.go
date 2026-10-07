@@ -148,7 +148,7 @@ func TestAdoptTDilithium3DKGActivationCertificateLiveInboxAdopts(t *testing.T) {
 		t.Fatal(err)
 	}
 	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
+	installTestAdoptionInbox(t, n, session, share.ParticipantPosition, verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {
@@ -190,7 +190,7 @@ func TestAdoptTDilithium3DKGActivationCertificateRejectsTamperedSignature(t *tes
 	}
 	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
 	certificate.Acknowledgements[4].IdentitySignature[0] ^= 1
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
+	installTestAdoptionInbox(t, n, session, share.ParticipantPosition, verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {
@@ -215,7 +215,7 @@ func TestAdoptTDilithium3DKGActivationCertificateRejectsWithoutCandidate(t *test
 		t.Fatal(err)
 	}
 	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
-	installTestAdoptionInbox(t, n, session, uint8(share.ParticipantPosition), verifier, bindings)
+	installTestAdoptionInbox(t, n, session, share.ParticipantPosition, verifier, bindings)
 
 	// Deliberately no candidate share on disk: only a node that ran the same
 	// DKG round holds one, so adoption without it must fail closed.
@@ -276,7 +276,7 @@ func TestAdoptTDilithium3DKGActivationCertificateInboxEpochMismatch(t *testing.T
 	// on this bare node, so the adoption fails closed.
 	mismatch := session.Clone()
 	mismatch.ActivationEpoch = share.ActivationEpoch + 1
-	installTestAdoptionInbox(t, n, mismatch, uint8(share.ParticipantPosition), verifier, bindings)
+	installTestAdoptionInbox(t, n, mismatch, share.ParticipantPosition, verifier, bindings)
 
 	store := newThresholdShareStore(n.config.DataDir)
 	if err := store.Store(share, password); err != nil {

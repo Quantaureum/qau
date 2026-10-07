@@ -1076,7 +1076,7 @@ func (n *Node) Stop() error {
 	n.cancel()
 
 	// Close the cached Dilithium3 signing journals after the node context is
-	// cancelled, so every seal session has stopped touching them first.
+	// canceled, so every seal session has stopped touching them first.
 	n.closeTDilithium3SigningJournals()
 
 	// SECURITY (audit-fix): Persist TSS key shares on graceful

@@ -295,7 +295,7 @@ func localRPCCall(endpoint, method string, params interface{}) map[string]interf
 		"params":  params,
 		"id":      1,
 	})
-	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(body))
+	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(body)) // #nosec G107 -- endpoint comes from operator flags
 	if err != nil {
 		return nil
 	}

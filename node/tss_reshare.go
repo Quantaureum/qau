@@ -259,7 +259,7 @@ func (t *P2PReshareTransport) Deliver(ctx context.Context, messages []*reshareWi
 	defer ticker.Stop()
 	for attempt := uint32(1); ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("reshare delivery cancelled: %w", err)
+			return fmt.Errorf("reshare delivery canceled: %w", err)
 		}
 		remaining := 0
 		for _, message := range messages {
@@ -279,7 +279,7 @@ func (t *P2PReshareTransport) Deliver(ctx context.Context, messages []*reshareWi
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("reshare delivery cancelled with %d unacknowledged recipients: %w", remaining, ctx.Err())
+			return fmt.Errorf("reshare delivery canceled with %d unacknowledged recipients: %w", remaining, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -313,7 +313,7 @@ func (t *P2PReshareTransport) Wait(ctx context.Context, oldParticipants []int) (
 		sort.Ints(missing)
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("reshare wait cancelled: %w", ctx.Err())
+			return nil, fmt.Errorf("reshare wait canceled: %w", ctx.Err())
 		case <-deadline.C:
 			return nil, fmt.Errorf("reshare wait timed out (received %d/%d contributions; missing participants %v)", len(result), len(expected), missing)
 		case <-time.After(resharePollInterval):

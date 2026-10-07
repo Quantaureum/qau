@@ -16,7 +16,7 @@ import (
 
 // TestCeremonyEndToEnd runs the whole binary logic: generate (random mode),
 // encrypt keystore, decrypt and confirm the round-trip, and validate the
-// public artefact fields.
+// public artifact fields.
 func TestCeremonyEndToEnd(t *testing.T) {
 	out := t.TempDir()
 	t.Setenv("QAU_KEYSTORE_PASSWORD", "test-ceremony-pwd-0001")
@@ -27,7 +27,7 @@ func TestCeremonyEndToEnd(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 	main()
 
-	// artefacts exist
+	// artifacts exist
 	pubRaw, err := os.ReadFile(filepath.Join(out, "master_public.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestCeremonyEndToEnd(t *testing.T) {
 	}
 	gotPub := hex.EncodeToString(priv.PublicKey().Bytes())
 	if gotPub != pubDoc.PublicKeyHex {
-		t.Fatal("keystore pubkey does not match public artefact")
+		t.Fatal("keystore pubkey does not match public artifact")
 	}
 
 	// wrong password must fail

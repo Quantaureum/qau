@@ -110,7 +110,8 @@ func (api *DeFiAPI) requireAuthorizedUser(addr types.Address) error {
 	return nil
 }
 
-//  This method uses a non-standard name. The convention across
+//	This method uses a non-standard name. The convention across
+//
 // other API structs (API, DebugAPI, ProofAPI, etc.) is RegisterHandlers.
 // The original name is retained for backward compatibility; a
 // RegisterHandlers alias is defined below.

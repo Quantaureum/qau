@@ -9,10 +9,10 @@ package node
 // here first.
 
 import (
-	"math/big"
 	"bytes"
 	"context"
 	"fmt"
+	"math/big"
 	"path/filepath"
 	"sync"
 	"testing"

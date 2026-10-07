@@ -216,7 +216,9 @@ func (s *HeaderSyncer) GetCheckpoint(height uint64) (*Checkpoint, error) {
 }
 
 // GetNearestCheckpoint finds the nearest checkpoint at or before the given height.
-//  [LOW] FIX: extracts keys into a sorted slice for deterministic iteration.
+//
+//	[LOW] FIX: extracts keys into a sorted slice for deterministic iteration.
+//
 // Go map iteration is non-deterministic and could cause consensus divergence across nodes.
 func (s *HeaderSyncer) GetNearestCheckpoint(height uint64) (*Checkpoint, error) {
 	s.mu.RLock()

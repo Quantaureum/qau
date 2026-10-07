@@ -145,6 +145,9 @@ func sampleSigningExecutorPartyRandomness(entropy io.Reader, params SigningParam
 	if _, err := io.ReadFull(entropy, seed[:]); err != nil {
 		return nil, fmt.Errorf("%w: entropy: %v", ErrInvalidSigningRandomness, err)
 	}
+	// #nosec G404 -- deterministic seeded sampler for session replayability;
+	// the 8 seed bytes come from the caller's entropy source (crypto/rand in
+	// production), the PRNG only expands them reproducibly.
 	point, err := sampleSigningRandomness(rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed[:])))), params)
 	if err != nil {
 		return nil, err

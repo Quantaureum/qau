@@ -13,16 +13,16 @@ import (
 )
 
 const (
-	localShareMagic   = "QTD3SH02"
+	localShareMagic       = "QTD3SH02"
 	legacyLocalShareMagic = "QTD3SH01"
 	// localShareVersion is the current share-encoding version. Version 3
 	// added the 32-bit fold multiplicity ahead of each component's secret
 	// vectors so R77-rotated shares round-trip their norm history.
-	localShareVersion          = uint16(3)
-	legacyLocalShareVersion    = uint16(2)
-	shareDigestSize            = 32
-	componentMetadataSize      = 2 + 1 + 32 + 4
-	componentSecretPolyCount   = L + K
+	localShareVersion        = uint16(3)
+	legacyLocalShareVersion  = uint16(2)
+	shareDigestSize          = 32
+	componentMetadataSize    = 2 + 1 + 32 + 4
+	componentSecretPolyCount = L + K
 )
 
 var (

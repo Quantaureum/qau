@@ -136,15 +136,15 @@ func TestTDilithium3SealSigningSessionManager(t *testing.T) {
 	node := &Node{}
 	ctx := context.Background()
 	// The permit bounds concurrent slots: up to maxConcurrentSlots acquires
-	// succeed, the next one with a cancelled context fails.
+	// succeed, the next one with a canceled context fails.
 	for i := 0; i < tdilithium3SealSigningMaxConcurrentSlots; i++ {
 		if !node.acquireTDilithium3SealSigning(ctx, uint64(7+i)) {
 			t.Fatalf("acquire %d of %d failed", i+1, tdilithium3SealSigningMaxConcurrentSlots)
 		}
 	}
-	cancelled, cancel := context.WithCancel(ctx)
+	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if node.acquireTDilithium3SealSigning(cancelled, 99) {
+	if node.acquireTDilithium3SealSigning(canceled, 99) {
 		t.Fatal("an acquire beyond the permit limit succeeded")
 	}
 	for i := 0; i < tdilithium3SealSigningMaxConcurrentSlots; i++ {

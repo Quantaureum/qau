@@ -52,7 +52,8 @@ func getBlockHeight(blockHeight []uint64) uint64 {
 	return 0
 }
 
-//  Default per-pool maximum total supply for lending pools (20M QAU
+//	Default per-pool maximum total supply for lending pools (20M QAU
+//
 // with 18 decimals). Prevents unbounded supply growth in a single lending pool.
 // Can be overridden per-instance via SetMaxTotalSupply.
 var DefaultMaxLendingSupply = new(big.Int).Mul(
@@ -60,7 +61,8 @@ var DefaultMaxLendingSupply = new(big.Int).Mul(
 	new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
 )
 
-//  Default global maximum total supply across ALL lending pools
+//	Default global maximum total supply across ALL lending pools
+//
 // (500M QAU with 18 decimals). Prevents unbounded aggregate supply growth.
 // Can be overridden per-instance via SetGlobalMaxSupply.
 var DefaultGlobalMaxLendingSupply = new(big.Int).Mul(
@@ -68,7 +70,8 @@ var DefaultGlobalMaxLendingSupply = new(big.Int).Mul(
 	new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
 )
 
-//  MINIMUM_LIQUIDITY is the minimum residual liquidity that must remain
+//	MINIMUM_LIQUIDITY is the minimum residual liquidity that must remain
+//
 // in a liquidity pool after removing liquidity. Prevents a pool from being
 // completely drained, which would cause division-by-zero and price manipulation.
 const MINIMUM_LIQUIDITY = 1000
@@ -388,7 +391,8 @@ func calculateDeviation(old, newVal *big.Int) uint64 {
 // Deprecated: DefaultPriceOracle is disabled and must not be used. It exists
 // solely for backward compatibility and all methods return errors. Provide a
 // real PriceOracle implementation (e.g. AggregatedPriceOracle) instead.
-//  This type is retained to avoid breaking callers but is disabled.
+//
+//	This type is retained to avoid breaking callers but is disabled.
 //
 // DefaultPriceOracle is kept for backward compatibility but always returns an error.
 // R58-N2 [HIGH] FIX: processEnv("QAU_ENV") always returned "", so the production
@@ -1468,7 +1472,8 @@ func (lm *LendingManager) SetCloseFactor(cf uint64) {
 }
 
 // SetMaxTotalSupply sets the per-pool maximum total supply cap.
-//  allows operators to configure a custom cap. Pass nil to disable.
+//
+//	allows operators to configure a custom cap. Pass nil to disable.
 func (lm *LendingManager) SetMaxTotalSupply(cap *big.Int) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -1476,7 +1481,8 @@ func (lm *LendingManager) SetMaxTotalSupply(cap *big.Int) {
 }
 
 // SetGlobalMaxSupply sets the global maximum total supply cap across all pools.
-//  allows operators to configure a custom aggregate cap. Pass nil to disable.
+//
+//	allows operators to configure a custom aggregate cap. Pass nil to disable.
 func (lm *LendingManager) SetGlobalMaxSupply(cap *big.Int) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()

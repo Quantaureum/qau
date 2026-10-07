@@ -909,14 +909,14 @@ const (
 // members of the grown committee), so their new positions are always
 // defined; the leaver's old positions appear only inside the group masks.
 type ReshareDeltaWire struct {
-	SessionDigest    [32]byte
-	CommitteeDigest  [32]byte
-	Kind             uint8
-	SourceGroup      RSSGroupMask
-	TargetGroup      RSSGroupMask
-	AnchorPosition   uint8
+	SessionDigest     [32]byte
+	CommitteeDigest   [32]byte
+	Kind              uint8
+	SourceGroup       RSSGroupMask
+	TargetGroup       RSSGroupMask
+	AnchorPosition    uint8
 	RecipientPosition uint8
-	Component        RSSComponent
+	Component         RSSComponent
 }
 
 // MarshalBinary produces the canonical fixed layout.
@@ -998,8 +998,8 @@ func UnmarshalReshareDeltaWire(encoded []byte) (ReshareDeltaWire, error) {
 
 // AddVectorL/AddVectorK are the exported modulo-q vector additions the
 // reshare ceremony drivers outside this package need for transcript checks.
-func AddVectorL(left, right VectorL) VectorL  { return addVectorL(left, right) }
-func AddVectorK(left, right VectorK) VectorK  { return addVectorK(left, right) }
+func AddVectorL(left, right VectorL) VectorL { return addVectorL(left, right) }
+func AddVectorK(left, right VectorK) VectorK { return addVectorK(left, right) }
 
 // addVectorL adds two module vectors coefficient-wise modulo q.
 func addVectorL(left, right VectorL) VectorL {

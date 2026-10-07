@@ -320,7 +320,7 @@ func TestR123StqauSpecTable(t *testing.T) {
 			f.mustDeposit(t, f.alice, stqauE18(100))
 			f.mustWithdraw(t, f.alice, stqauE18(100))
 			_, unlock, _ := f.queueOf(t, f.alice)
-			f.ctx.BlockNumber = uint64(unlock.Uint64() - 1)
+			f.ctx.BlockNumber = unlock.Uint64() - 1
 			if _, err := f.call(f.alice, stSelClaimWithdrawal, 8_000_000); err == nil {
 				t.Fatalf("claim at NUMBER-1 (%d) must revert", f.ctx.BlockNumber)
 			}
@@ -627,7 +627,6 @@ func TestR123StqauSpecTable(t *testing.T) {
 	}
 
 	for _, r := range rows {
-		r := r
 		t.Run(r.name, func(t *testing.T) { r.run(t, newStqauFixture(t)) })
 	}
 }

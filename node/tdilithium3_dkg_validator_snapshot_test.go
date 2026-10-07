@@ -2,8 +2,8 @@
 package node
 
 import (
-	"math/big"
 	"fmt"
+	"math/big"
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"

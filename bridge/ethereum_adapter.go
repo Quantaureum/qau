@@ -470,7 +470,9 @@ func (e *ExternalChainAdapter) SubmitMessage(ctx context.Context, msg *BridgeMes
 }
 
 // SignMessage signs a message using Dilithium3 and returns the signature.
-//  [HIGH] FIX: Returns error on panic during signing, preventing zeroed
+//
+//	[HIGH] FIX: Returns error on panic during signing, preventing zeroed
+//
 // signature from being blindly assigned and returned as valid.
 func (e *ExternalChainAdapter) SignMessage(ctx context.Context, msg *BridgeMessage) ([]byte, error) {
 	// AUDIT (2026 security review) R4-BRDG ( regression): Check for nil BEFORE
@@ -1302,7 +1304,9 @@ func (e *ExternalChainAdapter) FetchMerkleRootFromChain(ctx context.Context) (ty
 }
 
 // WatchEvents watches for bridge events on the external blockchain.
-//  [LOW] FIX: Previously returned nil, silently skipping all event monitoring.
+//
+//	[LOW] FIX: Previously returned nil, silently skipping all event monitoring.
+//
 // Adaptive polling adjusts the interval based on block arrival rate. A fixed 5-second
 // ticker can miss events under chain load when blocks arrive faster than the poll
 // interval. Conversely, under low activity, a fixed 5-second interval wastes RPC

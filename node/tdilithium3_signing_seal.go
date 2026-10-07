@@ -98,7 +98,7 @@ func tdilithium3SealExecutorEnabled(n *Node) bool {
 // entered: the legacy branch logs its own refusal, and the executor's does not.
 // This switch promotes only those decisions, so a devnet run can attribute a
 // missing signature to a specific precondition without changing any default
-// log level and without touching a behaviour.
+// log level and without touching a behavior.
 func tdilithium3SealExecutorTrace() bool {
 	return os.Getenv("QAU_TRACE_TDILITHIUM3_V1_SEAL") == "1"
 }
@@ -437,7 +437,7 @@ func (n *Node) tdilithium3SealSigningForget(slot uint64, session *tdilithium3Sea
 // so this no longer cancels other slots' sessions -- doing so was what forced a
 // node to abandon slot N the instant slot N+1 arrived, drifting it away from
 // peers still on N. The permit only bounds goroutine fan-out; the same-slot
-// retry (a higher ordinal) is cancelled where the session is created, not here.
+// retry (a higher ordinal) is canceled where the session is created, not here.
 func (n *Node) acquireTDilithium3SealSigning(ctx context.Context, slot uint64) bool {
 	n.tdilithium3SealSigningMu.Lock()
 	if n.tdilithium3SealSigningRunning == nil {
@@ -470,7 +470,7 @@ func (n *Node) releaseTDilithium3SealSigning() {
 }
 
 // tdilithium3SealSigningSleep pauses before a retry, and reports whether the
-// pause completed rather than being cancelled.
+// pause completed rather than being canceled.
 func (n *Node) tdilithium3SealSigningSleep(ctx context.Context, pause time.Duration) bool {
 	timer := time.NewTimer(pause)
 	defer timer.Stop()

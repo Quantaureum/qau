@@ -999,12 +999,16 @@ func computeTMLDSAReshareRecipientTerm(
 		if err != nil {
 			return 0, err
 		}
+		// #nosec G602 -- checkID in {0,1} and participantIndex < 6 by the
+		// evaluation-points contract of ReshareEvaluationCheckCoefficients.
 		coefficient = coefficients[checkID][participantIndex]
 	} else {
 		coefficients, err := protocolmldsa65.ReshareConstantCheckCoefficients(request.NewCommittee.Participants)
 		if err != nil {
 			return 0, err
 		}
+		// #nosec G602 -- ReshareConstantCheckCoefficients returns [6]int32 and
+		// participantIndex indexes the same validated participant set.
 		coefficient = coefficients[participantIndex]
 	}
 	masks := make([]int32, 0, len(request.NewCommittee.Participants))

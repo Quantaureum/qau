@@ -313,7 +313,6 @@ func main() {
 	// --- 6. Zeroize ---
 	crypto.ZeroBytesSecure(privBytes)
 	crypto.ZeroBytesSecure(pubBytes)
-	mnemo = ""
 
 	fmt.Fprintln(os.Stderr, "\nCeremony complete.")
 	fmt.Fprintf(os.Stderr, "Master address (hex): %s\n", addrHex)

@@ -42,11 +42,11 @@ var walletConfigs = []struct {
 	Percentage string
 	LockPeriod string
 }{
-	// {"private_sale", "Private sale reserve", "14,400,000 QAU", "20%", "TBD"}, // cancelled
+	// {"private_sale", "Private sale reserve", "14,400,000 QAU", "20%", "TBD"}, // canceled
 	{"team_advisors", "Team & advisors", "10,800,000 QAU", "15%", "4y, 1y locked"},
 	{"ecosystem_fund", "Ecosystem fund", "10,800,000 QAU", "15%", "4y vesting"},
 	{"community_airdrop", "Community airdrop", "7,200,000 QAU", "10%", "none"},
-	// {"development_fund", "Development fund", "7,200,000 QAU", "10%", "3y vesting"}, // cancelled
+	// {"development_fund", "Development fund", "7,200,000 QAU", "10%", "3y vesting"}, // canceled
 	{"validator_incentive", "Validator incentive pool", "20,000,000 QAU", "20%", "5y vesting"},
 	{"foundation_reserve", "Foundation reserve", "8,000,000 QAU", "8%", "4y vesting"},
 }

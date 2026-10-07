@@ -39,13 +39,13 @@ package dilithium3v1
 // ball points are caller-supplied here.
 
 import (
-	"math"
-	"os"
 	"bytes"
 	"crypto/sha3"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"sync"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol"
@@ -77,7 +77,6 @@ var ErrSigningExecutorSilence = errSigningExecutorSilence
 // signer's rejection-test outcome is an ordinary abort of the attempt, burned
 // and retried with a fresh request by the seal path, not a correctness bell.
 var ErrSigningRejected = errSigningRejected
-
 
 // signingExecutorAbort is the bounded abort of one slot: a reason code, the
 // attributable evidence, and a short detail. It never carries a secret-derived

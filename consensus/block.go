@@ -683,12 +683,12 @@ func NewQPOS(validators *ValidatorSet) (*QPOS, error) {
 		committeeCache:          make(map[uint64][]*Validator),
 		epochRewards:            make(map[uint64]*EpochRewards),
 		epochBlockRoots:         make(map[uint64]types.Hash),
-		slotBlockRoots:          make(map[uint64]types.Hash),   // AUDIT (2026) GOV-05
-		epochVRFAccumulator:     make(map[uint64]types.Hash),   // AUDIT (2026) R4-CORE-01
+		slotBlockRoots:          make(map[uint64]types.Hash),     // AUDIT (2026) GOV-05
+		epochVRFAccumulator:     make(map[uint64]types.Hash),     // AUDIT (2026) R4-CORE-01
 		vdfSeedCache:            make(map[vdfSeedKey]types.Hash), // stage-2 VDF seed hardening
 		vdfSeedBusy:             make(map[vdfSeedKey]struct{}),   // stage-2 VDF seed hardening
-		vdfSeedCfg:              vdfSeedConfigFromEnv(),        // nil unless QAU_VDF_SEED_ACTIVATION_EPOCH is set
-		appliedBlockRoots:       make(map[types.Hash]struct{}), // R38-P1-08 DEEP FIX
+		vdfSeedCfg:              vdfSeedConfigFromEnv(),          // nil unless QAU_VDF_SEED_ACTIVATION_EPOCH is set
+		appliedBlockRoots:       make(map[types.Hash]struct{}),   // R38-P1-08 DEEP FIX
 		randaoMix:               types.Hash{},
 		authorizedCallers:       NewAuthorizedCallers(),
 		stakeChecker:            NewStakeConsistencyChecker(),
@@ -801,7 +801,7 @@ func (q *QPOS) CanPropose(validatorIndex int, slot uint64) bool {
 
 	// FIX (2026-07-17): CanPropose now hard-rejects blocks on DA gate failure.
 	//
-	// The earlier soft-check (warning + continue) favoured liveness but let
+	// The earlier soft-check (warning + continue) favored liveness but let
 	// blocks committed while DA was unavailable reach the canonical chain.
 	// FinalizeBlock does enforce a hard check, but a block that has already
 	// been committed cannot be un-committed, so downstream txs and apps

@@ -413,9 +413,9 @@ func (fd *FeeDistributor) UpdateConfig(config *FeeDistributionConfig) error {
 // nodes) only calls CollectFee() for accounting — it no longer calls
 // Distribute().
 //
-//  AUDIT NOTE: Call chain documentation — this function is called from:
-//   - node/block_producer.go:1717 (during block production, before state root)
-//   - NOT from economics.ProcessBlock (which only accumulates fees via CollectFee)
+//	AUDIT NOTE: Call chain documentation — this function is called from:
+//	 - node/block_producer.go:1717 (during block production, before state root)
+//	 - NOT from economics.ProcessBlock (which only accumulates fees via CollectFee)
 //
 // This separation is intentional:
 //  1. ProcessBlock accumulates fees in-memory (consensus-safe, can be non-fatal)

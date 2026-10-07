@@ -820,14 +820,14 @@ func NewHost(cfg *Config) (*Host, error) {
 		snapCh:       make(chan []byte, 100),
 		snapReqCh:    make(chan PeerMessage, 100),
 		// ETHEREUM-PARITY SYNC (2026-08-13)
-		syncRespCh:           make(chan PeerMessage, 256),
-		checkpointCh:         make(chan []byte, 50),
+		syncRespCh:   make(chan PeerMessage, 256),
+		checkpointCh: make(chan []byte, 50),
 		// TSS/Dilithium3 protocol channels: bursts are committee-sized but
 		// loss is not recoverable (no retransmission; a dropped round
 		// message strands the whole ceremony on timeout). Size the buffer
 		// for a several-round burst, not for steady state.
-		tssCh:     make(chan PeerMessage, 4096),
-		qtdSealCh: make(chan PeerMessage, 4096),
+		tssCh:                make(chan PeerMessage, 4096),
+		qtdSealCh:            make(chan PeerMessage, 4096),
 		dasReqCh:             make(chan PeerMessage, 100),
 		dasPending:           make(map[uint64]chan PeerMessage),
 		shardBlockCh:         make(chan []byte, 200),
@@ -4118,27 +4118,27 @@ func (h *Host) registerProtocols() {
 		Name:    ProtocolTSS,
 		Version: ProtocolTSSVersion,
 		MsgTypes: map[uint8]bool{
-			MsgTypeTSSSessionInit:                     true,
-			MsgTypeTSSRound1Commit:                    true,
-			MsgTypeTSSRound2Reveal:                    true,
-			MsgTypeTSSRound2Private:                   true,
-			MsgTypeTSSSignature:                       true,
-			MsgTypeTSSDKGShare:                        true,
-			MsgTypeTSSKeyExchange:                     true,
-			MsgTypeTSSDKGCommitment:                   true,
-			MsgTypeTSSDKGAck:                          true,
-			MsgTypeTSSDKGReshare:                      true,
-			MsgTypeTDilithium3DKGRandomness:           true,
-			MsgTypeTDilithium3DKGRandomnessCommitment: true,
-			MsgTypeTDilithium3DKGGroupSeed:            true,
-			MsgTypeTDilithium3DKGAcknowledgement:      true,
-			MsgTypeTDilithium3DKGComplaint:            true,
-			MsgTypeTDilithium3DKGContribution:         true,
-			MsgTypeTDilithium3DKGActivation:           true,
-			MsgTypeTDilithium3SigningCommit:           true,
-			MsgTypeTDilithium3SigningReveal:           true,
-			MsgTypeTDilithium3SigningAcceptance:       true,
-			MsgTypeTDilithium3SigningResponse:         true,
+			MsgTypeTSSSessionInit:                      true,
+			MsgTypeTSSRound1Commit:                     true,
+			MsgTypeTSSRound2Reveal:                     true,
+			MsgTypeTSSRound2Private:                    true,
+			MsgTypeTSSSignature:                        true,
+			MsgTypeTSSDKGShare:                         true,
+			MsgTypeTSSKeyExchange:                      true,
+			MsgTypeTSSDKGCommitment:                    true,
+			MsgTypeTSSDKGAck:                           true,
+			MsgTypeTSSDKGReshare:                       true,
+			MsgTypeTDilithium3DKGRandomness:            true,
+			MsgTypeTDilithium3DKGRandomnessCommitment:  true,
+			MsgTypeTDilithium3DKGGroupSeed:             true,
+			MsgTypeTDilithium3DKGAcknowledgement:       true,
+			MsgTypeTDilithium3DKGComplaint:             true,
+			MsgTypeTDilithium3DKGContribution:          true,
+			MsgTypeTDilithium3DKGActivation:            true,
+			MsgTypeTDilithium3SigningCommit:            true,
+			MsgTypeTDilithium3SigningReveal:            true,
+			MsgTypeTDilithium3SigningAcceptance:        true,
+			MsgTypeTDilithium3SigningResponse:          true,
 			MsgTypeTDilithium3DKGActivationCertificate: true,
 			MsgTypeTDilithium3ReshareDelta:             true,
 		},
@@ -6487,6 +6487,7 @@ func (h *Host) SendRaw(peerID PeerID, data []byte) error {
 	}
 
 	if h.chaosLossPct > 0 || h.chaosLatencyMS > 0 {
+		// #nosec G404 -- test-instrument drop sampling, deliberately non-crypto.
 		if h.chaosLossPct > 0 && mathrand.Intn(1000) < h.chaosLossPct {
 			return nil // WAN loss simulation: silently dropped
 		}
@@ -6541,6 +6542,7 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 			continue
 		}
 		if chaosActive {
+			// #nosec G404 -- test-instrument drop sampling, deliberately non-crypto.
 			if h.chaosLossPct > 0 && mathrand.Intn(1000) < h.chaosLossPct {
 				continue // WAN loss simulation
 			}

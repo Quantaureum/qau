@@ -1852,13 +1852,16 @@ func (bv *BatchVerifier) VerifySchnorrSequential(proofs []*SchnorrProof, publicH
 
 // computeNativeMiMC computes the MiMC hash of a single field element.
 //
-//  DUPLICATION NOTE: This function is duplicated in the quantum
+//	DUPLICATION NOTE: This function is duplicated in the quantum
+//
 // package (quantum/zkp.go:computeNativeMiMC). The quantum package version
 // inlines the field-element serialization (Mod -> FillBytes -> Write)
 // because it cannot import qzkp without creating a circular dependency;
 // this version uses the shared writeFieldElement helper. Both implementations
 // MUST stay in sync: any change to one must be reflected in the other.
-//  NOTE: Callers should zero the input data after calling this
+//
+//	NOTE: Callers should zero the input data after calling this
+//
 // function if it contains sensitive material. This function zeroes its
 // internal buffers and result, but does not modify the caller's `data`.
 func computeNativeMiMC(data *big.Int) *big.Int {
@@ -1896,7 +1899,9 @@ func computeNativeMiMCWithSuffix(data *big.Int, suffix byte) *big.Int {
 
 // writeFieldElement writes a big.Int as a 32-byte big-endian field element
 // to the given writer, reducing it modulo the BLS12-381 scalar field first.
-//  NOTE: big.NewInt/new(big.Int) allocation per call is intentional
+//
+//	NOTE: big.NewInt/new(big.Int) allocation per call is intentional
+//
 // and acceptable for security: each invocation needs a fresh allocation to
 // avoid aliasing bugs where concurrent callers could corrupt shared state.
 func writeFieldElement(h io.Writer, val *big.Int) {

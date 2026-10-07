@@ -88,7 +88,7 @@ func TestSigningExecutorScheduleDifferentialValues(t *testing.T) {
 				t.Fatalf("slot %d: honest run returned %v", slot, deliveryErr)
 			}
 		}
-		signature, err := session.finish()
+		signature, _ := session.finish()
 		scheduleSignature, _, emitted, scheduleErr := schedule.runSlot(uint16(slot))
 		if referenceAccepted != (scheduleErr == nil) {
 			t.Fatalf("slot %d: the schedule and the reference disagree on the decision: %v", slot, scheduleErr)

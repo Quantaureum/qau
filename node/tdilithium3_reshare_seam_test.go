@@ -7,11 +7,11 @@ package node
 // presents to consensus never changes when membership does.
 
 import (
-	"strconv"
-	"strings"
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,7 +218,7 @@ func TestTDilithium3ReshareRemoveSeamSignsUnderSameKey(t *testing.T) {
 	share := rotated[signers[0]]
 
 	// R77-DIAG-SEAM: dump the rotated committee / share identity view the
-	// executor will consume, so a recuring silence points at the identity,
+	// executor will consume, so a recurring silence points at the identity,
 	// not at a random stack line.
 	{
 		ids := make([]uint32, 0, len(rotated))

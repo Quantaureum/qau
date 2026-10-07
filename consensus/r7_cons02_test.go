@@ -22,7 +22,7 @@ import (
 // Fix:
 //   1. On equal VRF output, compare the addresses lexicographically
 //     (bytes.Compare).
-//   2. RevealedAddrs and SlashedAddrs are now sorted for serialisation
+//   2. RevealedAddrs and SlashedAddrs are now sorted for serialization
 //      determinism.
 //
 // This test covers:

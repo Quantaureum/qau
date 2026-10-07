@@ -23,7 +23,7 @@ var (
 	errTDilithium3DKGPacketConflict = errors.New("conflicting Dilithium3 DKG packet")
 	// errTDilithium3DKGGroupStalled is the explicit fail-closed outcome of a
 	// group round whose leader stopped making progress. It wraps the context
-	// error so callers can tell a stalled peer from a cancelled ceremony.
+	// error so callers can tell a stalled peer from a canceled ceremony.
 	errTDilithium3DKGGroupStalled = errors.New("Dilithium3 DKG group stalled waiting for peer progress")
 )
 

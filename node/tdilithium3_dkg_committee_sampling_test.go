@@ -24,7 +24,6 @@ func tdilithium3TestRosterAt(t *testing.T, epoch uint64, n int, stakes []int64, 
 	return &tdilithium3DKGEpochRoster{Epoch: epoch, Entries: entries, SampleSeed: seed, SampleSeedSet: seedSet}
 }
 
-
 func TestTDilithium3DKGCommitteeSelection(t *testing.T) {
 	seed := tdilithium3DKGRosterTestHash(0x7A)
 

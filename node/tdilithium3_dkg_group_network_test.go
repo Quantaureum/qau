@@ -2,11 +2,11 @@
 package node
 
 import (
-	"math/big"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"testing"
@@ -589,13 +589,13 @@ func TestTDilithium3DKGActivationExchangeNetwork(t *testing.T) {
 		// delivered during broadcast are dropped (sink is nil). After
 		// a short delay the sink is installed and the collection loop
 		// is running; packets delivered at that point are consumed.
-			done := make(chan error, 1)
-			go func() {
-				done <- n.runTDilithium3DKGActivationExchange(
-					runnerCtx, harness.session, runner, results[position],
-					n.tdilithium3DKGInbox.verifyIdentity,
-					n.tdilithium3DKGInbox.IdentityBindings(),
-					harness.sign(position),
+		done := make(chan error, 1)
+		go func() {
+			done <- n.runTDilithium3DKGActivationExchange(
+				runnerCtx, harness.session, runner, results[position],
+				n.tdilithium3DKGInbox.verifyIdentity,
+				n.tdilithium3DKGInbox.IdentityBindings(),
+				harness.sign(position),
 				// The broadcast is a no-op: in the test the harness
 				// pre-encoded every envelope, so the P2P routing is
 				// simulated by delivering directly to the sink.
@@ -616,7 +616,7 @@ func TestTDilithium3DKGActivationExchangeNetwork(t *testing.T) {
 		// content and is a no-op.
 		redeliver := time.NewTicker(500 * time.Millisecond)
 		deadline := time.After(tdilithium3DKGActivationExchangeTimeout)
-		waitPosition:
+	waitPosition:
 		for {
 			select {
 			case err := <-done:

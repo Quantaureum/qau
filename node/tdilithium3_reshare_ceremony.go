@@ -138,13 +138,13 @@ func (inbox *tdilithium3DKGInbox) replayTDilithium3ReshareDeltas(n *Node, sessio
 // tdilithium3ReshareRemoveConfig carries the ceremony's explicit inputs so
 // the in-process choreography tests drive exactly the production path.
 type tdilithium3ReshareRemoveConfig struct {
-	Session          dilithium3v1.DKGSession  // reshare-shaped; NEW committee
-	Position         uint8                    // this node's position in the NEW committee
-	RosterEpoch      uint64                   // roster epoch the session is anchored on
-	OldShare         *dilithium3v1.LocalShare // active share of the previous committee
+	Session          dilithium3v1.DKGSession           // reshare-shaped; NEW committee
+	Position         uint8                             // this node's position in the NEW committee
+	RosterEpoch      uint64                            // roster epoch the session is anchored on
+	OldShare         *dilithium3v1.LocalShare          // active share of the previous committee
 	Plan             *dilithium3v1.ReshareRotationPlan // address-derived plan from the probe; nil recomputes by committees
-	Store            *thresholdShareStore     // candidate + activation persistence
-	Password         []byte                   // share-store password
+	Store            *thresholdShareStore              // candidate + activation persistence
+	Password         []byte                            // share-store password
 	PeerForValidator func(types.Address) (p2p.PeerID, bool)
 	Sign             func(message []byte) ([]byte, error)
 	Broadcast        func(messageType uint8, payload []byte) error
@@ -223,7 +223,7 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	// by the retention path and replayed at inbox install (the wait below runs
 	// BEFORE installation on purpose, to keep those arrivals on it).
 	if n.genesisBlock != nil && tdilithium3ReshareRoundTimeout > 0 {
-		epochStart := time.Unix(int64(n.genesisBlock.Header.Timestamp), 0).Add(
+		epochStart := time.Unix(n.genesisBlock.Header.Timestamp, 0).Add(
 			time.Duration(config.Session.ActivationEpoch) * consensus.EpochDuration)
 		step := tdilithium3ReshareRoundTimeout + 30*time.Second
 		if now := time.Now(); now.After(epochStart) {

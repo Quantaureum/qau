@@ -2,10 +2,10 @@
 package node
 
 import (
-	"math/big"
 	"bytes"
 	"context"
 	"fmt"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"testing"

@@ -226,7 +226,7 @@ func buildRateLimitConfig(cfg *Config) *rpc.RateLimitConfig {
 		base.GlobalRateLimit = cfg.RequestsPerSecond
 	}
 	// R107-LOCAL-FANOUT (2026-09-04): per-IP knobs. Only positive values are
-	// honoured; 0 means "keep the default", and negative values are ignored so a
+	// honored; 0 means "keep the default", and negative values are ignored so a
 	// typo cannot disable limiting outright.
 	if cfg.PerIPRequestsPerSecond > 0 {
 		base.PerIPRateLimit = cfg.PerIPRequestsPerSecond

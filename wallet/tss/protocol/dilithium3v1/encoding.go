@@ -60,6 +60,7 @@ func DecodePoly(encoded []byte) (Poly, error) {
 func EncodeHighBits(polynomial HighBitsPoly) ([HighBitsEncodedSize]byte, error) {
 	var encoded [HighBitsEncodedSize]byte
 	for index := 0; index < N; index += 2 {
+		// #nosec G602 -- N is even and index steps by 2, so index+1 < N.
 		if polynomial[index] > highBitsMask || polynomial[index+1] > highBitsMask {
 			return [HighBitsEncodedSize]byte{}, ErrInvalidHighBits
 		}
@@ -75,6 +76,7 @@ func DecodeHighBits(encoded []byte) (HighBitsPoly, error) {
 	}
 	var polynomial HighBitsPoly
 	for index, value := range encoded {
+		// #nosec G602 -- len(encoded)==HighBitsEncodedSize bounds index*2+1 < N.
 		polynomial[index*2] = value & highBitsMask
 		polynomial[index*2+1] = value >> 4
 	}
@@ -86,6 +88,7 @@ func EncodeZ(polynomial SignedPoly) ([ZEncodedSize]byte, error) {
 	var encoded [ZEncodedSize]byte
 	for coefficientIndex, byteIndex := 0, 0; coefficientIndex < N; coefficientIndex, byteIndex = coefficientIndex+2, byteIndex+5 {
 		left := polynomial[coefficientIndex]
+		// #nosec G602 -- N is even and the step is 2; byteIndex+4 < ZEncodedSize.
 		right := polynomial[coefficientIndex+1]
 		if left <= -Gamma1 || left > Gamma1 || right <= -Gamma1 || right > Gamma1 {
 			return [ZEncodedSize]byte{}, ErrInvalidZCoefficient

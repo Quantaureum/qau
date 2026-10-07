@@ -18,7 +18,7 @@ import (
 )
 
 // TestAcquireAdmitsConcurrentSlots requires two different slots to each hold a
-// seal-signing permit at the same time, with neither cancelling the other. This
+// seal-signing permit at the same time, with neither canceling the other. This
 // is the property that lets a node keep finishing slot N while slot N+1 starts.
 func TestAcquireAdmitsConcurrentSlots(t *testing.T) {
 	node := &Node{}
@@ -36,17 +36,17 @@ func TestAcquireAdmitsConcurrentSlots(t *testing.T) {
 	if !node.acquireTDilithium3SealSigning(firstCtx, 100) {
 		t.Fatal("slot 100 could not take a seal-signing permit")
 	}
-	// The second slot must acquire without waiting on or cancelling the first.
+	// The second slot must acquire without waiting on or canceling the first.
 	waiting, cancelWaiting := context.WithTimeout(ctx, time.Second)
 	defer cancelWaiting()
 	if !node.acquireTDilithium3SealSigning(waiting, 112) {
 		t.Fatal("slot 112 could not take a concurrent seal-signing permit")
 	}
 	if firstCtx.Err() != nil {
-		t.Fatal("acquiring slot 112 cancelled slot 100's session")
+		t.Fatal("acquiring slot 112 canceled slot 100's session")
 	}
 	if secondCtx.Err() != nil {
-		t.Fatal("acquiring slot 112 cancelled its own session")
+		t.Fatal("acquiring slot 112 canceled its own session")
 	}
 	node.releaseTDilithium3SealSigning()
 	node.releaseTDilithium3SealSigning()

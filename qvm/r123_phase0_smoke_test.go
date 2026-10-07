@@ -14,7 +14,9 @@ import (
 // The tests reuse the deployment/call patterns already proven in R122 (Create + Call).
 
 // r123EnvEchoContract: echo runtime assembly — hand-assembled QVM bytecode:
-//   SELFBALANCE / NUMBER / TIMESTAMP each pushed and stored into memory 0x00-0x60, then RETURN
+//
+//	SELFBALANCE / NUMBER / TIMESTAMP each pushed and stored into memory 0x00-0x60, then RETURN
+//
 // construction: initcode = COPY runtime + RETURN
 func r123EnvEchoCode() []byte {
 	// runtime:

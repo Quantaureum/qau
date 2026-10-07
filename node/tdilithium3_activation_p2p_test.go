@@ -8,8 +8,8 @@ import (
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/quantaureum/qau/p2p"
-	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 

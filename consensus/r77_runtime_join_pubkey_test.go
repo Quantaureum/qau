@@ -116,7 +116,3 @@ func TestAttachValidatorPublicKey_SurvivesRemoveReadd(t *testing.T) {
 		t.Fatalf("re-added key not bound: len=%d", len(got))
 	}
 }
-
-
-
-

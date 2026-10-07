@@ -227,7 +227,7 @@ func (s *simSender) GetPeerScore(peerID gossipsub.PeerID) float64 {
 func TestSim_MeshFormation(t *testing.T) {
 	scaleTestEnabled(t) // R123: opt-in gate for 100-node mesh runs
 
-	nodeCounts := []int{10, 50,  100}
+	nodeCounts := []int{10, 50, 100}
 	topics := []string{gossipsub.TopicBlocks, gossipsub.TopicTransactions}
 
 	for _, n := range nodeCounts {

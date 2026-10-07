@@ -24,8 +24,8 @@ import (
 	"strconv"
 	"time"
 
-	logging "github.com/quantaureum/qau/log"
 	"github.com/quantaureum/qau/crypto/vdf"
+	logging "github.com/quantaureum/qau/log"
 	"github.com/quantaureum/qau/types"
 )
 

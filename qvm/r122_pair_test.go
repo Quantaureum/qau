@@ -220,7 +220,7 @@ func TestR122PairDeployInit(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("token0(): %v", res.Err)
 	}
-	want0 := []byte(t0[:])
+	want0 := t0[:]
 	got0 := res.ReturnData[12:32]
 	for i := range want0 {
 		if want0[i] != got0[i] {
@@ -231,7 +231,7 @@ func TestR122PairDeployInit(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("token1(): %v", res.Err)
 	}
-	want1 := []byte(t1[:])
+	want1 := t1[:]
 	gotB := res.ReturnData[12:32]
 	for i := range want1 {
 		if want1[i] != gotB[i] {

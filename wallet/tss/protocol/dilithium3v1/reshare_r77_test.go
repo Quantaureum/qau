@@ -12,8 +12,6 @@ import (
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 )
 
-
-
 // testReshareComponents builds a deterministic synthetic v1 secret: one
 // honestly derived component per canonical group of the given committee size.
 func testReshareComponents(t *testing.T, participants int) map[RSSGroupMask]RSSComponent {
@@ -786,9 +784,9 @@ func reshareStubShare(t *testing.T, position uint8) *LocalShare {
 	publicKey2 := make([]byte, 1952)
 	publicKey2[0] = 0x99
 	share := &LocalShare{
-		Protocol:    protocol.ThresholdProtocolDilithium3V1,
-		Key:         protocol.ThresholdKeyID{Algorithm: qcrypto.SignatureAlgorithmDilithium3Legacy, Generation: 42, PublicKey: publicKey2},
-		Committee:   protocol.CommitteeID{Version: 30, Threshold: 4, Participants: []uint32{11, 12, 13, 14, 15, 16}},
+		Protocol:      protocol.ThresholdProtocolDilithium3V1,
+		Key:           protocol.ThresholdKeyID{Algorithm: qcrypto.SignatureAlgorithmDilithium3Legacy, Generation: 42, PublicKey: publicKey2},
+		Committee:     protocol.CommitteeID{Version: 30, Threshold: 4, Participants: []uint32{11, 12, 13, 14, 15, 16}},
 		ParticipantID: 11 + uint32(position), ParticipantPosition: position,
 		ActivationEpoch: 7,
 		Components:      components,

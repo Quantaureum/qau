@@ -11,7 +11,7 @@ import (
 )
 
 // blockingDKGTransport never delivers any message: WaitCommitments blocks
-// until ctx is cancelled, which is exactly what a round looks like while it
+// until ctx is canceled, which is exactly what a round looks like while it
 // waits for slow peers on a real network.
 type blockingDKGTransport struct {
 	pid     int
@@ -87,10 +87,10 @@ func TestGenerateKeySharesDistributed_ReleasesManagerLockWhileWaiting(t *testing
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("cancelled round reported success")
+			t.Fatal("canceled round reported success")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("cancelled round did not unwind")
+		t.Fatal("canceled round did not unwind")
 	}
 
 	mgr.mu.RLock()

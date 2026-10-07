@@ -316,7 +316,7 @@ func (t *P2PDKGTransport) IngestShare(msg *qtd.Round1OpenMessage) {
 
 // WaitCommitments blocks until the total-1 commitments from the other
 // participants have been ingested (excluding this participant's own ID), until
-// the wait timeout expires, or until ctx is cancelled. Returns a map keyed by
+// the wait timeout expires, or until ctx is canceled. Returns a map keyed by
 // participant ID.
 func (t *P2PDKGTransport) WaitCommitments(ctx context.Context, total int) (map[int]*qtd.Round1CommitmentMessage, error) {
 	return t.waitCommitments(ctx, total, t.currentWaitTimeout())
@@ -324,7 +324,7 @@ func (t *P2PDKGTransport) WaitCommitments(ctx context.Context, total int) (map[i
 
 // WaitShares blocks until the total-1 open+share messages from the other
 // participants have been ingested (excluding this participant's own ID), until
-// the wait timeout expires, or until ctx is cancelled. Returns a map keyed by
+// the wait timeout expires, or until ctx is canceled. Returns a map keyed by
 // participant ID.
 func (t *P2PDKGTransport) WaitShares(ctx context.Context, total int) (map[int]*qtd.Round1OpenMessage, error) {
 	return t.waitShares(ctx, total, t.currentWaitTimeout())
@@ -354,7 +354,7 @@ func (t *P2PDKGTransport) waitCommitments(ctx context.Context, total int, timeou
 		// TSS-R7-12: honor ctx cancellation (per-attempt round-window deadline)
 		// so an abandoned round unwinds promptly and releases the manager lock.
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("p2p dkg transport: commitments wait cancelled (have %d/%d): %w", others, total-1, err)
+			return nil, fmt.Errorf("p2p dkg transport: commitments wait canceled (have %d/%d): %w", others, total-1, err)
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("p2p dkg transport: timed out waiting for %d commitments (have %d)", total-1, others)
@@ -388,7 +388,7 @@ func (t *P2PDKGTransport) waitShares(ctx context.Context, total int, timeout tim
 		}
 		t.mu.Unlock()
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("p2p dkg transport: shares wait cancelled (have %d/%d): %w", others, total-1, err)
+			return nil, fmt.Errorf("p2p dkg transport: shares wait canceled (have %d/%d): %w", others, total-1, err)
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("p2p dkg transport: timed out waiting for %d shares (have %d)", total-1, others)

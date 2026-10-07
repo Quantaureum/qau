@@ -262,7 +262,7 @@ const tdilithium3DKGActivationCertificateGossipRounds = 3
 const tdilithium3DKGActivationCertificateGossipInterval = 2 * time.Second
 
 // broadcastTDilithium3DKGActivationCertificate gossips the encoded certificate
-// a bounded number of times, stopping early if the context is cancelled.
+// a bounded number of times, stopping early if the context is canceled.
 func (n *Node) broadcastTDilithium3DKGActivationCertificate(ctx context.Context, broadcast func(messageType uint8, payload []byte) error, encoded []byte) {
 	for round := 0; round < tdilithium3DKGActivationCertificateGossipRounds; round++ {
 		if err := broadcast(p2p.MsgTypeTDilithium3DKGActivationCertificate, encoded); err != nil {
