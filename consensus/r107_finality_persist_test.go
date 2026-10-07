@@ -249,7 +249,7 @@ func TestR107_BackfillRejectsConflictingFinalizedRoot(t *testing.T) {
 	if err := q.RestoreFinalityState(5, 5, finalizedRoot, finalizedRoot); err != nil {
 		t.Fatalf("RestoreFinalityState: %v", err)
 	}
-	if applied := q.BackfillEpochRoots(map[uint64]types.Hash{5: types.Hash{0xEE}}); applied != 0 {
+	if applied := q.BackfillEpochRoots(map[uint64]types.Hash{5: {0xEE}}); applied != 0 {
 		t.Fatalf("conflicting finalized root was applied to %d entries", applied)
 	}
 	if got := q.GetFinalizedEpoch(); got != 5 {
