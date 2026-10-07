@@ -224,9 +224,10 @@ func TestMessageValidatorGetMaxSizeForType(t *testing.T) {
 func TestMessageValidatorGetMaxSizeForInvalidType(t *testing.T) {
 	mv := NewMessageValidator()
 
-	// 102 is unassigned: types 90-101 are the threshold Dilithium3 v1
-	// protocol block (DKG 90-96, signing 97-100, activation certificate 101).
-	_, err := mv.GetMaxSizeForType(102)
+	// 200 is unassigned: types 90-102 are the threshold Dilithium3 v1
+	// protocol block (DKG 90-96, signing 97-100, activation certificate 101,
+	// reshare delta 102).
+	_, err := mv.GetMaxSizeForType(200)
 	if err == nil {
 		t.Error("expected error for invalid message type")
 	}
