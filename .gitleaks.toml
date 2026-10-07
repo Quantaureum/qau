@@ -1,0 +1,21 @@
+# Gitleaks configuration for the Quantaureum publish line.
+#
+# Everything below is a deliberate allowlist for SYNTHETIC test fixtures —
+# verified against the real key material (the audit's true-key reverse
+# lookup over full history is zero-hit); no live credentials live in this
+# repository. Keep entries narrow: file-scoped with a stated reason.
+
+[extend]
+# Start from gitleaks' default ruleset.
+
+[allowlist]
+description = "Synthetic test fixtures and documented devnet conventions"
+paths = [
+  '''log/log_test\.go''',
+  '''cmd/validator_keygen_ceremony/main_test\.go''',
+]
+regexes = [
+  # The devnet-only deterministic share password, public by design
+  # (QUANTAUREUM-DEV-* convention, mirrors the dev-chain seeds).
+  '''QUANTAUREUM-DEV-''',
+]
