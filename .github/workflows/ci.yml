@@ -73,7 +73,10 @@ jobs:
       - name: Test (encoding)
         run: go test ./encoding/... -timeout 30m -race
       - name: Test (consensus)
-        run: go test ./consensus/... -timeout 30m -race
+        # R77-CI-SHORT (2026-10-07): add -short — the LargeScale latency-budget
+        # tests self-gate on testing.Short() and cannot hold their budgets on
+        # shared 2-core -race runners (machine-dependent, not correctness).
+        run: go test ./consensus/... -timeout 30m -race -short
       - name: Test (core)
         run: go test ./core/... -timeout 45m -race
       - name: Test (simulation)
