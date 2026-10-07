@@ -1580,20 +1580,18 @@ func TestTryFinalizeBatches_L1Height(t *testing.T) {
 		t.Fatalf("SubmitL2Transaction failed: %v", err)
 	}
 
-	// Poll for batch 0 to reach Submitted state. Status reads go through
-	// GetBatchStatus (race-safe under RLock) because the engine's batchLoop
-	// keeps writing the shared *Batch concurrently.
+	// Poll for batch 0 to reach Submitted state.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		status, err := engine.GetBatchManager().GetBatchStatus(0)
-		if err == nil && status == BatchStatusSubmitted {
+		b, err := engine.GetBatchManager().GetBatch(0)
+		if err == nil && b.Status == BatchStatusSubmitted {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	status, err := engine.GetBatchManager().GetBatchStatus(0)
-	if err != nil || status != BatchStatusSubmitted {
-		t.Fatalf("batch 0 was not submitted within 2s (err=%v, status=%d)", err, status)
+	b, err := engine.GetBatchManager().GetBatch(0)
+	if err != nil || b.Status != BatchStatusSubmitted {
+		t.Fatalf("batch 0 was not submitted within 2s (err=%v, status=%d)", err, b.Status)
 	}
 
 	// Configure L1 anchor mode: SubmitHeight=1000, challengeBlocks=100.
@@ -1605,22 +1603,25 @@ func TestTryFinalizeBatches_L1Height(t *testing.T) {
 	// L1 height = 1050 < 1100 → challenge window still open.
 	bm.SetL1CurrentHeight(1050)
 	engine.tryFinalizeBatches()
-	if status, _ := bm.GetBatchStatus(0); status != BatchStatusSubmitted {
-		t.Errorf("expected Submitted (challenge window open), got %d", status)
+	b, _ = bm.GetBatch(0)
+	if b.Status != BatchStatusSubmitted {
+		t.Errorf("expected Submitted (challenge window open), got %d", b.Status)
 	}
 
 	// Advance L1 height to 1100 → challenge window closed.
 	bm.SetL1CurrentHeight(1100)
 	engine.tryFinalizeBatches()
-	if status, _ := bm.GetBatchStatus(0); status != BatchStatusFinalized {
-		t.Errorf("expected Finalized (challenge window closed), got %d", status)
+	b, _ = bm.GetBatch(0)
+	if b.Status != BatchStatusFinalized {
+		t.Errorf("expected Finalized (challenge window closed), got %d", b.Status)
 	}
 
 	// Double-call should be a no-op (batch already finalized → FinalizeBatch
 	// returns ErrBatchNotSubmitted, which is logged as a warning but not fatal).
 	engine.tryFinalizeBatches()
-	if status, _ := bm.GetBatchStatus(0); status != BatchStatusFinalized {
-		t.Errorf("expected Finalized (idempotent), got %d", status)
+	b, _ = bm.GetBatch(0)
+	if b.Status != BatchStatusFinalized {
+		t.Errorf("expected Finalized (idempotent), got %d", b.Status)
 	}
 }
 
@@ -1677,18 +1678,18 @@ func TestTryFinalizeBatches_WithdrawalHook(t *testing.T) {
 		t.Fatalf("SubmitL2Transaction failed: %v", err)
 	}
 
-	// Wait for batch 0 to be submitted (race-safe status reads: the engine's
-	// batchLoop writes the shared *Batch concurrently).
+	// Wait for batch 0 to be submitted.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		status, err := engine.GetBatchManager().GetBatchStatus(0)
-		if err == nil && status == BatchStatusSubmitted {
+		b, err := engine.GetBatchManager().GetBatch(0)
+		if err == nil && b.Status == BatchStatusSubmitted {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	bm := engine.GetBatchManager()
-	if status, err := bm.GetBatchStatus(0); err != nil || status != BatchStatusSubmitted {
+	b, err := bm.GetBatch(0)
+	if err != nil || b.Status != BatchStatusSubmitted {
 		t.Fatalf("batch 0 was not submitted within 2s (err=%v)", err)
 	}
 
@@ -1712,8 +1713,9 @@ func TestTryFinalizeBatches_WithdrawalHook(t *testing.T) {
 	wp.mu.Unlock()
 
 	// Verify the batch is finalized.
-	if status, _ := bm.GetBatchStatus(0); status != BatchStatusFinalized {
-		t.Errorf("expected Finalized, got %d", status)
+	b, _ = bm.GetBatch(0)
+	if b.Status != BatchStatusFinalized {
+		t.Errorf("expected Finalized, got %d", b.Status)
 	}
 }
 
