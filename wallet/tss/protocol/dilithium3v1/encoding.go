@@ -64,6 +64,7 @@ func EncodeHighBits(polynomial HighBitsPoly) ([HighBitsEncodedSize]byte, error) 
 		if polynomial[index] > highBitsMask || polynomial[index+1] > highBitsMask {
 			return [HighBitsEncodedSize]byte{}, ErrInvalidHighBits
 		}
+		// #nosec G602 -- N is even and index steps by 2, so index+1 < N.
 		encoded[index/2] = polynomial[index] | polynomial[index+1]<<4
 	}
 	return encoded, nil
@@ -114,6 +115,7 @@ func DecodeZ(encoded []byte) (SignedPoly, error) {
 		left := uint32(encoded[byteIndex]) | uint32(encoded[byteIndex+1])<<8 | uint32(encoded[byteIndex+2]&0x0f)<<16
 		right := uint32(encoded[byteIndex+2]>>4) | uint32(encoded[byteIndex+3])<<4 | uint32(encoded[byteIndex+4])<<12
 		polynomial[coefficientIndex] = Coefficient(Gamma1 - int(left))
+		// #nosec G602 -- N is even and the step is 2; byteIndex+4 < ZEncodedSize.
 		polynomial[coefficientIndex+1] = Coefficient(Gamma1 - int(right))
 	}
 	return polynomial, nil

@@ -123,6 +123,7 @@ func encodeMode3T1(polynomial Poly) ([320]byte, error) {
 	var encoded [320]byte
 	for coefficientIndex, byteIndex := 0, 0; coefficientIndex < N; coefficientIndex, byteIndex = coefficientIndex+4, byteIndex+5 {
 		first := polynomial[coefficientIndex]
+		// #nosec G602 -- N is even and divisible by 4; the step is 4.
 		second := polynomial[coefficientIndex+1]
 		third := polynomial[coefficientIndex+2]
 		// #nosec G602 -- N is even and divisible by 4; the step is 4.

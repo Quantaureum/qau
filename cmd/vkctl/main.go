@@ -188,7 +188,7 @@ func mustLoadKey(path, pwFile string) *crypto.KeyPair {
 	must(err)
 	kf, err := crypto.KeyFileFromJSON(data)
 	must(err)
-	priv, err := crypto.DecryptKeyBytes(kf, []byte(pw))
+	priv, err := crypto.DecryptKeyBytes(kf, pw)
 	must(err)
 	pub := priv.PublicKey()
 	return &crypto.KeyPair{Private: priv, Public: pub}

@@ -862,7 +862,7 @@ func ResolveNetworkConfig(cfg *Config) {
 	}
 	// Fallback to the canonical network bootnodes when the operator did not
 	// supply any bootstrap peers (flag or config). Explicit peers always win;
-	// this only fills the zero value, mirroring go-ethereum's behaviour.
+	// this only fills the zero value, mirroring go-ethereum's behavior.
 	if len(cfg.BootstrapPeers) == 0 {
 		cfg.BootstrapPeers = networkBootnodes[cfg.Network]
 	}
