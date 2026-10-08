@@ -29,9 +29,13 @@ import (
 
 // scoreAlmostEqual reports whether two peer scores are equal within the
 // EMA blend + time-sensitive uptime float noise that GetScore introduces
-// when called twice in quick succession (delta on the order of 1e-11).
+// when called twice in quick succession. On a loaded 2-core -race runner
+// (GitHub CI) the observed delta reaches ~1e-7 while %f still prints both
+// sides identically (observed: -25.000000 vs -25.000000 failing at eps 1e-9),
+// so the epsilon is 1e-6 — still orders of magnitude below any semantic
+// outcome these tests distinguish (|score| steps are >= 1.0).
 func scoreAlmostEqual(a, b float64) bool {
-	const eps = 1e-9
+	const eps = 1e-6
 	return math.Abs(a-b) <= eps
 }
 
