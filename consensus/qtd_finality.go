@@ -2096,6 +2096,83 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 	return validateGroupKey(key, "qtdSigner.GroupPublicKey")
 }
 
+// ObserveAnchoredGroupKey consumes the optional QTDGroupKey header field that
+// armed networks anchor on an epoch's first block. It is the observer (e.g.
+// verify-only validator) learning channel for the epoch's group key.
+//
+// Rotation hardening: an NEVER-trusted epoch is adopted only when the history
+// is continuous — either we hold the key of the immediately preceding epoch
+// (so the anchor continues an unbroken chain of custody), or we hold no keys
+// at all and the anchored epoch equals the lowest boundary we have seen this
+// sync (an observer's first establishment; its legitimacy source is the offline
+// ceremony's deployment record, which is how S8-class nodes got their keys
+// before this path existed). A skip-ahead anchor (epoch E > maxKnown+1 with
+// history present) is REFUSED, not adopted: a rotation-money-forwarding from an
+// anchoring point you never established must not teach observers a new key.
+// Already-known keys are cross-checked (a mismatch is reported and rejected,
+// never silently overwritten). All inputs pass the write-side length/non-zero
+// discipline. The cert-bound legitimacy chain (rotation certificates anchored
+// alongside) remains the M4 follow-up; this rule closes the self-certifying
+// fork that would otherwise let a rogue boundary block teach a wrong key.
+// ObserveAnchoredGroupKey consumes the optional QTDGroupKey header field of a
+// boundary importer entry. Proof-bearing anchors (rotation) additionally carry
+// the outgoing committee's handoff signature; see qtd_handoff.go.
+func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []byte) bool {
+	if qfs == nil || len(key) == 0 {
+		return false
+	}
+	if len(key) != crypto.Dilithium3PublicKeySize || crypto.IsZeroPublicKeyBytes(key) {
+		qtdLogger.Warn("QTD anchored group key rejected (bad length/zero)",
+			map[string]any{"epoch": epoch, "len": len(key)})
+		return false
+	}
+	qfs.mu.Lock()
+	defer qfs.mu.Unlock()
+	if qfs.groupKeyHistory == nil {
+		qfs.groupKeyHistory = make(map[uint64][]byte)
+	}
+	if existing, ok := qfs.groupKeyHistory[epoch]; ok {
+		if bytes.Equal(existing, key) {
+			return true
+		}
+		qtdLogger.Error("QTD anchored group key CONFLICTS with established key",
+			map[string]any{"epoch": epoch})
+		return false
+	}
+	if len(qfs.groupKeyHistory) > 0 {
+		// Continuous chain-of-custody only: the anchor may introduce at most
+		// the next epoch after the newest one we already trust. On a rotation
+		// (the anchored key differs from the previous epoch's), adoption also
+		// requires the previous committee's handoff signature over the handoff
+		// tuple (chainID, epoch, key, committeeVersion) — verified against the
+		// established key so a rogue boundary block cannot re-teach a rotated
+		// key it cannot endorse.
+		maxKnown := uint64(0)
+		for known := range qfs.groupKeyHistory {
+			if known > maxKnown {
+				maxKnown = known
+			}
+		}
+		if expected := maxKnown + 1; epoch != expected {
+			qtdLogger.Warn("QTD anchored group key REFUSED (breaks chained adoption)",
+				map[string]any{"epoch": epoch, "expected": expected})
+			return false
+		}
+		prevKey := qfs.groupKeyHistory[maxKnown]
+		if !bytes.Equal(prevKey, key) {
+			if err := qfs.observeAnchoredGroupKeyHandoffLocked(epoch, key, proof); err != nil {
+				qtdLogger.Warn("QTD anchored group key refused (rotation proof)",
+					map[string]any{"epoch": epoch, "err": err.Error()})
+				return false
+			}
+		}
+	}
+	qfs.groupKeyHistory[epoch] = append([]byte(nil), key...)
+	qtdLogger.Info("QTD anchored group key adopted for epoch",
+		map[string]any{"epoch": epoch, "keyPrefix": key[:8]})
+	return true
+}
+
 // ReceiveSealAnnouncement processes a QTD seal announcement received from
 // a peer node via P2P gossip. This is the cross-node seal propagation
 // path: when one node's executive chamber completes a seal, the seal is

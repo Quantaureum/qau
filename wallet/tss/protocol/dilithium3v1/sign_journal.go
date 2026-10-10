@@ -23,7 +23,13 @@ var signingJournalBucket = []byte("dilithium3-v1-signing-sessions")
 var errSigningJournal = errors.New("invalid Dilithium3 signing journal")
 
 type SigningJournal struct {
-	mu sync.Mutex
+	// mu guards the db handle. Write paths use db.Batch: concurrent candidate
+	// sessions of one request commit together, so the fsync per candidate does
+	// not serialize the schedule into the disk's seek budget. Durability is
+	// unchanged (Batch still commits through the same write transaction
+	// fsync); only the freelist sync is relaxed, which bolt rebuilds on open —
+	// the journal payload itself stays fully durable.
+	mu sync.RWMutex
 	db *bbolt.DB
 }
 
@@ -34,7 +40,7 @@ func OpenSigningJournal(path string) (*SigningJournal, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: time.Second})
+	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: time.Second, NoFreelistSync: true})
 	if err != nil {
 		return nil, err
 	}
@@ -86,13 +92,14 @@ func (journal *SigningJournal) Advance(sessionID [32]byte, next protocol.SingleU
 	if journal == nil {
 		return protocol.SingleUseRecord{}, errSigningJournal
 	}
-	journal.mu.Lock()
-	defer journal.mu.Unlock()
-	if journal.db == nil {
+	journal.mu.RLock()
+	db := journal.db
+	journal.mu.RUnlock()
+	if db == nil {
 		return protocol.SingleUseRecord{}, errSigningJournal
 	}
 	var nextRecord protocol.SingleUseRecord
-	err := journal.db.Update(func(transaction *bbolt.Tx) error {
+	err := db.Batch(func(transaction *bbolt.Tx) error {
 		bucket := transaction.Bucket(signingJournalBucket)
 		var record protocol.SingleUseRecord
 		var err error
@@ -124,14 +131,15 @@ func (journal *SigningJournal) Read(sessionID [32]byte) (protocol.SingleUseRecor
 	if journal == nil {
 		return protocol.SingleUseRecord{}, false, errSigningJournal
 	}
-	journal.mu.Lock()
-	defer journal.mu.Unlock()
-	if journal.db == nil {
+	journal.mu.RLock()
+	db := journal.db
+	journal.mu.RUnlock()
+	if db == nil {
 		return protocol.SingleUseRecord{}, false, errSigningJournal
 	}
 	var record protocol.SingleUseRecord
 	var found bool
-	err := journal.db.View(func(transaction *bbolt.Tx) error {
+	err := db.View(func(transaction *bbolt.Tx) error {
 		encoded := transaction.Bucket(signingJournalBucket).Get(sessionID[:])
 		if encoded == nil {
 			return nil

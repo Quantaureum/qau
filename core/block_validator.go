@@ -2400,6 +2400,8 @@ func (v *BlockValidator) ValidateSignature(header *encoding.BlockHeader) error {
 // header BEFORE these fields are populated, so the validator must strip
 // them to compute the same signing hash. Without this, every TSS-signed
 // block is rejected → catastrophic chain fork.
+// (Same rule for QTDGroupKey: the v1 observer anchor is attached after the
+// signature was computed and would otherwise flip the signing hash on import.)
 func (v *BlockValidator) computeSigningData(header *encoding.BlockHeader) []byte {
 	headerCopy := *header
 	headerCopy.Signature = nil
@@ -2409,6 +2411,8 @@ func (v *BlockValidator) computeSigningData(header *encoding.BlockHeader) []byte
 	headerCopy.ExecutiveSealers = nil
 	headerCopy.ReviewAttestationRoot = types.Hash{}
 	headerCopy.FinalityType = 0
+	headerCopy.QTDGroupKey = nil
+	headerCopy.QTDGroupKeyProof = nil
 
 	rawData, err := encoding.MarshalBlockHeader(&headerCopy)
 	if err != nil || len(rawData) == 0 {

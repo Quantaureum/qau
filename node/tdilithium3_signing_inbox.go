@@ -301,9 +301,14 @@ func (n *Node) installTDilithium3SigningInbox(inbox *tdilithium3SigningInbox) {
 // must be open for this network (mainnet additionally requires the explicit
 // QAU_ENABLE_TDILITHIUM3_V1_MAINNET acknowledgement).
 func (n *Node) tdilithium3SigningInboxAdmissible(inbox *tdilithium3SigningInbox) bool {
-	return n != nil && n.config != nil && inbox != nil &&
-		inbox.rosterBound &&
-		experimentalTDilithium3V1EnabledForNetwork(n.config.NetworkID)
+	if n == nil || n.config == nil || inbox == nil || !inbox.rosterBound {
+		return false
+	}
+	// The offline-ceremony sealing path is authorized by the armed config
+	// alone; the roster-bound session policy above remains the real gate for
+	// which sessions may consume inbound traffic.
+	return experimentalTDilithium3V1EnabledForNetwork(n.config.NetworkID) ||
+		n.offlineTDilithium3SealingConfigured()
 }
 
 func (n *Node) tdilithium3SigningInboundAllowed() bool {

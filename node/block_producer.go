@@ -101,6 +101,13 @@ type BlockProducer struct {
 	lastProducedHeight map[types.Address]uint64
 	syncCompletedAt    time.Time // When waitForInitialSync finished
 
+	// QTD noise discipline: the per-slot "TSS signing failed, falling back"
+	// failure is expected on a legacy-only network, so it is logged once per
+	// epoch and the rest counted and replayed at the next boundary.
+	// Guarded by bp.mu (block production is serialized under it).
+	tssFallbackWarnedEpoch uint64
+	tssFallbackSuppressed  int
+
 	// R42-P1 FIX (2026-08-05): Slot-level attestation deduplication.
 	// Tracks the highest slot this validator has already attested.
 	// Prevents double-vote slashing after node restarts: previously
@@ -140,6 +147,15 @@ func (bp *BlockProducer) QPOS() *consensus.QPOS {
 func (bp *BlockProducer) onCanonicalBlockImported(header *encoding.BlockHeader) {
 	if bp == nil || bp.qpos == nil || header == nil {
 		return
+	}
+	// V1 observer anchor: a boundary block may carry the epoch's QTD group
+	// public key; learn/cross-check it (no-op when absent or already known).
+	// Runs before the slot-root check so the path-independent sync of an
+	// observer — which has no slot root recorded yet — still learns the key.
+	if len(header.QTDGroupKey) > 0 {
+		if qfs := bp.qpos.GetQTDFinality(); qfs != nil {
+			qfs.ObserveAnchoredGroupKey(header.Epoch, header.QTDGroupKey, header.QTDGroupKeyProof)
+		}
 	}
 	root, known := bp.qpos.GetSlotBlockRoot(header.Slot)
 	if !known || root != block.ComputeBlockHash(header) {
@@ -201,7 +217,12 @@ func (bp *BlockProducer) ensureEpochStateForBlock(header *encoding.BlockHeader) 
 	// leaves the chamber in DKGRunning with its members selected, which is the
 	// state the v1 ceremony activates from.
 	groupPublicKey := bp.qpos.GetGroupPublicKey()
-	if bp.node != nil && bp.node.tdilithium3V1OwnsExecutiveActivation() {
+	v1OfflineArmed := bp.node != nil && bp.node.offlineTDilithium3SealingArmed(bp.qpos.GetCurrentEpoch())
+	if bp.node != nil && (bp.node.tdilithium3V1OwnsExecutiveActivation() || v1OfflineArmed) {
+		// v1 sealing owns the transition: the chamber activates with the v1
+		// committee key supplied by the adoption/driver path, never with the
+		// legacy TSS manager key. See tdilithium3V1OwnsExecutiveActivation and
+		// tdilithium3_offline_adoption.go.
 		groupPublicKey = nil
 	}
 	if err := coordinator.TransitionExecutiveForEpoch(header.Epoch, validatorSet, groupPublicKey); err != nil {
@@ -1075,7 +1096,17 @@ func (bp *BlockProducer) produceLoop() {
 					// stays gated on a non-empty key.
 					groupKey := bp.qpos.GetGroupPublicKey()
 					v1OwnsActivation := bp.node != nil && bp.node.tdilithium3V1OwnsExecutiveActivation()
-					if len(groupKey) > 0 || v1OwnsActivation {
+					// The offline-ceremony sealing path also drives the
+					// runner-based completion: its group key arrives through
+					// RunDistributedDKG's adoption branch. Force the legacy
+					// key out at the transition site so a legacy TSS manager
+					// can never pre-activate the chamber for a key the v1
+					// committee holds no shares for.
+					v1OfflineArmed := bp.node != nil && bp.node.offlineTDilithium3SealingArmed(bp.qpos.GetCurrentEpoch())
+					if v1OfflineArmed {
+						groupKey = nil
+					}
+					if len(groupKey) > 0 || v1OwnsActivation || v1OfflineArmed {
 						completed := coordinator.CompleteDKGViaDistributedRunner(bp.qpos.GetCurrentEpoch())
 						if !completed && len(groupKey) > 0 && bp.node.config.NetworkID != MainnetNetworkID && !bp.node.config.TSSDistributedDKG {
 							completed = coordinator.TriggerDKG(groupKey)
@@ -3146,7 +3177,22 @@ func (bp *BlockProducer) buildBlock(
 			if proposerIndex >= 0 {
 				sig, err := bp.qpos.SignBlock(proposerIndex, signingData)
 				if err != nil {
-					bpLog.Warn("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+					// QTD noise discipline: a network whose block signing is
+					// legacy-only falls back on every slot, so the failure is
+					// logged once per epoch at Warn and the rest at Debug with
+					// the running count replayed at the next boundary.
+					if epoch != bp.tssFallbackWarnedEpoch {
+						if bp.tssFallbackWarnedEpoch != 0 || bp.tssFallbackSuppressed != 0 {
+							bpLog.Warn("TSS signing fallback: epoch %d had %d suppressed fallbacks",
+								bp.tssFallbackWarnedEpoch, bp.tssFallbackSuppressed)
+						}
+						bp.tssFallbackWarnedEpoch = epoch
+						bp.tssFallbackSuppressed = 0
+						bpLog.Warn("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+					} else {
+						bp.tssFallbackSuppressed++
+						bpLog.Debug("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+					}
 					// Fall back to individual Dilithium3 signing
 					if bp.validatorKey != nil {
 						sig, err = bp.validatorKey.Sign(signingData)
@@ -3235,6 +3281,24 @@ func (bp *BlockProducer) buildBlock(
 	if bp.qpos != nil {
 		if err := consensus.PopulateStardustFields(newBlock.Header, bp.qpos); err != nil {
 			bpLog.Warn("Failed to populate stardust fields for block %d: %v", newHeight, err)
+		}
+	}
+
+	// V1 offline-sealing observer anchor: on the epoch's first block, when this
+	// producer is armed and holds the active v1 share, embed the epoch's group
+	// public key so verify-only consumers learn it from the chain. The v1 key
+	// comes from the ceremony share store, not the legacy qfs signer table
+	// (which is empty exactly on the armed path).
+	if bp.node != nil && bp.node.offlineTDilithium3SealingArmed(newBlock.Header.Epoch) &&
+		consensus.EpochStartSlot(newBlock.Header.Epoch) == newBlock.Header.Slot &&
+		len(newBlock.Header.QTDGroupKey) == 0 {
+		if _, key, _, err := bp.node.tdilithium3ActiveShareIdentityCached(); err == nil && len(key) > 0 {
+			newBlock.Header.QTDGroupKey = key
+			bpLog.Info("QTD group key anchored on epoch boundary block (v1 offline sealing): slot %d epoch %d",
+				slot, newBlock.Header.Epoch)
+		} else {
+			bpLog.Warn("QTD group key anchor skipped (armed but no v1 share key): slot %d epoch %d err=%v",
+				slot, newBlock.Header.Epoch, err)
 		}
 	}
 
@@ -3765,6 +3829,8 @@ func (bp *BlockProducer) computeSigningData(header *encoding.BlockHeader) []byte
 	headerCopy.ExecutiveSealers = nil
 	headerCopy.ReviewAttestationRoot = types.Hash{}
 	headerCopy.FinalityType = 0
+	headerCopy.QTDGroupKey = nil
+	headerCopy.QTDGroupKeyProof = nil
 
 	rawData, err := encoding.MarshalBlockHeader(&headerCopy)
 	if err != nil || len(rawData) == 0 {

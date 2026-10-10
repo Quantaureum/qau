@@ -51,6 +51,13 @@ const (
 	// proposer election is a deterministic function of verified headers,
 	// eliminating path-dependent local-state divergence (the chain-fork root cause).
 	fieldHeaderVRFAccumulator = 33 // per-epoch VRF accumulator at block production time
+	// V1 seal observer anchor: the epoch's active QTD group public key, carried
+	// on the first block of the epoch by armed networks (see
+	// consensus.PopulateStardustFields). Optional; older decoders skip it.
+	fieldHeaderQTDGroupKey = 34
+	// V1 seal observer anchor proof: the previous committee's handoff
+	// signature over the (epoch, key) pair, present on rotation anchors.
+	fieldHeaderQTDGroupKeyProof = 35
 )
 
 // MarshalBlockHeader serializes a BlockHeader to bytes using protobuf wire format
@@ -193,6 +200,14 @@ func MarshalBlockHeader(h *BlockHeader) ([]byte, error) {
 	// on-chain value participates in the block hash and is verifiable.
 	if h.VRFAccumulator != (types.Hash{}) {
 		buf.EncodeBytesField(fieldHeaderVRFAccumulator, h.VRFAccumulator[:])
+	}
+
+	// V1 seal observer anchor: on-chain group-key record (optional).
+	if len(h.QTDGroupKey) > 0 {
+		buf.EncodeBytesField(fieldHeaderQTDGroupKey, h.QTDGroupKey)
+	}
+	if len(h.QTDGroupKeyProof) > 0 {
+		buf.EncodeBytesField(fieldHeaderQTDGroupKeyProof, h.QTDGroupKeyProof)
 	}
 
 	return buf.Bytes(), nil
@@ -598,9 +613,29 @@ func UnmarshalBlockHeader(data []byte) (*BlockHeader, error) {
 				return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, err)
 			}
 			if len(data) != types.HashLength {
-				return nil, fmt.Errorf("%w: vrf_accumulator must be %d bytes, got %d", ErrInvalidHash, types.HashLength, len(data))
+				return nil, fmt.Errorf("%w: vrf_accumulator must be %d bytes, got %d", ErrMalformedMessage, types.HashLength, len(data))
 			}
-			copy(h.VRFAccumulator[:], data)
+			h.VRFAccumulator = types.BytesToHash(data)
+
+		case fieldHeaderQTDGroupKey:
+			if wireType != WireBytes {
+				return nil, fmt.Errorf("%w: invalid wire type for qtd_group_key", ErrMalformedMessage)
+			}
+			data, err := buf.DecodeBytes()
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, err)
+			}
+			h.QTDGroupKey = data
+
+		case fieldHeaderQTDGroupKeyProof:
+			if wireType != WireBytes {
+				return nil, fmt.Errorf("%w: invalid wire type for qtd_group_key_proof", ErrMalformedMessage)
+			}
+			data, err := buf.DecodeBytes()
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, err)
+			}
+			h.QTDGroupKeyProof = data
 
 		default:
 			// Skip unknown fields

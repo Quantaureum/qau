@@ -31,6 +31,18 @@ func (r *nodeConsensusDKGRunner) RunDistributedDKG(epoch uint64, threshold, tota
 	if r == nil || r.node == nil {
 		return nil, fmt.Errorf("consensus DKG runner is not wired")
 	}
+	// Offline-ceremony sealing (the mainnet-legal path): once the configured
+	// activation epoch is reached, the epoch's group key comes from the
+	// adopted offline share — no runtime DKG ceremony ever runs here.
+	if r.node.config != nil && r.node.config.TSSV1SealingActivationEpoch > 0 && epoch >= r.node.config.TSSV1SealingActivationEpoch {
+		publicKey, handled, err := r.node.offlineTDilithium3AdoptionGroupKey(context.Background(), epoch)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			return publicKey[:], nil
+		}
+	}
 	// Dilithium3 v1 CNF-RSS: with the experimental gate open for this network
 	// (mainnet additionally requires the QAU_ENABLE_TDILITHIUM3_V1_MAINNET
 	// acknowledgement) the epoch transition is served by the v1 ceremony. There

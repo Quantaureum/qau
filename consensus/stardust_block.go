@@ -35,9 +35,26 @@ func PopulateStardustFields(header *encoding.BlockHeader, qpos *QPOS) error {
 			}
 			header.ExecutiveSealers = sealerBytes
 		}
+
+		// Observer anchor (QTD v1): the first block of an epoch carries the
+		// epoch's active group public key, so verify-only consumers can learn
+		// it from the chain instead of an out-of-band ceremony artifact.
+		// Emitted only when this proposer actually holds the epoch's key.
+		if header.Slot == EpochStartSlot(header.Epoch) {
+			if key := qfs.getGroupPublicKeyForEpoch(header.Epoch); len(key) > 0 {
+				header.QTDGroupKey = append([]byte(nil), key...)
+				qtdLogger.Info("QTD group key anchored on epoch boundary block",
+					map[string]any{"slot": header.Slot, "epoch": header.Epoch, "keyPrefix": key[:8]})
+			}
+		}
 	} else {
+
 		header.FinalityType = 0
 	}
+	// Note: on the v1 offline-sealing path the QTD group key arrives through the
+	// ceremony's v1 share store (not the legacy qfs signer table), so consensus
+	// cannot self-anchor there — the node layer overlays the anchor in block
+	// production (see block_producer.populateStardust* call sites).
 
 	coordinator := qpos.GetChambersCoordinator()
 	if coordinator != nil {

@@ -402,9 +402,17 @@ func (n *Node) handleQTDSealRequest(msg p2p.PeerMessage) {
 		return
 	}
 	if !bytes.Equal(senderAddr[:], proposer.Address[:]) {
-		nodeLog.Warn("QTD seal request: sender %x is not the proposer %x for slot %d, rejecting (B-5)",
-			senderAddr[:8], proposer.Address[:8], slot)
-		return
+		// The one exception to the proposer-only rule: when the proposer is not
+		// one of the four signers it never runs the session and cannot drive
+		// ordinals, so the lowest signer carries the retry announcements
+		// (ordinal > 0 only — the slot's first attempt always comes from the
+		// proposer). The session binding commits the request, so a delegate
+		// cannot equivocate on anything but the ordinal.
+		if !n.tdilithium3SealRetryDelegateAuthed(slot, tdilithium3SealSigningOrdinal(data), proposer.Address, senderAddr) {
+			nodeLog.Warn("QTD seal request: sender %x is not the proposer %x for slot %d, rejecting (B-5)",
+				senderAddr[:8], proposer.Address[:8], slot)
+			return
+		}
 	}
 
 	// QUANTUM-FIX (R4-CORE-04): Verify blockHash matches the canonical
@@ -591,6 +599,18 @@ func (n *Node) requestQTDSeal(slot uint64, blockHash types.Hash) {
 	binary.BigEndian.PutUint64(msg[0:8], slot)
 	copy(msg[8:40], blockHash[:])
 	_ = n.p2pHost.BroadcastQTDSealRequest(msg)
+
+	// Slice 4 decision C: with the executor gate open the four-signer session
+	// IS the seal path, and the proposer is the attempt-ordinal authority — it
+	// must run its own first attempt locally. Its broadcast above reaches only
+	// peers (a host never receives its own), and a v1-armed network holds v1
+	// shares, not the legacy tssManager share that gates the legacy path below,
+	// so without this start the proposer of a slot would never join its own
+	// session and every candidate would die silent on its missing commit.
+	if tdilithium3SealExecutorEnabled(n) {
+		n.tdilithium3SealSigningStart(slot, blockHash, 0)
+		return
+	}
 
 	// Asynchronously compute the QTD threshold signature and complete the seal.
 	// This is the production path — the broken partial-seal collection in

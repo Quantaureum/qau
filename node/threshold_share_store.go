@@ -25,6 +25,14 @@ func newThresholdShareStore(basePath string) *thresholdShareStore {
 	return &thresholdShareStore{basePath: basePath}
 }
 
+// thresholdStoreOpsMutex serializes store lockfile use within this process:
+// the bolt handle is an flock token, and a second Open of the same path inside
+// one process waits for the first handle's Close — under per-slot sealing
+// traffic those waits stacked to the 30 s open timeout and cascaded into
+// adoption/seal stalls (observed 8-24 s handler stalls). A process-wide mutex
+// bounds each operation's wait to a single in-flight operation instead.
+var thresholdStoreOpsMutex sync.Mutex
+
 func (store *thresholdShareStore) lockFile() (*bbolt.DB, error) {
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
@@ -33,7 +41,19 @@ func (store *thresholdShareStore) lockFile() (*bbolt.DB, error) {
 	if err := os.MkdirAll(paths.Root, 0700); err != nil {
 		return nil, err
 	}
-	return bbolt.Open(filepath.Join(paths.Root, "store.lock.db"), 0600, &bbolt.Options{Timeout: 30 * time.Second})
+	thresholdStoreOpsMutex.Lock()
+	db, err := bbolt.Open(filepath.Join(paths.Root, "store.lock.db"), 0600, &bbolt.Options{Timeout: 30 * time.Second})
+	if err != nil {
+		thresholdStoreOpsMutex.Unlock()
+		return nil, err
+	}
+	return db, nil
+}
+
+// unlockStoreLockfile is the companion to lockFile's global serialization.
+func unlockStoreLockfile(db *bbolt.DB) {
+	_ = db.Close()
+	thresholdStoreOpsMutex.Unlock()
 }
 
 func (store *thresholdShareStore) Store(share *dilithium3v1.LocalShare, password []byte) error {
@@ -52,7 +72,7 @@ func (store *thresholdShareStore) Store(share *dilithium3v1.LocalShare, password
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	paths, err := newThresholdProtocolPaths(store.basePath, share.Protocol, share.Key.Generation, share.Committee.Version, share.ParticipantID)
 	if err != nil {
 		return err
@@ -157,7 +177,7 @@ func (store *thresholdShareStore) LoadCandidate(generation uint64, participantID
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	return store.loadCandidateLocked(generation, participantID, password)
 }
 
@@ -218,7 +238,7 @@ func (store *thresholdShareStore) LoadActive(password []byte) (*dilithium3v1.Loc
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
 		return nil, err

@@ -565,10 +565,13 @@ func parseTDilithium3DKGRosterHash(value string) (types.Hash, error) {
 }
 
 // tdilithium3DKGEpochRosterStoreForUse lazily creates and owns the node's
-// sidecar. It stays nil (and every lookup fails closed) unless the experimental
-// Dilithium3 v1 gates are open, so a production node never touches the file.
+// sidecar. It stays nil (and every lookup fails closed) unless the v1
+// protocol is in play on this node: the experimental gate, or the
+// offline-ceremony sealing config (tssV1SealingActivationEpoch), whose
+// session derivation reads this same sidecar.
 func (n *Node) tdilithium3DKGEpochRosterStoreForUse() *tdilithium3DKGEpochRosterStore {
-	if n == nil || n.config == nil || n.config.DataDir == "" || !experimentalTDilithium3V1Enabled() {
+	arming := experimentalTDilithium3V1Enabled() || n.offlineTDilithium3SealingConfigured()
+	if n == nil || n.config == nil || n.config.DataDir == "" || !arming {
 		return nil
 	}
 	n.tdilithium3DKGEpochRosterStoreMu.Lock()
@@ -621,7 +624,11 @@ func (n *Node) tdilithium3DKGCurrentFinalizedEpoch() uint64 {
 // to anchor on — and sessions referencing it fail closed, identically on every
 // node.
 func (n *Node) captureTDilithium3DKGEpochRosterFromBlock(blk *encoding.Block) {
-	if n == nil || blk == nil || blk.Header == nil || !experimentalTDilithium3V1Enabled() {
+	// Roster captures gate on "the v1 protocol is in play": the experimental
+	// env or the offline-ceremony sealing config. Without this capture the
+	// offline session derivation can never see an anchor roster.
+	if n == nil || blk == nil || blk.Header == nil ||
+		(!experimentalTDilithium3V1Enabled() && !n.offlineTDilithium3SealingConfigured()) {
 		return
 	}
 	header := blk.Header

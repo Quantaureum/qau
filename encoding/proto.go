@@ -133,6 +133,19 @@ type BlockHeader struct {
 	ExecutiveSealers      []byte     // Executive Chamber committee member indices who sealed this block
 	FinalityType          uint8      // 0=CasperFFG, 1=QTDInstant
 
+	// QTDGroupKey anchors the epoch's active QTD group public key on the first
+	// block of the epoch (v1 threshold sealing, armed networks only): consumers
+	// cross-check it against their locally established key for the epoch
+	// (mismatch is a warning, not a fork — on-chain anchoring is informational
+	// until the cert-bound observer handoff lands).
+	QTDGroupKey []byte
+
+	// QTDGroupKeyProof carries the previous epoch committee's threshold
+	// endorsement of the anchored key (a group signature over the handoff
+	// tuple), present when the anchored epoch's key differs from the previous
+	// epoch's — the chained-adoption rule refuses an unproven rotation anchor.
+	QTDGroupKeyProof []byte
+
 	// R54-ACC (2026-08-07): per-epoch VRF accumulator carried ON-CHAIN at
 	// block-production time. Derived deterministically from the parent header
 	// (see consensus.ComputeNextVRFAccumulator), so proposer election reads a
@@ -266,7 +279,9 @@ func (h *BlockHeader) Equal(other *BlockHeader) bool {
 		bytesEqual(h.QTDSignature, other.QTDSignature) &&
 		h.ReviewAttestationRoot.ConstantTimeEqual(other.ReviewAttestationRoot) &&
 		bytesEqual(h.ExecutiveSealers, other.ExecutiveSealers) &&
-		h.FinalityType == other.FinalityType
+		h.FinalityType == other.FinalityType &&
+		bytesEqual(h.QTDGroupKey, other.QTDGroupKey) &&
+		bytesEqual(h.QTDGroupKeyProof, other.QTDGroupKeyProof)
 }
 
 // Equal returns true if two Transactions are equal

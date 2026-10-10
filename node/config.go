@@ -252,6 +252,14 @@ type Config struct {
 	TSSGroupKeyFile    string `json:"tssGroupKeyFile"`
 	TSSKeyShareFile    string `json:"tssKeyShareFile"`
 	TSSDistributedMode bool   `json:"tssDistributedMode"` // Enable distributed (multi-party) TSS signing over P2P. Default: false (local mode)
+	// TSSV1SealingActivationEpoch arms the offline-ceremony Dilithium3 v1
+	// sealing path (tdilithium3_offline_adoption.go): at this epoch the v1
+	// committee key installed via tdil3_ceremony activates through the
+	// standard activation exchange, and the v1 seal executor engages from
+	// this epoch on. 0/absent = disabled (the default on every network).
+	// This is the mainnet-legal activation path: it introduces no runtime
+	// DKG (mainnet keeps refusing runtime DKG regardless of this field).
+	TSSV1SealingActivationEpoch uint64 `json:"tssV1SealingActivationEpoch"`
 	// TSSDistributedDKG enables runtime distributed DKG (multi-party DKG over
 	// P2P) at node startup. Default: false (OFF) — when off, node behavior is
 	// identical to previous releases (single-process simulated DKG). When on,

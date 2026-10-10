@@ -245,7 +245,7 @@ func (store *thresholdShareStore) ActivateCandidate(
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
 		return err
@@ -405,7 +405,7 @@ func (store *thresholdShareStore) LoadActiveAtEpoch(currentEpoch uint64, verifie
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
 		return nil, err
@@ -479,6 +479,50 @@ func (store *thresholdShareStore) LoadActiveAtEpoch(currentEpoch uint64, verifie
 // still runs LoadActiveAtEpoch with the roster verifier, which checks the
 // activation certificate, so a forged or mismatched active share still fails
 // closed there.
+// CandidateSharePublicIdentity reports the installed candidate share's
+// activation epoch, group public key, threshold and participant ID without
+// exposing secret bytes — the probe the offline-ceremony adoption driver runs
+// before committing to an exchange. A missing candidate is os.ErrNotExist;
+// the authoritative load still runs LoadCandidate/ActivateCandidate, which
+// validate the full share, so a forged candidate head fails closed there.
+func (store *thresholdShareStore) CandidateSharePublicIdentity(password []byte) (uint64, []byte, uint32, uint32, error) {
+	if store == nil || store.basePath == "" || len(password) == 0 {
+		return 0, nil, 0, 0, fmt.Errorf("threshold share store or password is not configured")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	lock, err := store.lockFile()
+	if err != nil {
+		return 0, nil, 0, 0, err
+	}
+	defer unlockStoreLockfile(lock)
+	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
+	if err != nil {
+		return 0, nil, 0, 0, err
+	}
+	candidate, exists, err := loadThresholdPlaintext(paths.CandidateHead, password)
+	if err != nil {
+		return 0, nil, 0, 0, err
+	}
+	if !exists {
+		return 0, nil, 0, 0, os.ErrNotExist
+	}
+	defer tss.SecureZero(candidate)
+	share, err := dilithium3v1.UnmarshalLocalShare(candidate)
+	if err != nil {
+		return 0, nil, 0, 0, err
+	}
+	epoch := share.ActivationEpoch
+	publicKey := append([]byte(nil), share.Key.PublicKey...)
+	threshold := share.Committee.Threshold
+	participantID := share.ParticipantID
+	share.Zeroize()
+	if epoch == 0 || len(publicKey) == 0 {
+		return 0, nil, 0, 0, fmt.Errorf("threshold candidate has no activation epoch or group key")
+	}
+	return epoch, publicKey, threshold, participantID, nil
+}
+
 func (store *thresholdShareStore) ActiveSharePublicIdentity(password []byte) (uint64, []byte, uint32, error) {
 	if store == nil || store.basePath == "" || len(password) == 0 {
 		return 0, nil, 0, fmt.Errorf("threshold activation store or password is not configured")
@@ -489,7 +533,7 @@ func (store *thresholdShareStore) ActiveSharePublicIdentity(password []byte) (ui
 	if err != nil {
 		return 0, nil, 0, err
 	}
-	defer lock.Close()
+	defer unlockStoreLockfile(lock)
 	paths, err := newThresholdProtocolPaths(store.basePath, protocol.ThresholdProtocolDilithium3V1, 1, 1, 1)
 	if err != nil {
 		return 0, nil, 0, err

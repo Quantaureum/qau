@@ -21,6 +21,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"time"
 
 	qcrypto "github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/p2p"
@@ -218,9 +219,7 @@ func (n *Node) newTDilithium3SigningBinding(
 	if err != nil {
 		return nil, err
 	}
-	share, err := newThresholdShareStore(n.config.DataDir).LoadActiveAtEpoch(
-		activationEpoch, verifier, []byte(n.config.ValidatorKeyPassword),
-	)
+	share, err := n.loadTDilithium3ActiveShareCached(activationEpoch, verifier)
 	if err != nil {
 		return nil, fmt.Errorf("Dilithium3 signing share: %w", err)
 	}
@@ -291,6 +290,50 @@ func (n *Node) newTDilithium3SigningBinding(
 		Entropy:    entropy,
 		chainID:    n.config.NetworkID,
 	}, nil
+}
+
+// loadTDilithium3ActiveShareCached serves the per-attempt share load through
+// a short-lived in-process cache. The store's bolt lockfile is a per-handle
+// file lock, and bursts of concurrent opens inside one process stall to the
+// open timeout — which the per-slot sealing cadence produced on every miss
+// (observed as "active share: timeout" on all signers). A hit still re-runs
+// the share's own integrity checks; only the disk read is skipped.
+func (n *Node) loadTDilithium3ActiveShareCached(activationEpoch uint64, verifier dilithium3v1.DKGIdentityVerifier) (*dilithium3v1.LocalShare, error) {
+	n.tdilithium3ShareCacheMu.Lock()
+	cached := n.tdilithium3ShareCache
+	fresh := cached != nil && n.tdilithium3ShareCacheEpoch == activationEpoch &&
+		time.Since(n.tdilithium3ShareCacheAt) < time.Second
+	if fresh {
+		out := cached.Clone()
+		n.tdilithium3ShareCacheMu.Unlock()
+		return out, nil
+	}
+	n.tdilithium3ShareCacheMu.Unlock()
+	share, err := newThresholdShareStore(n.config.DataDir).LoadActiveAtEpoch(
+		activationEpoch, verifier, []byte(n.config.ValidatorKeyPassword),
+	)
+	if err != nil {
+		return nil, err
+	}
+	n.tdilithium3ShareCacheMu.Lock()
+	n.tdilithium3ShareCache = share.Clone()
+	n.tdilithium3ShareCacheEpoch = activationEpoch
+	n.tdilithium3ShareCacheAt = time.Now()
+	n.tdilithium3ShareCacheMu.Unlock()
+	return share, nil
+}
+
+// invalidateTDilithium3ShareCache drops the memoized active share. The
+// activation exchange, the gossip adoption path, and reshare completion call
+// it — those are the only writers that can replace the active share.
+func (n *Node) invalidateTDilithium3ShareCache() {
+	n.tdilithium3ShareCacheMu.Lock()
+	defer n.tdilithium3ShareCacheMu.Unlock()
+	if n.tdilithium3ShareCache != nil {
+		n.tdilithium3ShareCache.Zeroize()
+		n.tdilithium3ShareCache = nil
+	}
+	n.tdilithium3ShareCacheEpoch = 0
 }
 
 // request builds the base signing request of one attempt: the binding's key and

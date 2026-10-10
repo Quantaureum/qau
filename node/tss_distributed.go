@@ -274,17 +274,24 @@ func (n *Node) tssProcessingLoop() {
 		}
 	}()
 
-	if (n.distributedSigner == nil && !n.config.TSSDistributedDKG && !n.tdilithium3DKGInboundAllowed() && !experimentalTDilithium3V1Enabled()) || n.p2pHost == nil {
+	if (n.distributedSigner == nil && !n.config.TSSDistributedDKG && !n.tdilithium3DKGInboundAllowed() && !experimentalTDilithium3V1Enabled() && !n.offlineTDilithium3SealingConfigured()) || n.p2pHost == nil {
 		return
 	}
 
 	tssCh := n.p2pHost.SubscribeTSS()
+	if n.offlineTDilithium3SealingConfigured() {
+		nodeLog.Info("offline v1 sealing: TSS processing loop started")
+	}
 	n.broadcastKyberPublicKey()
 	keyTicker := time.NewTicker(30 * time.Second)
 	defer keyTicker.Stop()
 	cleanupTicker := time.NewTicker(10 * time.Second)
 	defer cleanupTicker.Stop()
 
+	// DEBUG(M2): heartbeat with channel depth + slow-handler attribution while
+	// the seal-convergence window is being chased. Remove when M2 lands.
+	lastBeat := time.Now()
+	var beatCount, slowCount int
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -293,6 +300,7 @@ func (n *Node) tssProcessingLoop() {
 			n.broadcastKyberPublicKey()
 
 		case msg := <-tssCh:
+			started := time.Now()
 			// NODE-P2-01 FIX (R31, 2026-07-28): per-message recover so a
 			// malformed message or a bug in handleTSSMessage does not kill
 			// the entire TSS loop. Subsequent messages must still be
@@ -304,6 +312,15 @@ func (n *Node) tssProcessingLoop() {
 					}
 				}()
 				n.handleTSSMessage(msg)
+				if took := time.Since(started); took > 100*time.Millisecond {
+					slowCount++
+					nodeLog.Warn("tssProcessingLoop DEBUG: slow handler %v type=%d (slow total=%d)", took, msg.Type, slowCount)
+				}
+				beatCount++
+				if time.Since(lastBeat) > 5*time.Second {
+					nodeLog.Info("tssProcessingLoop DEBUG: drained=%d depth=%d slow=%d", beatCount, len(tssCh), slowCount)
+					lastBeat = time.Now()
+				}
 			}()
 
 		case <-cleanupTicker.C:
@@ -388,8 +405,20 @@ func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 		}
 		inbox := n.tdilithium3SigningInboxForSession(sessionID)
 		if !n.tdilithium3SigningInboxAdmissible(inbox) {
-			tdilithium3SealTrace("signing inbound type %d from %s: no admissible inbox for session %x",
-				msg.Type, msg.From, sessionID[:6])
+			if inbox == nil {
+				// Distinguish "no inbox registered for this session id at all"
+				// from "inbox present but not admissible": the first means the
+				// sender's session id never materialized here (or the attempt
+				// already ended), the second is a policy refusal.
+				n.tdilithium3SigningInboxMu.Lock()
+				registered := len(n.tdilithium3SigningInboxes)
+				n.tdilithium3SigningInboxMu.Unlock()
+				tdilithium3SealTrace("signing inbound type %d from %s: no inbox registered for session %x (registered=%d)",
+					msg.Type, msg.From, sessionID[:6], registered)
+			} else {
+				tdilithium3SealTrace("signing inbound type %d from %s: no admissible inbox for session %x",
+					msg.Type, msg.From, sessionID[:6])
+			}
 			return
 		}
 		if err := inbox.accept(msg); err != nil {

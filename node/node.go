@@ -299,6 +299,32 @@ type Node struct {
 	// (members start staggered; mirrors tdilithium3ResharePending on the
 	// reshare path). Drained by installTDilithium3DKGActivationSink.
 	tdilithium3DKGActivationPending [][]byte
+	// tdilithium3DKGAdoptedCerts deduplicates gossip-delivered activation
+	// certificates by content digest (guarded by tdilithium3DKGActivationMu).
+	tdilithium3DKGAdoptedCerts map[[32]byte]struct{}
+	// offlineTDilithium3AdoptionMu/offlineTDilithium3AdoptionEpoch serialize
+	// the offline-ceremony adoption exchange: the epoch-transition callback
+	// must never run the 60-second exchange inline (it would stall block
+	// production), so the callback only starts/reports a background adoption.
+	offlineTDilithium3AdoptionMu    sync.Mutex
+	offlineTDilithium3AdoptionEpoch uint64
+	// tdilithium3SealDeferredMu/tdilithium3SealDeferred hold the per-slot
+	// deferred seal-start latches: a proposer's attempt announcement can
+	// outrun the local block approval that creates the pending seal, and a
+	// refused start used to strand the slot's whole signing session.
+	tdilithium3SealDeferredMu sync.Mutex
+	tdilithium3SealDeferred   map[uint64]tdilithium3SealDeferredStart
+	// tdilithium3ShareCacheMu/tdilithium3ShareCache memoize the active v1
+	// share: the seal executor's per-slot attempts each re-read and
+	// re-verify the share store, and Windows bbolt file locks are
+	// per-HANDLE — concurrent opens by one process stall, so bursts of
+	// attempts starve themselves against the store. The cache is valid for
+	// cachedShareTTL per read and is dropped eagerly by the activation
+	// paths (the only writers of the active share).
+	tdilithium3ShareCacheMu    sync.Mutex
+	tdilithium3ShareCache      *dilithium3v1.LocalShare
+	tdilithium3ShareCacheEpoch uint64
+	tdilithium3ShareCacheAt    time.Time
 	// tdilithium3DKGEpochRosterStore is the lazily created finalized-epoch
 	// validator roster sidecar (Dilithium3 v1 CNF-RSS "Finalized-Epoch
 	// Validator Snapshot", option 2). It is nil until an epoch-boundary capture
@@ -6866,7 +6892,12 @@ func (n *Node) startServices() error {
 	// The Dilithium3 v1 DKG ceremony installs its inbox only when an epoch
 	// transition fires, so the loop must also start when the experimental gates
 	// are open, otherwise the ceremony's own traffic would never be consumed.
-	if n.distributedSigner != nil || n.dkgCoordinator != nil || n.config.TSSDistributedDKG || n.tdilithium3DKGInboundAllowed() || experimentalTDilithium3V1Enabled() {
+	// The offline-ceremony sealing path (tssV1SealingActivationEpoch) likewise
+	// routes its activation exchange and seal session traffic through this
+	// loop, so it forces the loop on independently of the experimental gates.
+	nodeLog.Info("offline v1 sealing: tss spawn gate: signer=%v coordinator=%v distDKG=%v inboxAllowed=%v experimental=%v offlineArmedCfg=%v hostSet=%v",
+		n.distributedSigner != nil, n.dkgCoordinator != nil, n.config.TSSDistributedDKG, n.tdilithium3DKGInboundAllowed(), experimentalTDilithium3V1Enabled(), n.offlineTDilithium3SealingConfigured(), n.p2pHost != nil)
+	if n.distributedSigner != nil || n.dkgCoordinator != nil || n.config.TSSDistributedDKG || n.tdilithium3DKGInboundAllowed() || experimentalTDilithium3V1Enabled() || n.offlineTDilithium3SealingConfigured() {
 		n.wg.Add(1)
 		go n.tssProcessingLoop()
 	}

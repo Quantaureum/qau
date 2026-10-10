@@ -87,7 +87,7 @@ func newTDilithium3SigningSlotDriver(
 
 // run drives the slot until it is done, the context ends, or a local failure
 // ends it. Every path but a signature consumes the slot's one-time material.
-func (driver *tdilithium3SigningSlotDriver) run(ctx context.Context) ([]byte, error) {
+func (driver *tdilithium3SigningSlotDriver) run(ctx context.Context) (result []byte, runErr error) {
 	if driver == nil || driver.node == nil || driver.slot == nil || driver.transport == nil || driver.inbox == nil {
 		return nil, fmt.Errorf("Dilithium3 signing slot driver is not fully wired")
 	}
@@ -100,9 +100,20 @@ func (driver *tdilithium3SigningSlotDriver) run(ctx context.Context) ([]byte, er
 	if !driver.node.tdilithium3SigningInboxAdmissible(driver.inbox) {
 		return nil, fmt.Errorf("Dilithium3 signing slot driver requires an admissible node and a bound inbox")
 	}
+	// Phase timings so a stall can be attributed to start/admission, delivery
+	// churn, or the finish path instead of guessed from the deadline overrun.
+	runStart := time.Now()
+	var startDur time.Duration
+	var delivered, retransmits int
+	defer func() {
+		tdilithium3SealTrace("slot driver exit: total=%s start=%s delivered=%d resent=%d err=%v",
+			time.Since(runStart).Round(time.Millisecond), startDur.Round(time.Millisecond),
+			delivered, retransmits, runErr)
+	}()
 	if err := driver.slot.Start(); err != nil {
 		return nil, err
 	}
+	startDur = time.Since(runStart)
 	driver.node.registerTDilithium3SigningInbox(driver.inbox)
 	defer driver.node.unregisterTDilithium3SigningInbox(driver.inbox)
 
@@ -128,20 +139,31 @@ func (driver *tdilithium3SigningSlotDriver) run(ctx context.Context) ([]byte, er
 	}
 	ticker := time.NewTicker(driver.retransmit)
 	defer ticker.Stop()
+	// starve closes the slot when its deadline ran out: Finish consumes the
+	// material and reports the missing input as the party's bounded outcome.
+	starve := func() ([]byte, error) {
+		_, err := driver.slot.Finish()
+		if err == nil {
+			return nil, fmt.Errorf("Dilithium3 signing slot ended without a signature")
+		}
+		return nil, err
+	}
 	for {
 		if driver.slot.Done() {
 			return driver.slot.Finish()
 		}
+		if ctx.Err() != nil {
+			// The deadline outranks a still-busy inbox: a select would serve
+			// the message case at random, so a slot starved by steady
+			// retransmissions could run unboundedly past its deadline before
+			// the context case wins the coin flip.
+			return starve()
+		}
 		select {
 		case <-ctx.Done():
-			// The slot is starved: Finish consumes the material and reports the
-			// missing input as the party's bounded outcome.
-			_, err := driver.slot.Finish()
-			if err == nil {
-				return nil, fmt.Errorf("Dilithium3 signing slot ended without a signature")
-			}
-			return nil, err
+			return starve()
 		case message := <-driver.inbox.messages:
+			delivered++
 			err := driver.slot.Deliver(message.SenderID, message.Kind, message.Payload)
 			if err != nil {
 				if outcome, ok := dilithium3v1.SigningExecutorOutcomeOf(err); ok && !outcome.Fatal {
@@ -157,6 +179,7 @@ func (driver *tdilithium3SigningSlotDriver) run(ctx context.Context) ([]byte, er
 			}
 		case <-ticker.C:
 			for _, kind := range sent {
+				retransmits++
 				// A retransmission is best effort: the slot deadline bounds a
 				// transport that stays broken.
 				if err := driver.transport.Resend(kind); err != nil {

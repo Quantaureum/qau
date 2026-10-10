@@ -40,6 +40,15 @@ func signingExecutorSlotRequest(request protocol.SignRequest, slot uint16) proto
 	return slotRequest
 }
 
+// SigningExecutorSlotRequestFor exports the per-slot request binding: the node
+// deployment derives candidate session ids before the session starts (to
+// pre-register the authenticated inboxes so early round messages queue instead
+// of dropping), which requires this exact binding to be reproducible outside
+// the package.
+func SigningExecutorSlotRequestFor(request protocol.SignRequest, slot uint16) protocol.SignRequest {
+	return signingExecutorSlotRequest(request, slot)
+}
+
 // signingExecutorSlotOutcome records one candidate slot: whether it produced
 // the signature, the bounded reason of a filtered slot, and how many messages
 // the four signers emitted in it.

@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -55,11 +56,13 @@ func tdilithium3SigningScheduleTestJournal(t *testing.T) *dilithium3v1.SigningJo
 }
 
 // tdilithium3SigningScheduleTestScript scripts one factory: the slot that
-// accepts (zero means none), the slots that filter, and the slot that fails
-// hard. Every other slot starves at its deadline.
+// accepts (zero means none), the slots that filter, the slots that end in a
+// silence, and the slot that fails hard. Every other slot starves at its
+// deadline.
 type tdilithium3SigningScheduleTestScript struct {
 	acceptAt uint16
 	filter   map[uint16]bool
+	silence  map[uint16]bool
 	failAt   uint16
 }
 
@@ -98,6 +101,10 @@ func tdilithium3SigningScheduleTestFactory(
 			stub.scriptFinish(errSigningSlotTestDelivery, false)
 		case script.filter[slot]:
 			stub.scriptFinish(errSigningSlotTestStarved, true)
+		case script.silence[slot]:
+			stub.scriptFinish(
+				fmt.Errorf("%w: signer 9: scripted silence", dilithium3v1.ErrSigningExecutorSilence), false,
+			)
 		}
 		*built = append(*built, stub)
 		return stub, transport, inbox, nil
@@ -191,6 +198,39 @@ func TestTDilithium3SigningScheduleExhaustsCandidates(t *testing.T) {
 	_, outcomes, err := schedule.run(ctx)
 	if !errors.Is(err, errTDilithium3SigningRequestExhausted) {
 		t.Fatalf("error = %v, want %v", err, errTDilithium3SigningRequestExhausted)
+	}
+	if len(outcomes) != 3 {
+		t.Fatalf("%d outcomes, want 3", len(outcomes))
+	}
+	for index, stub := range *built {
+		if !stub.wasBurned() {
+			t.Fatalf("candidate %d left its material live", index+1)
+		}
+	}
+}
+
+// TestTDilithium3SigningScheduleSilenceExhaustsLikeAFilter requires silence --
+// a candidate starved of a participant's message, the retry-class outcome the
+// executor pins (ErrSigningExecutorSilence) -- to exhaust the request alongside
+// the legitimate filters instead of surfacing as the request's hard error, so
+// the seal path retries the attempt with fresh material. A genuine local fault
+// still wins over exhaustion (TestTDilithium3SigningScheduleEndsOnHardFailure).
+func TestTDilithium3SigningScheduleSilenceExhaustsLikeAFilter(t *testing.T) {
+	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "1")
+	factory, built := tdilithium3SigningScheduleTestFactory(t, tdilithium3SigningScheduleTestScript{
+		filter:  map[uint16]bool{1: true},
+		silence: map[uint16]bool{2: true, 3: true},
+	})
+	node := &Node{config: &Config{NetworkID: TestnetNetworkID}}
+	schedule, err := newTDilithium3SigningRequestSchedule(node, factory, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, outcomes, err := schedule.run(ctx)
+	if !errors.Is(err, errTDilithium3SigningRequestExhausted) {
+		t.Fatalf("error = %v, want %v (silence is retry-class, not a hard failure)", err, errTDilithium3SigningRequestExhausted)
 	}
 	if len(outcomes) != 3 {
 		t.Fatalf("%d outcomes, want 3", len(outcomes))

@@ -229,6 +229,7 @@ func (n *Node) runTDilithium3ActivationExchange(
 	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, password); err != nil {
 		return fmt.Errorf("commit active share: %w", err)
 	}
+	n.invalidateTDilithium3ShareCache()
 	nodeLog.Info("Dilithium3 v1 activation committed (activation epoch %d, session %x, group key prefix %x)",
 		session.ActivationEpoch, sessionDigest[:8], sharePublicKey[:4])
 
@@ -366,6 +367,23 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 	// adoption handler so a JOIN stall can be attributed to either "not
 	// delivered" vs "delivered but rejected".
 	nodeLog.Warn("Dilithium3 v1 activation certificate received for adoption (bytes=%d)", len(payload))
+	// M2: the same certificate is re-gossiped by every adopter and by the
+	// exchange's retransmit cadence; re-verifying each copy costs seconds of
+	// single-threaded loop time (observed 8-24 s). Consuming each distinct
+	// certificate once is sufficient: adoption is idempotent by content.
+	digest := sha3.Sum256(payload)
+	n.tdilithium3DKGActivationMu.Lock()
+	if n.tdilithium3DKGAdoptedCerts == nil {
+		n.tdilithium3DKGAdoptedCerts = make(map[[32]byte]struct{})
+	}
+	_, seen := n.tdilithium3DKGAdoptedCerts[digest]
+	if !seen && len(n.tdilithium3DKGAdoptedCerts) < 64 {
+		n.tdilithium3DKGAdoptedCerts[digest] = struct{}{}
+	}
+	n.tdilithium3DKGActivationMu.Unlock()
+	if seen {
+		return
+	}
 	certificate, err := decodeThresholdActivationCertificate(payload)
 	if err != nil {
 		nodeLog.Debug("Dilithium3 v1 activation certificate decode rejected: %v", err)
@@ -486,6 +504,7 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 			activationEpoch, len(certificate.Acknowledgements), err)
 		return
 	}
+	n.invalidateTDilithium3ShareCache()
 
 	nodeLog.Info("Dilithium3 v1 activation adopted via gossip (activation epoch %d, session %x)",
 		activationEpoch, sessionDigest[:8])

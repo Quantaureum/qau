@@ -56,11 +56,13 @@ type tdilithium3SigningSlotFactory func(slot uint16) (
 )
 
 // tdilithium3SigningRequestOutcome records one candidate slot: whether it
-// produced the signature, and, for a filtered slot, the bounded reason.
+// produced the signature, and, for a filtered slot, the bounded reason and
+// its attributable evidence (the silent or rejecting participant).
 type tdilithium3SigningRequestOutcome struct {
 	Slot     uint16
 	Accepted bool
 	Reason   dilithium3v1.SigningExecutorReason
+	Evidence dilithium3v1.Evidence
 }
 
 // tdilithium3SigningRequestSchedule drives one request across its candidates.
@@ -107,8 +109,12 @@ func newTDilithium3SigningRequestSchedule(
 //
 // The first candidate to sign wins and cancels the rest. A candidate that ends
 // in a legitimate filter -- a local rejection or a failed public combine check
-// -- is recorded as a normal outcome; any other failure is remembered and, if
-// no candidate signs, returned as the request's error.
+// -- is recorded as a normal outcome; a silence is recorded likewise, because
+// the executor declares a never-arrived message a statistical, retry-class
+// outcome of the construction (ErrSigningExecutorSilence), not a structural
+// failure. Every other failure is remembered and, if no candidate signs,
+// returned as the request's error, so a genuine local fault (journal,
+// binding, transport) never masquerades as an exhaustable filter run.
 func (schedule *tdilithium3SigningRequestSchedule) run(
 	ctx context.Context,
 ) ([]byte, []tdilithium3SigningRequestOutcome, error) {
@@ -118,6 +124,7 @@ func (schedule *tdilithium3SigningRequestSchedule) run(
 
 	// Build every candidate up front so a factory error fails the whole request
 	// before any session is launched, as the serial schedule did.
+	buildStart := time.Now()
 	type candidate struct {
 		slot   uint16
 		driver *tdilithium3SigningSlotDriver
@@ -135,6 +142,7 @@ func (schedule *tdilithium3SigningRequestSchedule) run(
 		}
 		candidates = append(candidates, candidate{slot: slot, driver: driver, party: party})
 	}
+	tdilithium3SealTrace("request build: %d candidates in %s", len(candidates), time.Since(buildStart).Round(time.Millisecond))
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -168,9 +176,11 @@ func (schedule *tdilithium3SigningRequestSchedule) run(
 			outcomes = append(outcomes, tdilithium3SigningRequestOutcome{Slot: result.slot, Accepted: true})
 			return result.signature, outcomes, nil
 		}
-		if result.filtered {
+		if result.filtered || errors.Is(result.err, dilithium3v1.ErrSigningExecutorSilence) {
 			outcome, _ := dilithium3v1.SigningExecutorOutcomeOf(result.err)
-			outcomes = append(outcomes, tdilithium3SigningRequestOutcome{Slot: result.slot, Reason: outcome.Reason})
+			outcomes = append(outcomes, tdilithium3SigningRequestOutcome{
+				Slot: result.slot, Reason: outcome.Reason, Evidence: outcome.Evidence,
+			})
 			continue
 		}
 		if hardErr == nil {
@@ -298,9 +308,15 @@ func newTDilithium3SigningSchedule(
 			CommitteeVersion: config.Request.Committee.Version,
 			Signers:          config.Signers,
 		}
-		inbox, err := newTDilithium3SigningInboxFromIdentitySnapshot(slotContext, config.Identities)
-		if err != nil {
-			return nil, nil, nil, err
+		// Reuse the pre-registered inbox of a latched announce when one exists:
+		// it has been queuing the early starters' messages since before this
+		// node's pending seal landed, and replacing it would drop them.
+		inbox := node.tdilithium3SigningInboxForSession(slotContext.SessionID)
+		if inbox == nil {
+			inbox, err = newTDilithium3SigningInboxFromIdentitySnapshot(slotContext, config.Identities)
+			if err != nil {
+				return nil, nil, nil, err
+			}
 		}
 		transport, err := newTDilithium3SigningTransport(
 			slotContext, config.Share.ParticipantID, config.Sign, config.Broadcast,

@@ -1036,11 +1036,16 @@ type QTDSealAnnouncementValidator struct{}
 
 type QTDSealRequestValidator struct{}
 
+// The payload is the legacy 40-byte seal request (slot + block hash); the v1
+// executor's retry announcement appends the 8-byte attempt ordinal, which a
+// receiver that predates the extension simply does not read (the session
+// ordinal parser treats a 40-byte payload as attempt zero). The validator must
+// admit both lengths or every retry dies at the wire before routing.
 func (v *QTDSealRequestValidator) MinSize() uint64 { return 40 }
-func (v *QTDSealRequestValidator) MaxSize() uint64 { return 40 }
+func (v *QTDSealRequestValidator) MaxSize() uint64 { return 48 }
 func (v *QTDSealRequestValidator) Validate(payload []byte) error {
-	if len(payload) != 40 {
-		return fmt.Errorf("%w: QTD seal request requires exactly 40 bytes", ErrInvalidMessageFormat)
+	if len(payload) != 40 && len(payload) != 48 {
+		return fmt.Errorf("%w: QTD seal request requires 40 bytes (or 48 with a retry ordinal)", ErrInvalidMessageFormat)
 	}
 	return nil
 }
