@@ -2140,31 +2140,42 @@ func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []
 		return false
 	}
 	if len(qfs.groupKeyHistory) > 0 {
-		// Continuous chain-of-custody only: the anchor may introduce at most
-		// the next epoch after the newest one we already trust. On a rotation
-		// (the anchored key differs from the previous epoch's), adoption also
-		// requires the previous committee's handoff signature over the handoff
-		// tuple (chainID, epoch, key, committeeVersion) — verified against the
-		// established key so a rogue boundary block cannot re-teach a rotated
-		// key it cannot endorse.
+		// Continuous chain-of-custody only. Two distinct cases at the leading
+		// edge, split on whether the anchor CHANGES the key:
+		//   - same key at any epoch > maxKnown: idempotent continuation. MUST
+		//     be tolerant of gaps — an epoch with no boundary block (chain
+		//     stall, activation slip, node restart) embeds no anchor, and
+		//     demanding +1 continuity would deadlock custody forever (observed
+		//     on mainnet 2026-10-11/12: one empty epoch bricked every node's
+		//     adoption for all later epochs).
+		//   - rotated key (differs from newest trusted): still strict — at most
+		//     the next epoch, plus the previous committee's handoff signature
+		//     over the handoff tuple (chainID, epoch, key, committeeVersion).
 		maxKnown := uint64(0)
 		for known := range qfs.groupKeyHistory {
 			if known > maxKnown {
 				maxKnown = known
 			}
 		}
-		if expected := maxKnown + 1; epoch != expected {
-			qtdLogger.Warn("QTD anchored group key REFUSED (breaks chained adoption)",
-				map[string]any{"epoch": epoch, "expected": expected})
-			return false
-		}
 		prevKey := qfs.groupKeyHistory[maxKnown]
 		if !bytes.Equal(prevKey, key) {
+			if expected := maxKnown + 1; epoch != expected {
+				qtdLogger.Warn("QTD anchored group key REFUSED (breaks chained adoption)",
+					map[string]any{"epoch": epoch, "expected": expected})
+				return false
+			}
 			if err := qfs.observeAnchoredGroupKeyHandoffLocked(epoch, key, proof); err != nil {
 				qtdLogger.Warn("QTD anchored group key refused (rotation proof)",
 					map[string]any{"epoch": epoch, "err": err.Error()})
 				return false
 			}
+		} else if epoch <= maxKnown {
+			// Same key at an already-known-or-older epoch: idempotent anyway —
+			// only allow when not already present (present+different was
+			// checked above; here it would be same-epoch-same-key, fine).
+			qtdLogger.Debug("QTD anchored group key re-anchor of established key (no-op)",
+				map[string]any{"epoch": epoch, "maxKnown": maxKnown})
+			return true
 		}
 	}
 	qfs.groupKeyHistory[epoch] = append([]byte(nil), key...)

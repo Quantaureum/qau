@@ -45,10 +45,11 @@ func TestObserveAnchoredGroupKeyValidateAdoptReject(t *testing.T) {
 }
 
 // TestObserveAnchoredGroupKeyChainedAdoption pins the rotation hardening: a
-// history-bearing node only adopts anchors that advance the chain of custody
-// by exactly one epoch, and a key CHANGE at the boundary must carry the
-// outgoing committee's handoff proof (missing proof on a rotation anchor is
-// refused outright).
+// history-bearing node adopts same-key anchors across epoch gaps (empty
+// epochs and activation slips embed nothing, and know-nothing-trust continuity
+// is what the key already supplies), while a key CHANGE must still move by
+// exactly one epoch and carry the outgoing committee's handoff proof (missing
+// or junk proof on a rotation anchor is refused outright).
 func TestObserveAnchoredGroupKeyChainedAdoption(t *testing.T) {
 	mk := func(tag byte) []byte {
 		key := make([]byte, qcrypto.Dilithium3PublicKeySize)
@@ -66,21 +67,34 @@ func TestObserveAnchoredGroupKeyChainedAdoption(t *testing.T) {
 		t.Fatal("same-key continuation refused as rotation")
 	}
 
-	// Skip-ahead is refused (chained-adoption), proof or not.
-	if qfs.ObserveAnchoredGroupKey(8, mk(0x41), nil) {
-		t.Fatal("skip-ahead anchor adopted")
+	// M4.1 (mainnet 2026-10-11/12 evidence): an epoch with no anchor-embedding
+	// block (stall, restart, activation slip) must not wedge custody forever.
+	// Re-anchoring the established key across a gap is idempotent, not a fork.
+	if !qfs.ObserveAnchoredGroupKey(8, mk(0x41), nil) {
+		t.Fatal("same-key skip-ahead refused — gaps starve custody permanently")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(8); !bytes.Equal(got, mk(0x41)) {
+		t.Fatal("gap-tolerant same-key anchor not recorded")
 	}
 
-	// A rotation to a NEW key without the handoff proof must be refused.
-	if qfs.ObserveAnchoredGroupKey(6, mk(0x55), nil) {
+	// A rotation to a NEW key without the handoff proof must still be refused…
+	if qfs.ObserveAnchoredGroupKey(10, mk(0x55), nil) {
+		t.Fatal("rotation anchor without handoff proof adopted")
+	}
+	// … even when it lands exactly at maxKnown+1.
+	if qfs.ObserveAnchoredGroupKey(9, mk(0x55), nil) {
 		t.Fatal("rotation anchor without handoff proof adopted")
 	}
 	// Junk proof is refused as well (the signature is garbage).
-	if qfs.ObserveAnchoredGroupKey(6, mk(0x55), []byte("bogus-proof")) {
+	if qfs.ObserveAnchoredGroupKey(9, mk(0x55), []byte("bogus-proof")) {
 		t.Fatal("rotation anchor with garbage proof adopted")
 	}
 	// Continuity kept intact: nothing new was learned.
-	if got := qfs.getGroupPublicKeyForEpoch(6); got != nil {
+	if got := qfs.getGroupPublicKeyForEpoch(9); got != nil {
 		t.Fatal("unproven rotation anchor still recorded a key")
+	}
+	// After all the refusals, the established key still answers.
+	if got := qfs.getGroupPublicKeyForEpoch(8); !bytes.Equal(got, mk(0x41)) {
+		t.Fatal("established key corrupted by refused rotation attempts")
 	}
 }
