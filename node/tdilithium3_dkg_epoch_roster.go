@@ -480,6 +480,63 @@ func (s *tdilithium3DKGEpochRosterStore) lookupCaptured(epoch uint64) (*tdilithi
 	}, nil
 }
 
+// capturedAtOrAfter returns the captured record of the earliest epoch >= epoch.
+// It exists for the seal-session signer derivation: the roster content there
+// enters session digests only via canonical committee/identity digests (both
+// epoch-independent), so a same-content record from a later captured boundary
+// is cryptographically equivalent. Exact-epoch rows kept by .lookup always win.
+// Mainnet pain-point the explicit guard protects: nodes whose boot straddled
+// the activation-1 boundary never captured it. A fallen-back roster whose
+// committee digest still mismatches the share's claims is rejected by the
+// callers' digests comparison, unchanged.
+func (s *tdilithium3DKGEpochRosterStore) capturedAtOrAfter(epoch uint64) (*tdilithium3DKGEpochRoster, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return nil, err
+	}
+	if !s.bootstrapSet {
+		return nil, fmt.Errorf("%w: no bootstrap boundary recorded yet", errTDilithium3DKGEpochRosterUnavailable)
+	}
+	var best *tdilithium3DKGEpochRoster
+	oldest := uint64(0)
+	for e, roster := range s.epochs {
+		if e >= epoch && (best == nil || e < best.Epoch) {
+			best = roster
+		}
+		if oldest == 0 || e < oldest {
+			oldest = e
+		}
+	}
+	if best == nil {
+		return s.lookupCapturedLocked(epoch)
+	}
+	return &tdilithium3DKGEpochRoster{
+		Epoch: best.Epoch, BoundaryHash: best.BoundaryHash,
+		Entries:       append([]tdilithium3DKGEpochRosterEntry(nil), best.Entries...),
+		Digest:        best.Digest,
+		SampleSeed:    best.SampleSeed,
+		SampleSeedSet: best.SampleSeedSet,
+	}, nil
+}
+
+func (s *tdilithium3DKGEpochRosterStore) lookupCapturedLocked(epoch uint64) (*tdilithium3DKGEpochRoster, error) {
+	if epoch < s.bootstrap {
+		return nil, fmt.Errorf("%w: epoch %d is below the bootstrap boundary %d", errTDilithium3DKGEpochRosterUnavailable, epoch, s.bootstrap)
+	}
+	roster, exists := s.epochs[epoch]
+	if !exists {
+		return nil, fmt.Errorf("%w: no snapshot captured for epoch %d", errTDilithium3DKGEpochRosterUnavailable, epoch)
+	}
+	return &tdilithium3DKGEpochRoster{
+		Epoch: roster.Epoch, BoundaryHash: roster.BoundaryHash,
+		Entries:       append([]tdilithium3DKGEpochRosterEntry(nil), roster.Entries...),
+		Digest:        roster.Digest,
+		SampleSeed:    roster.SampleSeed,
+		SampleSeedSet: roster.SampleSeedSet,
+	}, nil
+}
+
 func (s *tdilithium3DKGEpochRosterStore) persistLocked() error {
 	file := tdilithium3DKGEpochRosterFileJSON{
 		Version:            tdilithium3DKGEpochRosterFileVersion,
@@ -729,4 +786,17 @@ func (n *Node) capturedEpochValidatorRoster(epoch uint64) (*tdilithium3DKGEpochR
 		return nil, fmt.Errorf("%w: roster snapshot store is not enabled on this node", errTDilithium3DKGEpochRosterUnavailable)
 	}
 	return store.lookupCaptured(epoch)
+}
+
+// capturedEpochValidatorRosterAtOrAfter is the signing-path variant: when the
+// exact epoch was never captured (a restart straddled the boundary or the
+// record fell off), return the earliest captured record at or after it. The
+// content enters sessions only through epoch-independent digests, so the
+// committee-mismatch case is rejected downstream exactly as before.
+func (n *Node) capturedEpochValidatorRosterAtOrAfter(epoch uint64) (*tdilithium3DKGEpochRoster, error) {
+	store := n.tdilithium3DKGEpochRosterStoreForUse()
+	if store == nil {
+		return nil, fmt.Errorf("%w: roster snapshot store is not enabled on this node", errTDilithium3DKGEpochRosterUnavailable)
+	}
+	return store.capturedAtOrAfter(epoch)
 }

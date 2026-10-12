@@ -187,7 +187,7 @@ func (n *Node) tdilithium3SealSigningSignersDetailed(activationEpoch uint64) ([]
 	if err != nil {
 		return nil, 0, false, err
 	}
-	roster, err := n.capturedEpochValidatorRoster(rosterEpoch)
+	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -699,7 +699,7 @@ func (n *Node) tdilithium3SealSigningDrivesRetries(slot uint64) bool {
 	if err != nil {
 		return false
 	}
-	roster, err := n.capturedEpochValidatorRoster(rosterEpoch)
+	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
 	if err != nil {
 		return false
 	}
@@ -742,7 +742,7 @@ func (n *Node) tdilithium3SealRetryDelegateAuthed(
 	if err != nil {
 		return false
 	}
-	roster, err := n.capturedEpochValidatorRoster(rosterEpoch)
+	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
 	if err != nil {
 		return false
 	}
