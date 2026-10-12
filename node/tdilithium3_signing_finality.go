@@ -151,6 +151,15 @@ func (n *Node) registerTDilithium3SigningFinalitySigner(activationEpoch uint64, 
 	if err != nil {
 		return err
 	}
+	// M4.1 (2026-10-12): the offline-ceremony share's key re-roots the custody
+	// table before the signer installs. Block replay during boot adopts anchors
+	// from pre-armed legacy eras (e.g. the GM-QTD group key), and the chained
+	// adoption rule would then treat every later anchor of the ceremony key as
+	// an unproven rotation — refusing it forever, as observed on mainnet
+	// (expected=7738 vs block epochs 7739+). The share is the higher-trust
+	// signal by construction, so this purge is sound; same-key anchors keep
+	// chaining via ObserveAnchoredGroupKey afterwards.
+	qfs.ReRootGroupKeyCustody(activationEpoch, groupPublicKey)
 	qfs.SetQTDSignerForEpoch(signer, activationEpoch)
 	return nil
 }

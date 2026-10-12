@@ -44,6 +44,55 @@ func TestObserveAnchoredGroupKeyValidateAdoptReject(t *testing.T) {
 	}
 }
 
+// TestQTDActiveShareRegistrationPurgesLegacyCustody pins the M4.1 ceremony
+// transition: when an offline-ceremony share becomes active, its group key is
+// the custody chain's trusted head. Pre-existing entries that disagree with it
+// (jurisdictional leftovers from replayed legacy blocks) must be PURGED,
+// otherwise subsequent same-key anchors are refused forever as phantom
+// rotations. Rotating AWAY from the registered key is unchanged: that still
+// requires the next-epoch chain rule plus a handoff proof.
+func TestQTDActiveShareRegistrationPurgesLegacyCustody(t *testing.T) {
+	legacyKey := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	legacyKey[0] = 0xee
+	legacyKey[len(legacyKey)-1] = 0xf1
+	newKey := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	newKey[0] = 0x21
+	newKey[len(newKey)-1] = 0x7e
+
+	qfs := &QTDFinalityState{groupKeyHistory: map[uint64][]byte{}}
+	if !qfs.ObserveAnchoredGroupKey(100, legacyKey, nil) {
+		t.Fatal("bootstrap adoption of legacy anchor failed")
+	}
+	if !qfs.ObserveAnchoredGroupKey(101, legacyKey, nil) {
+		t.Fatal("legacy same-key continuation refused")
+	}
+
+	// Registration of the activated v1 share purges foreign-keyeds entries.
+	qfs.ReRootGroupKeyCustody(200, newKey)
+	qfs.SetQTDSignerForEpoch(&epochKeySigner{groupKey: newKey}, 200)
+	if got := qfs.getGroupPublicKeyForEpoch(100); got != nil {
+		t.Fatal("legacy key entry at epoch 100 survived activation registration")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(101); got != nil {
+		t.Fatal("legacy key entry at epoch 101 survived activation registration")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(200); !bytes.Equal(got, newKey) {
+		t.Fatal("new key not recorded at activation epoch")
+	}
+
+	// After re-rooting, same-key anchors continue (gap-tolerant per prior test).
+	if !qfs.ObserveAnchoredGroupKey(201, newKey, nil) {
+		t.Fatal("same-key anchor refused after re-rooting")
+	}
+	// And a rotation without proof must still be refused as before.
+	if qfs.ObserveAnchoredGroupKey(202, legacyKey, nil) {
+		t.Fatal("rotation to legacy key accepted after re-rooting")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(202); got != nil {
+		t.Fatal("unproven rotation anchor recorded a key after re-rooting")
+	}
+}
+
 // TestObserveAnchoredGroupKeyChainedAdoption pins the rotation hardening: a
 // history-bearing node adopts same-key anchors across epoch gaps (empty
 // epochs and activation slips embed nothing, and know-nothing-trust continuity
@@ -96,5 +145,57 @@ func TestObserveAnchoredGroupKeyChainedAdoption(t *testing.T) {
 	// After all the refusals, the established key still answers.
 	if got := qfs.getGroupPublicKeyForEpoch(8); !bytes.Equal(got, mk(0x41)) {
 		t.Fatal("established key corrupted by refused rotation attempts")
+	}
+}
+
+// TestSetQTDSignerReRootsCustody pins M4.1 (2026-10-12): when the offline
+// ceremony share becomes active, its group key must RE-ROOT the custody
+// table — entries replayed from legacy blocks (foreign keys, e.g. a GM-QTD
+// manager's) would otherwise make every ceremony-key anchor look like an
+// unproven rotation and refuse forever. After the re-root, same-key anchors
+// remain gap-tolerant and rotations still strict.
+type fullLengthSigner struct{ key []byte }
+
+func (m *fullLengthSigner) SignBlock(int, []byte) ([]byte, error)   { return nil, nil }
+func (m *fullLengthSigner) SignVote(int, []byte) ([]byte, error)    { return nil, nil }
+func (m *fullLengthSigner) VerifyBlock([]byte, []byte, []byte) bool { return true }
+func (m *fullLengthSigner) VerifyVote([]byte, []byte, []byte) bool  { return true }
+func (m *fullLengthSigner) GroupPublicKey() []byte                  { return m.key }
+func (m *fullLengthSigner) IsThresholdMode() bool                   { return true }
+func (m *fullLengthSigner) Threshold() int                          { return 1 }
+func (m *fullLengthSigner) AggregatePartialSignatures([]int, map[int][]byte, []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func TestSetQTDSignerReRootsCustody(t *testing.T) {
+	legacy := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	legacy[0], legacy[len(legacy)-1] = 0x5a, 0x5a
+	ceremony := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	ceremony[0], ceremony[len(ceremony)-1] = 0x21, 0x7e
+
+	qfs := &QTDFinalityState{}
+	qfs.groupKeyHistory = map[uint64][]byte{7558: legacy, 7606: legacy, 7700: legacy}
+
+	qfs.ReRootGroupKeyCustody(7634, ceremony)
+	qfs.SetQTDSignerForEpoch(&fullLengthSigner{key: ceremony}, 7634)
+
+	if len(qfs.groupKeyHistory) != 1 {
+		t.Fatalf("re-root must purge foreign rows, got %d entries", len(qfs.groupKeyHistory))
+	}
+	if got := qfs.groupKeyHistory[7634]; !bytes.Equal(got, ceremony) {
+		t.Fatal("ceremony key not installed at the activation epoch")
+	}
+	// Same-key gap adoption stays open after the re-root (M4.1 + 7c588ac pair).
+	if !qfs.ObserveAnchoredGroupKey(7700, ceremony, nil) {
+		t.Fatal("same-key anchor at a later epoch refused after custody re-root")
+	}
+	if got := qfs.groupKeyHistory[7700]; !bytes.Equal(got, ceremony) {
+		t.Fatal("same-key continuation not recorded")
+	}
+	// Rotation semantics unchanged: a different key two epochs ahead is refused.
+	other := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	other[0], other[len(other)-1] = 0x42, 0x42
+	if qfs.ObserveAnchoredGroupKey(7702, other, nil) {
+		t.Fatal("unproven rotation accepted after re-root")
 	}
 }

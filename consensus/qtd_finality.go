@@ -1988,6 +1988,32 @@ func (qfs *QTDFinalityState) SetQTDSignerForEpoch(signer ThresholdKeySigner, act
 	qfs.setQTDSignerLocked(signer, activationEpoch)
 }
 
+// ReRootGroupKeyCustody re-establishes the chain-of-custody head at the
+// offline-ceremony activation: the locally installed, ceremony-verified share
+// is a strictly higher-trust signal than any block-replay observation. The
+// block-import observer path (ObserveAnchoredGroupKey) legitimately adopts
+// anchors while replaying old blocks — including stale keys from pre-armed
+// eras — and a table with foreign keys would otherwise treat every later
+// anchor of the ceremony key as an unproven rotation and refuse forever.
+// Re-rooting purges every entry whose key differs from key, then installs key
+// at epoch. Fresh tables (empty) are left alone except for the install.
+func (qfs *QTDFinalityState) ReRootGroupKeyCustody(epoch uint64, key []byte) {
+	if qfs == nil || len(key) != crypto.Dilithium3PublicKeySize || crypto.IsZeroPublicKeyBytes(key) {
+		return
+	}
+	qfs.mu.Lock()
+	defer qfs.mu.Unlock()
+	if qfs.groupKeyHistory == nil {
+		qfs.groupKeyHistory = make(map[uint64][]byte)
+	}
+	for e, k := range qfs.groupKeyHistory {
+		if !bytes.Equal(k, key) {
+			delete(qfs.groupKeyHistory, e)
+		}
+	}
+	qfs.groupKeyHistory[epoch] = append([]byte(nil), key...)
+}
+
 // getGroupPublicKeyForEpoch returns the DKG group public key that was
 // active at the given epoch. It first checks groupKeyHistory (for past
 // epochs with recorded keys), then falls back to the current signer's
