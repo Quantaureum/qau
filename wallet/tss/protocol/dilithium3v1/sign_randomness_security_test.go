@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"crypto/sha3"
 	"encoding/binary"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -253,6 +255,148 @@ func TestSigningProductionCodeAvoidsWeakRandomness(t *testing.T) {
 			t.Errorf("%s still reads QAU_DEBUG_SIGNING_NORM", file)
 		}
 	}
+}
+
+// The reciprocal and square root that replace the division and square root
+// instructions must stay accurate to a few ulp over every exponent the sampler
+// can reach, at the awkward mantissas, and on the exact ranges it uses.
+func TestSigningNewtonArithmeticMatchesTheInstructions(t *testing.T) {
+	const reciprocalUlps, rootUlps = 2, 3
+	check := func(x float64) {
+		t.Helper()
+		if err := math.Abs(signingReciprocal(x)*x - 1); err > reciprocalUlps*0x1p-52 {
+			t.Fatalf("signingReciprocal(%g): relative error %g exceeds %d ulp", x, err, reciprocalUlps)
+		}
+		root := math.Sqrt(x)
+		if err := math.Abs(signingInverseSqrt(x)*root - 1); err > rootUlps*0x1p-52 {
+			t.Fatalf("signingInverseSqrt(%g): relative error %g exceeds %d ulp", x, err, rootUlps)
+		}
+		if err := math.Abs(signingSqrt(x)/root - 1); err > rootUlps*0x1p-52 {
+			t.Fatalf("signingSqrt(%g): relative error %g exceeds %d ulp", x, err, rootUlps)
+		}
+	}
+	rng := rand.New(rand.NewPCG(11, 13))
+	for draw := 0; draw < 400000; draw++ {
+		check(math.Ldexp(1+rng.Float64(), rng.IntN(240)-120))
+	}
+	for exponent := -120; exponent <= 120; exponent++ {
+		for _, mantissa := range []float64{1, 1.5, math.Sqrt2, 2 - 0x1p-52, 1 + 0x1p-52} {
+			check(math.Ldexp(mantissa, exponent))
+		}
+	}
+	// The ranges the sampler uses: the polar radius, the logarithm's m+1, the
+	// squared norm of the Gaussian vector, and the polar scale argument.
+	for draw := 0; draw < 100000; draw++ {
+		check(math.Ldexp(1+rng.Float64(), -rng.IntN(106)-1)) // (0, 1)
+		check(math.Sqrt2/2 + 1 + rng.Float64()*(math.Sqrt2-math.Sqrt2/2))
+		check(2000 + rng.Float64()*2000)
+		check(0x1p-52 + rng.Float64()*1e34)
+	}
+}
+
+// The rounding that replaces math.RoundToEven must agree with it everywhere
+// the sampler can reach, ties to even included.
+func TestSigningRoundToEvenMatchesTheStandardLibrary(t *testing.T) {
+	check := func(x float64) {
+		t.Helper()
+		if got, want := signingRoundToEven(x), math.RoundToEven(x); got != want {
+			t.Fatalf("signingRoundToEven(%v) = %v, want %v", x, got, want)
+		}
+	}
+	rng := rand.New(rand.NewPCG(21, 23))
+	for draw := 0; draw < 400000; draw++ {
+		check((rng.Float64()*2 - 1) * 5e5)
+		check(float64(rng.IntN(2000001)-1000000) + 0.5) // exact ties
+		check(float64(rng.IntN(2000001)-1000000) + 0.5 + math.Copysign(0x1p-30, rng.Float64()-0.5))
+	}
+	for _, x := range []float64{0, math.Copysign(0, -1), 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999999999999994, -0.49999999999999994,
+		0x1p50 + 0.5, -(0x1p50 + 0.5), 0x1p50 - 0.5, 4.2e5, -4.2e5} {
+		check(x)
+	}
+}
+
+// A sampler that runs on secret-derived values must not contain a division by
+// a non-constant, a square root, or another call whose latency depends on its
+// operands: the reciprocal and root helpers are built from multiplications and
+// subtractions, and the rounding from an addition and a subtraction. The check
+// reads every production file of the package, so moving a helper elsewhere does
+// not avoid it.
+func TestSigningSamplerHasNoVariableLatencyArithmetic(t *testing.T) {
+	// The only identifiers of package math the sampler may use: bit casts and
+	// classification. params.go builds the public parameter rows and is the only
+	// other file allowed to import math.
+	allowedMath := map[string]bool{"Float64bits": true, "Float64frombits": true, "IsInf": true, "IsNaN": true}
+	const samplerFile = "sign_randomness.go"
+	allowedSamplerImports := map[string]bool{"encoding/binary": true, "errors": true, "fmt": true, "io": true, "math": true}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileSet := token.NewFileSet()
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, file, nil, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", file, err)
+		}
+		importsMath := false
+		for _, spec := range parsed.Imports {
+			path, _ := strconv.Unquote(spec.Path.Value)
+			if path == "math" {
+				importsMath = true
+				if spec.Name != nil {
+					t.Errorf("%s imports math under the name %q", file, spec.Name.Name)
+				}
+			}
+			if file == samplerFile && !allowedSamplerImports[path] {
+				t.Errorf("%s imports %q, which the sampler may not use", file, path)
+			}
+		}
+		if importsMath && file != samplerFile && file != "params.go" {
+			t.Errorf("%s imports math; only %s and params.go may", file, samplerFile)
+		}
+		if file != samplerFile {
+			continue
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch expression := node.(type) {
+			case *ast.SelectorExpr:
+				// Every use, call or value, of a math identifier outside the list.
+				if pkg, ok := expression.X.(*ast.Ident); ok && pkg.Name == "math" && !allowedMath[expression.Sel.Name] {
+					t.Errorf("%s: uses math.%s", fileSet.Position(expression.Pos()), expression.Sel.Name)
+				}
+			case *ast.BinaryExpr:
+				if expression.Op == token.QUO {
+					if _, literal := expression.Y.(*ast.BasicLit); !literal && !insideConstDeclaration(parsed, expression) {
+						t.Errorf("%s: divides by a non-literal", fileSet.Position(expression.Pos()))
+					}
+				}
+			case *ast.AssignStmt:
+				if expression.Tok == token.QUO_ASSIGN {
+					t.Errorf("%s: uses /=", fileSet.Position(expression.Pos()))
+				}
+			}
+			return true
+		})
+	}
+}
+
+// insideConstDeclaration reports whether the expression is part of a const
+// declaration, whose division the compiler evaluates.
+func insideConstDeclaration(file *ast.File, target ast.Node) bool {
+	for _, declaration := range file.Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok || generic.Tok != token.CONST {
+			continue
+		}
+		if target.Pos() >= generic.Pos() && target.End() <= generic.End() {
+			return true
+		}
+	}
+	return false
 }
 
 // signingSecurityTestSecretsWiped reports whether a signer's per-slot secrets

@@ -1044,6 +1044,21 @@ the threshold design document.
   candidates are independent of the accepted pair. On amd64 and arm64 the
   compiled logarithm, the centering, and the modular reduction contain no
   conditional branch.
+- The sampler also uses no division, square root or transcendental instruction
+  on a value derived from the secret sample, because those can take
+  operand-dependent time on some cores. Reciprocals and square roots come from
+  fixed sequences of multiplications and subtractions (four Newton iterations
+  from a bit-pattern seed; within 2 ulp wherever the reciprocal is a normal
+  float, and the tests cover 240 binades), and the rounding of the expansion is
+  an addition and a subtraction rather than `math.RoundToEven`, which is a
+  rounding instruction on some architectures and a branching function on others.
+  A test fails if a division by a non-constant, a `/=`, or any use of package
+  `math` beyond bit casts and classification appears in the sampler file, or if
+  another production file of the package imports `math` besides the parameter
+  table. What no software review can establish is that multiplication and
+  addition take constant time on every core; they do on mainstream x86-64 and
+  arm64 cores for normal operands, and the sampler's operands stay clear of
+  the subnormal range.
 - A debug switch that printed the secret-dependent rejection norm of every slot
   was removed.
 - Per-slot secrets (the ball point, the partial secrets, the challenge shift,

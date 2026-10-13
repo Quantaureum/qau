@@ -33,13 +33,12 @@ var ErrInvalidSigningRandomness = errors.New("invalid Dilithium3 v1 signing rand
 const signingRandomnessDimension = N * (L + K)
 
 // signingInverseNu turns the expansion's division by nu into a multiplication.
-// It does not make the sampler free of secret-dependent floating-point
-// latency: the polar method's division and square root, the ball
-// normalization, and the logarithm's series argument still divide by values
-// derived from the secret sample. On cores where division or square-root
-// latency depends on the operands this exposes timing on aggregates of the
-// sample; closing it needs a fixed-point sampler, which the side-channel
-// review tracks as an open item.
+// The sampler as a whole uses no floating-point division, square root or
+// transcendental instruction on a value derived from the secret sample: those
+// can take operand-dependent time on some cores. It computes reciprocals and
+// square roots with fixed sequences of multiplications and subtractions
+// (signingReciprocal, signingInverseSqrt), and a test pins that no division by
+// a non-constant and no math.Sqrt appears in this file.
 const signingInverseNu = 1.0 / SigningRandomnessNu
 
 // signingRandomness is one signer's per-slot ball point: the raw unexpanded
@@ -78,7 +77,7 @@ func sampleSigningRandomness(stream io.Reader, params SigningParameters) (*signi
 	if !(norm > 0) || math.IsInf(norm, 0) {
 		return nil, fmt.Errorf("%w: degenerate ball sample", ErrInvalidSigningRandomness)
 	}
-	scale := params.SampleRadius / math.Sqrt(norm)
+	scale := params.SampleRadius * signingInverseSqrt(norm)
 	point := &signingRandomness{}
 	for index := 0; index < signingRandomnessDimension; index++ {
 		point.raw[index] = buffer[index] * scale
@@ -91,8 +90,8 @@ func sampleSigningRandomness(stream io.Reader, params SigningParameters) (*signi
 // Marsaglia's polar method. A candidate (u, v) outside the unit disc is
 // discarded; discarded candidates are independent of the accepted pair, so the
 // number of iterations reveals nothing about the output. The accepted path has
-// no table lookup and no branch on the accepted values; its division and
-// square root do take secret operands (see signingInverseNu).
+// no table lookup, no branch on the accepted values, and no division or square
+// root instruction (see signingInverseNu).
 func signingGaussianPair(stream io.Reader) (float64, float64, error) {
 	var raw [16]byte
 	defer wipeBytes(raw[:])
@@ -104,7 +103,7 @@ func signingGaussianPair(stream io.Reader) (float64, float64, error) {
 		v := 2*signingUnitFloat(binary.LittleEndian.Uint64(raw[8:16])) - 1
 		radius := u*u + v*v
 		if radius > 0 && radius < 1 {
-			scale := math.Sqrt(-2 * signingLogUnit(radius) / radius)
+			scale := signingSqrt(-2 * signingLogUnit(radius) * signingReciprocal(radius))
 			return u * scale, v * scale, nil
 		}
 	}
@@ -145,7 +144,7 @@ func signingLogUnit(x float64) float64 {
 	above := (signingSqrt2Mantissa - mantissa) >> 63
 	m := math.Float64frombits(mantissa | (signingFloat64ExponentBias-above)<<52)
 	exponent += int64(above)
-	t := (m - 1) / (m + 1)
+	t := (m - 1) * signingReciprocal(m+1)
 	t2 := t * t
 	series := 1.0 / 25
 	series = 1.0/23 + t2*series
@@ -164,17 +163,74 @@ func signingLogUnit(x float64) float64 {
 	return k*signingLn2Hi + (logM + k*signingLn2Lo)
 }
 
+const (
+	// Seeds of the Newton iterations below. Subtracting the bit pattern of x
+	// from the first (and halving it for the second) yields an estimate within
+	// 6.2% of 1/x and 3.5% of 1/sqrt(x) over every binade; four iterations
+	// bring either below 2^-53 before rounding noise.
+	signingReciprocalSeed  = 0x7FDE03FF7F000000
+	signingInverseSqrtSeed = 0x5FE6EB50C7B537A9
+)
+
+// signingReciprocal returns 1/x for a normal x > 0 using multiplications and
+// subtractions only. Floating-point division can take a different number of
+// cycles for different operands on some cores, and the operands here derive
+// from the secret sample; multiplication and addition do not (the operands
+// stay far from the subnormal range, where they would). The result is within a
+// few ulp of 1/x, which is all a sampler needs.
+func signingReciprocal(x float64) float64 {
+	y := math.Float64frombits(signingReciprocalSeed - math.Float64bits(x))
+	y *= 2 - x*y
+	y *= 2 - x*y
+	y *= 2 - x*y
+	y *= 2 - x*y
+	return y
+}
+
+// signingInverseSqrt returns 1/sqrt(x) for a normal x > 0 by the same means
+// (the square root instruction is the other variable-latency operation).
+func signingInverseSqrt(x float64) float64 {
+	half := 0.5 * x
+	y := math.Float64frombits(signingInverseSqrtSeed - math.Float64bits(x)>>1)
+	y *= 1.5 - half*y*y
+	y *= 1.5 - half*y*y
+	y *= 1.5 - half*y*y
+	y *= 1.5 - half*y*y
+	return y
+}
+
+// signingSqrt returns sqrt(x) for a normal x > 0 as x * (1/sqrt(x)).
+func signingSqrt(x float64) float64 {
+	return x * signingInverseSqrt(x)
+}
+
+// signingRoundToMagic is 1.5 * 2^52: adding it to x with |x| < 2^51 leaves the
+// sum in [2^52, 2^53), where the spacing of float64 values is 1, so the
+// addition itself rounds x to the nearest integer (ties to even, the hardware
+// default) and subtracting the constant again recovers it.
+const signingRoundToMagic = 1.5 * (1 << 52)
+
+// signingRoundToEven rounds x to the nearest integer, ties to even, with one
+// addition and one subtraction. math.RoundToEven compiles to a rounding
+// instruction on some architectures only and to a function with branches on the
+// magnitude of its argument elsewhere; this behaves the same on every
+// architecture. The sampler's coordinates stay below the ball radius (about
+// 4e5), far inside the |x| < 2^51 bound.
+func signingRoundToEven(x float64) float64 {
+	return (x + signingRoundToMagic) - signingRoundToMagic
+}
+
 // roundFromRaw recomputes the rounded expansion from the raw point.
 func (point *signingRandomness) roundFromRaw() {
 	for row := 0; row < L; row++ {
 		for index := 0; index < N; index++ {
-			value := math.RoundToEven(point.raw[row*N+index] * SigningRandomnessNu)
+			value := signingRoundToEven(point.raw[row*N+index] * SigningRandomnessNu)
 			point.first[row][index] = Normalize(Coefficient(value))
 		}
 	}
 	for row := 0; row < K; row++ {
 		for index := 0; index < N; index++ {
-			value := math.RoundToEven(point.raw[(L+row)*N+index])
+			value := signingRoundToEven(point.raw[(L+row)*N+index])
 			point.second[row][index] = Normalize(Coefficient(value))
 		}
 	}
