@@ -59,7 +59,14 @@ type LocalShare struct {
 	TranscriptDigest    [32]byte
 	Rho                 [32]byte
 	Components          []RSSComponent
-	zeroized            bool
+	// Rotated marks a share produced by an R77 membership rotation. Every
+	// member of a rotated committee carries it, including the members whose
+	// own components all have multiplicity 1 (after an add rotation only the
+	// correction group's members hold a folded component), so the signing
+	// row a member derives from its own share is the row every other member
+	// of the session derives from theirs.
+	Rotated  bool
+	zeroized bool
 }
 
 // Validate rejects identity substitution and malformed RSS component state.

@@ -732,9 +732,10 @@ func validatePartialBound(name string, position, row int, polynomial Poly, bound
 	for index := 0; index < N; index++ {
 		value := int64(CenteredCoefficient(polynomial[index]))
 		if value < int64(-bound) || value > int64(bound) {
+			// The coefficient is secret, so the error names its position only.
 			return fmt.Errorf(
-				"%w: partial %s[%d][%d][%d] = %d outside the bound %d",
-				errInvalidSigningAttempt, name, position, row, index, value, bound,
+				"%w: partial %s[%d][%d] has a coefficient outside the bound %d",
+				errInvalidSigningAttempt, name, position, row, bound,
 			)
 		}
 	}

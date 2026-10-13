@@ -708,6 +708,7 @@ func TestResharedShareCarriesKeyAcrossAdd(t *testing.T) {
 	}
 
 	newComponents := make(map[RSSGroupMask]RSSComponent)
+	rotatedShares := make([]*LocalShare, 0, newSize)
 	// Continuing members carry their groups; the joiner has only the weave.
 	for oldPosition := uint8(0); oldPosition < oldSize; oldPosition++ {
 		myFresh := make(map[RSSGroupMask]RSSComponent)
@@ -727,6 +728,7 @@ func TestResharedShareCarriesKeyAcrossAdd(t *testing.T) {
 			!bytes.Equal(nextShare.Key.PublicKey, publicKey) || nextShare.Key.Generation != 20 {
 			t.Fatal("add resharing must preserve the key identity")
 		}
+		rotatedShares = append(rotatedShares, nextShare)
 		for _, component := range nextShare.Components {
 			if existing, clash := newComponents[component.GroupMask]; clash && existing != component {
 				t.Fatalf("group %06b disagrees between members", uint16(component.GroupMask))
@@ -744,6 +746,8 @@ func TestResharedShareCarriesKeyAcrossAdd(t *testing.T) {
 	if err := joinerShare.Validate(); err != nil {
 		t.Fatalf("joiner's share invalid: %v", err)
 	}
+	rotatedShares = append(rotatedShares, joinerShare)
+	assertAddRotationSelectsOneRow(t, rotatedShares)
 	for _, component := range joinerShare.Components {
 		if existing, clash := newComponents[component.GroupMask]; clash && existing != component {
 			t.Fatalf("group %06b: joiner disagrees with continuing members", uint16(component.GroupMask))
@@ -768,6 +772,54 @@ func TestResharedShareCarriesKeyAcrossAdd(t *testing.T) {
 		t.Fatal("a borrower's share with a mismatched old committee must refuse")
 	}
 	_ = bogus
+}
+
+// assertAddRotationSelectsOneRow checks that every member of an add-rotated
+// committee derives the same signing row from its own share alone, the way
+// the distributed signing party does. Only the correction group's members
+// hold a folded component, so the rotation flag is what carries the choice
+// to the others; the flag also survives the share encoding.
+func assertAddRotationSelectsOneRow(t *testing.T, shares []*LocalShare) {
+	t.Helper()
+	want, ok := signingParameterFamilyRotated[len(shares)]
+	if !ok {
+		t.Fatalf("no rotated row for committee size %d", len(shares))
+	}
+	folded := 0
+	for _, share := range shares {
+		if !share.Rotated {
+			t.Fatalf("participant %d: add-rotated share lacks the rotation flag", share.ParticipantID)
+		}
+		for _, component := range share.Components {
+			if componentMultiplicity(component) > 1 {
+				folded++
+				break
+			}
+		}
+		row, err := SigningParametersForShares([]*LocalShare{share})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row != want {
+			t.Fatalf("participant %d selects J=%d, want the rotated row's J=%d", share.ParticipantID, row.ParallelSlots, want.ParallelSlots)
+		}
+		encoded, err := share.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := UnmarshalLocalShare(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.Rotated {
+			t.Fatalf("participant %d: rotation flag lost in the share encoding", share.ParticipantID)
+		}
+		decoded.Zeroize()
+	}
+	// The flag matters only because some members hold no folded component.
+	if folded == 0 || folded == len(shares) {
+		t.Fatalf("%d of %d add-rotated shares hold a folded component; the add shape folds only the correction group", folded, len(shares))
+	}
 }
 
 func reshareStubShare(t *testing.T, position uint8) *LocalShare {

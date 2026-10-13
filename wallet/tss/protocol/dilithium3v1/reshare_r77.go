@@ -613,7 +613,7 @@ func (plan *ReshareRotationPlan) AssembleAddLocalComponents(
 		if err != nil {
 			return nil, err
 		}
-		if delta.Component != want.Component {
+		if !rssComponentsEqualConstantTime(delta.Component, want.Component) {
 			return nil, fmt.Errorf("%w: weaver delta mismatch for group %06b", ErrReshareRotationInput, uint16(plan.CorrectionGroup))
 		}
 	}
@@ -743,6 +743,7 @@ func (plan *ReshareRotationPlan) ResharedShare(
 		TranscriptDigest:    transcriptDigest,
 		Rho:                 old.Rho,
 		Components:          components,
+		Rotated:             true,
 	}, nil
 }
 
@@ -852,6 +853,7 @@ func (plan *ReshareRotationPlan) ResharedAddedShare(
 		TranscriptDigest:    transcriptDigest,
 		Rho:                 rho,
 		Components:          components,
+		Rotated:             true,
 	}, nil
 }
 
@@ -903,6 +905,11 @@ const (
 	ReshareDeltaKindCorrection = uint8(2)
 )
 
+// reshareDeltaWireSize is the fixed delta layout: magic, session and committee
+// digests, kind, source and target masks, anchor and recipient positions,
+// contribution digest, multiplicity, and the S1/S2 vectors.
+const reshareDeltaWireSize = 8 + 32 + 32 + 1 + 2 + 2 + 1 + 1 + 32 + 4 + (L+K)*PolyEncodedSize
+
 // ReshareDeltaWire is the on-the-wire delta body inside the versioned
 // threshold envelope. AnchorPosition and RecipientPosition use NEW-committee
 // coordinates: anchors and recipients are survivors of the removal (or
@@ -951,6 +958,11 @@ func UnmarshalReshareDeltaWire(encoded []byte) (ReshareDeltaWire, error) {
 	var message ReshareDeltaWire
 	if len(encoded) < 8 || string(encoded[:8]) != reshareDeltaWireMagic {
 		return message, fmt.Errorf("%w: reshare delta magic", ErrReshareRotationInput)
+	}
+	// The layout is fixed, so the exact length is checked before any field is
+	// sliced: a truncated delta from a peer is an error, never a panic.
+	if len(encoded) != reshareDeltaWireSize {
+		return message, fmt.Errorf("%w: reshare delta length %d, want %d", ErrReshareRotationInput, len(encoded), reshareDeltaWireSize)
 	}
 	offset := 8
 	copy(message.SessionDigest[:], encoded[offset:offset+32])

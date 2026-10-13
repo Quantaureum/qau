@@ -249,13 +249,21 @@ func SigningParametersForParticipants(participants int) (SigningParameters, erro
 	return row, nil
 }
 
-// shareCarriesRotationFold reports whether any component of the share carries
-// fold multiplicity above 1: the marker every remove-rotated share gets. Such
-// shares cannot sign under the fresh row (the radius margin is sized for
-// eta=1 fresh secrets), so rotation state becomes the row selector.
+// shareCarriesRotationFold reports whether the share comes from an R77
+// rotation: it carries the rotation flag, or any of its components carries
+// fold multiplicity above 1 (every remove-rotated share does, including the
+// ones encoded before the flag existed). Folded secrets cannot sign under the
+// fresh row (the radius margin is sized for eta=1 fresh secrets), so rotation
+// state becomes the row selector. The flag is what makes the choice
+// committee-wide after an add rotation, where only the correction group's
+// members hold a folded component: without it the other members would pick
+// the fresh row from their own shares and split the session.
 func shareCarriesRotationFold(share *LocalShare) bool {
 	if share == nil {
 		return false
+	}
+	if share.Rotated {
+		return true
 	}
 	for index := range share.Components {
 		if componentMultiplicity(share.Components[index]) > 1 {
@@ -267,9 +275,11 @@ func shareCarriesRotationFold(share *LocalShare) bool {
 
 // SigningParametersForShares returns the pinned row for the session's share
 // profile: every active share must agree on the committee size or the request
-// fails closed; if any active share carries a rotation fold, the rotated row is
-// selected. All signers of one session rotate together, so the row choice is
-// identical on every member.
+// fails closed; if any active share comes from a rotation, the rotated row is
+// selected. All signers of one session rotate together and every rotated
+// share carries the rotation flag, so a member deriving the row from its own
+// share alone (the distributed party does) gets the row every other member
+// gets.
 func SigningParametersForShares(shares []*LocalShare) (SigningParameters, error) {
 	if len(shares) == 0 || shares[0] == nil {
 		return SigningParameters{}, fmt.Errorf("%w: no active shares", ErrNoSigningRow)

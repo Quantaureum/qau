@@ -1028,6 +1028,68 @@ the threshold design document.
    R58. R58 deletes what is unused; anything kept must be test-only or
    explicitly quarantined, and nothing on the signing path may import it.
 
+### Status after the side-channel review and the security re-estimation
+
+**Obligation 5 (constant-time and side-channel review): done; findings fixed.**
+
+- The per-slot ball point masks a signer's partial secret in the response it
+  broadcasts, so its seed must carry the full strength of the signer's
+  cryptographic source. The point is now drawn from a fresh 32-byte seed of that
+  source, expanded with SHAKE256 under its own domain. No production file of the
+  package may import `math/rand`; a test enforces it.
+- The Gaussian coordinates were drawn with the standard library's ziggurat
+  method, which reads its tables at secret-dependent indices and takes
+  value-dependent slow paths. They now come from Marsaglia's polar method on
+  53-bit uniforms, with a branch-free logarithm (`signingLogUnit`). Rejected
+  candidates are independent of the accepted pair. On amd64 and arm64 the
+  compiled logarithm, the centering, and the modular reduction contain no
+  conditional branch.
+- A debug switch that printed the secret-dependent rejection norm of every slot
+  was removed.
+- Per-slot secrets (the ball point, the partial secrets, the challenge shift,
+  the prepared-digest buffer, and the sampler state) are now erased once the
+  response part is released, on burn, and when the party finishes. The node
+  erases its copies of the full share after every attempt. A test asserts the
+  erasure on both the signed and the starved path.
+- Lower-severity fixes: the rejection test multiplies by `1/nu` instead of
+  dividing a secret value; a secret coefficient no longer reaches an error
+  string; a secret component comparison is constant time; the offline dealer
+  erases its global randomness and contributions; a truncated reshare delta is
+  refused before any field is read instead of panicking.
+- Remove-rotation fold deltas carry complete secret components. They were
+  broadcast to every connected peer; they now go only to their recipient, over
+  that peer's encrypted link, like the DKG's private group seeds.
+
+**Obligation 6 (lattice security re-estimation): done; the margin does not
+clear the legacy level for every exposed instance.**
+
+Using the unmodified pq-crystals security-estimates scripts, validated against
+the published round-3 numbers (Dilithium3 key recovery: block size 624, core-SVP
+182 classical / 165 quantum bits):
+
+| instance | coefficient std | primal block size | core-SVP bits (classical / quantum) |
+|---|---|---|---|
+| native mode3 secret | 2.58 | 624 | 182.5 / 165.5 |
+| aggregate of 20 components | 3.65 | 661 | 193.3 / 175.3 |
+| one published group contribution `t_U` | 0.82 | 519 | 151.8 / 137.7 |
+| residual left to two corrupt participants | 1.63 | 579 | 169.4 / 153.6 |
+
+- The aggregate clears the legacy level, as the R57 reasoning expected.
+- The DKG publishes every group's full `t_U`, and each is an MLWE instance with
+  a ternary secret. Recovering one component needs only that instance, and it
+  sits about 31 classical bits below native. Two corrupt participants already
+  hold 16 of the 20 components; without the `t_U` broadcast their residual
+  would still sit below native.
+- Forgery hardness (MSIS and SelfTargetMSIS) is unchanged, because the verifier
+  is unmodified.
+- Restoring native key-recovery hardness for a single component needs a
+  component bound of 4 (block size 624), which is the reference construction's
+  choice and costs far more signing slots per request than the pinned row.
+- Until the component bound or the DKG's publication of `t_U` changes, no
+  "Dilithium3-equivalent" or "NIST category 3" claim may be made for keys of
+  this backend. Forgery resistance and the classical and quantum figures above
+  are the claims the estimate supports.
+
 ## Test Strategy and Acceptance Criteria
 
 Vector and unit level, against the local reference implementation:

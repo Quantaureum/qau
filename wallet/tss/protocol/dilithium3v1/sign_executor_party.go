@@ -22,11 +22,10 @@ package dilithium3v1
 // material, and is sticky.
 
 import (
-	"encoding/binary"
+	"crypto/sha3"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"slices"
 	"sync"
 
@@ -130,29 +129,38 @@ func NewSigningExecutorParty(config SigningExecutorPartyConfig) (*SigningExecuto
 	if err != nil {
 		return nil, err
 	}
+	// The party keeps its own copy; the sampled original is erased here.
+	defer point.wipe()
 	return newSigningExecutorParty(config, params, point)
 }
 
-// sampleSigningExecutorPartyRandomness draws one uniform ball point from the
-// caller's source: eight bytes seed the deterministic stream the sampler
-// consumes. A production caller passes a cryptographic source, so the seed is
-// unpredictable; the stream itself is deterministic given the seed.
+// signingBallSeedSize is the number of entropy bytes behind one ball point.
+const signingBallSeedSize = 32
+
+// signingBallStreamDomain separates the ball-point expansion from every other
+// SHAKE256 use of the protocol.
+const signingBallStreamDomain = "QAU-TDILITHIUM3-V1-SIGNING-BALL-POINT"
+
+// sampleSigningExecutorPartyRandomness draws one uniform ball point from a
+// fresh 32-byte seed of the caller's source (crypto/rand in production),
+// expanded with SHAKE256. The point is the secret mask of this signer's
+// broadcast commitment and response, so its whole entropy is the seed's: it is
+// never derived from a non-cryptographic generator, and the seed and the
+// expansion state are erased once the point is drawn.
 func sampleSigningExecutorPartyRandomness(entropy io.Reader, params SigningParameters) (*signingRandomness, error) {
 	if entropy == nil {
 		return nil, fmt.Errorf("%w: missing entropy source", ErrInvalidSigningRandomness)
 	}
-	var seed [8]byte
+	var seed [signingBallSeedSize]byte
+	defer wipeBytes(seed[:])
 	if _, err := io.ReadFull(entropy, seed[:]); err != nil {
 		return nil, fmt.Errorf("%w: entropy: %v", ErrInvalidSigningRandomness, err)
 	}
-	// #nosec G404 -- deterministic seeded sampler for session replayability;
-	// the 8 seed bytes come from the caller's entropy source (crypto/rand in
-	// production), the PRNG only expands them reproducibly.
-	point, err := sampleSigningRandomness(rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed[:])))), params)
-	if err != nil {
-		return nil, err
-	}
-	return point, nil
+	stream := sha3.NewSHAKE256()
+	defer stream.Reset()
+	_, _ = stream.Write([]byte(signingBallStreamDomain))
+	_, _ = stream.Write(seed[:])
+	return sampleSigningRandomness(stream, params)
 }
 
 // newSigningExecutorParty validates the binding and assembles the party around
@@ -220,6 +228,9 @@ func newSigningExecutorParty(
 		return nil, fmt.Errorf("%w: local share rho does not match the key", errInvalidSigningAttempt)
 	}
 	partialFirst, partialSecond := localPartialSecrets(config.Share, len(config.Share.Committee.Participants), allocation)
+	// The signer holds its own copy; these locals are erased on every return.
+	defer wipePolys(partialFirst[:])
+	defer wipePolys(partialSecond[:])
 	// The partial's norm bound tracks the underlying contribution count, not
 	// the raw group count: after an R77 rotation a folded group carries the
 	// multiplicity the rotation history assigned to it (public via the
@@ -266,7 +277,7 @@ func newSigningExecutorParty(
 			identities:     append([]uint32(nil), config.Signers...),
 			fullMask:       uint8(1<<params.Threshold) - 1,
 			params:         params,
-			randomness:     point,
+			randomness:     point.clone(),
 			partialFirst:   partialFirst,
 			partialSecond:  partialSecond,
 			journal:        config.Journal,
@@ -433,6 +444,8 @@ func (party *SigningExecutorParty) Finish() ([]byte, error) {
 	}
 	party.lock.Lock()
 	defer party.lock.Unlock()
+	// Finish ends the slot on every outcome, so no per-slot secret survives it.
+	defer party.signer.wipeSecrets()
 	if party.aborted != nil {
 		return nil, party.aborted
 	}

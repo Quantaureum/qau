@@ -125,9 +125,10 @@ func TestSigningExecutorC7FamilyRow(t *testing.T) {
 	if err := request.Validate(); err != nil {
 		t.Fatalf("request rejected for the C=7 row: %v", err)
 	}
-	// Draw fresh slots until the reference accepts one; the C=7 per-slot
-	// acceptance is about a half, so the pinned budget covers it many times
-	// over.
+	// Draw fresh slots until the reference accepts one. A pinned row's
+	// budget J gives one request about a one-in-two chance of success, so
+	// the search spans eight requests' worth of slots (failure ~2^-8 for any
+	// sampler stream) rather than depending on one seed's luck.
 	source := rand.New(rand.NewSource(0xC7))
 	journal := signingTestJournal(t)
 	var (
@@ -135,7 +136,7 @@ func TestSigningExecutorC7FamilyRow(t *testing.T) {
 		chosenRandomness []*signingRandomness
 		chosenSlot       uint16
 	)
-	for slot := uint16(1); slot <= uint16(params.ParallelSlots); slot++ {
+	for slot := uint16(1); slot <= uint16(8*params.ParallelSlots); slot++ {
 		randomness := make([]*signingRandomness, params.Threshold)
 		for index := range randomness {
 			point, drawErr := sampleSigningRandomness(source, params)

@@ -407,7 +407,10 @@ func TestSigningExecutorHonestRunMatchesReference(t *testing.T) {
 	accepted := 0
 	rejected := 0
 	for _, mask := range []uint8{0x0F, 0x3C, 0x33} {
-		for slot := 1; slot <= 5; slot++ {
+		// Five slots per active set, extended until an accepted slot has been
+		// seen: a slot is accepted with probability ~0.07, so a fixed handful
+		// of slots can miss the accepted class for some sampler streams.
+		for slot := 1; slot <= 5 || (accepted == 0 && slot <= 96); slot++ {
 			randomness := signingExecutorTestRandomness(t, int64(0x5E00+slot*131+int(mask)*7))
 			request := signingExecutorTestRequest(fixture, uint16(slot))
 			active := fixture.activeShares(t, mask)

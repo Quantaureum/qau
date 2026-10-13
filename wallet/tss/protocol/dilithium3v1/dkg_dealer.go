@@ -66,6 +66,12 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 	// One contribution per participant mirrors the distributed round that
 	// feeds DeriveDKGRandomness, keeping the rho/global domains identical.
 	contributions := make([][32]byte, participants)
+	// Every secret below is erased on every exit, error paths included.
+	defer func() {
+		for index := range contributions {
+			dealWipe(contributions[index][:])
+		}
+	}()
 	for i := range contributions {
 		if err := dealNonzero(entropy, contributions[i][:]); err != nil {
 			return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: contribution %d: %w", i, err)
@@ -75,8 +81,17 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 	if err != nil {
 		return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: randomness: %w", err)
 	}
+	defer dealWipe(global[:])
 
+	// components holds every group's secret, the whole key; the shares take
+	// value copies, so it is erased once they are built (or on any failure).
 	components := make([]RSSComponent, len(groups))
+	defer func() {
+		for index := range components {
+			wipePolys(components[index].S1[:])
+			wipePolys(components[index].S2[:])
+		}
+	}()
 	contributionsPublic := make([]PublicContribution, len(groups))
 	owned := make([][]RSSGroupMask, participants)
 	for position := 0; position < participants; position++ {
@@ -99,6 +114,9 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 		if err != nil {
 			return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: group %d component: %w", groupIndex, err)
 		}
+		// The component below takes copies; the locals are erased on every exit.
+		defer wipePolys(s1[:])
+		defer wipePolys(s2[:])
 		contribution, err := NewPublicContribution(sessionDigest, group, leader, rho, s1, s2)
 		if err != nil {
 			return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: group %d contribution: %w", groupIndex, err)
@@ -117,9 +135,6 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 			S2:                 s2,
 		}
 	}
-	dealWipeBytes := global
-	dealWipe(dealWipeBytes[:])
-
 	publicKey, transcriptDigest, err := AssembleMode3PublicKey(rho, contributionsPublic, participants)
 	if err != nil {
 		return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: assemble public key: %w", err)
@@ -131,6 +146,17 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 	}
 
 	shares := make([]*LocalShare, participants)
+	complete := false
+	defer func() {
+		if complete {
+			return
+		}
+		for _, share := range shares {
+			if share != nil {
+				share.Zeroize()
+			}
+		}
+	}()
 	for position := 0; position < participants; position++ {
 		share := &LocalShare{
 			Protocol:            session.Protocol,
@@ -156,11 +182,12 @@ func DealShares(session DKGSession, entropy io.Reader) ([]*LocalShare, protocol.
 				return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: position %d owns unknown group %x", position, uint16(group))
 			}
 		}
+		shares[position] = share
 		if err := share.Validate(); err != nil {
 			return nil, protocol.ThresholdKeyID{}, [32]byte{}, fmt.Errorf("dealer: share %d: %w", position, err)
 		}
-		shares[position] = share
 	}
+	complete = true
 	return shares, key, rho, nil
 }
 

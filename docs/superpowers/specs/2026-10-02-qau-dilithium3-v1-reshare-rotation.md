@@ -412,6 +412,24 @@ not justified.
   (produced on rotated shares, verified under the never-rotated group key)
   then passes with the row in place.
 
+  Correction (row selection after an add rotation): "all rotated shares
+  carry the marks identically" holds for the remove shape only. After an
+  add rotation the correction concentrates into one group, so only that
+  group's members hold a component with multiplicity > 1; every other
+  member's share looks fresh. Each signer derives the row from its own
+  share (the distributed party never sees the others), so the add seam's
+  signers split between the fresh C=7 row (J=43) and the rotated one
+  (J=466) and the request failed on the slot-count check before any
+  signing started. Rotated shares now carry an explicit rotation flag
+  (`LocalShare.Rotated`, set by both reshare builders), and the row
+  selector treats a flagged share as rotated whatever its multiplicities.
+  The flag is persisted as share-encoding version 4 (version 3 plus one
+  flags byte after rho); only rotated shares use it, so fresh shares,
+  including every offline-ceremony share, keep their version-3 bytes.
+  `TestResharedShareCarriesKeyAcrossAdd` asserts that every add-rotated
+  member selects the rotated row from its own share and that the flag
+  survives the encoding; `TestLocalShareRotatedEncoding` pins the format.
+
   Same-key ADD signing therefore needs a resharing-level redesign, and the
   natural one is also measured: cycle-difference spreading (replace every
   weave component k by the difference fresh_k - fresh_{pi(k)} along a

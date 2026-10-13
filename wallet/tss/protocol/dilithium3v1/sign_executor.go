@@ -44,8 +44,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
-	"os"
 	"sync"
 
 	"github.com/quantaureum/qau/wallet/tss/protocol"
@@ -195,6 +193,10 @@ func signingExecutorPreparedDigest(
 	randomness *signingRandomness,
 ) ([32]byte, error) {
 	buffer := make([]byte, 0, len(signingExecutorPreparedDomain)+32+4+2+32+(L+K)*PolyEncodedSize)
+	// The buffer is sized for everything appended below, so the appends never
+	// move it; wiping its whole capacity erases the encoded secret ball point
+	// (wiping the slice as it stands here would cover only the public header).
+	defer wipeBytes(buffer[:cap(buffer)])
 	buffer = append(buffer, signingExecutorPreparedDomain...)
 	buffer = append(buffer, sessionID[:]...)
 	buffer = binary.BigEndian.AppendUint32(buffer, participantID)
@@ -206,6 +208,7 @@ func signingExecutorPreparedDigest(
 			return [32]byte{}, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 		}
 		buffer = append(buffer, encoded[:]...)
+		wipeBytes(encoded[:])
 	}
 	for row := range randomness.second {
 		encoded, err := EncodePoly(randomness.second[row])
@@ -213,6 +216,7 @@ func signingExecutorPreparedDigest(
 			return [32]byte{}, fmt.Errorf("%w: %v", errInvalidSigningAttempt, err)
 		}
 		buffer = append(buffer, encoded[:]...)
+		wipeBytes(encoded[:])
 	}
 	return sha3.Sum256(buffer), nil
 }
@@ -554,6 +558,9 @@ func (signer *signingExecutorSigner) advanceLocked() error {
 					))
 				}
 				signer.responseSent = true
+				// The released part is public; the mask and the partial
+				// secret behind it are not needed again.
+				signer.wipeSecretsLocked()
 				signer.parts[signer.position] = part
 				signer.partsSeen |= 1 << signer.position
 				signer.outbound = append(signer.outbound, signingExecutorEnvelope{
@@ -609,6 +616,7 @@ func (signer *signingExecutorSigner) burnLocked() error {
 		return nil
 	}
 	signer.burned = true
+	signer.wipeSecretsLocked()
 	_ = signer.record.RejectOpening(errSigningRejected)
 	if _, err := signer.journal.Advance(signer.sessionID, protocol.SingleUseBurned, nil); err != nil {
 		return fmt.Errorf(
@@ -616,6 +624,28 @@ func (signer *signingExecutorSigner) burnLocked() error {
 		)
 	}
 	return nil
+}
+
+// wipeSecretsLocked zeroizes this signer's per-slot secrets: the ball point,
+// the partial secrets, the challenge shift, and an unrevealed commitment
+// contribution. It runs once none of them can be needed again -- after the
+// response part is released, on burn, and when the party finishes -- and is
+// idempotent.
+func (signer *signingExecutorSigner) wipeSecretsLocked() {
+	signer.randomness.wipe()
+	wipePolys(signer.partialFirst[:])
+	wipePolys(signer.partialSecond[:])
+	wipeSignedPolys(signer.shiftFirst[:])
+	if !signer.revealSent {
+		wipePolys(signer.contribution[:])
+	}
+}
+
+// wipeSecrets is wipeSecretsLocked under the signer's lock.
+func (signer *signingExecutorSigner) wipeSecrets() {
+	signer.lock.Lock()
+	defer signer.lock.Unlock()
+	signer.wipeSecretsLocked()
 }
 
 // failLocked burns the signer's one-time material and returns the cause, or the
@@ -687,33 +717,19 @@ func (signer *signingExecutorSigner) computeChallengeLocked() error {
 		return fmt.Errorf("%w: signer %d challenge: %v", errInvalidSigningAttempt, signer.participantID, err)
 	}
 	shiftFirst, shiftSecond := signingExecutorChallengeShift(signer.partialFirst, signer.partialSecond, challenge)
+	// c*spart^(2) is never published; it only feeds the local rejection test.
+	defer wipeSignedPolys(shiftSecond[:])
 	passes, err := signingRejectionTest(signer.randomness, shiftFirst, shiftSecond, signer.params.Radius)
 	if err != nil {
+		wipeSignedPolys(shiftFirst[:])
 		return fmt.Errorf("%w: signer %d rejection test: %v", errInvalidSigningAttempt, signer.participantID, err)
-	}
-	if os.Getenv("QAU_DEBUG_SIGNING_NORM") == "1" {
-		var debugTotal float64
-		for row := 0; row < L; row++ {
-			for index := 0; index < N; index++ {
-				v := float64(shiftFirst[row][index])/SigningRandomnessNu + signer.randomness.raw[row*N+index]
-				debugTotal += v * v
-			}
-		}
-		for row := 0; row < K; row++ {
-			for index := 0; index < N; index++ {
-				v := float64(shiftSecond[row][index]) + signer.randomness.raw[(L+row)*N+index]
-				debugTotal += v * v
-			}
-		}
-		fmt.Printf("QAU_DEBUG_NORM signer=%d norm=%.0f radius=%.0f ratio=%.3f pass=%v\n",
-			signer.participantID, math.Sqrt(debugTotal), signer.params.Radius,
-			math.Sqrt(debugTotal)/signer.params.Radius, passes)
 	}
 	signer.w = w
 	signer.highBits = highBits
 	signer.seed = seed
 	signer.challenge = challenge
 	signer.shiftFirst = shiftFirst
+	wipeSignedPolys(shiftFirst[:])
 	signer.accepted = passes
 	return nil
 }
@@ -881,7 +897,7 @@ func newSigningExecutorSession(
 			identities:     participantIDs,
 			fullMask:       fullMask,
 			params:         params,
-			randomness:     material[index].randomness,
+			randomness:     material[index].randomness.clone(),
 			partialFirst:   partialFirst[index],
 			partialSecond:  partialSecond[index],
 			journal:        material[index].journal,

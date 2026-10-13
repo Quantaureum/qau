@@ -46,18 +46,17 @@ func Normalize(coefficient Coefficient) Coefficient {
 // CenteredCoefficient returns the centered representative of a coefficient in
 // the interval (-q/2, q/2].
 func CenteredCoefficient(coefficient Coefficient) Coefficient {
-	value := Normalize(coefficient)
-	if value > Q/2 {
-		value -= Q
-	}
-	return value
+	// Branch-free: subtract q exactly when the value exceeds q/2, selected by
+	// the sign of q/2 - value. Coefficients are often secret.
+	value := int64(Normalize(coefficient))
+	value -= Q & ((Q/2 - value) >> 63)
+	return Coefficient(value)
 }
 
 func normalizeInt64(value int64) Coefficient {
+	// Branch-free: add q exactly when the remainder is negative.
 	value %= Q
-	if value < 0 {
-		value += Q
-	}
+	value += Q & (value >> 63)
 	return Coefficient(value)
 }
 

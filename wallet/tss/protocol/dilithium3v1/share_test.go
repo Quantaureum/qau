@@ -2,6 +2,7 @@
 package dilithium3v1
 
 import (
+	"crypto/sha3"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -96,6 +97,82 @@ func TestLocalShareEncodingRoundTripAndTamperRejection(t *testing.T) {
 	wrongMagic[0] = 'X'
 	if _, err := UnmarshalLocalShare(wrongMagic); !errors.Is(err, ErrInvalidLocalShareEncoding) {
 		t.Fatalf("magic error = %v", err)
+	}
+}
+
+// TestLocalShareRotatedEncoding pins the rotation flag's encoding: a fresh
+// share keeps its version-3 bytes, a rotated share is version 4 with exactly
+// one flags byte, and any other flags value is rejected.
+func TestLocalShareRotatedEncoding(t *testing.T) {
+	fresh := testLocalShare(t)
+	freshEncoded, err := fresh.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version := binary.BigEndian.Uint16(freshEncoded[8:10]); version != 3 {
+		t.Fatalf("fresh share version = %d, want 3", version)
+	}
+	restored, err := UnmarshalLocalShare(freshEncoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Rotated {
+		t.Fatal("fresh share decoded as rotated")
+	}
+
+	rotated := fresh.Clone()
+	rotated.Rotated = true
+	rotatedEncoded, err := rotated.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version := binary.BigEndian.Uint16(rotatedEncoded[8:10]); version != 4 {
+		t.Fatalf("rotated share version = %d, want 4", version)
+	}
+	if len(rotatedEncoded) != len(freshEncoded)+1 || len(rotatedEncoded) != localShareEncodedSize(rotated) {
+		t.Fatalf("rotated encoding is %d bytes, fresh %d, sized %d", len(rotatedEncoded), len(freshEncoded), localShareEncodedSize(rotated))
+	}
+	restored, err = UnmarshalLocalShare(rotatedEncoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.Rotated {
+		t.Fatal("rotation flag lost in the round trip")
+	}
+	for index := range rotated.Components {
+		if restored.Components[index] != rotated.Components[index] {
+			t.Fatalf("component %d changed in the round trip", index)
+		}
+	}
+
+	componentSize := componentMetadataSize + componentSecretPolyCount*PolyEncodedSize
+	flagsOffset := len(rotatedEncoded) - shareDigestSize - len(rotated.Components)*componentSize - 1
+	if rotatedEncoded[flagsOffset] != localShareFlagRotated {
+		t.Fatalf("flags byte at %d = %d", flagsOffset, rotatedEncoded[flagsOffset])
+	}
+	resealed := func(encoded []byte) []byte {
+		body := append([]byte(nil), encoded[:len(encoded)-shareDigestSize]...)
+		digest := sha3.Sum256(body)
+		return append(body, digest[:]...)
+	}
+	for _, flags := range []byte{0, 2, 3, 0x80} {
+		mutated := append([]byte(nil), rotatedEncoded...)
+		mutated[flagsOffset] = flags
+		if _, err := UnmarshalLocalShare(resealed(mutated)); !errors.Is(err, ErrInvalidLocalShareEncoding) {
+			t.Fatalf("flags %#x: error = %v", flags, err)
+		}
+	}
+	// A version-4 header over a version-3 body has no flags byte to read.
+	relabeled := append([]byte(nil), freshEncoded...)
+	binary.BigEndian.PutUint16(relabeled[8:10], 4)
+	if _, err := UnmarshalLocalShare(resealed(relabeled)); err == nil {
+		t.Fatal("version-4 header over a version-3 body accepted")
+	}
+	// And a version-3 header over a rotated body leaves a stray byte.
+	relabeled = append([]byte(nil), rotatedEncoded...)
+	binary.BigEndian.PutUint16(relabeled[8:10], 3)
+	if _, err := UnmarshalLocalShare(resealed(relabeled)); err == nil {
+		t.Fatal("version-3 header over a rotated body accepted")
 	}
 }
 
