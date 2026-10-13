@@ -20,7 +20,10 @@ package profiling
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	rpprof "runtime/pprof"
 	"testing"
+	"time"
 )
 
 // TestP3_Pprof_DefaultConfigHasPprofDisabled verifies that
@@ -140,5 +143,43 @@ func TestP3_Pprof_StopWithoutStartIsNoop(t *testing.T) {
 		t.Errorf("P3-PPROF-TOKEN-CLEANUP REGRESSION: tokenFile was set "+
 			"(value=%q) even though EnablePprof=false. No token file "+
 			"should be created when pprof is disabled.", p.tokenFile)
+	}
+}
+
+// TestProfilerLeavesContentionProfilingOffWithoutPprof pins that a profiler
+// without the pprof server does not switch on block or mutex profiling: the
+// default node profiler is one, and nothing would read the profiles.
+func TestProfilerLeavesContentionProfilingOffWithoutPprof(t *testing.T) {
+	defer runtime.SetBlockProfileRate(0)
+	defer runtime.SetMutexProfileFraction(0)
+	runtime.SetBlockProfileRate(0)
+	runtime.SetMutexProfileFraction(0)
+
+	NewProfiler(nil)
+	if fraction := runtime.SetMutexProfileFraction(-1); fraction != 0 {
+		t.Fatalf("default profiler set the mutex profile fraction to %d", fraction)
+	}
+	before := rpprof.Lookup("block").Count()
+	release := make(chan struct{})
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(release)
+	}()
+	<-release
+	if recorded := rpprof.Lookup("block").Count() - before; recorded != 0 {
+		t.Fatalf("default profiler recorded %d block events", recorded)
+	}
+
+	// Without pprof the block and mutex profiles are refused, not written empty.
+	quiet := NewProfiler(&ProfileConfig{OutputDir: t.TempDir()})
+	for _, profileType := range []ProfileType{ProfileBlock, ProfileMutex} {
+		if _, err := quiet.CaptureProfile(profileType, ""); err == nil {
+			t.Fatalf("%s profile captured without pprof enabled", profileType)
+		}
+	}
+
+	NewProfiler(&ProfileConfig{EnablePprof: true, BlockRate: 1, MutexFraction: 1})
+	if fraction := runtime.SetMutexProfileFraction(-1); fraction != 1 {
+		t.Fatalf("pprof profiler left the mutex profile fraction at %d", fraction)
 	}
 }

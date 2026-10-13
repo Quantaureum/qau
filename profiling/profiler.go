@@ -80,9 +80,15 @@ func NewProfiler(config *ProfileConfig) *Profiler {
 		config = DefaultProfileConfig()
 	}
 
-	// Enable block and mutex profiling
-	runtime.SetBlockProfileRate(config.BlockRate)
-	runtime.SetMutexProfileFraction(config.MutexFraction)
+	// Block and mutex profiling run only alongside the pprof server, the
+	// only consumer of their data. At the default rates every blocking
+	// event and every contended lock, the runtime's own locks included,
+	// records a stack: a cost that grows with message traffic, and on a
+	// production node with pprof off it bought nothing.
+	if config.EnablePprof {
+		runtime.SetBlockProfileRate(config.BlockRate)
+		runtime.SetMutexProfileFraction(config.MutexFraction)
+	}
 
 	return &Profiler{
 		config: config,
@@ -293,6 +299,12 @@ func (p *Profiler) StopCPUProfile() (string, error) {
 
 // CaptureProfile captures a profile of the specified type
 func (p *Profiler) CaptureProfile(profileType ProfileType, filename string) (string, error) {
+	// Block and mutex events are recorded only alongside the pprof server
+	// (NewProfiler); without it these profiles would be silently empty.
+	if (profileType == ProfileBlock || profileType == ProfileMutex) && !p.config.EnablePprof {
+		return "", fmt.Errorf("%s profile is recorded only with pprof enabled (EnablePprof)", profileType)
+	}
+
 	// Ensure output directory exists
 	if err := os.MkdirAll(p.config.OutputDir, 0755); err != nil { // #nosec G301
 		return "", fmt.Errorf("failed to create output directory: %w", err)
