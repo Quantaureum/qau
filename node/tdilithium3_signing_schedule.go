@@ -131,13 +131,25 @@ func (schedule *tdilithium3SigningRequestSchedule) run(
 		party  tdilithium3SigningSlot
 	}
 	candidates := make([]candidate, 0, schedule.slots)
+	// A failed build abandons the request; Finish erases the per-slot secrets
+	// (ball point, partial secrets) of every party built so far.
+	abandon := func(extra tdilithium3SigningSlot) {
+		for _, built := range candidates {
+			_, _ = built.party.Finish()
+		}
+		if extra != nil {
+			_, _ = extra.Finish()
+		}
+	}
 	for slot := uint16(1); slot <= schedule.slots; slot++ {
 		party, transport, inbox, err := schedule.factory(slot)
 		if err != nil {
+			abandon(party)
 			return nil, nil, err
 		}
 		driver, err := newTDilithium3SigningSlotDriver(schedule.node, party, transport, inbox)
 		if err != nil {
+			abandon(party)
 			return nil, nil, err
 		}
 		candidates = append(candidates, candidate{slot: slot, driver: driver, party: party})

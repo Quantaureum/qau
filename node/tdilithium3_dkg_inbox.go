@@ -190,10 +190,11 @@ func (inbox *tdilithium3DKGInbox) accept(message p2p.PeerMessage) error {
 		recipient = &inbox.recipientPosition
 	}
 	if message.Type == p2p.MsgTypeTDilithium3ReshareDelta {
-		// Cheap silent pre-filter: fold deltas are broadcast committee-wide,
-		// but only the named recipient consumes them. Discard foreign-recipient
-		// envelopes before paying for envelope verification — that is the
-		// documented discard path, not a rejection worth logging.
+		// Cheap silent pre-filter: fold deltas are sent to their recipient
+		// alone, so a foreign-recipient envelope only arrives from a sender
+		// that misaddressed it. Discard it before paying for envelope
+		// verification — the documented discard path, not a rejection worth
+		// logging.
 		if envelope, envErr := protocol.DecodeEnvelope(message.Payload); envErr == nil {
 			if wire, wireErr := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload); wireErr == nil &&
 				wire.RecipientPosition != inbox.recipientPosition {

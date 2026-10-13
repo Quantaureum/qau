@@ -1694,7 +1694,42 @@ func (qfs *QTDFinalityState) GetPendingSeal(slot uint64) *PendingSeal {
 		// to sign, so it refuses the seal instead of signing the wrong bytes.
 		ChainID: p.ChainID,
 		Epoch:   p.Epoch,
+		// The stake view the completed seal is checked against, deep-copied:
+		// the v1 seal executor picks signer subsets that meet it.
+		RequiredWeight: copyBigInt(p.RequiredWeight),
+		MemberStakes:   copyStakeMap(p.MemberStakes),
 	}
+}
+
+// copyBigInt returns an independent copy of value, or nil.
+func copyBigInt(value *big.Int) *big.Int {
+	if value == nil {
+		return nil
+	}
+	return new(big.Int).Set(value)
+}
+
+// copyStakeMap returns an independent copy of a validator-index stake map, or nil.
+func copyStakeMap(stakes map[int]*big.Int) map[int]*big.Int {
+	if stakes == nil {
+		return nil
+	}
+	copied := make(map[int]*big.Int, len(stakes))
+	for index, stake := range stakes {
+		copied[index] = copyBigInt(stake)
+	}
+	return copied
+}
+
+// SealerStakeSnapshot returns the stake view a seal requested now would be
+// checked against: every validator's stake by index and the required weight
+// (ceil(2/3) of the total), deep-copied. Nil values mean no view is available.
+func (qfs *QTDFinalityState) SealerStakeSnapshot() (map[int]*big.Int, *big.Int) {
+	if qfs == nil {
+		return nil, nil
+	}
+	stakes, _, required := qfs.snapshotSealerStakes()
+	return copyStakeMap(stakes), copyBigInt(required)
 }
 
 func (qfs *QTDFinalityState) GetFinalizedSlotCount() int {

@@ -9,6 +9,7 @@ package node
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -109,12 +110,20 @@ func TestTDilithium3SigningIdentitiesForRoster(t *testing.T) {
 		fixture.roster, fixture.committee, []uint32{1, 2, 3, 9}, fixture.resolver(types.Address{}),
 	); err == nil {
 		t.Fatal("signer outside the roster accepted")
+	} else if errors.Is(err, errTDilithium3SigningSignerUnreachable) {
+		t.Fatalf("a signer outside the roster is reported as merely unreachable: %v", err)
 	}
 	denied := fixture.roster.Entries[2].Address
-	if _, err := tdilithium3SigningIdentitiesForRoster(
+	_, err = tdilithium3SigningIdentitiesForRoster(
 		fixture.roster, fixture.committee, fixture.signers, fixture.resolver(denied),
-	); err == nil {
+	)
+	if err == nil {
 		t.Fatal("signer without a peer binding accepted")
+	}
+	// An unreachable signer is a liveness condition, not a structural fault:
+	// the seal path moves on to an attempt whose subset excludes that signer.
+	if !errors.Is(err, errTDilithium3SigningSignerUnreachable) {
+		t.Fatalf("missing peer binding is not reported as an unreachable signer: %v", err)
 	}
 	if _, err := tdilithium3SigningIdentitiesForRoster(
 		nil, fixture.committee, fixture.signers, fixture.resolver(types.Address{}),

@@ -4,8 +4,10 @@ package node
 // Node-side seal executor wiring (design note, Slice 4, decision C). The seal
 // flow knows the slot, the block hash, and -- through its pending seal -- the
 // epoch and the chain the finality message binds, so this node seals by running
-// one interactive four-round session of the four fixed signers (the first four
-// committee positions) in place of the legacy per-node aggregation. The
+// one interactive four-round session of a threshold subset of the committee in
+// place of the legacy per-node aggregation. The subset rotates with the slot
+// and the attempt (tdilithium3SealSigningSubset), so one offline member never
+// stops sealing. The
 // submission goes through qfs.SubmitCompletedSeal, which verifies the produced
 // signature against the epoch's group public key, so the executor never has to
 // be trusted by the finality layer.
@@ -13,11 +15,11 @@ package node
 // Two properties shape the code. First, the request nonce is derived from the
 // seal tuple and the attempt ordinal, never drawn locally, because the four
 // signers must derive one session from public inputs alone; a retry announces a
-// higher ordinal, and the ordinal authority is the slot's proposer — or, when
-// the proposer is not one of the four signers (it then never joins the session
-// and could never retry it), the lowest signer as an authenticated delegate
-// (tdilithium3SealRetryDelegateAuthed). The session binding commits the
-// request, so an ordinal authority can equivocate only on the ordinal.
+// higher ordinal. The slot's proposer may announce any attempt, and every
+// signer of a failed attempt may announce the next one
+// (tdilithium3SealRetryAnnouncerAllowed), so a retry never depends on one
+// node. The session binding commits the request, so an announcer can
+// equivocate only on the ordinal, which is bounded.
 // Second, sessions of different slots run concurrently up to a bounded fan-out:
 // the authenticated inbox is keyed by session id, so a node can drive several
 // slots' sessions at once without their messages crossing. This is what keeps a
@@ -28,9 +30,9 @@ package node
 // attempt (a retry), because only one attempt of one slot may be live at once.
 //
 // Nothing here is enabled by construction: the gate is the existing
-// experimental switch plus the mainnet exclusion, the signer set is the fixed
-// first four, and every missing input fails closed. While the gate is closed
-// the legacy sealing path stays byte-for-byte unchanged.
+// experimental switch plus the mainnet exclusion, the signer subset is a pure
+// function of public inputs, and every missing input fails closed. While the
+// gate is closed the legacy sealing path stays byte-for-byte unchanged.
 
 import (
 	"context"
@@ -38,7 +40,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -49,16 +53,28 @@ import (
 )
 
 const (
-	// tdilithium3SealSigningMaxAttempts bounds the attempts one slot runs when
-	// this node drives its ordinals. Every attempt is its own session run by
-	// all four signers over fresh one-time material, so the bound is the
-	// liveness/cost knob: at the pinned fresh row's per-attempt success rate
-	// three attempts leave ~10% of slots to Casper — and that is the stop the
-	// concurrency budget tolerates: a full silence run costs ~15s per attempt,
-	// so a deeper bound lets failing slots outlive the parallel-session cap and
-	// starve the slots behind them (measured on the 10-09 devnet: attempt
-	// depth 5 saturated the 8-session cap and cascaded into follower misses).
-	tdilithium3SealSigningMaxAttempts = 3
+	// tdilithium3SealSigningMaxAttempts bounds the attempts of one slot. Every
+	// attempt is its own session over fresh one-time material, run by that
+	// attempt's signer subset (tdilithium3SealSigningSubset). Six attempts walk
+	// a round's three excluded pairs twice. At C = 6 every member sits out two
+	// of the six attempts, so a slot with one member offline still gets two
+	// attempts without it (each succeeds about half the time at the pinned
+	// fresh row); at C = 7 the round's bye member sits out none, so a slot
+	// whose bye is the offline member cannot seal (one slot in seven). An
+	// attempt with an unreachable signer fails within milliseconds and a
+	// filtered one within a few seconds; tdilithium3SealSigningRetryWindow
+	// bounds the slow case where attempts time out on silence.
+	tdilithium3SealSigningMaxAttempts = 6
+
+	// tdilithium3SealSigningRetryWindow bounds, from the sealed slot's own
+	// start, when any node may still start one of the slot's retry attempts.
+	// The bound is anchored to the slot, not to a node's run, so it holds for
+	// the whole committee: a member that joins late (it sat out the earlier
+	// attempts) inherits the slot's remaining window instead of a fresh one.
+	// The first attempt starts about one slot in, so retries get about three
+	// slots; a run of silent attempts (15 s each) then ends after the window
+	// plus one attempt, well inside the concurrent-session cap.
+	tdilithium3SealSigningRetryWindow = 4 * consensus.SlotDuration
 
 	// tdilithium3SealSigningRetryBackoff is the pause before a retry attempt
 	// starts locally. The retry announcement already told the other three
@@ -80,13 +96,13 @@ const (
 )
 
 // errTDilithium3SealSigningNotASigner reports that this node's validator is not
-// one of the four fixed signers of the epoch, which is a quiet outcome: the
-// node announced the seal request but does not join the session.
+// in the signer subset of the attempt, which is a quiet outcome: the node does
+// not join that attempt's session.
 var errTDilithium3SealSigningNotASigner = errors.New("local validator is not one of the Dilithium3 v1 seal signers")
 
 // tdilithium3SealSigningSession is the running executor attempt of one slot.
-// The attempt is the highest announced ordinal, and cancel stops the slot when
-// a higher ordinal arrives.
+// The attempt is the highest admitted ordinal, and cancel stops the slot when
+// the next ordinal is admitted (tdilithium3SealOrdinalAdmissible).
 type tdilithium3SealSigningSession struct {
 	attempt uint64
 	cancel  context.CancelFunc
@@ -138,77 +154,265 @@ func tdilithium3SealSigningOrdinal(payload []byte) uint64 {
 	return binary.BigEndian.Uint64(payload[tdilithium3SealSigningRequestBaseLen : tdilithium3SealSigningRequestBaseLen+8])
 }
 
-// tdilithium3SealSigningSignersForRoster returns the fixed signers of one
-// epoch: the first t committee participants in canonical order, which are the
-// first t roster positions, where t comes from the committee itself (t = 4 at
-// C = 6, t = 5 at C = 7 per the pinned family). The boolean reports whether
-// local is one of them. Fixing the set keeps the selection deterministic on
-// every node with no extra round; a later revision may rotate the subset
-// without touching the session binding.
+// tdilithium3SealSigningWeights is the stake view a seal's signers must meet:
+// the stake of every committee position and the weight the finality engine
+// requires of a completed seal (SubmitCompletedSeal checks the signers' stake
+// against it). The zero value carries no constraint.
+type tdilithium3SealSigningWeights struct {
+	stakes   []*big.Int
+	required *big.Int
+}
+
+// admits reports whether leaving the pair of positions out keeps the rest of
+// a committee of the given size at the required weight.
+func (weights tdilithium3SealSigningWeights) admits(size int, pair [2]int) bool {
+	if weights.required == nil || len(weights.stakes) != size {
+		return true
+	}
+	remaining := new(big.Int)
+	for position, stake := range weights.stakes {
+		if position == pair[0] || position == pair[1] || stake == nil {
+			continue
+		}
+		remaining.Add(remaining, stake)
+	}
+	return remaining.Cmp(weights.required) >= 0
+}
+
+// tdilithium3SealSigningSubset returns the signer subset of one attempt of one
+// slot: the committee minus one excluded pair (tdilithium3SealAttemptPairs).
+// With equal stakes the pairs are the slot's round-robin round (the circle
+// method; an odd committee adds a bye), so:
+//
+//   - the attempts of a slot walk the round's disjoint pairs, so every member
+//     but the bye sits out an attempt of the slot: a single offline member is
+//     skipped within one slot (unless it is the bye);
+//   - over one full round every pair sits out exactly once, so any two
+//     offline members still leave some slots sealable.
+//
+// A pair whose exclusion would leave the signers below the required stake is
+// never used: the finality engine would reject the finished signature.
+//
+// The subset is a pure function of the committee, the threshold, the slot,
+// the attempt, and the stake view, so every node derives the same one with no
+// extra round. Committees whose threshold does not leave exactly two members
+// out, and stake views no pair satisfies, keep the first t participants.
+func tdilithium3SealSigningSubset(
+	participants []uint32,
+	threshold int,
+	slot, attempt uint64,
+	weights tdilithium3SealSigningWeights,
+) ([]uint32, error) {
+	size := len(participants)
+	if size == 0 || threshold <= 0 || threshold > size {
+		return nil, fmt.Errorf("Dilithium3 v1 seal signers require a committee and a threshold within it")
+	}
+	for index, participant := range participants {
+		if participant == 0 || (index > 0 && participants[index-1] >= participant) {
+			return nil, fmt.Errorf("Dilithium3 v1 seal signer set is not canonically ordered")
+		}
+	}
+	if size-threshold != 2 {
+		return append([]uint32(nil), participants[:threshold]...), nil
+	}
+	pairs := tdilithium3SealAttemptPairs(size, slot, weights)
+	if len(pairs) == 0 {
+		return append([]uint32(nil), participants[:threshold]...), nil
+	}
+	pair := pairs[attempt%uint64(len(pairs))]
+	selected := make([]uint32, 0, threshold)
+	for position, participant := range participants {
+		if position == pair[0] || position == pair[1] {
+			continue
+		}
+		selected = append(selected, participant)
+	}
+	return selected, nil
+}
+
+// tdilithium3SealAttemptPairs returns the excluded pairs a slot's attempts
+// walk: the admissible pairs of the slot's round, topped up to the round's
+// length with admissible pairs of the following rounds, in round order, when
+// the stake view rules some out. With equal stakes this is exactly the slot's
+// round. Empty when no pair at all is admissible.
+func tdilithium3SealAttemptPairs(size int, slot uint64, weights tdilithium3SealSigningWeights) [][2]int {
+	players := size + size%2
+	rounds := uint64(players - 1)
+	perRound := size / 2
+	pairs := make([][2]int, 0, perRound)
+	for offset := uint64(0); offset < rounds && len(pairs) < perRound; offset++ {
+		for _, pair := range tdilithium3SealRoundPairs(size, slot+offset) {
+			if len(pairs) == perRound {
+				break
+			}
+			if weights.admits(size, pair) && !slices.Contains(pairs, pair) {
+				pairs = append(pairs, pair)
+			}
+		}
+	}
+	return pairs
+}
+
+// tdilithium3SealRoundPairs returns the disjoint position pairs of the
+// round-robin round the slot falls in, each pair ordered and the list sorted.
+// For an even size the circle method fixes the last position and rotates the
+// rest; an odd size plays with a bye, and the pair holding the bye leaves
+// nobody out, so it is omitted.
+func tdilithium3SealRoundPairs(size int, slot uint64) [][2]int {
+	players := size + size%2
+	rounds := players - 1
+	round := int(slot % uint64(rounds))
+	pairs := make([][2]int, 0, players/2)
+	add := func(a, b int) {
+		if a >= size || b >= size {
+			return
+		}
+		if a > b {
+			a, b = b, a
+		}
+		pairs = append(pairs, [2]int{a, b})
+	}
+	add(round, players-1)
+	for offset := 1; offset < players/2; offset++ {
+		add((round+offset)%rounds, (round-offset+rounds)%rounds)
+	}
+	slices.SortFunc(pairs, func(left, right [2]int) int {
+		if left[0] != right[0] {
+			return left[0] - right[0]
+		}
+		return left[1] - right[1]
+	})
+	return pairs
+}
+
+// tdilithium3SealSigningSignersForRoster returns the signer subset of one
+// attempt of one slot over the epoch's committee (t = 4 at C = 6, t = 5 at
+// C = 7 per the pinned family), and whether local is in it.
 func tdilithium3SealSigningSignersForRoster(
 	roster *tdilithium3DKGEpochRoster,
 	committee protocol.CommitteeID,
 	local types.Address,
+	slot, attempt uint64,
+	weights tdilithium3SealSigningWeights,
 ) ([]uint32, bool, error) {
 	threshold := int(committee.Threshold)
 	if roster == nil || len(committee.Participants) != len(roster.Entries) ||
 		len(committee.Participants) < threshold || threshold == 0 {
 		return nil, false, fmt.Errorf("Dilithium3 v1 seal signers require a roster and its committee")
 	}
-	selected := append([]uint32(nil), committee.Participants[:threshold]...)
-	for index, signer := range selected {
-		if signer == 0 || (index > 0 && selected[index-1] >= signer) {
-			return nil, false, fmt.Errorf("Dilithium3 v1 seal signer set is not canonically ordered")
-		}
+	selected, err := tdilithium3SealSigningSubset(committee.Participants, threshold, slot, attempt, weights)
+	if err != nil {
+		return nil, false, err
 	}
 	for position, entry := range roster.Entries {
 		if entry.Address != local {
 			continue
 		}
-		return selected, position < len(selected), nil
+		return selected, slices.Contains(selected, committee.Participants[position]), nil
 	}
 	return nil, false, fmt.Errorf("local validator is not in the epoch roster")
 }
 
-// tdilithium3SealSigningSigners resolves the fixed signer set of the epoch a
-// local share activated at, and whether this node is one of the four. The
-// roster is read at the activation epoch's anchor, the same roster the signing
-// binding and the DKG ceremony derive from.
-func (n *Node) tdilithium3SealSigningSigners(activationEpoch uint64) ([]uint32, bool, error) {
-	signers, _, isSigner, err := n.tdilithium3SealSigningSignersDetailed(activationEpoch)
-	return signers, isSigner, err
-}
-
-// tdilithium3SealSigningSignersDetailed additionally reports this node's
-// participant id (0 when not in the roster) so the retry-authority rule can
-// name the lowest signer.
-func (n *Node) tdilithium3SealSigningSignersDetailed(activationEpoch uint64) ([]uint32, uint32, bool, error) {
+// tdilithium3SealSigningSigners resolves the signer subset of one attempt of
+// one slot, and whether this node is in it. The roster is read at the
+// activation epoch's anchor, the same roster the signing binding and the DKG
+// ceremony derive from.
+func (n *Node) tdilithium3SealSigningSigners(activationEpoch, slot, attempt uint64) ([]uint32, bool, error) {
 	rosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activationEpoch)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, false, err
 	}
 	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, false, err
 	}
-	committee, position, err := n.tdilithium3DKGCommitteeForRoster(roster)
+	committee, _, err := n.tdilithium3DKGCommitteeForRoster(roster)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, false, err
 	}
-	signers, isSigner, err := tdilithium3SealSigningSignersForRoster(roster, committee, n.blockProducer.ValidatorAddr())
+	return tdilithium3SealSigningSignersForRoster(
+		roster, committee, n.blockProducer.ValidatorAddr(), slot, attempt,
+		n.tdilithium3SealSigningWeightsFor(slot, committee.Participants),
+	)
+}
+
+// tdilithium3SealSigningWeightsFor reads the stake view a slot's seal is
+// checked against: the pending seal's own snapshot when the slot has one (the
+// exact values SubmitCompletedSeal compares with), otherwise the finality
+// engine's current snapshot. Participant p is validator index p-1, the mapping
+// submitTDilithium3SealSignature reports sealers under. An unavailable view is
+// the zero value, which constrains nothing.
+func (n *Node) tdilithium3SealSigningWeightsFor(slot uint64, participants []uint32) tdilithium3SealSigningWeights {
+	if n == nil || n.blockProducer == nil || n.blockProducer.QPOS() == nil {
+		return tdilithium3SealSigningWeights{}
+	}
+	qfs := n.blockProducer.QPOS().GetQTDFinality()
+	if qfs == nil {
+		return tdilithium3SealSigningWeights{}
+	}
+	var stakes map[int]*big.Int
+	var required *big.Int
+	if pending := qfs.GetPendingSeal(slot); pending != nil && pending.RequiredWeight != nil {
+		stakes, required = pending.MemberStakes, pending.RequiredWeight
+	} else {
+		stakes, required = qfs.SealerStakeSnapshot()
+	}
+	if required == nil || stakes == nil {
+		return tdilithium3SealSigningWeights{}
+	}
+	weights := tdilithium3SealSigningWeights{stakes: make([]*big.Int, len(participants)), required: required}
+	for position, participant := range participants {
+		if participant == 0 {
+			return tdilithium3SealSigningWeights{}
+		}
+		weights.stakes[position] = stakes[int(participant)-1]
+	}
+	return weights
+}
+
+// tdilithium3SealRetryAnnouncerAllowed reports whether a participant may
+// announce the given attempt: only a retry (ordinal >= 1) within the attempt
+// bound, and only from a signer of the attempt that just failed, which is
+// exactly the set of nodes that observed it fail. The rule binds the slot's
+// proposer too: its authority ends at the first attempt.
+func tdilithium3SealRetryAnnouncerAllowed(
+	participants []uint32,
+	threshold int,
+	slot, ordinal uint64,
+	sender uint32,
+	weights tdilithium3SealSigningWeights,
+) (bool, error) {
+	if ordinal == 0 || ordinal >= tdilithium3SealSigningMaxAttempts {
+		return false, nil
+	}
+	previous, err := tdilithium3SealSigningSubset(participants, threshold, slot, ordinal-1, weights)
 	if err != nil {
-		return nil, 0, false, err
+		return false, err
 	}
-	return signers, uint32(position) + 1, isSigner, nil
+	return slices.Contains(previous, sender), nil
 }
 
 // tdilithium3SealSigningStart makes this node run the announced attempt of one
-// sealed slot, replacing a lower attempt that is still running. It returns
-// false, without any state change, when the gate is closed, the seal is not
-// pending on this node, it is already finalized, or the announced ordinal is
-// not newer than the running one.
+// sealed slot, replacing the lower attempt that is still running. It returns
+// false, without any state change, when the gate is closed, the ordinal is
+// out of bounds or out of sequence (tdilithium3SealOrdinalAdmissible), the
+// slot's retry window has passed, the seal is not pending on this node, it is
+// already finalized, or the announced ordinal is not newer than the running
+// one.
 func (n *Node) tdilithium3SealSigningStart(slot uint64, blockHash types.Hash, ordinal uint64) bool {
 	if n == nil {
+		return false
+	}
+	if ordinal >= tdilithium3SealSigningMaxAttempts {
+		tdilithium3SealTrace("slot %d: attempt %d is beyond the attempt bound", slot, ordinal)
+		return false
+	}
+	if ordinal > 0 && !tdilithium3SealWithinRetryWindow(slot, time.Now()) {
+		tdilithium3SealTrace("slot %d: attempt %d arrived after the slot's retry window", slot, ordinal)
+		return false
+	}
+	if !n.tdilithium3SealOrdinalAdmissible(slot, ordinal) {
+		tdilithium3SealTrace("slot %d: attempt %d skips ahead of the attempts seen so far", slot, ordinal)
 		return false
 	}
 	if !tdilithium3SealExecutorEnabled(n) {
@@ -237,6 +441,7 @@ func (n *Node) tdilithium3SealSigningStart(slot uint64, blockHash types.Hash, or
 		// (the round then dies on "silence: missing commit"), so latch the
 		// start and let the waiter fire it when the pending seal appears.
 		tdilithium3SealTrace("slot %d: no pending seal yet (block %s) — deferring start", slot, blockHash.String())
+		n.tdilithium3SealOrdinalRecord(slot, ordinal)
 		n.deferTDilithium3SealStart(slot, blockHash, ordinal)
 		return false
 	}
@@ -268,6 +473,7 @@ func (n *Node) tdilithium3SealSigningStart(slot uint64, blockHash types.Hash, or
 		}
 		existing.cancel()
 	}
+	n.tdilithium3SealOrdinalRecordLocked(slot, ordinal)
 	base := n.ctx
 	if base == nil {
 		base = context.Background()
@@ -340,7 +546,7 @@ func (n *Node) tdilithium3SealPrebuildInboxes(slot uint64, blockHash types.Hash,
 	if err != nil {
 		return
 	}
-	signers, _, localSigner, err := n.tdilithium3SealSigningSignersDetailed(activationEpoch)
+	signers, localSigner, err := n.tdilithium3SealSigningSigners(activationEpoch, slot, ordinal)
 	if err != nil || !localSigner {
 		return
 	}
@@ -348,6 +554,7 @@ func (n *Node) tdilithium3SealPrebuildInboxes(slot uint64, blockHash types.Hash,
 	if err != nil {
 		return
 	}
+	defer binding.close()
 	epoch := consensus.SlotToEpoch(slot)
 	message := consensus.QTDSignedMessage(n.config.NetworkID, epoch, slot, blockHash)
 	request, err := binding.request(epoch, slot, protocol.SigningDomainFinality, message, ordinal)
@@ -447,7 +654,9 @@ func (n *Node) runDeferredTDilithium3SealStart(slot uint64, ordinal uint64) {
 
 // tdilithium3ActiveShareIdentityCached is the identity-only variant of the
 // share cache (activation epoch/key/threshold), same 1s TTL, same
-// invalidation discipline.
+// invalidation discipline. On the offline path an active share of an earlier
+// ceremony than the armed one is refused (errTDilithium3ActiveShareSuperseded),
+// so nothing signs, anchors, or registers with a key being replaced.
 func (n *Node) tdilithium3ActiveShareIdentityCached() (uint64, []byte, uint32, error) {
 	n.tdilithium3ShareCacheMu.Lock()
 	cached := n.tdilithium3ShareCache
@@ -457,10 +666,20 @@ func (n *Node) tdilithium3ActiveShareIdentityCached() (uint64, []byte, uint32, e
 		epoch, key, threshold := n.tdilithium3ShareCacheEpoch, append([]byte(nil), out.Key.PublicKey...), out.Committee.Threshold
 		n.tdilithium3ShareCacheMu.Unlock()
 		out.Zeroize()
+		if n.offlineTDilithium3ShareSuperseded(epoch) {
+			return 0, nil, 0, fmt.Errorf("%w: share activates at epoch %d", errTDilithium3ActiveShareSuperseded, epoch)
+		}
 		return epoch, key, threshold, nil
 	}
 	n.tdilithium3ShareCacheMu.Unlock()
-	return newThresholdShareStore(n.config.DataDir).ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+	epoch, key, threshold, err := newThresholdShareStore(n.config.DataDir).ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	if n.offlineTDilithium3ShareSuperseded(epoch) {
+		return 0, nil, 0, fmt.Errorf("%w: share activates at epoch %d", errTDilithium3ActiveShareSuperseded, epoch)
+	}
+	return epoch, key, threshold, nil
 }
 
 // tdilithium3SealTrace logs one seal executor decision when the trace switch is
@@ -504,12 +723,11 @@ func tdilithium3SealOutcomeSummary(outcomes []tdilithium3SigningRequestOutcome) 
 	return sb.String()
 }
 
-// tdilithium3SealSigningRun drives the announced attempt and, when this node is
-// the slot's ordinal authority, the announced retries after it. Only the
-// authority advances the ordinal — the proposer, or the lowest signer when the
-// proposer is outside the signer set (see tdilithium3SealSigningDrivesRetries);
-// the remaining signers follow announcements, so the four cannot drift into
-// different attempt numbers.
+// tdilithium3SealSigningRun drives the announced attempt and the retries after
+// it. A signer whose attempt was exhausted announces the next ordinal, which
+// every node orders by the same rule (a higher ordinal replaces a running
+// lower one), and keeps running only if it is in the next attempt's subset;
+// the other signers of the next attempt start on the announcement.
 func (n *Node) tdilithium3SealSigningRun(
 	ctx context.Context,
 	session *tdilithium3SealSigningSession,
@@ -523,7 +741,6 @@ func (n *Node) tdilithium3SealSigningRun(
 		return
 	}
 	defer n.releaseTDilithium3SealSigning()
-	authority := n.tdilithium3SealSigningDrivesRetries(slot)
 	for attempt := ordinal; ; attempt++ {
 		if ctx.Err() != nil {
 			return
@@ -535,18 +752,18 @@ func (n *Node) tdilithium3SealSigningRun(
 			return
 		}
 		if errors.Is(err, errTDilithium3SealSigningNotASigner) {
-			tdilithium3SealTrace("slot %d attempt %d skipped: local validator is not one of the four signers", slot, attempt)
+			tdilithium3SealTrace("slot %d attempt %d skipped: local validator is not in this attempt's signers", slot, attempt)
 			return
 		}
 		tdilithium3SealTrace("slot %d attempt %d failed (%s) after %s: %v",
 			slot, attempt, tdilithium3SealOutcomeSummary(outcomes), time.Since(attemptStart).Round(time.Millisecond), err)
-		if !errors.Is(err, errTDilithium3SigningRequestExhausted) || !authority ||
-			attempt+1 >= tdilithium3SealSigningMaxAttempts {
+		if !tdilithium3SealSigningRetryAllowed(err, attempt, tdilithium3SealWithinRetryWindow(slot, time.Now())) {
 			return
 		}
 		next := attempt + 1
-		// Announce the fresh attempt before running it: the other signers
-		// switch to the new ordinal, so they cannot wait in the exhausted one.
+		// Announce the fresh attempt before running it: the next attempt's
+		// signers switch to the new ordinal, so they cannot wait in the
+		// exhausted one, and the members who sat out the failed attempt start.
 		n.broadcastTDilithium3SealSigningRetry(slot, blockHash, next)
 		if !n.tdilithium3SealSigningAdvance(slot, session, next) {
 			return
@@ -557,9 +774,86 @@ func (n *Node) tdilithium3SealSigningRun(
 	}
 }
 
+// tdilithium3SealSigningRetryAllowed reports whether a slot whose attempt
+// failed with err starts its next attempt: the failure must be retryable,
+// another ordinal must remain, and the slot must still be inside its retry
+// window.
+func tdilithium3SealSigningRetryAllowed(err error, attempt uint64, withinWindow bool) bool {
+	return tdilithium3SealAttemptRetryable(err) &&
+		attempt+1 < tdilithium3SealSigningMaxAttempts &&
+		withinWindow
+}
+
+// tdilithium3SealWithinRetryWindow reports whether now is still inside the
+// slot's retry window (tdilithium3SealSigningRetryWindow), measured from the
+// slot's start on the chain clock. Without a configured genesis time there is
+// no chain clock, and the window does not bound anything.
+func tdilithium3SealWithinRetryWindow(slot uint64, now time.Time) bool {
+	if !consensus.IsGenesisTimeConfigured() {
+		return true
+	}
+	return now.Sub(consensus.GetSlotStartTime(slot)) <= tdilithium3SealSigningRetryWindow
+}
+
+// tdilithium3SealOrdinalHistorySlots is how many slots of admitted-ordinal
+// history a node keeps; a slot's attempts end within its retry window.
+const tdilithium3SealOrdinalHistorySlots = 256
+
+// tdilithium3SealOrdinalAdmissible reports whether an announced attempt may
+// start here: attempts advance one ordinal at a time, so an ordinal is
+// admitted only up to one past the highest this node has admitted for the
+// slot (the first attempt, or the retry after it, when none was seen). A
+// member that may announce the next attempt (a signer of the current one)
+// therefore cannot skip the attempts that exclude it; it can only cut short
+// an attempt it belongs to, which it could stall by going silent anyway.
+func (n *Node) tdilithium3SealOrdinalAdmissible(slot, ordinal uint64) bool {
+	n.tdilithium3SealSigningMu.Lock()
+	defer n.tdilithium3SealSigningMu.Unlock()
+	highest, seen := n.tdilithium3SealSigningOrdinals[slot]
+	if !seen {
+		return ordinal <= 1
+	}
+	return ordinal <= highest+1
+}
+
+// tdilithium3SealOrdinalRecord notes an admitted ordinal for the slot.
+func (n *Node) tdilithium3SealOrdinalRecord(slot, ordinal uint64) {
+	n.tdilithium3SealSigningMu.Lock()
+	defer n.tdilithium3SealSigningMu.Unlock()
+	n.tdilithium3SealOrdinalRecordLocked(slot, ordinal)
+}
+
+// tdilithium3SealOrdinalRecordLocked is tdilithium3SealOrdinalRecord for a
+// caller holding tdilithium3SealSigningMu; it also prunes old slots.
+func (n *Node) tdilithium3SealOrdinalRecordLocked(slot, ordinal uint64) {
+	if n.tdilithium3SealSigningOrdinals == nil {
+		n.tdilithium3SealSigningOrdinals = make(map[uint64]uint64)
+	}
+	if highest, seen := n.tdilithium3SealSigningOrdinals[slot]; !seen || ordinal > highest {
+		n.tdilithium3SealSigningOrdinals[slot] = ordinal
+	}
+	if len(n.tdilithium3SealSigningOrdinals) > 2*tdilithium3SealOrdinalHistorySlots {
+		for old := range n.tdilithium3SealSigningOrdinals {
+			if old+tdilithium3SealOrdinalHistorySlots < slot {
+				delete(n.tdilithium3SealSigningOrdinals, old)
+			}
+		}
+	}
+}
+
+// tdilithium3SealAttemptRetryable reports whether a failed attempt moves the
+// slot on to the next ordinal: its candidate slots were all filtered (a
+// statistical outcome), or one of its signers is unreachable from this node, in
+// which case a later attempt's subset may exclude that signer. Any other
+// failure is structural and stops the slot.
+func tdilithium3SealAttemptRetryable(err error) bool {
+	return errors.Is(err, errTDilithium3SigningRequestExhausted) ||
+		errors.Is(err, errTDilithium3SigningSignerUnreachable)
+}
+
 // tdilithium3SealSigningAttempt runs one attempt: it resolves the local share's
-// activation epoch, refuses the slot unless this node is one of the four fixed
-// signers, assembles the binding, and signs the canonical seal message. The
+// activation epoch, refuses the attempt unless this node is in its signer
+// subset, assembles the binding, and signs the canonical seal message. The
 // active share is read twice by design -- once as an epoch hint, once through
 // the roster verifier in the binding -- because the roster can only be chosen
 // after the epoch is known; both reads are the share store's own encrypted
@@ -578,7 +872,7 @@ func (n *Node) tdilithium3SealSigningAttempt(
 		tdilithium3SealTrace("slot %d attempt %d: active share: %v", slot, attempt, err)
 		return nil, nil, nil, fmt.Errorf("Dilithium3 v1 seal executor active share: %w", err)
 	}
-	signers, localSigner, err := n.tdilithium3SealSigningSigners(activationEpoch)
+	signers, localSigner, err := n.tdilithium3SealSigningSigners(activationEpoch, slot, attempt)
 	if err != nil {
 		tdilithium3SealTrace("slot %d attempt %d: signers at activation epoch %d: %v",
 			slot, attempt, activationEpoch, err)
@@ -640,9 +934,9 @@ func (n *Node) submitTDilithium3SealSignature(slot uint64, signers []uint32, sig
 
 // broadcastTDilithium3SealSigningRetry announces a retry attempt of one slot.
 // The ordinal is appended to the legacy request payload, so a receiver that
-// does not know the extension still reads the slot and the block hash. Only the
-// slot's proposer announces, and the receiver's proposer check authenticates
-// the announcement, so the ordinal has one authority per slot.
+// does not know the extension still reads the slot and the block hash. The
+// receiver authenticates the sender as a signer of the attempt that just
+// failed (tdilithium3SealRetryDelegateAuthed), whoever proposed the slot.
 func (n *Node) broadcastTDilithium3SealSigningRetry(slot uint64, blockHash types.Hash, ordinal uint64) {
 	if n.p2pHost == nil {
 		return
@@ -656,76 +950,12 @@ func (n *Node) broadcastTDilithium3SealSigningRetry(slot uint64, blockHash types
 	}
 }
 
-// tdilithium3SealSigningIsProposer reports whether this node proposes the slot,
-// which is the same authority the seal request receivers check.
-func (n *Node) tdilithium3SealSigningIsProposer(slot uint64) bool {
-	if n.blockProducer == nil || n.blockProducer.QPOS() == nil {
-		return false
-	}
-	proposer, err := n.blockProducer.QPOS().GetProposerForSlot(slot)
-	if err != nil || proposer == nil {
-		return false
-	}
-	return proposer.Address == n.blockProducer.ValidatorAddr()
-}
-
-// tdilithium3SealSigningDrivesRetries reports whether this node may advance the
-// attempt ordinals of one slot. The slot's proposer is the ordinal authority;
-// when the proposer is not one of the four signers it never joins the session
-// and could never time an announcement to the attempt's end, so the lowest
-// signer of the session drives retries instead — a delegate the receivers
-// authenticate the same way (roster position), and which cannot equivocate on
-// anything but the ordinal because the session binding commits the request.
-func (n *Node) tdilithium3SealSigningDrivesRetries(slot uint64) bool {
-	if n == nil || n.blockProducer == nil || n.blockProducer.QPOS() == nil {
-		return false
-	}
-	if n.tdilithium3SealSigningIsProposer(slot) {
-		return true
-	}
-	activationEpoch, _, _, err := n.tdilithium3ActiveShareIdentityCached()
-	if err != nil {
-		return false
-	}
-	signers, local, isSigner, err := n.tdilithium3SealSigningSignersDetailed(activationEpoch)
-	if err != nil || !isSigner || len(signers) == 0 {
-		return false
-	}
-	proposer, err := n.blockProducer.QPOS().GetProposerForSlot(slot)
-	if err != nil || proposer == nil {
-		return false
-	}
-	rosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activationEpoch)
-	if err != nil {
-		return false
-	}
-	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
-	if err != nil {
-		return false
-	}
-	for position, entry := range roster.Entries {
-		if entry.Address == proposer.Address {
-			// A proposer inside the signer set drives its own retries; the
-			// delegate rule never runs alongside it.
-			if uint32(position) < uint32(len(signers)) { // #nosec G115 -- roster positions are small
-				return false
-			}
-		}
-	}
-	return local == signers[0]
-}
-
-// tdilithium3SealRetryDelegateAuthed reports whether the sender of a seal
-// request that failed the proposer check may still carry it: only a retry
-// announcement (ordinal ≥ 1) and only when the slot's proposer is outside the
-// four signers, in which case the lowest signer drives the ordinals
-// (tdilithium3SealSigningDrivesRetries). Everything else stays rejected. With
-// the executor gate closed there is no ordinal at all, so the legacy path is
-// untouched.
-func (n *Node) tdilithium3SealRetryDelegateAuthed(
-	slot, ordinal uint64,
-	proposer, sender types.Address,
-) bool {
+// tdilithium3SealRetryDelegateAuthed reports whether the sender may announce a
+// retry attempt: only within the attempt bound, and only as a signer of the
+// attempt that just failed (tdilithium3SealRetryAnnouncerAllowed); the slot's
+// proposer is held to the same rule. With the executor gate closed there are
+// no retries at all, so the legacy path is untouched.
+func (n *Node) tdilithium3SealRetryDelegateAuthed(slot, ordinal uint64, sender types.Address) bool {
 	if ordinal == 0 || !tdilithium3SealExecutorEnabled(n) ||
 		n.blockProducer == nil || n.blockProducer.QPOS() == nil {
 		return false
@@ -734,10 +964,6 @@ func (n *Node) tdilithium3SealRetryDelegateAuthed(
 	if err != nil {
 		return false
 	}
-	signers, _, _, err := n.tdilithium3SealSigningSignersDetailed(activationEpoch)
-	if err != nil || len(signers) == 0 {
-		return false
-	}
 	rosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activationEpoch)
 	if err != nil {
 		return false
@@ -746,18 +972,21 @@ func (n *Node) tdilithium3SealRetryDelegateAuthed(
 	if err != nil {
 		return false
 	}
-	threshold := len(signers)
-	proposerIsSigner := false
-	senderIsLowest := false
-	for position, entry := range roster.Entries {
-		if entry.Address == proposer && position < threshold {
-			proposerIsSigner = true
-		}
-		if entry.Address == sender && position == 0 {
-			senderIsLowest = true
-		}
+	committee, _, err := n.tdilithium3DKGCommitteeForRoster(roster)
+	if err != nil || len(committee.Participants) != len(roster.Entries) {
+		return false
 	}
-	return !proposerIsSigner && senderIsLowest
+	for position, entry := range roster.Entries {
+		if entry.Address != sender {
+			continue
+		}
+		allowed, err := tdilithium3SealRetryAnnouncerAllowed(
+			committee.Participants, int(committee.Threshold), slot, ordinal, committee.Participants[position],
+			n.tdilithium3SealSigningWeightsFor(slot, committee.Participants),
+		)
+		return err == nil && allowed
+	}
+	return false
 }
 
 // tdilithium3SealSigningAdvance moves the session entry to the retry's ordinal
@@ -769,6 +998,7 @@ func (n *Node) tdilithium3SealSigningAdvance(slot uint64, session *tdilithium3Se
 		return false
 	}
 	session.attempt = ordinal
+	n.tdilithium3SealOrdinalRecordLocked(slot, ordinal)
 	return true
 }
 

@@ -259,10 +259,15 @@ func loadThresholdPlaintext(path string, password []byte) ([]byte, bool, error) 
 	if err != nil {
 		return nil, false, err
 	}
+	key := thresholdPlaintextCacheKey(data, password)
+	if plaintext, cached := thresholdPlaintextCacheGet(key); cached {
+		return plaintext, true, nil
+	}
 	plaintext, err := thresholdDecryptPersistenceBlob(data, password)
 	if err != nil {
 		return nil, false, err
 	}
+	thresholdPlaintextCachePut(key, plaintext)
 	return plaintext, true, nil
 }
 

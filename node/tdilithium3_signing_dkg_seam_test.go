@@ -15,7 +15,6 @@ package node
 // signature the mode3 verifier accepts under the ceremony's group key.
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -51,18 +50,10 @@ const tdilithium3SeamSlotTimeout = 5 * time.Second
 // schedule time; rows with large slot counts scale the slot window by it.
 const tdilithium3SeamSlotPerSlotBudget = 50 * time.Millisecond
 
-// tdilithium3SeamSlots is how many candidate slots one seam request runs. The
-// executor rejects a candidate unless every signer accepts it, and the
-// per-slot acceptance rate the sampler parameters predict is about one in
-// ten, so eleven candidates accept with high probability. This mirrors the
-// production schedule, which stops at the same bound, so the seam exercises the
-// retry path a live node relies on rather than a single lucky slot.
-const tdilithium3SeamSlots = dilithium3v1.SigningParallelSlots
-
 // tdilithium3SeamRequests bounds the retries of a request whose candidate
-// slots were all filtered. Each is an independent draw with a per-slot
-// acceptance rate near 0.10, so a handful of requests converges with
-// probability far above any tolerable flake.
+// slots were all filtered. Every request runs the selected row's J candidate
+// slots, which the row sizes for about a one-in-two chance of success, so
+// eight requests fail together with probability about 2^-8.
 const tdilithium3SeamRequests = 8
 
 // tdilithium3SeamFixture is the DKG half of the seam: the six ceremony
@@ -308,8 +299,12 @@ func tdilithium3SeamHarnessFor(
 			Broadcast: func(messageType uint8, encoded []byte) error {
 				return network.broadcast(index, messageType, encoded)
 			},
-			Entropy:     rand.Reader,
-			Slots:       dilithium3v1.SigningParallelSlots,
+			Entropy: rand.Reader,
+			// The row the shares select sets the candidate count, exactly as
+			// the production schedule does: a rotated share needs its rotated
+			// row's larger budget, and pinning the fresh count here starved
+			// rotated requests (J=26 or J=466 against 11 candidates).
+			Slots:       uint16(params.ParallelSlots),
 			SlotTimeout: slotTimeout,
 		})
 		if err != nil {
@@ -365,15 +360,20 @@ func (harness *tdilithium3SeamHarness) signOne(t *testing.T) []byte {
 	if len(signatures) == 0 {
 		t.Fatal("seam produced no signature")
 	}
-	signature := signatures[0]
-	if len(signature) != qcrypto.Dilithium3SignatureSize {
-		t.Fatalf("seam signature size = %d, want %d", len(signature), qcrypto.Dilithium3SignatureSize)
-	}
-	for index, other := range signatures[1:] {
-		if !bytes.Equal(signature, other) {
-			t.Fatalf("signer %d produced a different signature", index+1)
+	// Every candidate slot runs in parallel, so two candidates can both
+	// complete and two signers can each return a different one first. Each
+	// returned signature must stand on its own under the group key.
+	for index, other := range signatures {
+		if len(other) != qcrypto.Dilithium3SignatureSize {
+			t.Fatalf("signer %d signature size = %d, want %d", index, len(other), qcrypto.Dilithium3SignatureSize)
+		}
+		if err := qcrypto.VerifySignatureForAlgorithm(
+			qcrypto.SignatureAlgorithmDilithium3Legacy, harness.fixture.groupKey, harness.request.Message, nil, other,
+		); err != nil {
+			t.Fatalf("signer %d signature does not verify: %v", index, err)
 		}
 	}
+	signature := signatures[0]
 	if err := qcrypto.VerifySignatureForAlgorithm(
 		qcrypto.SignatureAlgorithmDilithium3Legacy, harness.fixture.groupKey, harness.request.Message, nil, signature,
 	); err != nil {
@@ -404,7 +404,7 @@ func tdilithium3SeamSign(
 			return signature
 		}
 	}
-	t.Fatalf("seam did not converge in %d requests of %d candidate slots", tdilithium3SeamRequests, tdilithium3SeamSlots)
+	t.Fatalf("seam did not converge in %d requests of the row's candidate slots", tdilithium3SeamRequests)
 	return nil
 }
 

@@ -17,6 +17,7 @@ package node
 import (
 	"context"
 	"crypto/sha3"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -29,6 +30,12 @@ import (
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
+
+// errTDilithium3SigningSignerUnreachable reports that a signer of the attempt
+// has no peer binding on this node (it is offline or not yet connected). It is
+// a liveness condition, not a structural fault: the seal path moves on to an
+// attempt whose signer subset excludes that member.
+var errTDilithium3SigningSignerUnreachable = errors.New("Dilithium3 signing signer is unreachable")
 
 // tdilithium3SigningIdentitiesForRoster projects the identity snapshot of the
 // four active signers out of the epoch roster a DKG activation was anchored on.
@@ -62,7 +69,7 @@ func tdilithium3SigningIdentitiesForRoster(
 		address := types.Address(binding.ValidatorAddress)
 		peer, mapped := peerForValidator(address)
 		if !mapped || peer == "" {
-			return nil, fmt.Errorf("Dilithium3 signing signer %s has no peer binding", address.String())
+			return nil, fmt.Errorf("%w: signer %s has no peer binding", errTDilithium3SigningSignerUnreachable, address.String())
 		}
 		identities[signer] = tdilithium3SigningIdentity{
 			Peer:             peer,
@@ -122,10 +129,16 @@ type tdilithium3SigningBinding struct {
 	chainID uint64
 }
 
-// close releases the binding's per-attempt state. The share stays caller-owned
-// and the journal is a node-cached shared handle (closed at node shutdown, not
-// here), so a concurrent session sealing another slot keeps using it.
+// close releases the binding's per-attempt state: it erases the binding's own
+// copy of the local share (every candidate party derives its partial secrets
+// when the request schedule is built, so the share is not needed once the
+// request has run). The journal is a node-cached shared handle, closed at node
+// shutdown and not here, so a concurrent session sealing another slot keeps
+// using it.
 func (binding *tdilithium3SigningBinding) close() error {
+	if binding != nil && binding.Share != nil {
+		binding.Share.Zeroize()
+	}
 	return nil
 }
 
@@ -316,6 +329,9 @@ func (n *Node) loadTDilithium3ActiveShareCached(activationEpoch uint64, verifier
 		return nil, err
 	}
 	n.tdilithium3ShareCacheMu.Lock()
+	if n.tdilithium3ShareCache != nil {
+		n.tdilithium3ShareCache.Zeroize()
+	}
 	n.tdilithium3ShareCache = share.Clone()
 	n.tdilithium3ShareCacheEpoch = activationEpoch
 	n.tdilithium3ShareCacheAt = time.Now()

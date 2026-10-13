@@ -178,6 +178,12 @@ func (n *Node) refreshTDilithium3SigningFinalitySigner() {
 		nodeLog.Debug("Dilithium3 v1 finality signer not refreshed (no loadable active share): %v", err)
 		return
 	}
+	if n.offlineTDilithium3ShareSuperseded(activationEpoch) {
+		// A re-key is armed: the replaced ceremony's key must not verify seals.
+		// The new ceremony registers its key when its share activates.
+		nodeLog.Info("Dilithium3 v1 finality signer not refreshed: active share (epoch %d) is superseded by the armed ceremony", activationEpoch)
+		return
+	}
 	// The seal quorum is the activated committee's own threshold, read back
 	// from the same decrypted active share bytes the identity probe carried.
 	threshold := int(committeeThreshold)

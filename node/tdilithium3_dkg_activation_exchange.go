@@ -10,6 +10,7 @@ import (
 
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
@@ -220,6 +221,7 @@ func (n *Node) runTDilithium3ActivationExchange(
 	// exchange, or a stale candidate from a prior epoch is on disk).
 	if encoded, merr := share.MarshalBinary(); merr == nil {
 		memDigest := sha3.Sum256(encoded)
+		tss.SecureZero(encoded)
 		nodeLog.Warn("R77-DIAG activation exchange: in-memory share pos=%d id=%d epoch=%d transcript=%x pub=%x candDigest=%x acks=%d",
 			share.ParticipantPosition, share.ParticipantID, session.ActivationEpoch, share.TranscriptDigest[:4], share.Key.PublicKey[:4], memDigest[:4], len(certificate.Acknowledgements))
 	}

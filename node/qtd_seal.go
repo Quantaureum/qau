@@ -401,18 +401,22 @@ func (n *Node) handleQTDSealRequest(msg p2p.PeerMessage) {
 		nodeLog.Warn("QTD seal request: cannot resolve sender address, rejecting (B-5)")
 		return
 	}
-	if !bytes.Equal(senderAddr[:], proposer.Address[:]) {
-		// The one exception to the proposer-only rule: when the proposer is not
-		// one of the four signers it never runs the session and cannot drive
-		// ordinals, so the lowest signer carries the retry announcements
-		// (ordinal > 0 only — the slot's first attempt always comes from the
-		// proposer). The session binding commits the request, so a delegate
-		// cannot equivocate on anything but the ordinal.
-		if !n.tdilithium3SealRetryDelegateAuthed(slot, tdilithium3SealSigningOrdinal(data), proposer.Address, senderAddr) {
+	// The slot's first attempt comes from its proposer only. A retry
+	// announcement (ordinal > 0) comes from a signer of the attempt that just
+	// failed, the proposer included: its authority ends at the first attempt.
+	// The session binding commits the request, so an announcer cannot
+	// equivocate on anything but the ordinal, which is bounded and advances one
+	// step at a time (tdilithium3SealOrdinalAdmissible).
+	if ordinal := tdilithium3SealSigningOrdinal(data); ordinal == 0 {
+		if !bytes.Equal(senderAddr[:], proposer.Address[:]) {
 			nodeLog.Warn("QTD seal request: sender %x is not the proposer %x for slot %d, rejecting (B-5)",
 				senderAddr[:8], proposer.Address[:8], slot)
 			return
 		}
+	} else if !n.tdilithium3SealRetryDelegateAuthed(slot, ordinal, senderAddr) {
+		nodeLog.Warn("QTD seal request: sender %x may not announce attempt %d of slot %d, rejecting (B-5)",
+			senderAddr[:8], ordinal, slot)
+		return
 	}
 
 	// QUANTUM-FIX (R4-CORE-04): Verify blockHash matches the canonical
@@ -430,9 +434,9 @@ func (n *Node) handleQTDSealRequest(msg p2p.PeerMessage) {
 	}
 
 	// Slice 4 decision C: with the executor gate open this notification is the
-	// attempt announcement of the four fixed signers. The trailing ordinal is
-	// present only on a retry; the sender check above already binds the
-	// announcement to the slot's proposer, the only ordinal authority. The
+	// attempt announcement of the attempt's signer subset. The trailing ordinal is
+	// present only on a retry; the sender check above binds the first attempt to
+	// the slot's proposer and a retry to a signer of the attempt before it. The
 	// legacy executive-member notification below stays unchanged while the gate
 	// is closed.
 	if tdilithium3SealExecutorEnabled(n) {
@@ -751,9 +755,9 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 	}
 
 	// Slice 4 decision C: with the executor gate open, sealing runs as one
-	// interactive four-signer session instead of the legacy per-node
-	// aggregation. This node runs its own first attempt when it is one of the
-	// four fixed signers; a node outside the four only announced the seal
+	// interactive threshold-signer session instead of the legacy per-node
+	// aggregation. This node runs its own first attempt when it is in the
+	// attempt's signer subset; a node outside it only announced the seal
 	// request above and waits for the seal announcement. The legacy path below
 	// stays byte-for-byte unchanged while the gate is closed.
 	if tdilithium3SealExecutorEnabled(n) {

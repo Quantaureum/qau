@@ -9,6 +9,8 @@ package node
 import (
 	"bytes"
 	"crypto/sha3"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
@@ -122,40 +124,56 @@ func TestTDilithium3ReshareRemoveWireSeam(t *testing.T) {
 		members = append(members, &member{runner: runner, inbox: inbox, participant: participantID, newPos: newPos})
 	}
 
-	// Every member publishes; every envelope passes the p2p payload
-	// validator, the structural+identity validation and the inbox.
+	// Every member publishes through the production encoder and sender; each
+	// delta reaches only the member it is addressed to (it carries a secret
+	// component), and every envelope passes the p2p payload validator, the
+	// structural+identity validation and the inbox.
 	for _, sender := range members {
-		for _, delivery := range sender.runner.OutgoingDeltas() {
-			wire := dilithium3v1.ReshareDeltaWire{
-				SessionDigest:     reshareSessionDigest,
-				CommitteeDigest:   committeeDigest,
-				Kind:              dilithium3v1.ReshareDeltaKindFold,
-				SourceGroup:       delivery.Delta.Source,
-				TargetGroup:       delivery.Delta.Target,
-				AnchorPosition:    sender.newPos,
-				RecipientPosition: delivery.RecipientPosition,
-				Component:         delivery.Delta.Component,
+		envelopes, err := encodeTDilithium3ReshareDeltas(
+			session, reshareSessionDigest, committeeDigest, sender.newPos,
+			sender.runner.OutgoingDeltas(), signFor(fixture.privateKeys[sender.participant]),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelopes) == 0 {
+			continue
+		}
+		delivered := 0
+		sendPrivate := func(messageType uint8, recipient uint8, encoded []byte) error {
+			if messageType != p2p.MsgTypeTDilithium3ReshareDelta {
+				t.Fatalf("delta sent as message type %d", messageType)
 			}
-			payload, err := wire.MarshalBinary()
-			if err != nil {
-				t.Fatal(err)
-			}
-			encoded, err := encodeTDilithium3DKGSignedEnvelope(session, p2p.MsgTypeTDilithium3ReshareDelta,
-				sender.newPos, 1, payload, signFor(fixture.privateKeys[sender.participant]))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := p2p.ValidateTDilithium3DKGEnvelope(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
+			if err := p2p.ValidateTDilithium3DKGEnvelope(messageType, encoded); err != nil {
 				t.Fatalf("p2p envelope validation: %v", err)
 			}
-			receiver := members[delivery.RecipientPosition]
-			message := p2p.PeerMessage{From: fixture.peers[sender.participant], Type: p2p.MsgTypeTDilithium3ReshareDelta, Payload: encoded}
+			envelope, err := protocol.DecodeEnvelope(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := dilithium3v1.UnmarshalReshareDeltaWire(envelope.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wire.RecipientPosition != recipient {
+				t.Fatalf("delta for position %d was sent to position %d", wire.RecipientPosition, recipient)
+			}
+			receiver := members[recipient]
+			message := p2p.PeerMessage{From: fixture.peers[sender.participant], Type: messageType, Payload: encoded}
 			if err := receiver.inbox.accept(message); err != nil {
 				t.Fatalf("inbox delivery from new position %d: %v", sender.newPos, err)
 			}
 			if err := receiver.inbox.accept(message); err != nil {
 				t.Fatalf("inbox replay of a seen delta must be accepted idempotently: %v", err)
 			}
+			delivered++
+			return nil
+		}
+		if err := sendTDilithium3ReshareDeltas(envelopes, sendPrivate); err != nil {
+			t.Fatal(err)
+		}
+		if delivered != len(envelopes) {
+			t.Fatalf("sender %d delivered %d of %d deltas", sender.newPos, delivered, len(envelopes))
 		}
 	}
 
@@ -236,5 +254,37 @@ func TestTDilithium3ReshareRemoveWireSeam(t *testing.T) {
 				t.Fatalf("cross-member disagreement on group %06b", uint16(component.GroupMask))
 			}
 		}
+	}
+}
+
+// TestSendTDilithium3ReshareDeltasTriesEveryRecipient requires one unreachable
+// recipient to hold back neither the other recipients nor the report: every
+// delta is attempted, and the joined error names the failed position.
+func TestSendTDilithium3ReshareDeltasTriesEveryRecipient(t *testing.T) {
+	envelopes := []tdilithium3ReshareDeltaEnvelope{
+		{Recipient: 1, Encoded: []byte{0x01}},
+		{Recipient: 2, Encoded: []byte{0x02}},
+		{Recipient: 4, Encoded: []byte{0x04}},
+	}
+	unreachable := errors.New("peer link down")
+	var delivered []uint8
+	err := sendTDilithium3ReshareDeltas(envelopes, func(messageType uint8, recipient uint8, encoded []byte) error {
+		if messageType != p2p.MsgTypeTDilithium3ReshareDelta {
+			t.Fatalf("delta sent as message type %d", messageType)
+		}
+		if recipient == 2 {
+			return unreachable
+		}
+		delivered = append(delivered, recipient)
+		return nil
+	})
+	if !errors.Is(err, unreachable) || !strings.Contains(err.Error(), "position 2") {
+		t.Fatalf("send error = %v, want the position 2 failure", err)
+	}
+	if !bytes.Equal(delivered, []byte{1, 4}) {
+		t.Fatalf("delivered to %v, want positions 1 and 4 despite position 2 failing", delivered)
+	}
+	if err := sendTDilithium3ReshareDeltas(envelopes, func(uint8, uint8, []byte) error { return nil }); err != nil {
+		t.Fatalf("all sends succeeded but the helper reported %v", err)
 	}
 }

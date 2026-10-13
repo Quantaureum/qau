@@ -271,6 +271,10 @@ type Node struct {
 	tdilithium3SealSigningMu       sync.Mutex
 	tdilithium3SealSigningSessions map[uint64]*tdilithium3SealSigningSession
 	tdilithium3SealSigningRunning  chan struct{}
+	// tdilithium3SealSigningOrdinals is the highest attempt ordinal admitted
+	// per slot (guarded by tdilithium3SealSigningMu); it outlives the run so a
+	// member that sat out an attempt still advances one ordinal at a time.
+	tdilithium3SealSigningOrdinals map[uint64]uint64
 	// tdilithium3SigningJournals caches the per-key signing journal handles.
 	// Each is a bbolt database that takes an exclusive file lock, so a fresh
 	// handle per session (the old single-session path opened one per attempt)
@@ -6834,6 +6838,9 @@ func (n *Node) startServices() error {
 	// share, so the development network needs no extra wiring after activation.
 	// Gated and a quiet no-op while the gate is closed or no share is installed.
 	n.refreshTDilithium3SigningFinalitySigner()
+	// A verify-only node follows the armed ceremony's key from its operator
+	// (tssV1TrustedGroupKey); a quiet no-op on share holders.
+	n.applyTDilithium3TrustedGroupKey()
 
 	// Enable syncing mode if the node is starting from genesis or a very low
 	// height. This skips election verification until sync completes, because

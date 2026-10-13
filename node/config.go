@@ -260,6 +260,16 @@ type Config struct {
 	// This is the mainnet-legal activation path: it introduces no runtime
 	// DKG (mainnet keeps refusing runtime DKG regardless of this field).
 	TSSV1SealingActivationEpoch uint64 `json:"tssV1SealingActivationEpoch"`
+	// TSSV1TrustedGroupKey is the hex-encoded group public key of the armed
+	// offline ceremony (the ceremony manifest's group_public_key). It is read
+	// only by verify-only nodes, which hold no share of that ceremony: at
+	// startup such a node re-roots its QTD group-key custody to this key at
+	// the armed epoch, so later boundary anchors of the same key chain onto
+	// it and anchors of any other key are refused. The operator is the trust
+	// source, exactly as for the ceremony itself. This is what lets a
+	// verify-only node follow a re-key whose new key no handoff signed by the
+	// replaced key can vouch for. Empty = not used.
+	TSSV1TrustedGroupKey string `json:"tssV1TrustedGroupKey"`
 	// TSSDistributedDKG enables runtime distributed DKG (multi-party DKG over
 	// P2P) at node startup. Default: false (OFF) — when off, node behavior is
 	// identical to previous releases (single-process simulated DKG). When on,
@@ -918,6 +928,15 @@ func (c *Config) Validate() error {
 			"KZG commitments and opening proofs are hash placeholders, not real polynomial commitments "+
 			"(DA-). Disable danksharding.enabled in config or wait for post-quantum polynomial "+
 			"commitment implementation", c.NetworkID)
+	}
+
+	if c.TSSV1TrustedGroupKey != "" {
+		if c.TSSV1SealingActivationEpoch == 0 {
+			return fmt.Errorf("tssV1TrustedGroupKey requires tssV1SealingActivationEpoch: the key belongs to one armed ceremony")
+		}
+		if _, err := parseTDilithium3TrustedGroupKey(c.TSSV1TrustedGroupKey); err != nil {
+			return fmt.Errorf("tssV1TrustedGroupKey: %w", err)
+		}
 	}
 
 	// Task 5 (TSSDistributedDKG): mainnet hard guard — runtime distributed

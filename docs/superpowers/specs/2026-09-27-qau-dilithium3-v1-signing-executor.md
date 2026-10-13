@@ -553,6 +553,74 @@ stays the behavioral oracle that the executor is differentially tested
 against. `mpc_arithmetic.go` is retired from the signing path (signing note,
 Open Obligations item 8).
 
+## Seal Signer Subsets, Unreachable Signers, and Offline Re-Key
+
+### Rotating signer subsets
+
+The seal executor no longer uses the fixed first `t` committee positions. The
+signer subset of a slot's attempt is the committee minus one excluded pair,
+taken from a round-robin schedule over the committee positions (the circle
+method; an odd committee plays with a bye):
+
+- the round is the slot modulo the number of rounds, and the attempts of a slot
+  walk that round's disjoint pairs; with six attempts per slot the walk covers
+  the round twice;
+- over one full round every pair sits out exactly once.
+
+At `C = 6` every member sits out two of a slot's six attempts, so with one
+member offline every slot still has two attempts without it. At `C = 7` the
+round's bye sits out none of the slot's attempts, so with one member offline
+the slot whose bye it is (one in seven) has no attempt without it. With two
+members offline, one slot per round has an attempt that excludes both.
+
+A pair is used only if the remaining signers hold the stake the finality engine
+requires of a completed seal (two thirds of the total, the check
+`SubmitCompletedSeal` applies); the stake view is the pending seal's own
+snapshot. When the view rules pairs of the slot's round out, the slot's list is
+topped up with admissible pairs of the following rounds; with equal stakes the
+list is exactly the round. The subset is a pure function of the committee, the
+threshold, the slot, the attempt, and the stake view, so every node derives it
+without an extra round. Committees whose threshold does not leave exactly two
+members out, and stake views that no pair satisfies, keep the first `t`
+participants.
+
+### Retry announcements
+
+The slot's proposer announces the first attempt; its authority ends there. A
+retry (ordinal `k >= 1`) may be announced only by a signer of attempt `k - 1`,
+the proposer included, and only for an ordinal below the attempt bound. A node
+admits an announced ordinal only up to one past the highest it has admitted for
+the slot, so attempts advance one at a time: a member can cut short an attempt
+it belongs to (which it could stall by going silent anyway) but cannot skip the
+attempts that leave it out.
+
+A signer moves on to the next attempt when its attempt's candidate slots were
+all filtered, or when one of the attempt's signers has no peer binding on this
+node (it is offline or not connected). The second case fails within
+milliseconds, so the next attempt starts without waiting out the slot timeout.
+No attempt of a slot starts later than four slots after the slot's own start on
+the chain clock; the bound is the same for every member, whichever attempt it
+joined at.
+
+### Offline re-key
+
+A re-key installs the new ceremony's shares as candidates and arms a later
+activation epoch while the replaced ceremony's share is still active. On the
+offline path the only usable share is the one of the armed ceremony: an active
+share whose activation epoch differs from the armed epoch is superseded and is
+never signed with, never anchored on a boundary block, and never registered as
+the finality key. The replaced key therefore goes quiet when the operator arms
+the new epoch, not when the new share activates.
+
+Validators re-root their group-key custody to their own share's key when it
+activates. A verify-only node holds no share and learns keys from boundary
+anchors; the chained-adoption rule refuses a changed key unless the replaced key
+signed a handoff, and a handoff from a replaced key proves nothing once that key
+must be treated as exposed. Such a node is given the new ceremony's group key by
+its operator (`tssV1TrustedGroupKey`, the ceremony manifest's group key) and
+re-roots its custody to it at startup. Anchors of the new key then chain onto
+it, and anchors of any other key, the replaced one included, are refused.
+
 ## Open Questions for Review
 
 1. ~~Is the per-party local rejection revision authorized?~~ **Authorized and

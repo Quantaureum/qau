@@ -21,6 +21,7 @@ import (
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
 	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
@@ -151,6 +152,75 @@ type tdilithium3ReshareRemoveConfig struct {
 	SendPrivate      func(messageType uint8, recipient uint8, encoded []byte) error
 }
 
+// tdilithium3ReshareDeltaEnvelope is one signed fold delta and the only
+// new-committee position it may be sent to.
+type tdilithium3ReshareDeltaEnvelope struct {
+	Recipient uint8
+	Target    dilithium3v1.RSSGroupMask
+	Encoded   []byte
+}
+
+// encodeTDilithium3ReshareDeltas signs every fold delta this member anchors.
+// The anchor coordinate on the wire is the sender's new-committee position,
+// which the inbox checks against the envelope's committee position.
+func encodeTDilithium3ReshareDeltas(
+	session dilithium3v1.DKGSession,
+	sessionDigest, committeeDigest [32]byte,
+	anchorPosition uint8,
+	deliveries []tdilithium3ReshareDeltaDelivery,
+	sign func([]byte) ([]byte, error),
+) ([]tdilithium3ReshareDeltaEnvelope, error) {
+	envelopes := make([]tdilithium3ReshareDeltaEnvelope, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		wire := dilithium3v1.ReshareDeltaWire{
+			SessionDigest:     sessionDigest,
+			CommitteeDigest:   committeeDigest,
+			Kind:              dilithium3v1.ReshareDeltaKindFold,
+			SourceGroup:       delivery.Delta.Source,
+			TargetGroup:       delivery.Delta.Target,
+			AnchorPosition:    anchorPosition,
+			RecipientPosition: delivery.RecipientPosition,
+			Component:         delivery.Delta.Component,
+		}
+		payload, err := wire.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := encodeTDilithium3DKGSignedEnvelope(session, p2p.MsgTypeTDilithium3ReshareDelta,
+			anchorPosition, 1, payload, sign)
+		tss.SecureZero(payload)
+		if err != nil {
+			return nil, err
+		}
+		envelopes = append(envelopes, tdilithium3ReshareDeltaEnvelope{
+			Recipient: delivery.RecipientPosition, Target: delivery.Delta.Target, Encoded: encoded,
+		})
+	}
+	return envelopes, nil
+}
+
+// sendTDilithium3ReshareDeltas hands every delta to its recipient alone, over
+// that peer's encrypted link, exactly like a DKG private group seed. A fold
+// delta carries a complete secret component: broadcast to every connected
+// peer, it would let any three members of the new committee rebuild the whole
+// key from their own shares plus the leaked components.
+//
+// Every envelope is attempted: a recipient that cannot be reached right now (a
+// dropped link, a full send queue) must not hold back the others, and the
+// caller's re-send cadence retries it. The error joins every failed send.
+func sendTDilithium3ReshareDeltas(
+	envelopes []tdilithium3ReshareDeltaEnvelope,
+	sendPrivate func(messageType uint8, recipient uint8, encoded []byte) error,
+) error {
+	var failures []error
+	for _, envelope := range envelopes {
+		if err := sendPrivate(p2p.MsgTypeTDilithium3ReshareDelta, envelope.Recipient, envelope.Encoded); err != nil {
+			failures = append(failures, fmt.Errorf("reshare delta send to position %d: %w", envelope.Recipient, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
 // tdilithium3ReshareTranscriptDigest binds the old share's transcript to the
 // reshare session so two different rotation artifacts never share a store row.
 func tdilithium3ReshareTranscriptDigest(session dilithium3v1.DKGSession, oldTranscript [32]byte) ([32]byte, error) {
@@ -263,42 +333,23 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	// the wire is the SENDER's new-committee position (the delivery list
 	// contains only this member's own anchor duties), which the inbox checks
 	// against the envelope's committee position.
-	sent := 0
-	var published [][]byte
-	for _, delivery := range runner.OutgoingDeltas() {
-		wire := dilithium3v1.ReshareDeltaWire{
-			SessionDigest:     sessionDigest,
-			CommitteeDigest:   committeeDigest,
-			Kind:              dilithium3v1.ReshareDeltaKindFold,
-			SourceGroup:       delivery.Delta.Source,
-			TargetGroup:       delivery.Delta.Target,
-			AnchorPosition:    config.Position,
-			RecipientPosition: delivery.RecipientPosition,
-			Component:         delivery.Delta.Component,
-		}
-		payload, err := wire.MarshalBinary()
-		if err != nil {
-			return publicKey, err
-		}
-		encoded, err := encodeTDilithium3DKGSignedEnvelope(config.Session, p2p.MsgTypeTDilithium3ReshareDelta,
-			config.Position, 1, payload, config.Sign)
-		if err != nil {
-			return publicKey, err
-		}
-		// Broadcast rather than direct-send: the envelope's RecipientPosition
-		// and the signed-anchor identity are verified at the inbox, so peers
-		// not named by the delta simply discard it. The TSS broadcast path is
-		// the same one the DKG randomness/commitment rounds use, which the
-		// point-to-point SendTSSToPeer routing does not traverse.
-		if err := config.Broadcast(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
-			return publicKey, fmt.Errorf("reshare delta broadcast for position %d: %w", delivery.RecipientPosition, err)
-		}
-		published = append(published, encoded)
-		sent++
-		nodeLog.Info("reshare delta sent: anchor=%d -> recipient=%d target=%06b", config.Position, delivery.RecipientPosition, uint16(delivery.Delta.Target))
+	published, err := encodeTDilithium3ReshareDeltas(
+		config.Session, sessionDigest, committeeDigest, config.Position, runner.OutgoingDeltas(), config.Sign,
+	)
+	if err != nil {
+		return publicKey, err
 	}
-	// Loss hardening (R77 acceptance, WAN-chaos pass): re-broadcast every
-	// anchored delta on a 1s cadence for the whole delivery window. Members
+	if err := sendTDilithium3ReshareDeltas(published, config.SendPrivate); err != nil {
+		// Not fatal: the re-send cadence below retries every delta, so an
+		// unreachable recipient only delays its own delivery.
+		nodeLog.Warn("Dilithium3 v1 reshare rotation: initial delta send incomplete, re-sending every second: %v", err)
+	}
+	for _, envelope := range published {
+		nodeLog.Info("reshare delta published: recipient=%d target=%06b", envelope.Recipient, uint16(envelope.Target))
+	}
+	sent := len(published)
+	// Loss hardening (R77 acceptance, WAN-chaos pass): re-send every
+	// anchored delta to its recipient on a 1s cadence for the whole delivery window. Members
 	// enter their rotation windows at slightly different block heights, so a
 	// single-shot publication can land before a peer's window opens (or be
 	// lost in transit); receivers dedup identical envelopes idempotently, so
@@ -316,10 +367,8 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					for _, encoded := range published {
-						if err := config.Broadcast(p2p.MsgTypeTDilithium3ReshareDelta, encoded); err != nil {
-							nodeLog.Debug("reshare delta re-broadcast failed: %v", err)
-						}
+					if err := sendTDilithium3ReshareDeltas(published, config.SendPrivate); err != nil {
+						nodeLog.Debug("reshare delta re-send failed: %v", err)
 					}
 				}
 			}
