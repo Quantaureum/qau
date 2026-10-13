@@ -621,6 +621,58 @@ its operator (`tssV1TrustedGroupKey`, the ceremony manifest's group key) and
 re-roots its custody to it at startup. Anchors of the new key then chain onto
 it, and anchors of any other key, the replaced one included, are refused.
 
+## Executive Restriction End Epoch
+
+While the executive chamber is active, its member may neither propose nor
+attest. On the v1 sealing path the executive member holds no sealing power of
+its own: the threshold signers are the DKG committee, which is every validator
+at the pinned committee sizes. The restriction therefore only removes one
+validator per epoch from the review quorum.
+
+The review verdict and Casper justification need two thirds of the total
+stake. The slot's proposer cannot attest, so with the restriction in force only
+`n - 2` validators can: 4 of 6 and 5 of 7 with equal stakes, exactly the
+required `ceil(2n / 3)`. Any one offline validator then stops review approval
+(and with it QTD sealing) and Casper justification. Without the restriction
+`n - 1` can attest, and one offline validator is tolerated.
+
+`executiveRestrictionEndEpoch` (node config, `0` = never) names the first epoch
+from which the executive chamber's member has the same proposing and attesting
+rights as every other validator. The per-slot proposer and reviewer exclusions
+are independent of the executive chamber and stay. Proposer election and
+attestation acceptance are cross-verified, so every node of a network must
+configure the same value: set it on all nodes, restart them, and choose an
+epoch that lies ahead of the last restart. Before the epoch the code path is
+unchanged, and the default keeps the previous behavior for a network that does
+not opt in.
+
+## Restart After a Long Stall
+
+The proposer schedule of epoch `E` reads the VRF accumulator of epoch `E - 2`,
+carried by the last block of that epoch. An epoch without a block has no
+accumulator on any node. When every validator is down for more than two
+epochs, the first slot after the restart lies in an epoch whose `E - 2` is
+empty: every node's schedule is cold, every node declines to propose, and the
+chain cannot restart.
+
+The cold-start guard exists to keep a restarting node from contradicting peers
+that carry the accumulator. It is relaxed when no node can carry it: the node
+has peers, none of them is ahead, and the canonical chain has no block in epoch
+`E - 2` (the node walks down from its head until it finds a block in or below
+that epoch). All nodes at that head derive the same fallback shuffle and elect
+the same proposer, and receivers already trust the canonical proposer of a
+block whose schedule is cold. The condition looks at the chain and not at the
+head: after the first block of the restarted chain the head lies in epoch `E`,
+yet `E` and `E + 1` still read the empty epochs `E - 2` and `E - 1`, and
+production continues. From epoch `E + 2` the accumulator of epoch `E` exists
+and the guard resumes its normal role. A single empty epoch in the middle of a
+chain is handled the same way two epochs later. Nothing changes for a chain
+with blocks in every epoch.
+
+Executive selection keeps its own fail-closed rule for a cold epoch, so there is
+no executive chamber, and with it no QTD sealing, in epochs `E` and `E + 1`;
+Casper finality continues and sealing resumes in epoch `E + 2`.
+
 ## Open Questions for Review
 
 1. ~~Is the per-party local rejection revision authorized?~~ **Authorized and

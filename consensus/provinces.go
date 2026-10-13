@@ -515,11 +515,11 @@ func (tpc *ThreeChambersCoordinator) AssignProposing(validatorIndex int, slot ui
 	// rejected a proposer carrying a stale Review role from a past slot.
 	//
 	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive conflict is gated on
-	// executiveRestrictionsActiveLocked() to stay consistent with CanPropose.
+	// executiveRestrictionsApplyLocked() to stay consistent with CanPropose.
 	// Without this, GetProposerForSlot would elect a DKG-pending executive
 	// member (now permitted) and then fail to register the Proposing role,
 	// logging "AssignProposing failed" every slot.
-	if (tpc.executiveRestrictionsActiveLocked() &&
+	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberReview, slot) {
 		currentChamber := tpc.assignment.GetChamber(validatorIndex)
@@ -539,7 +539,10 @@ func (tpc *ThreeChambersCoordinator) AssignReview(validatorIndices []int, slot u
 	for _, idx := range validatorIndices {
 		// FIX: scope the conflict check (Executive per-epoch, Proposing
 		// per-slot) so stale roles from past slots don't block the committee.
-		if tpc.assignment.IsInChamberForEpoch(idx, ChamberExecutive, epoch) ||
+		// From the executive restriction end epoch the Executive conflict
+		// is gone (executive_restriction_end.go).
+		if (!tpc.executiveRestrictionEndedLocked(epoch) &&
+			tpc.assignment.IsInChamberForEpoch(idx, ChamberExecutive, epoch)) ||
 			tpc.assignment.IsInChamberForSlot(idx, ChamberProposing, slot) {
 			currentChamber := tpc.assignment.GetChamber(idx)
 			return fmt.Errorf("%w: validator %d is already in %s for slot %d epoch %d",
@@ -590,7 +593,7 @@ func (tpc *ThreeChambersCoordinator) AssignExecutive(validatorIndices []int, epo
 	return nil
 }
 
-// executiveRestrictionsActiveLocked reports whether ChamberExecutive
+// executiveRestrictionsApplyLocked reports whether ChamberExecutive
 // membership should carry its power-separation restrictions (its member may
 // neither propose nor attest).
 //
@@ -618,8 +621,23 @@ func (tpc *ThreeChambersCoordinator) AssignExecutive(validatorIndices []int, epo
 // tpc.mu.RLock itself, and recursive RLock deadlocks if a writer is queued.
 // ExecutiveChamber.IsActive uses the chamber's own mutex, so no lock
 // ordering issue arises.
-func (tpc *ThreeChambersCoordinator) executiveRestrictionsActiveLocked() bool {
-	return tpc.executive != nil && tpc.executive.IsActive()
+//
+// From the network's executive restriction end epoch (QPOS.
+// SetExecutiveRestrictionEndEpoch) the restrictions no longer apply even to an
+// active chamber: the member keeps the proposing and attesting rights of every
+// other validator (executive_restriction_end.go explains why).
+func (tpc *ThreeChambersCoordinator) executiveRestrictionsApplyLocked(epoch uint64) bool {
+	if tpc.executive == nil || !tpc.executive.IsActive() {
+		return false
+	}
+	return !tpc.executiveRestrictionEndedLocked(epoch)
+}
+
+// executiveRestrictionEndedLocked reports whether the configured executive
+// restriction end epoch has been reached. A coordinator without a QPOS has no
+// configuration and keeps the restriction.
+func (tpc *ThreeChambersCoordinator) executiveRestrictionEndedLocked(epoch uint64) bool {
+	return tpc.qpos != nil && tpc.qpos.executiveRestrictionEnded(epoch)
 }
 
 func (tpc *ThreeChambersCoordinator) CanPropose(validatorIndex int, slot uint64) bool {
@@ -633,11 +651,11 @@ func (tpc *ThreeChambersCoordinator) CanPropose(validatorIndex int, slot uint64)
 	// Executive/Review role, stalling block production on the live network.
 	//
 	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive exclusion is gated on
-	// executiveRestrictionsActiveLocked() — a chamber stuck in DKGRunning must
+	// executiveRestrictionsApplyLocked() — a chamber stuck in DKGRunning must
 	// not strip its member's proposing right. The Review exclusion is NOT
 	// gated: it is a per-slot role assigned by AssignReview and carries no
 	// DKG precondition.
-	if (tpc.executiveRestrictionsActiveLocked() &&
+	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberReview, slot) {
 		return false
@@ -656,12 +674,12 @@ func (tpc *ThreeChambersCoordinator) CanAttest(validatorIndex int, slot uint64) 
 	// proposer, starving the Review Chamber and preventing block finality.
 	//
 	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive exclusion is gated on
-	// executiveRestrictionsActiveLocked(). With a DKG-pending chamber this was
+	// executiveRestrictionsApplyLocked(). With a DKG-pending chamber this was
 	// rejecting the member's attestation on every slot
 	// ("cannot attest: not in Review Chamber") while the chamber did no work.
 	// The Proposing exclusion stays ungated — the slot's own proposer must
 	// never attest for its own block.
-	if (tpc.executiveRestrictionsActiveLocked() &&
+	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberProposing, slot) {
 		return false

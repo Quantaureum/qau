@@ -719,6 +719,17 @@ func (bp *BlockProducer) initValidatorSet() {
 	}
 	bp.qpos = qpos
 
+	// Executive restriction end epoch: epoch-gated from node config. Applied
+	// as soon as the QPOS exists, ahead of every step that can return early,
+	// because every node of the network must hold the same value. The
+	// ElectionVerifier shares this QPOS instance, so one setter covers the
+	// producer, the proposer check and the attestation path.
+	if bp.node.config.ExecutiveRestrictionEndEpoch > 0 {
+		qpos.SetExecutiveRestrictionEndEpoch(bp.node.config.ExecutiveRestrictionEndEpoch)
+		bpLog.Info("Executive restriction end epoch configured: epoch=%d",
+			bp.node.config.ExecutiveRestrictionEndEpoch)
+	}
+
 	// Activate the three-chamber governance + QTD instant finality.
 	// This initializes the chambers coordinator and QTD finality state,
 	// activating menxia_review.go, shangshu_committee.go, provinces.go,
@@ -738,7 +749,10 @@ func (bp *BlockProducer) initValidatorSet() {
 	// Executive node ever advances justified/finalized — every other node
 	// reports justifiedEpoch=0 forever. Blocks are still produced and stay
 	// consistent, so this is easy to mistake for a finality bug on a small
-	// devnet. Mainnet runs 6 validators, exactly this minimum.
+	// devnet. Mainnet runs 6 validators, exactly this minimum. From the
+	// configured executiveRestrictionEndEpoch the Executive member attests
+	// again, which leaves one more attester per slot (one offline validator is
+	// then tolerated at this minimum).
 	if n := len(validators); n < consensus.MinValidatorsForChambers {
 		bpLog.Warn("Three Chambers: validator set has %d validators, below the design minimum of %d — QTD justification will only advance on the single Executive node and every other node will report justifiedEpoch=0. Blocks and state stay consistent; do not read per-node justified/finalized as a health signal on this network.",
 			n, consensus.MinValidatorsForChambers)
@@ -2433,8 +2447,17 @@ func (bp *BlockProducer) isProposerForSlot(slot uint64) (bool, types.Address) {
 		chainTooYoung := bp.node != nil && bp.node.IsChainTooYoungForProposerSchedule(epoch)
 		youngChainExemption := atNetworkHead && chainTooYoung
 
+		// A chain with no block in epoch-2 cannot hold that epoch's
+		// accumulator either (see cold_start_stalled_chain.go): the same
+		// reasoning as the young chain, for an epoch that is empty because the
+		// network stalled. It needs peers: a node on its own has no evidence
+		// that the network did not move on.
+		stalledChainExemption := atNetworkHead && epoch >= 2 && bp.node != nil &&
+			bp.node.p2pHost != nil && bp.node.p2pHost.PeerCount() > 0 &&
+			bp.node.canonicalChainHasNoBlockInEpoch(epoch-2)
+
 		scheduleReady := bp.qpos.IsProposerScheduleReadyForSlot(slot)
-		if !scheduleReady && !atGenesis && !youngChainExemption {
+		if !scheduleReady && !atGenesis && !youngChainExemption && !stalledChainExemption {
 			bpLog.Warn("isProposerForSlot: QPOS cold-start for slot=%d epoch=%d, refusing to propose (chain catches up via peers)",
 				slot, epoch)
 			return false, types.Address{}
@@ -2446,6 +2469,10 @@ func (bp *BlockProducer) isProposerForSlot(slot uint64) (bool, types.Address) {
 		if !scheduleReady && !atGenesis && youngChainExemption {
 			bpLog.Info("isProposerForSlot: cold-start on a young chain at network head (slot=%d epoch=%d) — epoch-2 accumulator cannot exist yet, using deterministic fallback shuffle (R80)",
 				slot, epoch)
+		}
+		if !scheduleReady && !atGenesis && !youngChainExemption && stalledChainExemption {
+			bpLog.Info("isProposerForSlot: cold-start after a stall at network head (slot=%d epoch=%d) — the chain has no block in epoch %d, so its accumulator cannot exist; using deterministic fallback shuffle",
+				slot, epoch, epoch-2)
 		}
 
 		// R88-E (2026-08-30): STAND DOWN from proposing for an epoch whose

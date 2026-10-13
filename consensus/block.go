@@ -513,6 +513,10 @@ type QPOS struct {
 	// the qpos side, so it must not take q.mu itself.
 	firstBlockEpochKnown atomic.Bool
 	firstBlockEpoch      atomic.Uint64
+	// executiveRestrictionEnd is the first epoch at which an active executive
+	// chamber's member regains the proposing and attesting rights (0 = never;
+	// see executive_restriction_end.go).
+	executiveRestrictionEnd atomic.Uint64
 
 	// Reward tracking per epoch
 	epochRewards map[uint64]*EpochRewards

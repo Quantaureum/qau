@@ -161,6 +161,15 @@ type Config struct {
 	// the network — proposer election is cross-verified ("invalid block
 	// proposer"), so a divergent value forks the chain at the cutover epoch.
 	WeightedConsensusCutoverEpoch uint64 `json:"weightedConsensusCutoverEpoch,omitempty"`
+	// ExecutiveRestrictionEndEpoch is the first epoch at which an active
+	// executive chamber's member regains the proposing and attesting rights of
+	// every other validator. 0 / unset = never (the member of an active chamber
+	// may neither propose nor attest). MUST be identical on every node of the
+	// network — proposer election and attestation acceptance are cross-verified,
+	// so a divergent value forks the chain at the epoch. Set it to an epoch
+	// every node has restarted with this value before (see
+	// consensus/executive_restriction_end.go).
+	ExecutiveRestrictionEndEpoch uint64 `json:"executiveRestrictionEndEpoch,omitempty"`
 	// VDFSeedActivationEpoch enables the VDF-hardened proposer shuffle seed
 	// for shuffle epochs >= this value. 0 / unset = disabled (pre-VDF seed).
 	// MUST be identical on every node of the network — the seed feeds

@@ -216,7 +216,7 @@ func TestThreeChambersPowerSeparation(t *testing.T) {
 	// exclusion now applies only while the chamber is genuinely ACTIVE (DKG
 	// complete). AssignExecutive alone leaves it in ExecutiveIdle, in which
 	// state members intentionally keep their rights — see
-	// executiveRestrictionsActiveLocked. Drive the chamber to ExecutiveActive so
+	// executiveRestrictionsApplyLocked. Drive the chamber to ExecutiveActive so
 	// this test keeps asserting what it was written to assert: power separation
 	// under an operational chamber.
 	if err := coordinator.executive.SetMembers([]int{4, 5, 6}, 0); err != nil {
