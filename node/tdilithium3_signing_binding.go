@@ -203,7 +203,7 @@ func (n *Node) newTDilithium3SigningBinding(
 	if err != nil {
 		return nil, err
 	}
-	roster, err := n.capturedEpochValidatorRoster(rosterEpoch)
+	roster, err := n.capturedEpochValidatorRosterAtOrAfter(rosterEpoch)
 	if err != nil {
 		return nil, err
 	}
