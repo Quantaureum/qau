@@ -240,13 +240,26 @@ func TestCONS_P0_03_getGroupPublicKeyForEpochLocked_PrecomputesCurrentEpoch(t *t
 			currentEpoch, string(gotHist), string(oldKey))
 	}
 
-	// Case 3: With rotation → fail-closed for non-current epoch without history.
+	// Case 3: With rotation → fail-closed for a non-current epoch without an
+	// applicable record. After the QTD-H03 floor refinement (2026-10-15) a
+	// past epoch IS answered by the newest entry at-or-before it, so the
+	// fail-closed cases are exactly: (a) future epochs, and (b) past epochs
+	// below every recorded entry. Pass explicit currentEpoch values — the
+	// package-global genesis time makes qpos.GetCurrentEpoch()
+	// non-deterministic across tests.
 	qfs.mu.RLock()
-	gotNil := qfs.getGroupPublicKeyForEpochLocked(99, currentEpoch)
+	gotFutureNil := qfs.getGroupPublicKeyForEpochLocked(99, 5)
 	qfs.mu.RUnlock()
-	if gotNil != nil {
-		t.Errorf("Case 3: getGroupPublicKeyForEpochLocked(99, %d) = %q, want nil (fail-closed for non-current epoch after rotation)",
-			currentEpoch, string(gotNil))
+	if gotFutureNil != nil {
+		t.Errorf("Case 3a: getGroupPublicKeyForEpochLocked(99, current=5) = %q, want nil (future epoch: fail-closed after rotation)",
+			string(gotFutureNil))
+	}
+	qfs.mu.RLock()
+	gotNoFloor := qfs.getGroupPublicKeyForEpochLocked(2, 99)
+	qfs.mu.RUnlock()
+	if gotNoFloor != nil {
+		t.Errorf("Case 3b: getGroupPublicKeyForEpochLocked(2, current=99) = %q, want nil (no entry at-or-below epoch 2: never serve the live key)",
+			string(gotNoFloor))
 	}
 
 	// Case 4: With rotation → fallback to currentKey for current epoch.

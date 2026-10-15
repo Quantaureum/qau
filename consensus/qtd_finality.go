@@ -2057,13 +2057,21 @@ func (qfs *QTDFinalityState) ReRootGroupKeyCustody(epoch uint64, key []byte) {
 // QTD-H03 fix: during DKG rotation, the current signer has the NEW key,
 // but seals from PAST epochs must be verified with the OLD key.
 //
-// QTD-009 fix (R30): when DKG rotation has occurred (groupKeyHistory is
-// non-empty) but no historical record exists for a NON-current epoch,
-// returns nil (fail-closed) rather than falling back to the current key.
-// This prevents an attacker who injects a malicious signer from forging
-// arbitrary historical finality proofs. When groupKeyHistory is empty
-// (no rotation has occurred), the current key is the ONLY key that ever
-// existed, so it is valid for ALL epochs — the fallback is safe.
+// QTD-009 fix (R30): once any rotation history exists (groupKeyHistory
+// non-empty), a NON-current epoch is NEVER answered with the current
+// signer's key — that key might belong to an attacker-injected signer, and
+// serving it for past epochs would let it forge historical finality proofs.
+// Instead, a past epoch is answered with the recorded entry from the most
+// recent activation/rotation epoch <= the target epoch (floor semantics):
+// every write-side chokepoint (setQTDSignerLocked, ReRootGroupKeyCustody,
+// ObserveAnchoredGroupKey) installs its key at the epoch that key takes
+// effect, and a key stays in force until superseded, so the floor entry is
+// exactly the key that was active then. Fail-closed is preserved where the
+// floor finds no entry at all (pre-activation era, or epochs aged out of
+// the retention window), and for future epochs (epoch > currentEpoch).
+// When groupKeyHistory is empty (no rotation has ever occurred), the
+// current key is the ONLY key that ever existed, so it is valid for ALL
+// epochs — the fallback is safe.
 //
 // R30-IMPLEMENT (2026-07-27): QTD-H03 + QTD-009. Caller must hold qfs.mu
 // (at least RLock).
@@ -2138,14 +2146,37 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 		return validateGroupKey(key, "groupKeyHistory")
 	}
 
-	// No historical record for this epoch.
-	hasRotation := len(qfs.groupKeyHistory) > 0
-
-	if hasRotation && epoch != currentEpoch {
-		// QTD-009: DKG rotation has occurred, but we have no historical
-		// key for this non-current epoch. Fail-closed — do NOT fall back
-		// to the current key, as it may not have been active at this epoch.
-		return nil
+	// No exact record for this epoch.
+	if len(qfs.groupKeyHistory) > 0 && epoch != currentEpoch {
+		// QTD-009 (unchanged invariant): once any rotation history exists,
+		// a non-current epoch is NEVER answered with the live signer's key.
+		// Future epochs keep failing closed exactly as before.
+		if epoch > currentEpoch {
+			return nil
+		}
+		// QTD-H03 boundary fix (2026-10-15): for a PAST epoch, serve the
+		// entry recorded at the most recent activation/rotation epoch <=
+		// the target. The history table carries entries only at
+		// activation/rotation epochs (plus gap-tolerant same-key observer
+		// anchors), and each key stays in force until superseded — so the
+		// floor entry IS the key that was active at the target epoch. The
+		// previous exact-epoch matching wrongly failed closed for every
+		// ordinary past epoch, most visibly the final slot's seal of every
+		// epoch, which is submitted and verified only after the chain has
+		// already advanced into epoch+1. Fail-closed is preserved when no
+		// entry <= epoch exists (pre-activation era, or epochs aged out of
+		// the retention window).
+		floorEpoch := uint64(0)
+		foundFloor := false
+		for e := range qfs.groupKeyHistory {
+			if e <= epoch && (!foundFloor || e > floorEpoch) {
+				floorEpoch, foundFloor = e, true
+			}
+		}
+		if !foundFloor {
+			return nil
+		}
+		return validateGroupKey(qfs.groupKeyHistory[floorEpoch], "groupKeyHistory(floor)")
 	}
 
 	// No rotation (groupKeyHistory empty) OR this IS the current epoch:
