@@ -1402,6 +1402,18 @@ func (s *Syncer) SetOnStateRootResult(fn func(height uint64, matched bool)) {
 
 // reportStateRoot forwards a state-root comparison outcome to the node.
 func (s *Syncer) reportStateRoot(height uint64, matched bool) {
+	if matched {
+		// M4-FULLSYNC-GATE (2026-10-16): a per-block root match proves the
+		// cumulative state through this height, so advance the verified
+		// baseline. Without this, a full-mode resync (ProcessBlock applies
+		// every synced block, no unvalidated markers, so no post-sync
+		// rebuildState pass ever runs) leaves stateVerifiedHeight at 0
+		// forever and IsStateReady() gates block production permanently —
+		// a freshly re-synced validator can never produce again. The snap
+		// path never reaches here during sync (applyBlock is skipped), so
+		// only genuinely re-executed blocks advance the baseline.
+		s.MarkStateVerified(height)
+	}
 	if s.onStateRootResult != nil {
 		s.onStateRootResult(height, matched)
 	}
