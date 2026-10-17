@@ -157,6 +157,14 @@ func (n *Node) loadVKSnapshots() {
 	if applied > 0 {
 		nodeLog.Info("validator-keys registry replayed from chain: %d ops", applied)
 		n.persistVKSnapshot()
+	} else {
+		// R111-VK-EMPTY-SNAPSHOT (2026-10-17): persist the (empty) snapshot even
+		// when the replay found no ops. Without this, a chain with zero
+		// ValidatorKey transactions never writes a snapshot, so EVERY boot
+		// re-runs the O(chain height) block scan before P2P binds — hours of
+		// disk-speed grinding on hosts whose blocks.db exceeds RAM.
+		n.persistVKSnapshot()
+		nodeLog.Info("validator-keys registry empty after full replay — snapshot persisted to skip future rescans")
 	}
 }
 

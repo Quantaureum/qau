@@ -6518,6 +6518,7 @@ func (n *Node) startServices() error {
 			//     persisted entry is DISCARDED (fail-closed: cold-start guard
 			// R45 is safer than un-verifiable fork-local entropy).
 			persistedAccs, persistedErr := n.blockStore.LoadVRFAccumulators()
+			loadedFromPersisted := false // R111-VRF-FASTBOOT: set when the checkpoint is proven fresh
 			if persistedErr != nil {
 				nodeLog.Warn("R58-VRF-PERSIST: failed to load persisted VRF accumulators: %v (R52 replay will rebuild)", persistedErr)
 			}
@@ -6527,6 +6528,48 @@ func (n *Node) startServices() error {
 				if tip := n.blockStore.FindContinuousTip(); tip < continuousTip {
 					continuousTip = tip
 				}
+				// R111-VRF-FASTBOOT (2026-10-17): restore from the persisted
+				// accumulator checkpoint instead of replaying every block from
+				// height 1 when the checkpoint provably matches the canonical
+				// chain. The R52 replay is O(chain height) single-block reads;
+				// on a host whose blocks.db exceeds RAM (2-core/11G validators
+				// with a ~20G store) a cold-cache replay grinds for hours at
+				// disk speed BEFORE the P2P listener binds, so the node appears
+				// wedged with peers=0 and the chain stalls on every restart.
+				//
+				// Safety proof sketch (mirrors the R88-C calibration that
+				// already guards this data): the persisted map was written by
+				// the previous session from THIS store's canonical headers.
+				// It can only be stale when the store was subsequently
+				// reorganized (R53 truncation) or is newer than the persisted
+				// tip. Both are detected with ONE header read each: the tip
+				// block's own accumulator must equal the persisted value for
+				// its epoch (a fork-truncated store fails this: R53 truncation
+				// replaced that epoch's surviving tip with a block carrying a
+				// different accumulator), and the tip epoch must be covered by
+				// the persisted set (a store grown past the persisted session
+				// fails this and the replay legitimately resumes for the tail).
+				// On any mismatch we fall back to the full R52 replay — this
+				// path only ever skips work, never invents state.
+				if persistedErr == nil && len(persistedAccs) > 0 && n.blockStore != nil {
+					if tipBlk, tErr := n.blockStore.GetBlockByHeight(continuousTip); tErr == nil && tipBlk != nil && tipBlk.Header != nil {
+						tipEpoch := tipBlk.Header.Epoch
+						tipAcc := tipBlk.Header.VRFAccumulator
+						if persistedAcc, ok := persistedAccs[tipEpoch]; ok && persistedAcc == tipAcc {
+							for e, acc := range persistedAccs {
+								if e <= tipEpoch {
+									qpos.SetEpochVRFAccumulator(e, acc)
+								}
+							}
+							if cleared := qpos.ClearColdStartEpochs(); cleared > 0 {
+								nodeLog.Info("FIX: cleared %d stale QPOS cold-start epoch flags after R52 rebuild (chain tip=%d)", cleared, continuousTip)
+							}
+							nodeLog.Info("R111-VRF-FASTBOOT: restored %d epoch accumulator(s) from persisted checkpoint (tip=%d epoch=%d) — skipped %d-block replay", len(persistedAccs), continuousTip, tipEpoch, continuousTip)
+							loadedFromPersisted = true
+						}
+					}
+				}
+				if !loadedFromPersisted {
 				count := 0
 				var lastEpoch uint64
 				var lastAcc types.Hash
@@ -6637,6 +6680,7 @@ func (n *Node) startServices() error {
 				if cleared := qpos.ClearColdStartEpochs(); cleared > 0 {
 					nodeLog.Info("FIX: cleared %d stale QPOS cold-start epoch flags after R52 rebuild (chain tip=%d)", cleared, continuousTip)
 				}
+				} // R111-VRF-FASTBOOT: end of !loadedFromPersisted (full R52 replay) branch
 
 				// R45-STATE-PERSIST-FIX (2026-08-12): On restart when state was
 				// loaded from persistent storage (stateAlreadyPersisted=true),
