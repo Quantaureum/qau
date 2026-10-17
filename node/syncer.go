@@ -3443,13 +3443,45 @@ func (s *Syncer) completeSnapSync() {
 		// still not in blockStore, fetch the header from skeletonHeaders
 		// (HeaderResponse may have arrived mid-snap). The R62 path itself
 		// will log the missing-header state if neither is available.
-		if blk, err := s.blockStore.GetBlockByHeight(s.snapTargetBlock); err == nil && blk != nil && blk.Header != nil {
-			s.snapTargetHeader = blk.Header
-			syncLog.Info("R62-SNAP-ADVANCE: backfilled snapTargetHeader from blockStore at %d (was nil at snap start)", s.snapTargetBlock)
-		} else if hdr, ok := s.skeletonHeaders[s.snapTargetBlock]; ok && hdr != nil {
-			s.snapTargetHeader = hdr
-			syncLog.Info("R62-SNAP-ADVANCE: backfilled snapTargetHeader from skeletonHeaders at %d (was nil at snap start)", s.snapTargetBlock)
+		if s.blockStore != nil {
+			if blk, err := s.blockStore.GetBlockByHeight(s.snapTargetBlock); err == nil && blk != nil && blk.Header != nil {
+				s.snapTargetHeader = blk.Header
+				syncLog.Info("R62-SNAP-ADVANCE: backfilled snapTargetHeader from blockStore at %d (was nil at snap start)", s.snapTargetBlock)
+			} else if hdr, ok := s.skeletonHeaders[s.snapTargetBlock]; ok && hdr != nil {
+				s.snapTargetHeader = hdr
+				syncLog.Info("R62-SNAP-ADVANCE: backfilled snapTargetHeader from skeletonHeaders at %d (was nil at snap start)", s.snapTargetBlock)
+			}
 		}
+	}
+	// R111B-SNAP-FAIL-CLOSED (2026-10-18): the pivot header is REQUIRED to verify
+	// the imported state root. Previously a nil snapTargetHeader skipped the
+	// verification block entirely (the `if s.snapTargetHeader != nil` below),
+	// letting unverified — and on mainnet twice observed, poisoned — account
+	// state become the node's canonical state: nonce walls at the first
+	// replayed transaction, R87-STATE-TRUST lockout, and a "state already
+	// persisted" boot that never re-applies genesis (incident docs
+	// s3-snap-pollution-incident-2026-10-15.md §A, 2026-10-17 S1 recurrence).
+	// Fail closed exactly like a root mismatch: discard the session's imports,
+	// clear every snap flag, and force full sync. The snap will not re-trigger
+	// because full sync is now on.
+	if s.snapTargetHeader == nil && s.snapTargetBlock > 0 {
+		syncLog.Error("R111B-SNAP-FAIL-CLOSED: snap session finished without a pivot header (target=%d) — state root CANNOT be verified; discarding imported state and forcing full sync",
+			s.snapTargetBlock)
+		if s.stateDB != nil {
+			if err := s.stateDB.ClearSnapImport(); err != nil {
+				syncLog.Error("Snap sync: failed to clear imported state: %v", err)
+			} else {
+				syncLog.Warn("Snap sync: discarded imported state — pivot header unavailable, falling back to FULL sync (fail-closed)")
+			}
+		}
+		s.snapSyncing = false
+		s.snapSyncCompleted = false
+		s.snapAccounts = nil
+		s.snapStorageWanted = nil
+		s.snapServerChosen = false
+		s.SetFullSyncMode(true)
+		s.mu.Unlock()
+		return
 	}
 	// every block instead of trusting downloaded state.
 	if s.blockValidator != nil {
