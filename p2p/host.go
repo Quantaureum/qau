@@ -64,6 +64,16 @@ const (
 	// peers plus the Dilithium3 PoW handshake without hanging connections open.
 	DefaultHandshakeTimeout = 60 * time.Second
 
+	// R113-SENDQ-MEMCAP (2026-10-18): per-peer cap on queued LARGE (>1 MB)
+	// outbound messages. Block responses reach MaxBlockResponseSize (10 MB);
+	// without a byte cap, a slot-count-only queue let four slow resyncing peers
+	// pin a 13+ GB heap on the serving node until the OOM killer struck
+	// (observed twice on mainnet, 2026-10-17). 256 MB per peer bounds four
+	// slow consumers to ~1 GB worst case while leaving ample burst room for
+	// legitimate fast consumers (a full 10 MB batch drains in ~50 ms on an
+	// idle link, so honest peers never see this cap).
+	maxQueuedLargeSendBytes = int64(256 << 20) // 256 MB
+
 	// defaultPeerReadTimeout is the per-message read deadline applied inside
 	// readLoop before each header read. R14-LOW (P2P-LOW-09): previously an
 	// inline `120 * time.Second` magic number at the SetReadDeadline call site
@@ -593,8 +603,15 @@ type Peer struct {
 	mu              sync.Mutex
 
 	sendCh chan []byte
-	ctx    context.Context
-	cancel context.CancelFunc
+	// R113-SENDQ-MEMCAP (2026-10-18): bytes of LARGE (>1 MB) messages currently
+	// queued in sendCh, tracked atomically. A slow peer cannot pin unbounded
+	// block-response memory on this node: SendRaw refuses large messages past
+	// maxQueuedLargeSendBytes and the caller (block request handler) drops the
+	// batch, forcing the requesting peer to re-request — backpressure instead of
+	// an OOM kill. Decremented by writeLoop after each message leaves the queue.
+	queuedLargeBytes atomic.Int64
+	ctx              context.Context
+	cancel           context.CancelFunc
 
 	// P2P-R28-H02 FIX (2026-07-25): closeSendCh guards sendCh closure to
 	// prevent double-close panics. readLoop and disconnectPeer may both
@@ -2749,7 +2766,15 @@ func (h *Host) handleConnection(conn net.Conn, dir Direction) error {
 		Conn:      conn,
 		Connected: true,
 		Direction: dir,
-		sendCh:    make(chan []byte, 4096), // TPS FIX: 100→4096, prevents silent tx broadcast drops
+	// R113-SENDQ-MEMCAP (2026-10-18): the queue was raised to 4096 slots for
+	// tx-broadcast flood tolerance, but every slot may hold a full
+	// MaxBlockResponseSize (10 MB) block response. Four slow resyncing peers
+	// each pinning a near-full queue retain gigabytes of queued responses on
+	// the producer — observed live as a 13.3 GB anon heap and repeated
+	// OOM kills (S1/S7, 2026-10-17) while serving chain history. The slot count
+	// stays generous for small consensus/broadcast messages; the memory bound
+	// for large messages is enforced by peer.queuedLargeBytes in SendRaw below.
+	sendCh:    make(chan []byte, 512),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -3929,6 +3954,9 @@ func (h *Host) writeLoop(peer *Peer) {
 						"addr":   peer.Addr,
 						"size":   len(data),
 					})
+				// R113-SENDQ-MEMCAP: the message left the queue — release its
+				// byte-accounting before the drop so the cap doesn't leak.
+				peer.releaseLargeBytes(data)
 				continue
 			}
 			// P2-DEADLINE FIX (R29, 2026-07-26): Previously the SetWriteDeadline
@@ -3952,7 +3980,20 @@ func (h *Host) writeLoop(peer *Peer) {
 			if _, err := peer.Conn.Write(data); err != nil {
 				return
 			}
+			// R113-SENDQ-MEMCAP: write completed — the message left the queue.
+			peer.releaseLargeBytes(data)
 		}
+	}
+}
+
+// releaseLargeBytes subtracts a drained/dropped message's byte-accounting from
+// the per-peer large-send backlog (R113-SENDQ-MEMCAP). Only messages above
+// largeSendMsgBytes were counted on enqueue, so sub-1MB messages are a no-op.
+// Called from writeLoop only; the cap itself lives in SendRaw.
+func (p *Peer) releaseLargeBytes(data []byte) {
+	const largeSendMsgBytes = 1 << 20 // must match SendRaw
+	if n := int64(len(data)); n > largeSendMsgBytes {
+		p.queuedLargeBytes.Add(-n)
 	}
 }
 
@@ -6484,6 +6525,29 @@ func (h *Host) SendRaw(peerID PeerID, data []byte) error {
 
 	if !exists || !peer.Connected {
 		return fmt.Errorf("peer %s not found or not connected", peerID)
+	}
+
+	// R113-SENDQ-MEMCAP (2026-10-18): cap the per-peer backlog of LARGE
+	// messages. Block responses reach MaxBlockResponseSize (10 MB); with a
+	// slot-count-only queue, four slow resyncing peers each pinning a full
+	// queue retained a 13+ GB heap on the serving node and OOM-killed it
+	// twice on mainnet. Messages at or below largeSendMsgBytes (consensus,
+	// votes, tx broadcasts) bypass the byte cap so propagation is never
+	// starved; oversized sends fail with a typed error and the block
+	// request handler drops the batch (the peer re-requests).
+	const largeSendMsgBytes = 1 << 20 // 1 MB
+	if msgBytes := int64(len(data)); msgBytes > largeSendMsgBytes {
+		if peer.queuedLargeBytes.Load()+msgBytes > maxQueuedLargeSendBytes {
+			return fmt.Errorf("send backlog over byte cap for peer %s: %d queued + %d incoming > %d (slow consumer; dropping batch — peer will re-request)",
+				peerID, peer.queuedLargeBytes.Load(), msgBytes, maxQueuedLargeSendBytes)
+		}
+		select {
+		case peer.sendCh <- data:
+			peer.queuedLargeBytes.Add(msgBytes)
+			return nil
+		default:
+			return fmt.Errorf("send channel full for peer %s", peerID)
+		}
 	}
 
 	if h.chaosLossPct > 0 || h.chaosLatencyMS > 0 {
