@@ -140,6 +140,17 @@ type Syncer struct {
 	rebuildRunning int32
 	rebuildPending int32
 
+	// R114-UNTRUSTED-BASE (2026-10-18): set while the running rebuildState
+	// lifted its baseline above stateVerifiedHeight by trusting the persisted
+	// stateDB LastCommittedHeight (the R87-M4-RESTART skip-forward). lch carries
+	// no verification provenance — after a restart it may be the residue of a
+	// diverged or reward-less replay. A final verification mismatch on such a
+	// rebuild must NOT engage the R63 canonical-trust path: R63 marks the range
+	// verified and permanently freezes the poisoned state (the 2026-10-15..18
+	// mainnet incident family: six production lockouts). Instead the mismatch
+	// forces full sync so state is re-executed from a trusted base.
+	rebuildBaseUntrusted bool
+
 	// GHOST-HEIGHT FIX (2026-08-06): per-peer advertised height map.
 	// highestKnown is (re)computed as max(currentHeight, max(peerHeights)).
 	// This lets highestKnown decay when a peer that previously advertised a
@@ -4425,6 +4436,11 @@ func (s *Syncer) rebuildState(fromHeight, toHeight uint64) {
 		return
 	}
 	defer atomic.StoreInt32(&s.rebuildRunning, 0)
+	// R114-UNTRUSTED-BASE: reset per rebuildState invocation; only the lch
+	// skip-forward below sets it, and rebuildRange consumes it at final
+	// verification. Cleared here so a later, cleanly-based rebuild is not
+	// tainted by an earlier one's provenance.
+	defer func() { s.rebuildBaseUntrusted = false }()
 
 	// R61-REBUILD-FIX (2026-08-09): Resume from stateVerifiedHeight instead of
 	// stateDB.LastCommittedHeight(). The latter only means "stateDB was committed
@@ -4468,6 +4484,15 @@ func (s *Syncer) rebuildState(fromHeight, toHeight uint64) {
 						"lowering baseline so blocks %d..%d are re-applied instead of skipped (R87-M4)",
 						lch, baseline, clamped+1, baseline)
 				} else {
+					// R114-UNTRUSTED-BASE: record that this rebuild's base was
+					// lifted by trusting unverified persisted lch. If the final
+					// verification then mismatches, the R63 trust path is
+					// forbidden (see rebuildRange) and full sync is forced.
+					if clamped > verifiedH && !s.stateDB.HasRollbackHistory() {
+						s.rebuildBaseUntrusted = true
+						syncLog.Info("rebuildState: baseline lifted from verified=%d to untrusted persisted lch=%d (R87-M4-RESTART); a final mismatch will force full sync instead of R63 trust (R114)",
+							verifiedH, clamped)
+					}
 					syncLog.Info("rebuildState: stateDB lch=%d is AHEAD of baseline=%d and rollback "+
 						"history is unavailable (restart); skipping forward to %d - replaying the "+
 						"range would re-execute blocks already in the state (R87-M4-RESTART)",
@@ -4623,6 +4648,31 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	}
 	computedRoot := s.stateDB.Root()
 	if computedRoot != finalBlk.Header.StateRoot {
+		// R114-UNTRUSTED-BASE (2026-10-18): forbid the R63 canonical-trust path
+		// when the rebuild's baseline was lifted by trusting unverified persisted
+		// state (lch skip-forward). R63 marks the contested range verified and
+		// permanently freezes whatever state the rebuild produced — on an
+		// untrusted base that state is poisoned, every subsequent live block
+		// keeps mismatching, and R87-STATE-TRUST locks production forever (six
+		// such lockouts observed on mainnet, 2026-10-15..18, each requiring a
+		// manual wipe+resync). Fail closed instead: force full sync so every
+		// block is re-executed from a genesis-equivalent base.
+		if s.rebuildBaseUntrusted {
+			syncLog.Error("R114-UNTRUSTED-BASE: post-rebuild state root mismatch (computed=%x header=%x block=%d) on a rebuild whose baseline came from unverified persisted lch — "+
+				"REFUSING R63 canonical trust; forcing full sync to re-execute state from a trusted base",
+				computedRoot[:8], finalBlk.Header.StateRoot[:8], toHeight)
+			s.rebuildBaseUntrusted = false
+			s.SetFullSyncMode(true)
+			// Drop the verified baseline so the forced full sync re-applies the
+			// entire range instead of resuming above the poisoned state.
+			s.mu.Lock()
+			s.stateVerifiedHeight = 0
+			cb := s.onStateDBVerified
+			s.mu.Unlock()
+			_ = cb // state is NOT verified; do not fire the verified callback
+			s.requestMissingBlocks()
+			return false
+		}
 		// R63-STATE-ROOT-TRUST (2026-08-18): Canonical chain trust path.
 		// A rebuild can apply canonical blocks while local root derivation
 		// still differs from the canonical header because of the M4
