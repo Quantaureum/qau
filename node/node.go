@@ -7088,6 +7088,32 @@ func (n *Node) wireElectionVerifier() {
 			if !isSealer {
 				verifier.SetTrustCanonicalProposer(true)
 				nodeLog.Warn("Election verifier: non-sealer node — trusting canonical proposer (geth EL-style, no independent VRF schedule)")
+			}
+			// R118-CATCHUP-HEAL (2026-10-20): a sealer that is RE-SYNCING
+			// history can hold a diverged VRF-accumulator trajectory for the
+			// range it has not yet re-imported (S7 2026-10-19/20: after the
+			// full resync from scratch, every canonical block in a ~2k-block
+			// window was rejected as "proposer mismatch" — the expected
+			// proposer derived from the stale accumulator disagreed with the
+			// canonical block for ALL six validators, not one fork's
+			// proposer). The R61 heal already repairs the accumulator after
+			// healThreshold consecutive rejects, but each rejected block is
+			// DROPPED and must survive a full peer re-delivery round trip
+			// (~30-60s per batch cycle) before it can be rejected/healed
+			// again — measured on S7 as 8 network round trips per epoch =
+			// 4-8 minutes per 32-block epoch. QAU_HEAL_THRESHOLD=1 collapses
+			// that to the first reject per epoch: the block is healed
+			// immediately, SetEpochVRFAccumulator repairs the local
+			// trajectory from the block's own on-chain value, and the rest
+			// of the epoch verifies normally. Safety is unchanged in
+			// substance — a healed block still passed signature and
+			// state-root validation, and the healed epoch's accumulator is
+			// overwritten with the canonical on-chain value immediately.
+			if h := os.Getenv("QAU_HEAL_THRESHOLD"); h != "" {
+				if n, err := strconv.Atoi(h); err == nil {
+					verifier.SetHealThreshold(n)
+					nodeLog.Info("Election verifier: heal threshold overridden via QAU_HEAL_THRESHOLD=%d (catch-up nodes: first mismatch heals the epoch instead of 8 network round trips)", n)
+				}
 			} else {
 				nodeLog.Info("Election verifier: sealer node — strict proposer verification enabled")
 			}
@@ -7374,12 +7400,31 @@ func (n *Node) blockProcessingLoop() {
 					nodeLog.Info("blockProcessingLoop: evicted %d far-ahead/old blocks from syncBuf (currentH=%d, incoming=%d)", dropped, currentH, blk.Header.Height)
 				}
 				if len(n.syncBuf) >= 200 && time.Since(n.lastBlockInsert) > 30*time.Second {
-					evicted := len(n.syncBuf)
-					n.syncBuf = n.syncBuf[:0]
+					// R117-STALLLOOP (2026-10-20): same reasoning as the takeNextBlock
+					// twin — never discard the next-expected window; see the full
+					// comment there. Clearing the seed blocks here is what armed the
+					// 60s clear-loop on S7: each throw discarded the currentH+1 block
+					// whose parent had also just been discarded, so every
+					// re-delivery arrived parentless and inserts never resumed.
+					const windowKeepProc = 8
+					keepFrom, keepTo := currentH+1, currentH+windowKeepProc
+					kept2 := n.syncBuf[:0]
+					evicted := 0
+					for _, b := range n.syncBuf {
+						if b != nil && b.Header.Height >= keepFrom && b.Header.Height <= keepTo {
+							kept2 = append(kept2, b)
+						} else {
+							evicted++
+						}
+					}
+					for i := len(kept2); i < len(n.syncBuf); i++ {
+						n.syncBuf[i] = nil
+					}
+					n.syncBuf = kept2
 					n.syncBufRebuildAccounting()
 					n.syncBufMu.Unlock()
-					nodeLog.Warn("blockProcessingLoop: syncBuf stall (%d blocks, no insert for %v), clearing entirely (currentH=%d)",
-						evicted, time.Since(n.lastBlockInsert).Round(time.Second), currentH)
+					nodeLog.Warn("blockProcessingLoop: syncBuf stall (%d blocks, no insert for %v) — cleared %d far-ahead, kept %d in next-expected window [%d,%d] (currentH=%d, R117-STALLLOOP)",
+						evicted+len(kept2), time.Since(n.lastBlockInsert).Round(time.Second), evicted, len(kept2), keepFrom, keepTo, currentH)
 					continue
 				}
 			}
@@ -7767,13 +7812,41 @@ func (n *Node) takeNextBlock() *encoding.Block {
 		// inserts and is still cleared — deadlock protection is preserved.
 		const syncBufOverflowThreshold = 200
 		if len(n.syncBuf) > syncBufOverflowThreshold && time.Since(n.lastBlockInsert) > 30*time.Second {
-			nodeLog.Warn("takeNextBlock: syncBuf stall (%d > %d, no insert for %v), clearing to prevent deadlock (currentH=%d)",
-				len(n.syncBuf), syncBufOverflowThreshold, time.Since(n.lastBlockInsert), currentH)
-			for i := range n.syncBuf {
+			// R117-STALLLOOP (2026-10-20): the wholesale clear used to throw
+			// away EVERY buffered block, including the currentH+1 block that
+			// is the only key to unwedging. Once that block was gone, every
+			// in-window re-delivery landed as parentless (its parent — the
+			// block the insert loop needed to write first — had just been
+			// discarded), ProcessBlock returned ErrParentNotFound, inserts
+			// never advanced, and 30s later the whole buffer was cleared
+			// again: a self-sustaining 60s clear-loop that measured ~20-30
+			// blocks/min on S7 (2026-10-19/20, six full clears per 10 min,
+			// CPU 220% burned on re-decoding discarded work).
+			//
+			// Keep the blocks around the next expected height instead of
+			// nuking them: they are few (<= windowKeep), they are exactly the
+			// ones the insert loop needs to resume, and checkSync's
+			// re-request covers any that are genuinely wrong. Only the
+			// far-ahead bulk is discarded — that part of the old behavior
+			// was correct.
+			const windowKeep = 8
+			keepFrom, keepTo := currentH+1, currentH+windowKeep
+			kept := n.syncBuf[:0]
+			cleared := 0
+			for _, b := range n.syncBuf {
+				if b != nil && b.Header.Height >= keepFrom && b.Header.Height <= keepTo {
+					kept = append(kept, b)
+				} else {
+					cleared++
+				}
+			}
+			for i := len(kept); i < len(n.syncBuf); i++ {
 				n.syncBuf[i] = nil
 			}
-			n.syncBuf = n.syncBuf[:0]
+			n.syncBuf = kept
 			n.syncBufRebuildAccounting()
+			nodeLog.Warn("takeNextBlock: syncBuf stall (%d > %d, no insert for %v) — cleared %d far-ahead, kept %d in next-expected window [%d,%d] (currentH=%d, R117-STALLLOOP)",
+				cleared+len(kept), syncBufOverflowThreshold, time.Since(n.lastBlockInsert).Round(time.Second), cleared, len(kept), keepFrom, keepTo, currentH)
 		}
 		nodeLog.Info("takeNextBlock: returning nil, syncBuf=%d, currentH=%d, checked=%d, found=%d, lastInsert=%v ago",
 			len(n.syncBuf), currentH, parentCheckCount, parentFoundCount, time.Since(n.lastBlockInsert).Round(time.Second))
