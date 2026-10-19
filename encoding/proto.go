@@ -633,3 +633,52 @@ func hashData(data []byte) []byte {
 	hash := sha3.Sum256(data)
 	return hash[:]
 }
+
+// ApproxBlockBytes estimates the decoded heap footprint of a block without
+// serializing it. R115-SYNCBUF-BOUND uses it to enforce a byte budget on the
+// node's receive-side sync buffer, so the estimate must (a) stay cheap and
+// (b) never UNDER-count the real cost — over-counting merely drops the block
+// early and checkSync re-requests it, while under-counting lets the buffer
+// grow past its budget.
+//
+// Cost model: per-transaction floor (struct + signature fields + slice/map
+// overhead) plus the variable-length payload fields we know dominate for
+// this chain: signature/signature2, privacy proofs and encrypted outputs.
+// A nil header counts as zero — callers treat such blocks as invalid before
+// reaching the budget path anyway.
+func ApproxBlockBytes(b *Block) int {
+	if b == nil {
+		return 0
+	}
+	total := 512 // Block struct + header pointer + slice headers
+	if b.Header != nil {
+		// BlockHeader carries fixed arrays and a few slices (validators,
+		// TSS fields); measure only what can actually grow.
+		total += 1024
+	}
+	for _, tx := range b.Transactions {
+		total += 2048 // Transaction struct floor: hashes, addrs, scalar fields
+		if tx == nil {
+			continue
+		}
+		total += len(tx.PublicKey) + len(tx.Signature) + len(tx.Data)
+		for _, sig := range tx.MultiSigSignatures {
+			total += 64 + len(sig)
+		}
+		for _, c := range tx.PrivacyCommitments {
+			total += 64 + len(c)
+		}
+		for _, ea := range tx.PrivacyEncryptedAmounts {
+			total += 64 + len(ea)
+		}
+		for _, pr := range tx.PrivacyRangeProofs {
+			total += 64 + len(pr)
+		}
+		total += len(tx.PrivacyEphemeralPubKey) + len(tx.PrivacyBalanceProof)
+		if tx.BlobSidecar != nil {
+			// Blobs are fixed-size arrays (~128KB each) plus commitments/proofs
+			total += len(tx.BlobSidecar.Blobs) * (BlobSize + 96)
+		}
+	}
+	return total
+}

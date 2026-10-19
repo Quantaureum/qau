@@ -428,6 +428,31 @@ type Node struct {
 	// them) from "the node has genuinely stalled" (clear + re-request).
 	lastBlockInsert time.Time
 
+	// R115-SYNCBUF-BOUND (2026-10-19): full-sync memory root cause. During
+	// full-mode catch-up, multiple peers deliver overlapping 500-block
+	// batches while blockInsertLoop re-executes blocks at only ~30-80/s.
+	// blockProcessingLoop accepted every in-window block with NO dedup and NO
+	// byte cap: production S7 held 26,223 decoded blocks (~1MB each after
+	// decode) => >10GB anonymous heap on a 24GB box that also runs a 2.2GB
+	// anti-reclaim keepalive, wedging the whole OS twice. r113 capped the
+	// SENDING side (per-peer sendq bytes); this closes the RECEIVING side
+	// with the same 256MB budget, enforced on the decoded block size so the
+	// bound covers real heap cost, not message framing.
+	//
+	// syncBufSet makes in-window delivery idempotent: each block hash enters
+	// the set at append time and leaves when the block leaves the buffer
+	// (inserted, evicted or cleared), so the set can never outlive its block
+	// and duplicate deliveries from overlapping peer batches cost O(1) map
+	// lookups instead of O(buffer) memory.
+	//
+	// maxSyncBufBytes is the hard cap. On breach the oldest blocks are
+	// dropped first (they are the least likely to still be processable once
+	// the buffer has drifted that far ahead); checkSync re-requests whatever
+	// was dropped, same as the existing stall-clear path.
+	syncBufSet      map[string]struct{}
+	syncBufBytes    int64
+	maxSyncBufBytes int64
+
 	// High Availability
 	shutdownHandler *ha.ShutdownHandler
 	healthServer    *ha.HealthServer
@@ -3712,6 +3737,7 @@ func (n *Node) initSyncer() error {
 			}
 		}
 		n.syncBuf = filtered
+		n.syncBufRebuildAccounting()
 		n.syncBufMu.Unlock()
 		nodeLog.Info("OnForkRollback: evicted %d blocks at/above forkHeight=%d, kept %d blocks below",
 			evicted, forkHeight, kept)
@@ -3789,6 +3815,11 @@ func (n *Node) initSyncer() error {
 	// pressure and delaying deadlock detection. The spec (project memory)
 	// mandates clearing syncBuf when len > 200 to prevent deadlock.
 	n.syncBuf = make([]*encoding.Block, 0, 200)
+	// R115-SYNCBUF-BOUND: receiving-side dedup set + byte budget (see field
+	// comment). 256MB mirrors the r113 per-peer send cap.
+	n.syncBufSet = make(map[string]struct{}, 256)
+	n.syncBufBytes = 0
+	n.maxSyncBufBytes = 256 << 20
 	n.syncBufSignal = make(chan struct{}, 1)
 	n.startTime = time.Now()
 
@@ -6570,116 +6601,116 @@ func (n *Node) startServices() error {
 					}
 				}
 				if !loadedFromPersisted {
-				count := 0
-				var lastEpoch uint64
-				var lastAcc types.Hash
-				// R108-VRF-REPLAY-BATCH: buffer what the replay observes and
-				// persist it in a single transaction afterwards (see the callback
-				// comment above). Later blocks of an epoch overwrite earlier ones,
-				// so the map ends up holding the last on-chain value per epoch —
-				// exactly what the per-block callback used to write.
-				replayAccs := make(map[uint64]types.Hash)
-				replayingVRF.Store(true)
-				for h := uint64(1); h <= continuousTip; h++ {
-					blk, err := n.blockStore.GetBlockByHeight(h)
-					if err != nil || blk == nil {
-						nodeLog.Warn("R52 FIX: failed to load block at height %d for VRF rebuild: %v", h, err)
-						break
+					count := 0
+					var lastEpoch uint64
+					var lastAcc types.Hash
+					// R108-VRF-REPLAY-BATCH: buffer what the replay observes and
+					// persist it in a single transaction afterwards (see the callback
+					// comment above). Later blocks of an epoch overwrite earlier ones,
+					// so the map ends up holding the last on-chain value per epoch —
+					// exactly what the per-block callback used to write.
+					replayAccs := make(map[uint64]types.Hash)
+					replayingVRF.Store(true)
+					for h := uint64(1); h <= continuousTip; h++ {
+						blk, err := n.blockStore.GetBlockByHeight(h)
+						if err != nil || blk == nil {
+							nodeLog.Warn("R52 FIX: failed to load block at height %d for VRF rebuild: %v", h, err)
+							break
+						}
+						// R54-ACC (2026-08-07): Rebuild the per-epoch accumulator from
+						// the ON-CHAIN header value (deterministic across nodes), not
+						// by re-XOR-ing VRF outputs (path-asymmetric → fork).
+						qpos.SetEpochVRFAccumulator(blk.Header.Epoch, blk.Header.VRFAccumulator)
+						replayAccs[blk.Header.Epoch] = blk.Header.VRFAccumulator
+						if blk.Header.Epoch >= lastEpoch {
+							lastEpoch = blk.Header.Epoch
+							lastAcc = blk.Header.VRFAccumulator
+						}
+						count++
 					}
-					// R54-ACC (2026-08-07): Rebuild the per-epoch accumulator from
-					// the ON-CHAIN header value (deterministic across nodes), not
-					// by re-XOR-ing VRF outputs (path-asymmetric → fork).
-					qpos.SetEpochVRFAccumulator(blk.Header.Epoch, blk.Header.VRFAccumulator)
-					replayAccs[blk.Header.Epoch] = blk.Header.VRFAccumulator
-					if blk.Header.Epoch >= lastEpoch {
-						lastEpoch = blk.Header.Epoch
-						lastAcc = blk.Header.VRFAccumulator
+					replayingVRF.Store(false)
+					if err := n.blockStore.PutVRFAccumulatorsBatch(replayAccs); err != nil {
+						nodeLog.Error("R108-VRF-REPLAY-BATCH: failed to persist %d replayed epoch accumulator(s): %v", len(replayAccs), err)
 					}
-					count++
-				}
-				replayingVRF.Store(false)
-				if err := n.blockStore.PutVRFAccumulatorsBatch(replayAccs); err != nil {
-					nodeLog.Error("R108-VRF-REPLAY-BATCH: failed to persist %d replayed epoch accumulator(s): %v", len(replayAccs), err)
-				}
-				nodeLog.Info("R52 FIX: Rebuilt VRF accumulator from %d canonical blocks (height 1..%d, lastOnChainEpoch=%d)", count, continuousTip, lastEpoch)
+					nodeLog.Info("R52 FIX: Rebuilt VRF accumulator from %d canonical blocks (height 1..%d, lastOnChainEpoch=%d)", count, continuousTip, lastEpoch)
 
-				// R45-WARMUP-REVERT-FIX (2026-08-12): The earlier
-				// R45-FUTURE-EPOCH-WARMUP-EXPAND-FIX pre-loaded
-				// epochVRFAccumulator for epochs [lastEpoch-2 .. lastEpoch+5]
-				// with the chain-tip accumulator as a placeholder. This was
-				// MEANT to suppress QPOS cold-start fallbacks during sealer
-				// restart, but in practice the placeholder accumulator is
-				// not the value that the canonical chain uses for those future
-				// epochs: the canonical accumulator is the running XOR of
-				// blocks produced above the local tip. For gaps above the tip,
-				// a placeholder can elect a proposer different from the
-				// canonical-chain ProposerAddr, causing valid incoming blocks
-				// to be rejected as ordinary proposer mismatches.
-				//
-				// The fix is the OPPOSITE of the warmup: do NOT pre-load
-				// accumulators for future epochs. Leave them empty. When
-				// the syncer imports a new block whose epoch srcEpoch is
-				// not in the map, GetProposerForSlot falls back via the
-				// R45-PoA-FIX cold-start path (commitProcessingLoop),
-				// marking coldStartEpochs[epoch] = {} and returning an
-				// epoch-zero-accumulator shuffle to the caller. ValidateBlock
-				// (block_validator.go:1317-1323) catches
-				// ErrProposerScheduleNotReady explicitly and TRUSTS the
-				// canonical proposer for that block instead of rejecting.
-				// As the syncer applies block headers (calling
-				// SetEpochVRFAccumulator for those future epochs from the
-				// authoritative block), the placeholder-shuffle cache
-				// is invalidated, coldStartEpochs is cleared, and the
-				// schedule catches up to canonical reality.
-				//
-				// We intentionally keep lastEpoch/lastAcc populated above
-				// (no-op uses) so a future, more-accurate warmup strategy
-				// can compute it, but we DO NOT write it into qpos for any
-				// epoch > lastEpoch. That preserves correctness.
-				_ = lastAcc
+					// R45-WARMUP-REVERT-FIX (2026-08-12): The earlier
+					// R45-FUTURE-EPOCH-WARMUP-EXPAND-FIX pre-loaded
+					// epochVRFAccumulator for epochs [lastEpoch-2 .. lastEpoch+5]
+					// with the chain-tip accumulator as a placeholder. This was
+					// MEANT to suppress QPOS cold-start fallbacks during sealer
+					// restart, but in practice the placeholder accumulator is
+					// not the value that the canonical chain uses for those future
+					// epochs: the canonical accumulator is the running XOR of
+					// blocks produced above the local tip. For gaps above the tip,
+					// a placeholder can elect a proposer different from the
+					// canonical-chain ProposerAddr, causing valid incoming blocks
+					// to be rejected as ordinary proposer mismatches.
+					//
+					// The fix is the OPPOSITE of the warmup: do NOT pre-load
+					// accumulators for future epochs. Leave them empty. When
+					// the syncer imports a new block whose epoch srcEpoch is
+					// not in the map, GetProposerForSlot falls back via the
+					// R45-PoA-FIX cold-start path (commitProcessingLoop),
+					// marking coldStartEpochs[epoch] = {} and returning an
+					// epoch-zero-accumulator shuffle to the caller. ValidateBlock
+					// (block_validator.go:1317-1323) catches
+					// ErrProposerScheduleNotReady explicitly and TRUSTS the
+					// canonical proposer for that block instead of rejecting.
+					// As the syncer applies block headers (calling
+					// SetEpochVRFAccumulator for those future epochs from the
+					// authoritative block), the placeholder-shuffle cache
+					// is invalidated, coldStartEpochs is cleared, and the
+					// schedule catches up to canonical reality.
+					//
+					// We intentionally keep lastEpoch/lastAcc populated above
+					// (no-op uses) so a future, more-accurate warmup strategy
+					// can compute it, but we DO NOT write it into qpos for any
+					// epoch > lastEpoch. That preserves correctness.
+					_ = lastAcc
 
-				// R88-C (2026-08-30): calibrate the R58 persisted checkpoints
-				// against the block store — see the long comment at the R58 load
-				// above. The replay just assigned authoritative values for every
-				// epoch ≤ lastEpoch; for entries beyond that we verify the epoch
-				// still has surviving blocks and use the LAST surviving block's
-				// header value, else discard (fail-closed).
-				if persistedErr == nil && len(persistedAccs) > 0 {
-					kept, calibrated, discarded := calibratePersistedVRFAccumulators(
-						qpos, n.blockStore, persistedAccs, lastEpoch, continuousTip, latestHeight)
-					nodeLog.Info("R58-VRF-PERSIST: calibrated %d persisted VRF accumulator checkpoint(s) against the block store (kept=%d calibrated=%d discarded=%d, replayTipEpoch=%d)",
-						len(persistedAccs), kept, calibrated, discarded, lastEpoch)
-				}
+					// R88-C (2026-08-30): calibrate the R58 persisted checkpoints
+					// against the block store — see the long comment at the R58 load
+					// above. The replay just assigned authoritative values for every
+					// epoch ≤ lastEpoch; for entries beyond that we verify the epoch
+					// still has surviving blocks and use the LAST surviving block's
+					// header value, else discard (fail-closed).
+					if persistedErr == nil && len(persistedAccs) > 0 {
+						kept, calibrated, discarded := calibratePersistedVRFAccumulators(
+							qpos, n.blockStore, persistedAccs, lastEpoch, continuousTip, latestHeight)
+						nodeLog.Info("R58-VRF-PERSIST: calibrated %d persisted VRF accumulator checkpoint(s) against the block store (kept=%d calibrated=%d discarded=%d, replayTipEpoch=%d)",
+							len(persistedAccs), kept, calibrated, discarded, lastEpoch)
+					}
 
-				// R45-COLDSTART-CLEAR-FIX (2026-08-12): The R52 rebuild above
-				// populated q.epochVRFAccumulator for every canonical epoch
-				// visible in blockStore [1, continuousTip]. Each
-				// SetEpochVRFAccumulator call also cleared coldStartEpochs for
-				// epoch+1 and epoch+2, but it did NOT clear coldStartEpochs for
-				// the last epoch itself — and crucially, it did NOT scorch the
-				// map of any epoch for which we never even called
-				// GetProposerForSlot during the rebuild (the rebuild only
-				// touches headers, never askes QPOS for shuffles).
-				//
-				// A stale cold-start flag can survive a restart through the
-				// last-session-state replay even when the corresponding VRF
-				// accumulator has since been loaded from a block header. The
-				// producer would then refuse to propose indefinitely.
-				//
-				// Fix: clear coldStartEpochs entirely after R52 rebuild. Every
-				// epoch with a populated accumulator is now safe to compute
-				// the shuffle deterministically from the on-chain header
-				// (SetEpochVRFAccumulator → shuffle cache invalidation already
-				// ran). Epochs older than those covered by the rebuild are
-				// unreachable (chain can only advance past the current tip),
-				// and any future epoch depends on the accumulators we just
-				// loaded. QPOSProposerForSlot will re-mark a cold-start epoch
-				// only if, going forward, it actually has a missing
-				// accumulator for a fresh future epoch — which is the
-				// legitimate fail-closed path.
-				if cleared := qpos.ClearColdStartEpochs(); cleared > 0 {
-					nodeLog.Info("FIX: cleared %d stale QPOS cold-start epoch flags after R52 rebuild (chain tip=%d)", cleared, continuousTip)
-				}
+					// R45-COLDSTART-CLEAR-FIX (2026-08-12): The R52 rebuild above
+					// populated q.epochVRFAccumulator for every canonical epoch
+					// visible in blockStore [1, continuousTip]. Each
+					// SetEpochVRFAccumulator call also cleared coldStartEpochs for
+					// epoch+1 and epoch+2, but it did NOT clear coldStartEpochs for
+					// the last epoch itself — and crucially, it did NOT scorch the
+					// map of any epoch for which we never even called
+					// GetProposerForSlot during the rebuild (the rebuild only
+					// touches headers, never askes QPOS for shuffles).
+					//
+					// A stale cold-start flag can survive a restart through the
+					// last-session-state replay even when the corresponding VRF
+					// accumulator has since been loaded from a block header. The
+					// producer would then refuse to propose indefinitely.
+					//
+					// Fix: clear coldStartEpochs entirely after R52 rebuild. Every
+					// epoch with a populated accumulator is now safe to compute
+					// the shuffle deterministically from the on-chain header
+					// (SetEpochVRFAccumulator → shuffle cache invalidation already
+					// ran). Epochs older than those covered by the rebuild are
+					// unreachable (chain can only advance past the current tip),
+					// and any future epoch depends on the accumulators we just
+					// loaded. QPOSProposerForSlot will re-mark a cold-start epoch
+					// only if, going forward, it actually has a missing
+					// accumulator for a fresh future epoch — which is the
+					// legitimate fail-closed path.
+					if cleared := qpos.ClearColdStartEpochs(); cleared > 0 {
+						nodeLog.Info("FIX: cleared %d stale QPOS cold-start epoch flags after R52 rebuild (chain tip=%d)", cleared, continuousTip)
+					}
 				} // R111-VRF-FASTBOOT: end of !loadedFromPersisted (full R52 replay) branch
 
 				// R45-STATE-PERSIST-FIX (2026-08-12): On restart when state was
@@ -7328,12 +7359,14 @@ func (n *Node) blockProcessingLoop() {
 					}
 				}
 				n.syncBuf = filtered
+				n.syncBufRebuildAccounting()
 				if dropped > 0 {
 					nodeLog.Info("blockProcessingLoop: evicted %d far-ahead/old blocks from syncBuf (currentH=%d, incoming=%d)", dropped, currentH, blk.Header.Height)
 				}
 				if len(n.syncBuf) >= 200 && time.Since(n.lastBlockInsert) > 30*time.Second {
 					evicted := len(n.syncBuf)
 					n.syncBuf = n.syncBuf[:0]
+					n.syncBufRebuildAccounting()
 					n.syncBufMu.Unlock()
 					nodeLog.Warn("blockProcessingLoop: syncBuf stall (%d blocks, no insert for %v), clearing entirely (currentH=%d)",
 						evicted, time.Since(n.lastBlockInsert).Round(time.Second), currentH)
@@ -7362,7 +7395,35 @@ func (n *Node) blockProcessingLoop() {
 				n.syncer.NotifyIncomingBlock(blk.Header.Height)
 			}
 
+			// R115-SYNCBUF-BOUND: dedup + hard byte cap on the receive side.
+			// Duplicate delivery is the NORMAL case during catch-up (six peers
+			// answering the same re-request with overlapping 500-block batches),
+			// so a duplicate is dropped silently, not logged per-block.
+			var blkKey string
+			if h := block.ComputeBlockHash(blk.Header); true {
+				blkKey = string(h[:])
+			}
+			if _, dup := n.syncBufSet[blkKey]; dup {
+				n.syncBufMu.Unlock()
+				continue
+			}
+			blkBytes := int64(encoding.ApproxBlockBytes(blk))
+			if n.syncBufBytes+blkBytes > n.maxSyncBufBytes {
+				// Budget breach: drop oldest-first until the new block fits.
+				// The oldest entries are the ones the insert loop has already
+				// walked past or cannot use yet; checkSync re-requests anything
+				// that is still needed, identical to the stall-clear recovery.
+				dropped := 0
+				for len(n.syncBuf) > 0 && n.syncBufBytes+blkBytes > n.maxSyncBufBytes {
+					n.syncBufRemoveAt(0)
+					dropped++
+				}
+				nodeLog.Warn("blockProcessingLoop: syncBuf byte cap hit (%dMB > %dMB budget), dropped %d oldest blocks to admit height=%d (currentH=%d)",
+					n.syncBufBytes/(1024*1024), n.maxSyncBufBytes/(1024*1024), dropped, blk.Header.Height, currentH)
+			}
 			n.syncBuf = append(n.syncBuf, blk)
+			n.syncBufSet[blkKey] = struct{}{}
+			n.syncBufBytes += blkBytes
 			n.syncBufMu.Unlock()
 			select {
 			case n.syncBufSignal <- struct{}{}:
@@ -7495,6 +7556,7 @@ func (n *Node) memoryMonitorLoop() {
 						evicted = len(n.syncBuf) - 50
 						n.syncBuf = n.syncBuf[evicted:]
 					}
+					n.syncBufRebuildAccounting()
 					nodeLog.Warn("MEMORY: evicted %d blocks from syncBuf (remaining=%d, currentH=%d)", evicted, len(n.syncBuf), currentH)
 				}
 				n.syncBufMu.Unlock()
@@ -7506,6 +7568,48 @@ func (n *Node) memoryMonitorLoop() {
 
 			lastGCCount = m.NumGC
 		}()
+	}
+}
+
+// syncBufRemoveAt removes the block at index i from the receive buffer and
+// keeps the R115 dedup set and byte budget in sync with it. Every path that
+// takes a block OUT of n.syncBuf must go through this helper (or rebuild the
+// whole accounting below) — otherwise the dedup set leaks an entry and the
+// byte budget permanently over-counts, which would silently shrink the
+// usable buffer after every eviction.
+// Caller must hold n.syncBufMu.
+func (n *Node) syncBufRemoveAt(i int) {
+	blk := n.syncBuf[i]
+	last := len(n.syncBuf) - 1
+	n.syncBuf[i] = n.syncBuf[last]
+	n.syncBuf[last] = nil
+	n.syncBuf = n.syncBuf[:last]
+	if blk != nil {
+		h := block.ComputeBlockHash(blk.Header)
+		delete(n.syncBufSet, string(h[:]))
+		n.syncBufBytes -= int64(encoding.ApproxBlockBytes(blk))
+	}
+}
+
+// syncBufRebuildAccounting recomputes the dedup set and byte budget from the
+// current buffer contents. Used by paths that filter/replace the whole
+// slice in one shot (fork rollback, stall clears, monitor eviction), where
+// calling syncBufRemoveAt per block would be quadratic churn for no gain.
+// Caller must hold n.syncBufMu.
+func (n *Node) syncBufRebuildAccounting() {
+	if n.syncBufSet == nil {
+		n.syncBufSet = make(map[string]struct{}, 256)
+	} else {
+		clear(n.syncBufSet)
+	}
+	n.syncBufBytes = 0
+	for _, b := range n.syncBuf {
+		if b == nil {
+			continue
+		}
+		h := block.ComputeBlockHash(b.Header)
+		n.syncBufSet[string(h[:])] = struct{}{}
+		n.syncBufBytes += int64(encoding.ApproxBlockBytes(b))
 	}
 }
 
@@ -7596,15 +7700,14 @@ func (n *Node) takeNextBlock() *encoding.Block {
 				n.syncBuf[i] = nil
 			}
 			n.syncBuf = n.syncBuf[:0]
+			n.syncBufRebuildAccounting()
 		}
 		nodeLog.Info("takeNextBlock: returning nil, syncBuf=%d, currentH=%d, checked=%d, found=%d, lastInsert=%v ago",
 			len(n.syncBuf), currentH, parentCheckCount, parentFoundCount, time.Since(n.lastBlockInsert).Round(time.Second))
 		return nil
 	}
 	blk := n.syncBuf[bestIdx]
-	n.syncBuf[bestIdx] = n.syncBuf[len(n.syncBuf)-1]
-	n.syncBuf[len(n.syncBuf)-1] = nil
-	n.syncBuf = n.syncBuf[:len(n.syncBuf)-1]
+	n.syncBufRemoveAt(bestIdx)
 	return blk
 }
 

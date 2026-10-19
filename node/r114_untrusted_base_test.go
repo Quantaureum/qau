@@ -4,9 +4,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/qaudb/block"
 	"github.com/quantaureum/qau/qaudb/db"
-	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/qaudb/state"
 	"github.com/quantaureum/qau/types"
 )
