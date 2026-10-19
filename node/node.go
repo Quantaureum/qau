@@ -452,6 +452,15 @@ type Node struct {
 	syncBufSet      map[string]struct{}
 	syncBufBytes    int64
 	maxSyncBufBytes int64
+	// R116-SYNCBUF-HEIGHT-INDEX: height -> indices of buffered blocks at that
+	// height. takeNextBlock previously scanned the WHOLE buffer calling
+	// HasBlock per candidate — O(N) DB point-reads per insert, O(N^2) per
+	// drain. With 300-400 buffered blocks during catch-up that dominated
+	// insert throughput (~30 blocks/min at high occupancy vs 65/s when the
+	// buffer stayed small). The index hands the hot path (currentH+1) in
+	// O(1); the full scan stays as fallback for genesis-height blocks and
+	// the no-parent debug path.
+	syncBufByHeight map[uint64][]int
 
 	// High Availability
 	shutdownHandler *ha.ShutdownHandler
@@ -3818,6 +3827,7 @@ func (n *Node) initSyncer() error {
 	// R115-SYNCBUF-BOUND: receiving-side dedup set + byte budget (see field
 	// comment). 256MB mirrors the r113 per-peer send cap.
 	n.syncBufSet = make(map[string]struct{}, 256)
+	n.syncBufByHeight = make(map[uint64][]int, 256)
 	n.syncBufBytes = 0
 	n.maxSyncBufBytes = 256 << 20
 	n.syncBufSignal = make(chan struct{}, 1)
@@ -7423,6 +7433,7 @@ func (n *Node) blockProcessingLoop() {
 			}
 			n.syncBuf = append(n.syncBuf, blk)
 			n.syncBufSet[blkKey] = struct{}{}
+			n.syncBufByHeight[blk.Header.Height] = append(n.syncBufByHeight[blk.Header.Height], len(n.syncBuf)-1)
 			n.syncBufBytes += blkBytes
 			n.syncBufMu.Unlock()
 			select {
@@ -7579,8 +7590,28 @@ func (n *Node) memoryMonitorLoop() {
 // usable buffer after every eviction.
 // Caller must hold n.syncBufMu.
 func (n *Node) syncBufRemoveAt(i int) {
+	if i < 0 || i >= len(n.syncBuf) {
+		return
+	}
+	if n.syncBufByHeight == nil {
+		n.syncBufByHeight = make(map[uint64][]int, 256)
+	}
 	blk := n.syncBuf[i]
 	last := len(n.syncBuf) - 1
+	// R116-SYNCBUF-HEIGHT-INDEX: the element moved into slot i changes its
+	// index; fix up its height-index entry before the slice shrinks. The
+	// removed block's own entry is dropped by value so duplicate heights
+	// stay correct.
+	if i != last && n.syncBuf[last] != nil {
+		movedH := n.syncBuf[last].Header.Height
+		idxs := n.syncBufByHeight[movedH]
+		for k, v := range idxs {
+			if v == last {
+				idxs[k] = i
+				break
+			}
+		}
+	}
 	n.syncBuf[i] = n.syncBuf[last]
 	n.syncBuf[last] = nil
 	n.syncBuf = n.syncBuf[:last]
@@ -7588,7 +7619,23 @@ func (n *Node) syncBufRemoveAt(i int) {
 		h := block.ComputeBlockHash(blk.Header)
 		delete(n.syncBufSet, string(h[:]))
 		n.syncBufBytes -= int64(encoding.ApproxBlockBytes(blk))
+		n.syncBufByHeight[blk.Header.Height] = removeIntValue(n.syncBufByHeight[blk.Header.Height], i)
+		if len(n.syncBufByHeight[blk.Header.Height]) == 0 {
+			delete(n.syncBufByHeight, blk.Header.Height)
+		}
 	}
+}
+
+// removeIntValue removes one occurrence of v from idxs, preserving order.
+// The height index stores at most a handful of entries per height (R115
+// dedup usually leaves one), so a linear scan is the right cost.
+func removeIntValue(idxs []int, v int) []int {
+	for k, x := range idxs {
+		if x == v {
+			return append(idxs[:k], idxs[k+1:]...)
+		}
+	}
+	return idxs
 }
 
 // syncBufRebuildAccounting recomputes the dedup set and byte budget from the
@@ -7602,13 +7649,19 @@ func (n *Node) syncBufRebuildAccounting() {
 	} else {
 		clear(n.syncBufSet)
 	}
+	if n.syncBufByHeight == nil {
+		n.syncBufByHeight = make(map[uint64][]int, 256)
+	} else {
+		clear(n.syncBufByHeight)
+	}
 	n.syncBufBytes = 0
-	for _, b := range n.syncBuf {
+	for i, b := range n.syncBuf {
 		if b == nil {
 			continue
 		}
 		h := block.ComputeBlockHash(b.Header)
 		n.syncBufSet[string(h[:])] = struct{}{}
+		n.syncBufByHeight[b.Header.Height] = append(n.syncBufByHeight[b.Header.Height], i)
 		n.syncBufBytes += int64(encoding.ApproxBlockBytes(b))
 	}
 }
@@ -7624,6 +7677,26 @@ func (n *Node) takeNextBlock() *encoding.Block {
 	var currentH uint64
 	if n.syncer != nil {
 		currentH = n.syncer.CurrentHeight()
+	}
+
+	// R116-SYNCBUF-HEIGHT-INDEX: O(1) fast path. During ordinary catch-up the
+	// correct next block is currentH+1; the previous full-scan-plus-HasBlock
+	// loop cost O(N) DB point-reads per insert and O(N^2) per drain, which at
+	// 300-400 buffered blocks throttled inserts to ~30/min. Look the height
+	// up directly and verify its parent in one HasBlock call; fall through to
+	// the scan only when the fast path misses (out-of-order delivery, fork
+	// fallback, genesis blocks).
+	if currentH > 0 {
+		for _, i := range n.syncBufByHeight[currentH+1] {
+			b := n.syncBuf[i]
+			if b == nil {
+				continue
+			}
+			parentExists, _ := n.blockStore.HasBlock(b.Header.ParentHash)
+			if parentExists {
+				return n.syncBufTakeByIndex(i)
+			}
+		}
 	}
 
 	var bestIdx int = -1
@@ -7708,6 +7781,15 @@ func (n *Node) takeNextBlock() *encoding.Block {
 	}
 	blk := n.syncBuf[bestIdx]
 	n.syncBufRemoveAt(bestIdx)
+	return blk
+}
+
+// syncBufTakeByIndex removes and returns the block at buffer index i via the
+// accounting-aware removal (R115 set/budget + R116 height index).
+// Caller must hold n.syncBufMu.
+func (n *Node) syncBufTakeByIndex(i int) *encoding.Block {
+	blk := n.syncBuf[i]
+	n.syncBufRemoveAt(i)
 	return blk
 }
 

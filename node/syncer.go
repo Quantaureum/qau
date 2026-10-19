@@ -2347,6 +2347,22 @@ func (s *Syncer) checkSync() {
 					"%d unvalidated blocks in range) — no rebuild needed (R96-SYNCFLAP)",
 					s.currentHeight, s.stateVerifiedHeight, pendingUnvalidated)
 			}
+		} else if shouldRestartRebuild(atomic.LoadInt32(&s.rebuildRunning) == 1, atomic.LoadInt32(&s.rebuildPending) == 1, s.currentHeight, s.stateVerifiedHeight, s.countUnvalidatedInRangeLocked(s.stateVerifiedHeight, s.currentHeight)) {
+			// R115B-RESTART-REBUILD (2026-10-19): a node that restarts mid
+			// full-sync boots with syncing=false (the sync-completed transition
+			// happened in the previous process) while stateVerifiedHeight can be
+			// far behind the restored chain head — e.g. S7 2026-10-19: reboot at
+			// head=220698 with verified=0 meant the wasSyncing-triggered rebuild
+			// never fired, the producer logged "state not verified yet"
+			// forever, and no further blocks were requested. The gating
+			// question is the same one shouldRebuildAfterSync asks on the
+			// completion edge: is there an actually-unvalidated range above
+			// the verified height? If yes, start the rebuild unconditionally —
+			// rebuildState's own lch reconciliation (R87-M4-RESTART) handles
+			// where to resume from.
+			syncLog.Info("checkSync: restart with unverified range (current=%d verified=%d unvalidated=%d) — starting rebuild without a sync transition (R115B)",
+				s.currentHeight, s.stateVerifiedHeight, s.countUnvalidatedInRangeLocked(s.stateVerifiedHeight, s.currentHeight))
+			go s.rebuildState(s.startHeight, s.currentHeight)
 		}
 	}
 

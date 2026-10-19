@@ -209,3 +209,36 @@ func skippedStateRootReason(duringRebuild bool) string {
 func (s *Syncer) isRebuilding() bool {
 	return atomic.LoadInt32(&s.rebuildRunning) == 1
 }
+
+// shouldRestartRebuild reports whether checkSync's caught-up path must launch
+// a rebuild even though no syncing→caught-up transition happened in this
+// process. R115B-RESTART-REBUILD (2026-10-19): a node restarting mid
+// full-sync boots with syncing=false while stateVerifiedHeight can be far
+// behind the restored chain head; the edge-triggered rebuild already fired
+// inside the previous process, so nobody would ever verify the remaining
+// range. Production hit: S7 2026-10-19, reboot at head=220698 with verified=0
+// wedged the producer on "state not verified yet" forever.
+//
+// The condition mirrors shouldRebuildAfterSync's substantive question —
+// "is there work?" — with two differences:
+//   - a rebuild already running/pending makes a second launch pointless
+//     (rebuildState would just mark pending and exit),
+//   - stateVerifiedHeight < currentHeight alone is sufficient even when the
+//     in-memory unvalidated-marker count is zero: after a restart the durable
+//     markers live in the block store while countUnvalidatedInRangeLocked
+//     sees only the in-memory set, so a marker-only check false-negatives
+//     exactly in the case this branch exists for.
+func shouldRestartRebuild(rebuildRunning, rebuildPending bool, currentHeight, stateVerifiedHeight uint64, unvalidatedInRange int) bool {
+	if rebuildRunning || rebuildPending {
+		return false
+	}
+	if currentHeight == 0 {
+		// Genesis-only: nothing above genesis to verify.
+		return false
+	}
+	if stateVerifiedHeight >= currentHeight {
+		// Fully verified through the head — no work.
+		return false
+	}
+	return unvalidatedInRange > 0 || stateVerifiedHeight < currentHeight
+}

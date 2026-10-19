@@ -26,6 +26,7 @@ func r115TestNode(t *testing.T) *Node {
 	n := &Node{}
 	n.syncBuf = make([]*encoding.Block, 0, 8)
 	n.syncBufSet = make(map[string]struct{}, 8)
+	n.syncBufByHeight = make(map[uint64][]int, 8)
 	n.syncBufBytes = 0
 	n.maxSyncBufBytes = 256 << 20
 	return n
@@ -194,5 +195,102 @@ func TestApproxBlockBytesNeverUndercountsRealSerialization(t *testing.T) {
 	}
 	if got := encoding.ApproxBlockBytes(nil); got != 0 {
 		t.Fatalf("nil block must be 0, got %d", got)
+	}
+}
+
+// R116-SYNCBUF-HEIGHT-INDEX: the height index must stay exact across every
+// removal shape, or the O(1) fast path in takeNextBlock would hand out blocks
+// that are no longer buffered (or miss ones that are). These tests drive the
+// same field state the production receive path maintains.
+
+func r115IndexAdd(n *Node, b *encoding.Block) {
+	if n.syncBufByHeight == nil {
+		n.syncBufByHeight = make(map[uint64][]int, 8)
+	}
+	key := block.ComputeBlockHash(b.Header)
+	k := string(key[:])
+	if _, dup := n.syncBufSet[k]; dup {
+		return
+	}
+	blkBytes := int64(encoding.ApproxBlockBytes(b))
+	for len(n.syncBuf) > 0 && n.syncBufBytes+blkBytes > n.maxSyncBufBytes {
+		n.syncBufRemoveAt(0)
+	}
+	n.syncBuf = append(n.syncBuf, b)
+	n.syncBufSet[k] = struct{}{}
+	n.syncBufByHeight[b.Header.Height] = append(n.syncBufByHeight[b.Header.Height], len(n.syncBuf)-1)
+	n.syncBufBytes += blkBytes
+}
+
+func TestSyncBufHeightIndexTracksRemovals(t *testing.T) {
+	n := r115TestNode(t)
+	for h := uint64(1); h <= 5; h++ {
+		r115IndexAdd(n, r115Block(h, 256))
+	}
+	if len(n.syncBufByHeight[3]) != 1 || n.syncBufByHeight[3][0] != 2 {
+		t.Fatalf("index before removal wrong: %v", n.syncBufByHeight[3])
+	}
+
+	// Remove the middle block (index 2, height 3). The tail block moves to
+	// slot 2, so heights 4 and 5 must both re-point to index 2.
+	n.syncBufRemoveAt(2)
+	if _, ok := n.syncBufByHeight[3]; ok {
+		t.Fatalf("height 3 still indexed after removal: %v", n.syncBufByHeight[3])
+	}
+	// Buffer was [h1,h2,h3,h4,h5]; removing idx 2 (h3) swaps the TAIL (h5,
+	// idx 4) into slot 2 and truncates. h4 never moved (still idx 3); h5 must
+	// now be indexed at 2.
+	if n.syncBufByHeight[4][0] != 3 {
+		t.Fatalf("h4 index must be untouched: got %v want [3]", n.syncBufByHeight[4])
+	}
+	if n.syncBufByHeight[5][0] != 2 {
+		t.Fatalf("moved tail block (h5) not re-indexed: got %v want [2]", n.syncBufByHeight[5])
+	}
+}
+
+func TestSyncBufHeightIndexO1FastPathPicksCurrentHPlusOne(t *testing.T) {
+	n := r115TestNode(t)
+	// Buffer heights 11..15; "store" head is 10, so currentH+1 = 11 must be
+	// found via the index without any full scan. The fast path in production
+	// checks HasBlock(parent); here the parent of block 11 is a zero hash we
+	// cannot fake into the store, so we assert the lookup itself: the index
+	// must contain 11 with a live block.
+	for h := uint64(11); h <= 15; h++ {
+		r115IndexAdd(n, r115Block(h, 128))
+	}
+	idxs := n.syncBufByHeight[11]
+	if len(idxs) != 1 || n.syncBuf[idxs[0]] == nil || n.syncBuf[idxs[0]].Header.Height != 11 {
+		t.Fatalf("index lookup for currentH+1 failed: %v", idxs)
+	}
+	// Take it; index must no longer reference 11.
+	taken := n.syncBufTakeByIndex(idxs[0])
+	if taken.Header.Height != 11 {
+		t.Fatalf("took wrong block: height=%d", taken.Header.Height)
+	}
+	if _, ok := n.syncBufByHeight[11]; ok {
+		t.Fatal("height 11 still indexed after take")
+	}
+}
+
+func TestSyncBufRebuildRebuildsHeightIndex(t *testing.T) {
+	n := r115TestNode(t)
+	for h := uint64(20); h <= 23; h++ {
+		r115IndexAdd(n, r115Block(h, 128))
+	}
+	// Simulate the whole-slice filter shape (OnForkRollback) then rebuild.
+	forkHeight := uint64(22)
+	filtered := n.syncBuf[:0]
+	for _, b := range n.syncBuf {
+		if b.Header.Height < forkHeight {
+			filtered = append(filtered, b)
+		}
+	}
+	n.syncBuf = filtered
+	n.syncBufRebuildAccounting()
+	if len(n.syncBufByHeight) != 2 {
+		t.Fatalf("index rebuild wrong: %v", n.syncBufByHeight)
+	}
+	if n.syncBufByHeight[21][0] != 1 {
+		t.Fatalf("index positions wrong after rebuild: %v", n.syncBufByHeight)
 	}
 }
