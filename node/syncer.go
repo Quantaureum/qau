@@ -4593,8 +4593,24 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	startTime := time.Now()
 	applied := uint64(0)
 	failed := uint64(0)
+	skippedCommitted := uint64(0)
 
 	for h := fromHeight; h <= toHeight; h++ {
+		// R122-REBUILD-RACE (2026-10-20): the live insert loop can commit blocks
+		// concurrently with this rebuild — rebuildState captured its baseline
+		// from LastCommittedHeight BEFORE the insert committed h. Re-applying a
+		// block already in state double-applies its whole transition (worst case:
+		// epoch-boundary rewards, which credit validator balances a second time
+		// and permanently diverge the state — production fork source 2026-10-20:
+		// two applyEpochRewards lines for the same boundary block 25ms apart).
+		// Re-read lch per block: anything at or below it is already in state.
+		if s.stateDB != nil {
+			if lch := s.stateDB.LastCommittedHeight(); h <= lch {
+				skippedCommitted++
+				continue
+			}
+		}
+
 		blk, err := s.blockStore.GetBlockByHeight(h)
 		if err != nil {
 			failed++
@@ -4648,8 +4664,8 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 		}
 	}
 
-	syncLog.Info("rebuildState: complete, applied=%d, failed=%d, duration=%s",
-		applied, failed, time.Since(startTime).Round(time.Second))
+	syncLog.Info("rebuildState: complete, applied=%d, failed=%d, skippedCommitted=%d, duration=%s",
+		applied, failed, skippedCommitted, time.Since(startTime).Round(time.Second))
 
 	// R32-P1-02 FIX (2026-07-28): Final state root verification after rebuild.
 	// rebuildState uses skipStateRootValidation=true per block during the loop

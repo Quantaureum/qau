@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -35,14 +36,17 @@ func main() {
 		return
 	}
 	h := block.ComputeBlockHash(blk.Header)
-	fmt.Printf("height=%d hash=%s proposer=%s slot=%d epoch=%d acc=%s txs=%d\n",
+	att := blk.Header.Attestations
+	attSum := sha256.Sum256(att)
+	fmt.Printf("height=%d hash=%s proposer=%s slot=%d epoch=%d acc=%s txs=%d attLen=%d attSha=%s stateRoot=%s\n",
 		blk.Header.Height, hex.EncodeToString(h[:]), hex.EncodeToString(blk.Header.ProposerAddr[:]),
-		blk.Header.Slot, blk.Header.Epoch, hex.EncodeToString(blk.Header.VRFAccumulator[:]), len(blk.Transactions))
+		blk.Header.Slot, blk.Header.Epoch, hex.EncodeToString(blk.Header.VRFAccumulator[:]), len(blk.Transactions),
+		len(att), hex.EncodeToString(attSum[:8]), hex.EncodeToString(blk.Header.StateRoot[:8]))
 }
 
 // roDB adapts a read-only bbolt handle to the db.Database interface expected
 // by BlockStore. Reads use the default bucket exactly like BoltDB.Get; all
-// mutations fail — this tool must never write.
+// mutations fail - this tool must never write.
 type roDB struct {
 	bdb *bolt.DB
 }
@@ -67,10 +71,10 @@ func (r *roDB) Has(key []byte) (bool, error) {
 	ok, err := r.Get(key)
 	return len(ok) > 0, err
 }
-func (r *roDB) Put(_, _ []byte) error                               { return fmt.Errorf("read-only") }
-func (r *roDB) Delete(_ []byte) error                               { return fmt.Errorf("read-only") }
-func (r *roDB) Close() error                                        { return r.bdb.Close() }
-func (r *roDB) NewBatch() db.Batch                                  { panic("read-only") }
+func (r *roDB) Put(_, _ []byte) error { return fmt.Errorf("read-only") }
+func (r *roDB) Delete(_ []byte) error { return fmt.Errorf("read-only") }
+func (r *roDB) Close() error          { return r.bdb.Close() }
+func (r *roDB) NewBatch() db.Batch    { panic("read-only") }
 func (r *roDB) NewIterator(prefix []byte, start []byte) db.Iterator { panic("read-only") }
 func (r *roDB) NewIteratorWithLimit(prefix []byte, start []byte, limit int) db.Iterator {
 	panic("read-only")
