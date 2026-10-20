@@ -47,7 +47,7 @@ func TestSendRawByteCapBoundary(t *testing.T) {
 	}
 	// A backlog of (cap - 2 MB) plus a 2.5 MB message must exceed the cap.
 	backlog := maxQueuedLargeSendBytes - (2 << 20)
-	incoming := int64(5 << 20) / 2 // 2.5 MB
+	incoming := int64(5<<20) / 2 // 2.5 MB
 	if backlog+incoming <= maxQueuedLargeSendBytes {
 		t.Fatalf("test invariant broken: backlog(%d)+incoming(%d) must exceed cap(%d)",
 			backlog, incoming, maxQueuedLargeSendBytes)

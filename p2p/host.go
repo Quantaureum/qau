@@ -2766,17 +2766,17 @@ func (h *Host) handleConnection(conn net.Conn, dir Direction) error {
 		Conn:      conn,
 		Connected: true,
 		Direction: dir,
-	// R113-SENDQ-MEMCAP (2026-10-18): the queue was raised to 4096 slots for
-	// tx-broadcast flood tolerance, but every slot may hold a full
-	// MaxBlockResponseSize (10 MB) block response. Four slow resyncing peers
-	// each pinning a near-full queue retain gigabytes of queued responses on
-	// the producer — observed live as a 13.3 GB anon heap and repeated
-	// OOM kills (S1/S7, 2026-10-17) while serving chain history. The slot count
-	// stays generous for small consensus/broadcast messages; the memory bound
-	// for large messages is enforced by peer.queuedLargeBytes in SendRaw below.
-	sendCh:    make(chan []byte, 512),
-		ctx:       ctx,
-		cancel:    cancel,
+		// R113-SENDQ-MEMCAP (2026-10-18): the queue was raised to 4096 slots for
+		// tx-broadcast flood tolerance, but every slot may hold a full
+		// MaxBlockResponseSize (10 MB) block response. Four slow resyncing peers
+		// each pinning a near-full queue retain gigabytes of queued responses on
+		// the producer — observed live as a 13.3 GB anon heap and repeated
+		// OOM kills (S1/S7, 2026-10-17) while serving chain history. The slot count
+		// stays generous for small consensus/broadcast messages; the memory bound
+		// for large messages is enforced by peer.queuedLargeBytes in SendRaw below.
+		sendCh: make(chan []byte, 512),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	// R40-H11 FIX: Atomically swap placeholder with real peer entry.

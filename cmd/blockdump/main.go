@@ -5,12 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"time"
 	"path/filepath"
+	"time"
 
-	bolt "go.etcd.io/bbolt"
-	"github.com/quantaureum/qau/qaudb/db"
 	"github.com/quantaureum/qau/qaudb/block"
+	"github.com/quantaureum/qau/qaudb/db"
+	bolt "go.etcd.io/bbolt"
 )
 
 func main() {
@@ -67,9 +67,11 @@ func (r *roDB) Has(key []byte) (bool, error) {
 	ok, err := r.Get(key)
 	return len(ok) > 0, err
 }
-func (r *roDB) Put(_, _ []byte) error  { return fmt.Errorf("read-only") }
-func (r *roDB) Delete(_ []byte) error  { return fmt.Errorf("read-only") }
-func (r *roDB) Close() error           { return r.bdb.Close() }
-func (r *roDB) NewBatch() db.Batch     { panic("read-only") }
+func (r *roDB) Put(_, _ []byte) error                               { return fmt.Errorf("read-only") }
+func (r *roDB) Delete(_ []byte) error                               { return fmt.Errorf("read-only") }
+func (r *roDB) Close() error                                        { return r.bdb.Close() }
+func (r *roDB) NewBatch() db.Batch                                  { panic("read-only") }
 func (r *roDB) NewIterator(prefix []byte, start []byte) db.Iterator { panic("read-only") }
-func (r *roDB) NewIteratorWithLimit(prefix []byte, start []byte, limit int) db.Iterator { panic("read-only") }
+func (r *roDB) NewIteratorWithLimit(prefix []byte, start []byte, limit int) db.Iterator {
+	panic("read-only")
+}
