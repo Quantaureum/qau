@@ -2362,7 +2362,7 @@ func (s *Syncer) checkSync() {
 			// R115B-RESTART-REBUILD (2026-10-19): a node that restarts mid
 			// full-sync boots with syncing=false (the sync-completed transition
 			// happened in the previous process) while stateVerifiedHeight can be
-			// far behind the restored chain head — e.g. S7 2026-10-19: reboot at
+			// far behind the restored chain head — e.g. node-G 2026-10-19: reboot at
 			// head=220698 with verified=0 meant the wasSyncing-triggered rebuild
 			// never fired, the producer logged "state not verified yet"
 			// forever, and no further blocks were requested. The gating
@@ -3498,7 +3498,7 @@ func (s *Syncer) completeSnapSync() {
 	// state become the node's canonical state: nonce walls at the first
 	// replayed transaction, R87-STATE-TRUST lockout, and a "state already
 	// persisted" boot that never re-applies genesis (incident docs
-	// s3-snap-pollution-incident-2026-10-15.md §A, 2026-10-17 S1 recurrence).
+	// s3-snap-pollution-incident-2026-10-15.md §A, 2026-10-17 node-A recurrence).
 	// Fail closed exactly like a root mismatch: discard the session's imports,
 	// clear every snap flag, and force full sync. The snap will not re-trigger
 	// because full sync is now on.
@@ -4741,10 +4741,10 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 		// and marked the range verified. Feeding the trust tracker a MATCH
 		// here is not papering over a mismatch: without it, a node whose
 		// state derivation sits on the M4 side of the discrepancy (every
-		// freshly rebuilt node, e.g. S7 2026-10-20) accumulates
+		// freshly rebuilt node, e.g. node-G 2026-10-20) accumulates
 		// recordMismatch on every live tip block forever, crosses the
 		// 32-streak limit, and R87-STATE-TRUST locks production — for the
-		// SAME state posture that the long-synced S1-S6 validators run
+		// SAME state posture that the long-synced nodes A-F validators run
 		// happily (their derivation happened to align once at genesis era
 		// and their live path reports match). The streak counter's purpose
 		// is to detect a node DRIFTING AWAY from the network; a node
@@ -4773,7 +4773,7 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	// (reportStateRoot) is bypassed during rebuildRange by design
 	// (skipStateRootValidation=true), so Node.recordStateRootMatch — the
 	// only thing that clears a soft R87-STATE-TRUST break — never ran for
-	// an entire rebuilt range. S7 (2026-10-20) finished a clean full
+	// an entire rebuilt range. node-G (2026-10-20) finished a clean full
 	// resync with every segment root verified, yet stayed locked out of
 	// production on "sustained state-root mismatch streak" because the
 	// streak was earned during the earlier poisoned catch-up and nothing

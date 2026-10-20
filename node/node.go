@@ -432,7 +432,7 @@ type Node struct {
 	// full-mode catch-up, multiple peers deliver overlapping 500-block
 	// batches while blockInsertLoop re-executes blocks at only ~30-80/s.
 	// blockProcessingLoop accepted every in-window block with NO dedup and NO
-	// byte cap: production S7 held 26,223 decoded blocks (~1MB each after
+	// byte cap: production node-G held 26,223 decoded blocks (~1MB each after
 	// decode) => >10GB anonymous heap on a 24GB box that also runs a 2.2GB
 	// anti-reclaim keepalive, wedging the whole OS twice. r113 capped the
 	// SENDING side (per-peer sendq bytes); this closes the RECEIVING side
@@ -5097,7 +5097,7 @@ func (n *Node) replayBlocksToRestoreState() error {
 		// skip discarded every epoch boundary and the replayed state never
 		// credited any epoch reward. A node restored this way computes state
 		// roots that differ from every proposer's root by the accumulated
-		// reward delta — permanently. Production hit: S7 2026-10-20, whose
+		// reward delta — permanently. Production hit: node-G 2026-10-20, whose
 		// live tip showed a constant computed-vs-header root mismatch and a
 		// R87-STATE-TRUST production lockout after the resync-era mismatch
 		// streak (32). Same derivation as the syncer path by construction:
@@ -7139,7 +7139,7 @@ func (n *Node) wireElectionVerifier() {
 			}
 			// R118-CATCHUP-HEAL (2026-10-20): a sealer that is RE-SYNCING
 			// history can hold a diverged VRF-accumulator trajectory for the
-			// range it has not yet re-imported (S7 2026-10-19/20: after the
+			// range it has not yet re-imported (node-G 2026-10-19/20: after the
 			// full resync from scratch, every canonical block in a ~2k-block
 			// window was rejected as "proposer mismatch" — the expected
 			// proposer derived from the stale accumulator disagreed with the
@@ -7148,7 +7148,7 @@ func (n *Node) wireElectionVerifier() {
 			// healThreshold consecutive rejects, but each rejected block is
 			// DROPPED and must survive a full peer re-delivery round trip
 			// (~30-60s per batch cycle) before it can be rejected/healed
-			// again — measured on S7 as 8 network round trips per epoch =
+			// again — measured on node-G as 8 network round trips per epoch =
 			// 4-8 minutes per 32-block epoch. QAU_HEAL_THRESHOLD=1 collapses
 			// that to the first reject per epoch: the block is healed
 			// immediately, SetEpochVRFAccumulator repairs the local
@@ -7451,7 +7451,7 @@ func (n *Node) blockProcessingLoop() {
 					// R117-STALLLOOP (2026-10-20): same reasoning as the takeNextBlock
 					// twin — never discard the next-expected window; see the full
 					// comment there. Clearing the seed blocks here is what armed the
-					// 60s clear-loop on S7: each throw discarded the currentH+1 block
+					// 60s clear-loop on node-G: each throw discarded the currentH+1 block
 					// whose parent had also just been discarded, so every
 					// re-delivery arrived parentless and inserts never resumed.
 					const windowKeepProc = 8
@@ -7868,7 +7868,7 @@ func (n *Node) takeNextBlock() *encoding.Block {
 			// discarded), ProcessBlock returned ErrParentNotFound, inserts
 			// never advanced, and 30s later the whole buffer was cleared
 			// again: a self-sustaining 60s clear-loop that measured ~20-30
-			// blocks/min on S7 (2026-10-19/20, six full clears per 10 min,
+			// blocks/min on node-G (2026-10-19/20, six full clears per 10 min,
 			// CPU 220% burned on re-decoding discarded work).
 			//
 			// Keep the blocks around the next expected height instead of

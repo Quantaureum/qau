@@ -2197,7 +2197,7 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 // (so the anchor continues an unbroken chain of custody), or we hold no keys
 // at all and the anchored epoch equals the lowest boundary we have seen this
 // sync (an observer's first establishment; its legitimacy source is the offline
-// ceremony's deployment record, which is how S8-class nodes got their keys
+// ceremony's deployment record, which is how verify-only class nodes got their keys
 // before this path existed). A skip-ahead anchor (epoch E > maxKnown+1 with
 // history present) is REFUSED, not adopted: a rotation-money-forwarding from an
 // anchoring point you never established must not teach observers a new key.

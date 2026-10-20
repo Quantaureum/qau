@@ -2771,7 +2771,7 @@ func (h *Host) handleConnection(conn net.Conn, dir Direction) error {
 		// MaxBlockResponseSize (10 MB) block response. Four slow resyncing peers
 		// each pinning a near-full queue retain gigabytes of queued responses on
 		// the producer — observed live as a 13.3 GB anon heap and repeated
-		// OOM kills (S1/S7, 2026-10-17) while serving chain history. The slot count
+		// OOM kills (node-A/node-G, 2026-10-17) while serving chain history. The slot count
 		// stays generous for small consensus/broadcast messages; the memory bound
 		// for large messages is enforced by peer.queuedLargeBytes in SendRaw below.
 		sendCh: make(chan []byte, 512),
