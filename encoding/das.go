@@ -364,7 +364,7 @@ func (s *DASSession) GetUniqueSuccessCount() int {
 // recordSuccessIfUnique marks resp's (Slot, CellRow, CellCol) coordinate as
 // seen and returns true if this is the FIRST time we've recorded that
 // coordinate this Sample() call. Returns false if the coordinate was already
-// recorded, signalling the caller NOT to increment SuccessSamples. R38-P1-06.
+// recorded, signaling the caller NOT to increment SuccessSamples. R38-P1-06.
 //
 // Caller MUST hold no other session lock when invoking; this method takes
 // s.mu internally. Exposed (lower-cased) so the dedup logic is unit-testable
@@ -778,7 +778,7 @@ func (c *DASClient) generateSampleRequests(slot uint64, blobCount int, count int
 			nonce = b
 		} else {
 			log.Printf("[WARN] DAS: crypto/rand failed for RequestID nonce, using fallback: %v (R38-P1-06)", err)
-			nonce = uint64(slot)<<32 | uint64(i)
+			nonce = slot<<32 | uint64(i)
 		}
 
 		requests[i] = DASSampleRequest{

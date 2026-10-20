@@ -62,7 +62,6 @@ func TestCRYPTO_R13_008_BlockHeaderEqual_HashFieldsUsesConstantTime(t *testing.T
 		{"ReviewAttestationRoot", func(h *BlockHeader) { h.ReviewAttestationRoot = types.Hash{0xFF} }},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			diffed := *base

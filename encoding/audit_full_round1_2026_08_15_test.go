@@ -15,7 +15,7 @@ import (
 // AUDIT-FULL-ROUND1-2026-08-15 P0-01 — closes the drift gap between
 // rollup/sequencer.go (L2 tx) and encoding.VerifyTransactionAuthorization
 // (L1 tx). Both callers are required to delegate to this helper; this
-// test pins the helper's behaviour so future regressions in either
+// test pins the helper's behavior so future regressions in either
 // caller are caught here first.
 func TestAuditFull_R1_P0_01_VerifySingleSigBinding(t *testing.T) {
 	kp, err := crypto.GenerateKeyPair()
