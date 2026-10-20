@@ -1451,7 +1451,18 @@ func (s *Syncer) SetQPOS(qpos *consensus.QPOS) {
 // the validator's stateDB matches the proposer's stateDB at epoch boundaries,
 // so stateRoot validation can succeed.
 func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
-	if s.qpos == nil || s.stateDB == nil || blk == nil || blk.Header == nil {
+	ApplyEpochRewards(s.qpos, s.stateDB, blk)
+}
+
+// ApplyEpochRewards applies the deterministic epoch reward for the epoch
+// boundary block blk (if it is one) to stateDB. Package-level so the node's
+// boot-time state replay (replayBlocksToRestoreState) shares EXACTLY the
+// same reward derivation as the syncer's block application — the replay
+// previously skipped epoch rewards entirely (empty-block skip + no reward
+// call), leaving a state root that diverges from every proposer's root
+// (R120-REPLAY-REWARDS, 2026-10-20).
+func ApplyEpochRewards(qpos *consensus.QPOS, stateDB *state.StateDB, blk *encoding.Block) {
+	if qpos == nil || stateDB == nil || blk == nil || blk.Header == nil {
 		return
 	}
 	slot := blk.Header.Slot
@@ -1486,7 +1497,7 @@ func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
 	var rewards *consensus.EpochRewards
 	if censusData := blk.Header.Attestations; len(censusData) > 0 {
 		if atts, prop, err := consensus.DeserializeAttestationCensus(censusData); err == nil {
-			rewards = s.qpos.ComputeEpochRewardsFromCensus(prevEpoch, atts, prop)
+			rewards = qpos.ComputeEpochRewardsFromCensus(prevEpoch, atts, prop)
 		} else {
 			syncLog.Warn("applyEpochRewards: block %d header census failed to deserialize: %v (applying zero rewards)",
 				blk.Header.Height, err)
@@ -1495,7 +1506,7 @@ func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
 	if rewards == nil || rewards.TotalRewards.Sign() == 0 {
 		return
 	}
-	validators := s.qpos.GetValidatorSet()
+	validators := qpos.GetValidatorSet()
 	if validators == nil {
 		return
 	}
@@ -1513,7 +1524,7 @@ func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
 	for idx, attReward := range rewards.AttesterRewards {
 		if attReward.Sign() > 0 && idx >= 0 && idx < len(vList) {
 			addr := vList[idx].Address
-			if err := s.stateDB.AddBalance(addr, attReward); err != nil {
+			if err := stateDB.AddBalance(addr, attReward); err != nil {
 				syncLog.Warn("applyEpochRewards: failed to credit attestation reward to validator %x: %v", addr[:8], err)
 			}
 		}
@@ -1521,7 +1532,7 @@ func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
 	for idx, propReward := range rewards.ProposerRewards {
 		if propReward.Sign() > 0 && idx >= 0 && idx < len(vList) {
 			addr := vList[idx].Address
-			if err := s.stateDB.AddBalance(addr, propReward); err != nil {
+			if err := stateDB.AddBalance(addr, propReward); err != nil {
 				syncLog.Warn("applyEpochRewards: failed to credit proposer reward to validator %x: %v", addr[:8], err)
 			}
 		}
@@ -1529,23 +1540,23 @@ func (s *Syncer) applyEpochRewards(blk *encoding.Block) {
 	for idx, penalty := range rewards.Penalties {
 		if penalty.Sign() > 0 && idx >= 0 && idx < len(vList) {
 			addr := vList[idx].Address
-			balance := s.stateDB.GetBalance(addr)
+			balance := stateDB.GetBalance(addr)
 			newBal := new(big.Int).Sub(balance, penalty)
 			if newBal.Sign() < 0 {
 				newBal = big.NewInt(0)
 			}
-			s.stateDB.SetBalance(addr, newBal)
+			stateDB.SetBalance(addr, newBal)
 		}
 	}
 	for idx, slashPenalty := range rewards.SlashingPenalties {
 		if slashPenalty.Sign() > 0 && idx >= 0 && idx < len(vList) {
 			addr := vList[idx].Address
-			balance := s.stateDB.GetBalance(addr)
+			balance := stateDB.GetBalance(addr)
 			newBal := new(big.Int).Sub(balance, slashPenalty)
 			if newBal.Sign() < 0 {
 				newBal = big.NewInt(0)
 			}
-			s.stateDB.SetBalance(addr, newBal)
+			stateDB.SetBalance(addr, newBal)
 		}
 	}
 	syncLog.Info("applyEpochRewards: block %d slot %d prevEpoch %d rewards=%s penalties=%s",
@@ -4721,7 +4732,30 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 		s.mu.Lock()
 		s.stateVerifiedHeight = toHeight
 		cb := s.onStateDBVerified
+		sr63 := s.onStateRootResult
 		s.mu.Unlock()
+		// R119B-R63-TRUST-FEED (2026-10-20): the R63 canonical-trust path IS
+		// the M4-era equivalent of a match — the local derivation differs
+		// from the header by construction (documented M4 discrepancy), and
+		// this branch has just decided the canonical chain is authoritative
+		// and marked the range verified. Feeding the trust tracker a MATCH
+		// here is not papering over a mismatch: without it, a node whose
+		// state derivation sits on the M4 side of the discrepancy (every
+		// freshly rebuilt node, e.g. S7 2026-10-20) accumulates
+		// recordMismatch on every live tip block forever, crosses the
+		// 32-streak limit, and R87-STATE-TRUST locks production — for the
+		// SAME state posture that the long-synced S1-S6 validators run
+		// happily (their derivation happened to align once at genesis era
+		// and their live path reports match). The streak counter's purpose
+		// is to detect a node DRIFTING AWAY from the network; a node
+		// following canonical blocks and re-verifying each range is the
+		// opposite of drifting. Keep feeding recordMismatch from the live
+		// per-block comparisons (that catches real drift between rebuilds);
+		// the per-segment verified feed bounds the streak to at most one
+		// rebuild cycle.
+		if sr63 != nil {
+			sr63(toHeight, true)
+		}
 		if cb != nil {
 			cb(toHeight)
 		}
@@ -4733,7 +4767,25 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	s.mu.Lock()
 	s.stateVerifiedHeight = toHeight
 	cb := s.onStateDBVerified
+	sr := s.onStateRootResult
 	s.mu.Unlock()
+	// R119-REBUILD-TRUST (2026-10-20): the per-block state-root feed
+	// (reportStateRoot) is bypassed during rebuildRange by design
+	// (skipStateRootValidation=true), so Node.recordStateRootMatch — the
+	// only thing that clears a soft R87-STATE-TRUST break — never ran for
+	// an entire rebuilt range. S7 (2026-10-20) finished a clean full
+	// resync with every segment root verified, yet stayed locked out of
+	// production on "sustained state-root mismatch streak" because the
+	// streak was earned during the earlier poisoned catch-up and nothing
+	// in the rebuild path ever reported a MATCH. The rebuild's final
+	// verified root against the canonical header is exactly the evidence
+	// recordMatch requires (cumulative-root proof, same reasoning as
+	// R63/R97b), so feed it through the same callback the live path uses.
+	// A HARD break (failed rollback) is still not clearable this way —
+	// recordMatch only clears soft breaks by design.
+	if sr != nil {
+		sr(toHeight, true)
+	}
 	if cb != nil {
 		cb(toHeight)
 	}

@@ -5020,6 +5020,39 @@ func (n *Node) replayBlocksToRestoreState() error {
 
 	nodeLog.Info("🔄 Replaying %d blocks to restore state...", latestHeight)
 
+	// R120-REPLAY-REWARDS: replay runs inside initState, BEFORE blockProducer
+	// (and thus its QPOS) exists in startServices. Build a throwaway QPOS
+	// from the same genesis validator set that initValidatorSet will use
+	// later, purely for deterministic epoch-reward derivation — it is
+	// discarded when the replay ends. ApplyEpochRewards only reads the
+	// validator set and computes from the header-embedded census, so a
+	// genesis-built engine produces byte-identical rewards to the live one.
+	var replayQPOS *consensus.QPOS
+	if n.genesis != nil && len(n.genesis.Validators) > 0 {
+		var validators []*consensus.Validator
+		for _, gv := range n.genesis.Validators {
+			addr, err := parseAddressString(gv.Address)
+			if err != nil {
+				continue
+			}
+			stake, ok := new(big.Int).SetString(gv.Stake, 10)
+			if !ok {
+				stake = big.NewInt(1000000)
+			}
+			validators = append(validators, &consensus.Validator{Address: addr, Stake: stake, Active: true})
+		}
+		if vs, err := consensus.NewValidatorSet(validators); err == nil {
+			if q, qerr := consensus.NewQPOS(vs); qerr == nil {
+				replayQPOS = q
+			}
+		}
+	}
+	if replayQPOS == nil {
+		nodeLog.Warn("R120: replay could not build a QPOS from genesis — epoch rewards will NOT be applied during replay (state will diverge from proposers)")
+	} else {
+		nodeLog.Info("R120: replay-local QPOS ready for epoch reward application")
+	}
+
 	// Create executor for transaction execution.
 	// AUDIT (2026) R4-ZK-03: Use the shared persistent privacy store
 	// (initialized in initPrivacyStore) so nullifiers survive across
@@ -5057,6 +5090,21 @@ func (n *Node) replayBlocksToRestoreState() error {
 			continue
 		}
 		consecutiveFailures = 0 // reset on success
+
+		// R120-REPLAY-REWARDS (2026-10-20): epoch rewards MUST be applied
+		// before the empty-block skip. The epoch-boundary block is usually
+		// EMPTY (rewards are header-embedded, not transactions), so the old
+		// skip discarded every epoch boundary and the replayed state never
+		// credited any epoch reward. A node restored this way computes state
+		// roots that differ from every proposer's root by the accumulated
+		// reward delta — permanently. Production hit: S7 2026-10-20, whose
+		// live tip showed a constant computed-vs-header root mismatch and a
+		// R87-STATE-TRUST production lockout after the resync-era mismatch
+		// streak (32). Same derivation as the syncer path by construction:
+		// both call ApplyEpochRewards.
+		if replayQPOS != nil {
+			ApplyEpochRewards(replayQPOS, n.stateDB, blk)
+		}
 
 		if len(blk.Transactions) == 0 {
 			continue
