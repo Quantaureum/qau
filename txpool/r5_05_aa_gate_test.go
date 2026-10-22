@@ -17,7 +17,7 @@ import (
 // boundary now refuses user-operation admission instead of accepting work that
 // can only ever be discarded. The Bundler itself stays functional and covered by
 // its own tests (R4-01, R5-06), which is why these tests call Bundler methods
-// directly where they need bundler behaviour and go through the pool where they
+// directly where they need bundler behavior and go through the pool where they
 // need the gate.
 
 func TestR5_05_PoolRefusesUserOperationAdmission(t *testing.T) {

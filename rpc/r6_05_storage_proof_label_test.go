@@ -17,7 +17,7 @@ import (
 // live in. The result-level Unverified flag did not reflect any of that, because
 // it was computed from the account proof alone.
 //
-// These tests pin the honest labelling: storage entries are always marked
+// These tests pin the honest labeling: storage entries are always marked
 // unverified, and a response that carries storage invalidates itself at the top
 // level so a caller that only checks one flag refuses it instead of trusting it.
 
@@ -43,7 +43,7 @@ func TestR6_05_GetProofMarksStorageEntriesUnverified(t *testing.T) {
 		t.Fatalf("got %d storage entries, want 1", len(res.StorageProof))
 	}
 	if !res.StorageProof[0].Unverified {
-		t.Fatal("a storage entry was labelled verified although no state-root-bound storage proof exists on this node")
+		t.Fatal("a storage entry was labeled verified although no state-root-bound storage proof exists on this node")
 	}
 	if !res.Unverified {
 		t.Fatal("GetProof returned Unverified=false for a response that contains storage — a caller checking only the top-level flag would trust a claim this node cannot prove")

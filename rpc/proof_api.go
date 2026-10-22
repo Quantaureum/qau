@@ -161,7 +161,7 @@ func (api *ProofAPI) GetProof(address string, storageKeys []string, blockNum str
 		// proof — a proof that contradicts the non-zero Value reported beside it,
 		// and which a light client would accept as verification that the slot is
 		// empty. The synthetic path stays (it proves nothing about canonical
-		// state either) but every entry is labelled unverified, and the
+		// state either) but every entry is labeled unverified, and the
 		// result-level flag is forced so a caller that only checks that one flag
 		// rejects the response instead of trusting it.
 		storageProof := buildStorageProof(addr, key, val)

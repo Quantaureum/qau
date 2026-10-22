@@ -4,7 +4,7 @@ package node
 // R10-05 (2026-10-21 tenth-round audit): shipped text must survive the tools that
 // write it.
 //
-// Four comments in node/syncer.go labelled one snap-sync guard with an audit round
+// Four comments in node/syncer.go labeled one snap-sync guard with an audit round
 // ID whose digits had been replaced by two literal question marks, in the initial
 // open-source release and still present in HEAD. The reference resolved to
 // nothing: nobody could grep for it, and the round it pointed to could not be

@@ -673,7 +673,7 @@ func requireSnapshotRefused(t *testing.T, result any, rpcErr *Error) {
 		t.Errorf("message = %q, want %q", rpcErr.Message, ErrStateSnapshotNotSupportedRPC)
 	}
 	if rpcErr.Data == nil {
-		t.Error("refusal must explain why the feature cannot be honoured")
+		t.Error("refusal must explain why the feature cannot be honored")
 	}
 }
 

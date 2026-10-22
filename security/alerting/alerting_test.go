@@ -360,7 +360,7 @@ func TestR11_02_PagerDutyDashboardLinkIsConfigDriven(t *testing.T) {
 	}
 
 	// An unconfigured channel marshals to an event whose links field is null, so
-	// there is no invented endpoint travelling with the alert.
+	// there is no invented endpoint traveling with the alert.
 	empty, err := json.Marshal(map[string]any{"links": dashboardLinks("")})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

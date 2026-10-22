@@ -9,7 +9,7 @@ import (
 )
 
 // R6-01 (2026-10-21 sixth-round audit): evm_snapshot and evm_revert were served
-// by a SnapshotManager seam that no backend could honour. The node adapter
+// by a SnapshotManager seam that no backend could honor. The node adapter
 // recorded a state root keyed by BLOCK HEIGHT in StateDB.stateSnapshots -- a map
 // that is written, pruned and counted but never read back -- and "restore"
 // passed that same height to StateDB.RevertToSnapshot(id), whose argument is a

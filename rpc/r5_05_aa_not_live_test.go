@@ -11,7 +11,7 @@ import (
 // accepted user operation was never bundled and never produced a receipt —
 // the node returned a success hash for work it could not do. eth_sendUserOperation
 // and qau_sendUserOperation now refuse with an explicit "not live" error.
-// These tests pin that behaviour for BOTH registered names, because the two
+// These tests pin that behavior for BOTH registered names, because the two
 // names are what makes the handler reachable by standard ERC-4337 clients.
 
 // A complete ERC-4337 shaped operation: every field parseUserOperation reads,

@@ -12,7 +12,7 @@ import (
 )
 
 // R7-01 (2026-10-21 seventh-round audit): block building must use
-// StateDB.CopyForBuild(), never StateDB.Copy(). The behavioural difference only
+// StateDB.CopyForBuild(), never StateDB.Copy(). The behavioral difference only
 // shows up on the discard path (the chain tip moved, signing failed, or the node
 // stopped while the block was being built): Copy() has already written the
 // block-under-construction onto the shared durable database, while
@@ -24,7 +24,7 @@ import (
 // Copy() would be invisible to the suite. This guard reads the source instead.
 
 // exprText renders a selector/identifier chain as dotted text, good enough to
-// recognise the receiver of a StateDB call in a source guard.
+// recognize the receiver of a StateDB call in a source guard.
 func exprText(e ast.Expr) string {
 	switch v := e.(type) {
 	case *ast.Ident:

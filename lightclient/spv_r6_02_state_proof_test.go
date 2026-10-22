@@ -229,7 +229,7 @@ func TestR6_02_AddressBindingIsEnforced(t *testing.T) {
 	other := *proof
 	other.Address = types.Address{0xc3, 0xd4}
 	if VerifyStateProof(root, &other) {
-		t.Fatal("VerifyStateProof accepted a proof re-labelled with another address")
+		t.Fatal("VerifyStateProof accepted a proof re-labeled with another address")
 	}
 
 	// A proof envelope claiming a storage entry that is not bound to the
@@ -293,7 +293,7 @@ func TestR6_05_StorageSlotRequestsAreRefused(t *testing.T) {
 	}
 
 	// Without storage keys the account proof still works (the refusal is scoped
-	// to the claim that cannot be honoured).
+	// to the claim that cannot be honored).
 	if _, err := prover.GenerateStateProof(addr, nil); err != nil {
 		t.Fatalf("GenerateStateProof without storage keys: %v", err)
 	}

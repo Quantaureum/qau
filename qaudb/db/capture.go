@@ -278,7 +278,7 @@ func (c *Capture) baseView(prefix []byte, start []byte) ([]iterItem, error) {
 // already cleared) while only part of the accounts and trie nodes behind them
 // were applied. Callers that stage durability metadata must pass a predicate so
 // that metadata is applied last, in one batch. nil keeps raw key-order
-// behaviour, which is fine for buffers that carry no durability metadata.
+// behavior, which is fine for buffers that carry no durability metadata.
 //
 // Data keys are applied first and may be split across transactions — the
 // buffered set of one full block can legitimately exceed the base's batch

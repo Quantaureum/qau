@@ -17,7 +17,7 @@ import (
 // ExtensionStems, StemHash, InclusionLeaf and ExclusionEvidence. A proof that
 // verified on the prover's node therefore arrived at the light client in a shape
 // that could not verify -- exactly what a serialized proof must never do. These
-// tests pin full-fidelity round-tripping, and the fail-closed behaviour on
+// tests pin full-fidelity round-tripping, and the fail-closed behavior on
 // anything the decoder cannot fully account for.
 
 func u32(v uint32) []byte {

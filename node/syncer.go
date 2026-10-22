@@ -191,7 +191,7 @@ type Syncer struct {
 
 	snapSyncing       bool
 	snapSyncCompleted bool // SNAP-REGUARD (2026-08-17): prevents re-triggering snap sync after completion
-	// R10-05 (2026-10-21 tenth-round audit): this guard was labelled with an audit
+	// R10-05 (2026-10-21 tenth-round audit): this guard was labeled with an audit
 	// round ID whose digits had been replaced by two literal question marks in the
 	// initial open-source release. The ID is unrecoverable from history, so the
 	// label now carries only the name and the date instead of a reference that

@@ -69,7 +69,7 @@ func r704Registrations(t *testing.T) (registered, admin map[string]bool) {
 }
 
 // r704DocRows parses the method rows of the generated reference into
-// method -> admin-flag. A row is recognised by its source-file cell, which keeps
+// method -> admin-flag. A row is recognized by its source-file cell, which keeps
 // the namespace summary rows out of the result.
 func r704DocRows(t *testing.T) map[string]bool {
 	t.Helper()
@@ -233,7 +233,7 @@ func TestR7_04_JSONRPCAPIDocMatchesTheRegisteredSurface(t *testing.T) {
 			continue
 		}
 		if got != want {
-			t.Errorf("namespace %q is summarised as %d methods / %d admin-gated but the code registers %d / %d (R7-04)",
+			t.Errorf("namespace %q is summarized as %d methods / %d admin-gated but the code registers %d / %d (R7-04)",
 				ns, got[0], got[1], want[0], want[1])
 		}
 	}
@@ -248,7 +248,7 @@ func TestR7_04_JSONRPCAPIDocMatchesTheRegisteredSurface(t *testing.T) {
 			}
 		}
 		if documented != cell[0] {
-			t.Errorf("namespace %q is summarised as %d method(s) but the reference documents %d row(s) under it (R7-04)",
+			t.Errorf("namespace %q is summarized as %d method(s) but the reference documents %d row(s) under it (R7-04)",
 				ns, cell[0], documented)
 		}
 	}

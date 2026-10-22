@@ -1224,7 +1224,7 @@ func (api *API) SendRawTransaction(ctx context.Context, params json.RawMessage) 
 
 // SendUserOperation refuses every submission while account abstraction is
 // dark. R5-05 (2026-10-21 fifth-round audit): nothing in the node consumes
-// Bundler.BundleChannel(), so the old behaviour accepted an operation, kept it
+// Bundler.BundleChannel(), so the old behavior accepted an operation, kept it
 // in an in-memory set that no block producer ever read, and returned a hash
 // that could never resolve to a receipt via GetUserOperationReceipt. Callers
 // (and the wallets/bundlers sitting behind them) acted on that success as if
@@ -3391,7 +3391,7 @@ func (api *API) UpdateCommission(ctx context.Context, params json.RawMessage) (a
 func (api *API) CreateSnapshot(ctx context.Context, params json.RawMessage) (any, *Error) {
 	// R6-01 (2026-10-21 sixth-round audit): the refusal is unconditional and
 	// happens before the manager is consulted, so it holds for every backend,
-	// including a stub. The previous behaviour was to take the caller's height
+	// including a stub. The previous behavior was to take the caller's height
 	// (defaulting to the chain tip) and record currentRoot under it in the
 	// StateDB height -> root map. That map is never read for a restore, so the
 	// call only ever produced a misleading {"success": true} plus one more
