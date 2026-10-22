@@ -2,7 +2,6 @@
 package qvm
 
 import (
-	"crypto/elliptic"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -865,6 +864,12 @@ func (i *Interpreter) opAuthCall(env *Environment) error {
 	// Snapshot BEFORE value transfer so that revert undoes both the transfer
 	// and the sub-call's state changes.
 	snapshot := env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the state journal is full, so this frame
+		// could not be journaled — refuse the call like the depth guards do.
+		env.activeAddresses = env.activeAddresses[:savedActiveLen]
+		return env.stack.PushUint64(0)
+	}
 
 	// Transfer value (from effectiveCaller to addr)
 	// R31-P3 FIX: Reuse callerBalance from the earlier check to avoid redundant read.
@@ -920,6 +925,11 @@ func (i *Interpreter) opAuthCall(env *Environment) error {
 	if result.Reverted {
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		env.stateDB.RevertToSnapshot(snapshot)
+	}
+
+	// R4-08 (2026-10-21 audit): release the consumed frame entry (see opCall).
+	if !result.Reverted {
+		releaseFrame(env.stateDB, snapshot)
 	}
 
 	// Store return data
@@ -1058,12 +1068,12 @@ func recoverSignerAddress(msgHash Hash, yParity byte, rBytes, sBytes []byte) (Ad
 // operations (they now panic unconditionally), breaking ECDSA recovery
 // for the AUTH opcode. Delegate to the self-contained Jacobian-coordinate
 // implementation in qvm/secp256k1, shared with the ecrecover precompile.
-func secp256k1Curve() elliptic.Curve {
+func secp256k1Curve() *secp256k1.Curve {
 	return secp256k1.Shared()
 }
 
 // decompressPoint recovers the y coordinate from x and a parity bit.
-func decompressPoint(x *big.Int, parity uint, curve elliptic.Curve) (*big.Int, error) {
+func decompressPoint(x *big.Int, parity uint, curve *secp256k1.Curve) (*big.Int, error) {
 	params := curve.Params()
 	x3 := new(big.Int).Exp(x, big.NewInt(3), params.P)
 	y2 := new(big.Int).Add(x3, params.B)

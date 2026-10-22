@@ -199,14 +199,21 @@ type Node struct {
 	blockStore            *block.BlockStore
 	stateDB               *state.StateDB
 	stateAlreadyPersisted bool
-	txPool                *txpool.TxPool
-	commitRevealManager   *txpool.CommitRevealManager
-	bundler               *txpool.Bundler
-	blockValidator        *core.BlockValidator
-	validatorManager      *consensus.ValidatorManager
-	stakingManager        *economics.StakingManager
-	defiManager           *economics.DeFiManager
-	governanceManager     *economics.GovernanceManager
+	// R10-01 (2026-10-21 tenth-round audit): set by replayBlocksToRestoreState
+	// only when the replay covered every height in [1, tip] AND the committed root
+	// equals the tip header's StateRoot. Until then nothing distinguished a
+	// head-matching state from one that had skipped an unreadable block, because
+	// the same "State restored" line was printed either way.
+	stateRestoreVerified       bool
+	stateRestoreVerifiedHeight uint64
+	txPool                     *txpool.TxPool
+	commitRevealManager        *txpool.CommitRevealManager
+	bundler                    *txpool.Bundler
+	blockValidator             *core.BlockValidator
+	validatorManager           *consensus.ValidatorManager
+	stakingManager             *economics.StakingManager
+	defiManager                *economics.DeFiManager
+	governanceManager          *economics.GovernanceManager
 
 	// Economics components (inflation, gas fees, fee distribution, rewards, DeFi incentives, liquid staking)
 	inflationModel       *economics.InflationModel
@@ -389,6 +396,9 @@ type Node struct {
 	wsServer    *rpc.WebSocketServer
 	authManager *rpc.AuthManager // audit-fix INFO-3: tracked for lifecycle management
 	api         *rpc.API         // tracked for late-injected ConsensusStakeUpdater
+	// authReplayStore persists signatures already accepted by the
+	// state-mutating RPC APIs so a restart cannot reopen a replay window.
+	authReplayStore *rpc.AuthReplayStore
 
 	// Metrics
 	metricsServer *metrics.Server
@@ -432,11 +442,11 @@ type Node struct {
 	// full-mode catch-up, multiple peers deliver overlapping 500-block
 	// batches while blockInsertLoop re-executes blocks at only ~30-80/s.
 	// blockProcessingLoop accepted every in-window block with NO dedup and NO
-	// byte cap: production node-G held 26,223 decoded blocks (~1MB each after
-	// decode) => >10GB anonymous heap on a 24GB box that also runs a 2.2GB
-	// anti-reclaim keepalive, wedging the whole OS twice. r113 capped the
-	// SENDING side (per-peer sendq bytes); this closes the RECEIVING side
-	// with the same 256MB budget, enforced on the decoded block size so the
+	// byte cap: a production sealer was measured holding 26,223 decoded blocks
+	// (~1MB each after decode) => >10GB anonymous heap on a 24GB host that also
+	// runs a 2.2GB anti-reclaim keepalive, wedging the whole OS twice. r113
+	// capped the SENDING side (per-peer sendq bytes); this closes the RECEIVING
+	// side with the same 256MB budget, enforced on the decoded block size so the
 	// bound covers real heap cost, not message framing.
 	//
 	// syncBufSet makes in-window delivery idempotent: each block hash enters
@@ -502,9 +512,10 @@ type Node struct {
 	assetLockManager *bridge.AssetLockManager
 	bridgeAPI        *bridge.BridgeAPI
 	// P1-5: SPV header verifier for cross-chain reorg detection.
-	// bridgeSyncCommittee is the Ethereum sync committee verifier, stored on
-	// the Node so it can be updated when Ethereum sync committee data becomes
-	// available (e.g., via Ethereum light client sync).
+	// bridgeSyncCommittee is the external-chain sync committee verifier
+	// (QAU format, Dilithium3), stored on the Node so an external-chain
+	// committee feed can update it. It is not populated by this node: the
+	// local QAU committee is not the external chain's committee (R2-15).
 	bridgeHeaderVerifier *bridge.BridgeHeaderVerifier
 	bridgeSyncCommittee  *lightclient.SyncCommitteeVerifier
 
@@ -898,6 +909,14 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to initialize upgrade subsystem: %w", err)
 	}
 
+	// R10-03: PruningConfig.Enabled is true in DefaultConfig and --prune defaults to
+	// true, yet no pruner is constructed anywhere in this build. The fact belongs in
+	// the log as well as the banner — an operator whose disk is filling up needs it
+	// recorded where the growth is observable, not only on the terminal at startup.
+	if n.config.PruningConfig.Enabled && !PruningImplemented {
+		nodeLog.Warn("%s", PruningStatusLine(n.config.PruningConfig))
+	}
+
 	// Initialize state
 	if err := n.initState(); err != nil {
 		return fmt.Errorf("failed to initialize state: %w", err)
@@ -918,7 +937,15 @@ func (n *Node) Start() error {
 	// With BoltDB persistence, state survives restarts — replaying would double-apply transactions.
 	if !n.stateAlreadyPersisted {
 		if err := n.replayBlocksToRestoreState(); err != nil {
-			nodeLog.Warn("failed to replay blocks: %v", err)
+			// R10-01: this used to be a Warn the rest of the boot path then forgot.
+			// The replay is the only thing that can prove the restored state matches
+			// the head, so a failure here means the node is carrying state nobody has
+			// verified. Boot still proceeds, on the same recovery contract as the
+			// persisted-state anchor in R45-STATE-PERSIST-FIX: state stays unverified,
+			// IsStateReady() keeps the producer from building, and the syncer's
+			// rebuildState owns the repair. But the outcome is now logged as the error
+			// it is instead of being filed under "failed to replay blocks".
+			nodeLog.Error("R10-01: startup state restoration did NOT yield a head-verified state: %v — state stays unverified; the producer will not build until IsStateReady() passes and the syncer's rebuild owns recovery", err)
 		}
 	} else {
 		nodeLog.Info("State loaded from persistent storage, skipping block replay")
@@ -952,6 +979,12 @@ func (n *Node) Start() error {
 	// Start periodic staking data persistence (every 30s)
 	n.startStakingPersistence(stakingFile)
 
+	// R4-RES: push the node height to the governance manager so that the
+	// cleanupLoop's auto-expire branch (R14-LOW) actually runs. Without
+	// this, GetCurrentHeight stays at 0 and active proposals that passed
+	// EndHeight are never marked Expired.
+	n.startGovernanceHeightSync()
+
 	// Initialize optimization modules
 	if err := n.initOptimizations(); err != nil {
 		return fmt.Errorf("failed to initialize optimizations: %w", err)
@@ -976,9 +1009,10 @@ func (n *Node) Start() error {
 
 	// Initialize P3 features (bridge, rollup, quantum crypto).
 	// All are disabled by default; enable via environment variables.
-	// Failures are non-fatal — the node continues without the feature.
+	// Failures are non-fatal except for an explicitly enabled rollup, which
+	// fails fast (R2-08).
 	if err := n.initP3Features(); err != nil {
-		nodeLog.Warn("P3 features initialization warning: %v", err)
+		return fmt.Errorf("P3 features initialization: %w", err)
 	}
 
 	// Initialize RPC server
@@ -1116,6 +1150,18 @@ func (n *Node) getTSSPassword() ([]byte, error) {
 	return nil, fmt.Errorf("TSS encryption password not configured —set QAU_VALIDATOR_KEY_PASSWORD env var or ValidatorPasswordFile in config (audit-fix)")
 }
 
+// closeAuthReplayStore releases the persistent RPC replay cache. Safe to call
+// multiple times and before the store was ever opened.
+func (n *Node) closeAuthReplayStore() {
+	if n.authReplayStore == nil {
+		return
+	}
+	if err := n.authReplayStore.Close(); err != nil {
+		nodeLog.Error("Failed to close auth replay store: %v", err)
+	}
+	n.authReplayStore = nil
+}
+
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	if !n.running {
@@ -1180,6 +1226,13 @@ func (n *Node) Stop() error {
 	if n.wsServer != nil {
 		n.wsServer.Stop()
 	}
+
+	// R4-05: the replay store backs every signed RPC namespace, and the
+	// WebSocket transport dispatches the same handlers as HTTP. It has to be
+	// released after BOTH transports stopped serving, otherwise a request still
+	// in flight would use a closed store (Reserve now fails closed with
+	// ErrAuthReplayStoreClosed rather than dereferencing the released handle).
+	n.closeAuthReplayStore()
 
 	// R14-MED (2026-07-21): P2P host shutdown was previously here (before
 	// blockProducer/QPOS). This caused a window where blockProducer/QPOS
@@ -1328,6 +1381,12 @@ func (n *Node) Stop() error {
 
 	n.wg.Wait()
 
+	// R9-01 (2026-10-21 ninth-round audit): release the durable state database
+	// once every tracked goroutine has finished. Nothing in the node lifecycle
+	// released it before, so the bbolt handle and its exclusive file lock
+	// outlived Stop().
+	n.closeDurableStateDatabase()
+
 	if n.blockStore != nil {
 		n.blockStore.Close()
 	}
@@ -1348,6 +1407,35 @@ func (n *Node) Stop() error {
 	consensus.FreezeAttestationNetworkID()
 
 	return nil
+}
+
+// closeDurableStateDatabase releases the durable state database handle.
+//
+// R9-01 (2026-10-21 ninth-round audit): initState() opens a persistent BoltDB
+// for the state and hands it to the StateDB, which is the only thing that can
+// close it. Stop() never did, so after a shutdown the file descriptor and the
+// exclusive file lock stayed held for the life of the process. The next Start()
+// in the same process then stalls in db.openBoltWithRetry (30s bolt.Open timeout
+// retried 5 times) and one of two things happens: DevMode=false fails to boot,
+// or DevMode=true logs a warning and falls back to a FRESH EMPTY in-memory state
+// while the block store on disk still holds the chain — a node that would serve
+// and validate blocks against a state root no other node agrees with.
+//
+// StateDB.Close() serializes the release against durable writers and closes the
+// shared handle at most once, so this is idempotent and safe to call again.
+//
+// Not called from cleanupPartialInit(): that path does not wait for the
+// goroutines Start() already launched (no n.wg.Wait()), so closing the state
+// database there could pull the durable handle out from under a writer that is
+// still running. A failed Start() therefore still leaks the handle until the
+// process exits — recorded as a known limitation rather than fixed silently.
+func (n *Node) closeDurableStateDatabase() {
+	if n.stateDB == nil {
+		return
+	}
+	if err := n.stateDB.Close(); err != nil {
+		nodeLog.Error("R9-01: failed to close the durable state database: %v — the file lock stays held until the process exits, and a restart in this process will not be able to open it", err)
+	}
 }
 
 // cleanupPartialInit tears down any components that were initialized during a
@@ -1401,6 +1489,7 @@ func (n *Node) cleanupPartialInit() {
 		n.rpcServer.Stop(ctx)
 		cancel()
 	}
+	n.closeAuthReplayStore()
 	if n.wsServer != nil {
 		n.wsServer.Stop()
 	}
@@ -2160,6 +2249,12 @@ func (n *Node) initTxPool() error {
 		MinPriorityFee: big.NewInt(txpool.DefaultMinPriorityFee),
 	}
 	n.bundler = txpool.NewBundler(bundlerCfg, entryPoint, executor, stateAdapter)
+	// R4-07 (2026-10-21 audit): AA validation simulation executes account code on
+	// the live StateDB, whose snapshot stack and dirty journal are global to that
+	// instance. Give the bundler the state's execution guard so a simulation runs
+	// inside an exclusive frame and fails fast while consensus is applying a
+	// block, instead of reverting state that belongs to the in-flight block.
+	n.bundler.SetExecutionGuard(n.stateDB)
 	n.txPool.SetBundler(n.bundler)
 	n.bundler.Start()
 
@@ -2272,14 +2367,35 @@ func (n *Node) initConsensus() error {
 	// production networks so CreateProposal rejects nil DepositLocker
 	// (zero-cost proposal DoS guard). Devnet (1333) keeps the legacy
 	// warning-only behavior so contract authors can prototype without
-	// wiring a locker; mainnet/testnet must fail-closed. The economic
-	// DepositLocker implementation itself must still be wired separately
-	// (SetDepositLocker); production mode only governs the nil path.
+	// wiring a locker; mainnet/testnet must fail-closed.
+	//
+	// R3-09 (2026-10-21): the locker is now actually wired below, so this
+	// fail-closed branch is a defense-in-depth check rather than the
+	// permanent proposal-creation failure it used to be. The locker reserves
+	// the deposit against the proposer's free on-chain balance and persists
+	// reservations next to the governance state.
 	switch n.chainID {
 	case 1668, 1669:
 		n.governanceManager.SetProductionMode(true)
 		nodeLog.Info("Governance production hardening enabled (chainID=%d): nil DepositLocker will fail-closed", n.chainID)
 	}
+	depositLocker, err := newGovernanceDepositLocker(
+		filepath.Join(govDataDir, "deposit-locks.json"),
+		func(addr types.Address) (*big.Int, error) {
+			n.mu.RLock()
+			sdb := n.stateDB
+			n.mu.RUnlock()
+			if sdb == nil {
+				return nil, fmt.Errorf("state database is not initialized")
+			}
+			return sdb.GetBalance(addr), nil
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize governance deposit locker: %w", err)
+	}
+	n.governanceManager.SetDepositLocker(depositLocker)
+	nodeLog.Info("Governance deposit locker wired (governance/deposit-locks.json)")
 	nodeLog.Info("Governance manager initialized")
 
 	// Initialize economics components (inflation, gas fees, fee distribution, rewards, DeFi incentives, liquid staking)
@@ -2869,7 +2985,7 @@ func redactEnodeURL(enodeURL string) string {
 }
 
 // initRPC initializes the RPC server
-func (n *Node) initRPC() error {
+func (n *Node) initRPC() (retErr error) {
 	nodeLog.Info("initRPC called, RPCEnabled=%v", n.config.RPCEnabled)
 	if !n.config.RPCEnabled {
 		return nil
@@ -2932,6 +3048,20 @@ func (n *Node) initRPC() error {
 		}
 	}
 
+	// F-01: one persistent replay cache shared by every signed RPC namespace.
+	// A restart must not forget which nonces were already accepted, otherwise
+	// a captured signed request becomes replayable after a node reboot.
+	replayStore, replayErr := rpc.OpenAuthReplayStore(filepath.Join(n.config.DataDir, "rpc", "auth_replay.db"))
+	if replayErr != nil {
+		return fmt.Errorf("open auth replay store: %w", replayErr)
+	}
+	n.authReplayStore = replayStore
+	defer func() {
+		if retErr != nil {
+			n.closeAuthReplayStore()
+		}
+	}()
+
 	// Register API handlers using adapter types, with PersonalAPI as AccountManager
 	api := rpc.NewAPI(
 		&stateReaderAdapter{n},
@@ -2941,6 +3071,7 @@ func (n *Node) initRPC() error {
 		personalAPI, // AccountManager for eth_sendTransaction
 	)
 	n.api = api // store for late-injected ConsensusStakeUpdater in startServices()
+	api.SetAuthReplayStore(replayStore)
 	// Set staking manager
 	api.SetStakingManager(&stakingManagerAdapter{n.stakingManager})
 	// R131: validator-key registry status (read-only). Resolved lazily via
@@ -2984,8 +3115,9 @@ func (n *Node) initRPC() error {
 		node:       n,
 	}
 	api.SetContractCaller(contractCaller)
-	// Set snapshot manager for qau_createSnapshot/qau_restoreSnapshot
-	api.SetSnapshotManager(newSnapshotManagerAdapter(n))
+	// R6-01 (2026-10-21 sixth-round audit): the height-keyed snapshot backend
+	// behind evm_snapshot/evm_revert is gone — those handlers now refuse, so
+	// there is nothing to inject. Fork recovery keeps its own backend below.
 	// R45-FORKRECOVERY-API (2026-08-12): wire debug_rollbackChainToHeight
 	// backend so the sealer operator can manually resolve a persistent
 	// chain fork when syncer-side OnForkRollback can't (e.g. when local
@@ -3035,6 +3167,11 @@ func (n *Node) initRPC() error {
 	// Register DeFi API handlers
 	if n.defiManager != nil {
 		defiAPI := rpc.NewDeFiAPI(n.defiManager, &blockReaderAdapter{n.blockStore, n.stateDB, n.config.MaxGasLimit, n})
+		defiAPI.SetAuthReplayStore(replayStore)
+		// Bind the real chain ID into the DeFi signature domain
+		// ("QAU-<method>|<chainID>|..."). NewDeFiAPI leaves chainID=0, so
+		// without this the cross-chain replay domain separator is inert.
+		defiAPI.SetChainID(n.chainID)
 		// R74-STAKE-ALLOWLIST: apply the same policy as the staking API. This
 		// used to be SetEnforceAdminAuth(true) in production with no allowlist
 		// ever configured — an empty list under enforcement is fail-closed, so
@@ -3052,6 +3189,10 @@ func (n *Node) initRPC() error {
 	// Register Governance API handlers
 	if n.governanceManager != nil {
 		govAPI := rpc.NewGovernanceAPI(n.governanceManager, &blockReaderAdapter{n.blockStore, n.stateDB, n.config.MaxGasLimit, n})
+		govAPI.SetAuthReplayStore(replayStore)
+		// Bind the real chain ID into the governance signature domain, same
+		// rationale as the DeFi wiring above.
+		govAPI.SetChainID(n.chainID)
 		govAPI.RegisterGovernanceHandlers(n.rpcServer)
 		nodeLog.Info("Governance API handlers registered")
 	}
@@ -3068,6 +3209,11 @@ func (n *Node) initRPC() error {
 		n.stakingManager,
 		&blockReaderAdapter{n.blockStore, n.stateDB, n.config.MaxGasLimit, n},
 	)
+	econAPI.SetAuthReplayStore(replayStore)
+	// Bind the real chain ID for the economics mutators. R2-04 binds it into
+	// the signed message, so a signature produced for one chain cannot be
+	// replayed on another (KEYS-08-style cross-chain binding).
+	econAPI.SetChainID(n.chainID)
 	econAPI.RegisterEconomicsHandlers(n.rpcServer)
 	nodeLog.Info("Economics API handlers registered")
 
@@ -3763,7 +3909,16 @@ func (n *Node) initSyncer() error {
 		// blocks so local divergence
 		// is never pushed onto peers.
 		if n.stateDB != nil {
-			if err := n.stateDB.RollbackToHeight(forkHeight); err != nil {
+			// R6-03 (2026-10-21 sixth-round audit): a rollback rewrites committed
+			// accounts while the live StateDB still journals whatever frame is in
+			// flight, so it must own that frame. ProcessBlock invokes this callback
+			// outside applyBlockInternal's frame and syncHealthLoop runs on its own,
+			// so acquiring here cannot self-deadlock; it only waits for an import
+			// that is genuinely in progress.
+			err := n.stateDB.WithExecutionFrame(func() error {
+				return n.stateDB.RollbackToHeight(forkHeight)
+			})
+			if err != nil {
 				nodeLog.Error("OnForkRollback: failed to roll back stateDB to height %d: %v", forkHeight, err)
 				n.markStateTrustBroken(fmt.Sprintf(
 					"fork rollback to height %d failed: %v — chain history was already "+
@@ -3938,15 +4093,7 @@ func (n *Node) initHA() error {
 		n.shutdownHandler.RegisterHook(ha.ShutdownHook{
 			Name:     "flush-data",
 			Priority: 5,
-			Fn: func(ctx context.Context) error {
-				// Commit any pending state changes
-				if n.stateDB != nil {
-					if _, err := n.stateDB.Commit(); err != nil {
-						nodeLog.Warn("Failed to commit state on shutdown: %v", err)
-					}
-				}
-				return nil
-			},
+			Fn:       n.flushStateForShutdown,
 		})
 	}
 
@@ -4328,7 +4475,10 @@ func (n *Node) SendSecurityAlert(alertType string, severity alerting.Severity, t
 //   - Quantum RNG                  (QAU_ENABLE_QRNG=1)
 //
 // Every subsystem is disabled by default. Initialization failures are
-// non-fatal: the node logs a warning and continues without the feature.
+// non-fatal (the node logs a warning and continues without the feature),
+// except for the L2 rollup: when the operator explicitly enables it, a
+// failure to start aborts node startup instead of silently running without
+// the rollup (R2-08).
 func (n *Node) initP3Features() error {
 	// Cross-chain Bridge
 	if os.Getenv("QAU_ENABLE_BRIDGE") == "1" {
@@ -4340,7 +4490,11 @@ func (n *Node) initP3Features() error {
 	// L2 Rollup
 	if os.Getenv("QAU_ENABLE_ROLLUP") == "1" {
 		if err := n.initRollup(); err != nil {
-			nodeLog.Warn("Rollup initialization failed: %v", err)
+			// R2-08: fail fast. A node that silently runs without an
+			// operator-enabled rollup can mislead monitoring into treating
+			// rollup-backed assets as live.
+			nodeLog.Error("Rollup initialization failed, aborting startup: %v", err)
+			return fmt.Errorf("rollup initialization failed: %w", err)
 		}
 	}
 
@@ -4631,8 +4785,53 @@ func parseChainURLPairs(pairs string, base map[bridge.ChainID]string) map[bridge
 	return result
 }
 
+// checkMemoryL1AnchorPolicy enforces F-18: the node only ships an in-memory
+// L1Anchor implementation, which does not commit batch data to L1. On a
+// non-devnet network that silently invalidates the fraud-proof challenge
+// window, so the rollup must not start unless the operator explicitly
+// accepts the degraded mode via QAU_ALLOW_MEMORY_L1_ANCHOR=1. Devnet keeps
+// the permissive behavior so local development needs no extra flags.
+func checkMemoryL1AnchorPolicy(networkID uint64, allowMemoryAnchorEnv string) error {
+	if networkID == DevnetNetworkID {
+		return nil
+	}
+	if allowMemoryAnchorEnv == "1" {
+		return nil
+	}
+	return fmt.Errorf("rollup: memory L1 anchor is not permitted on network %d (non-devnet): anchors would not be committed to L1, leaving the challenge window without an on-chain commitment; wire a real rollup.L1Anchor or set QAU_ALLOW_MEMORY_L1_ANCHOR=1 to explicitly accept in-memory anchors (F-18)", networkID)
+}
+
+// checkBridgeHeaderVerificationPolicy enforces R4-02: on mainnet the bridge
+// must not run with an external-chain sync committee verifier that has no
+// committee loaded. Such a verifier accepts any QAU-format header without
+// sync committee data as a "pre-committee" block, so cross-chain messages are
+// anchored only by the block-hash/reorg check — a header from a minority fork
+// of the external chain would pass. Signature verification therefore has to be
+// either active or an explicit, auditable operator decision. Non-mainnet
+// networks keep the degraded behavior so test bridges still start.
+func checkBridgeHeaderVerificationPolicy(networkID uint64, committeeReady bool, allowDegradedEnv string) error {
+	if committeeReady {
+		return nil
+	}
+	if networkID != MainnetNetworkID {
+		return nil
+	}
+	if allowDegradedEnv == "1" {
+		return nil
+	}
+	return fmt.Errorf("bridge: external-chain sync committee has no members on mainnet (networkId=%d): sync committee signature "+
+		"verification of external-chain headers is inactive, so only block-hash/reorg checks run — a header from a non-canonical "+
+		"external chain fork would be accepted. Wire an external-chain committee feed, or set "+
+		"QAU_ALLOW_DEGRADED_BRIDGE_HEADER_VERIFICATION=1 to explicitly accept hash-only verification (R4-02)", networkID)
+}
+
 // initRollup creates and starts the L2 rollup engine.
 func (n *Node) initRollup() error {
+	if err := checkMemoryL1AnchorPolicy(n.config.NetworkID, os.Getenv("QAU_ALLOW_MEMORY_L1_ANCHOR")); err != nil {
+		nodeLog.Error("Rollup refuses to start: %v", err)
+		return err
+	}
+
 	cfg := rollup.DefaultRollupConfig()
 
 	// RLLP- (2026-07-16): Set BridgeAddress so processBatchLocked burns
@@ -4732,11 +4931,18 @@ func (n *Node) initRollup() error {
 	// (~20 minutes at 12s block time). Production should replace this with a
 	// real L1 contract submission implementation (see rollup/l1_anchor.go
 	// L1Anchor interface).
+	// F-18: checkMemoryL1AnchorPolicy above guarantees that on a non-devnet
+	// network we only reach this point when the operator explicitly opted in
+	// via QAU_ALLOW_MEMORY_L1_ANCHOR=1.
 	// The L1 current height is synced from the blockchain on each new block.
 	const defaultChallengeBlocks = 100
 	l1Anchor := rollup.NewMemoryL1Anchor(defaultChallengeBlocks)
 	engine.SetL1Anchor(l1Anchor)
 	engine.GetBatchManager().SetL1ChallengeBlocks(defaultChallengeBlocks)
+	if n.config.NetworkID != DevnetNetworkID {
+		nodeLog.Warn("Rollup L1 anchor is IN-MEMORY on non-devnet network %d: anchors are NOT committed to L1 "+
+			"(explicitly allowed via QAU_ALLOW_MEMORY_L1_ANCHOR=1, F-18)", n.config.NetworkID)
+	}
 	nodeLog.Info("Rollup L1 anchor enabled (challengeBlocks=%d)", defaultChallengeBlocks)
 
 	// W-P1-6 FIX (2026-07-13), Phase 3 (2026-07-14): Wire the L1↔L2 bridge.
@@ -5012,6 +5218,19 @@ func (n *Node) replayBlocksToRestoreState() error {
 		return nil
 	}
 
+	// R5-03 (2026-10-21 fifth-round audit): take the instance-wide execution
+	// frame for the whole replay, as the syncer's applyBlockInternal does
+	// (R4-07 contract C1: one execution frame per live StateDB at a time).
+	// Today this runs from initState before the RPC servers start, so there is
+	// no concurrent speculative frame to collide with — but the replay
+	// Executes and Commits on the live state, and any future caller that wires
+	// it up as a runtime maintenance action would otherwise silently reproduce
+	// R4-07 (a concurrent eth_call reverting mid-replay would drop journal
+	// entries of transactions already applied). Blocking variant: state
+	// restoration must not skip a transition.
+	releaseExecution := n.stateDB.BeginExecution()
+	defer releaseExecution()
+
 	latestHeight, err := n.blockStore.GetLatestHeight()
 	if err != nil || latestHeight == 0 {
 		nodeLog.Info("No blocks to replay for state restoration")
@@ -5072,24 +5291,32 @@ func (n *Node) replayBlocksToRestoreState() error {
 
 	totalTxs := 0
 	successTxs := 0
+	replayedHeights := uint64(0)
 
-	// audit-fix R2-L4: track consecutive failures — abort if too many blocks are
-	// missing in a row, since that likely indicates a corrupted database.
-	const maxConsecutiveFailures = 10
-	consecutiveFailures := 0
+	// R10-01 (2026-10-21 tenth-round audit): a single unreadable height is fatal
+	// to the replay. The audit-fix R2-L4 tolerance it replaces skipped any block it
+	// could not read and aborted only after ten misses in a row, so an isolated gap
+	// yielded a state missing that block's transitions — which was then committed
+	// and announced as "State restored". A state built that way can never match the
+	// head, and the node had no way to find out.
+	var gapHeight uint64
+	var tipStateRoot types.Hash
+	var haveTip bool
 
 	// Replay each block in order
 	for height := uint64(1); height <= latestHeight; height++ {
 		blk, err := n.blockStore.GetBlockByHeight(height)
-		if err != nil {
-			consecutiveFailures++
-			nodeLog.Warn("failed to get block %d: %v (consecutive: %d)", height, err, consecutiveFailures)
-			if consecutiveFailures >= maxConsecutiveFailures {
-				return fmt.Errorf("aborting state replay: %d consecutive block load failures (last at height %d)", consecutiveFailures, height)
-			}
-			continue
+		if err != nil || blk == nil || blk.Header == nil {
+			gapHeight = height
+			nodeLog.Error("R10-01: block %d of %d is unreadable during state replay (err=%v) — aborting, the replay cannot reproduce the chain head",
+				height, latestHeight, err)
+			break
 		}
-		consecutiveFailures = 0 // reset on success
+		replayedHeights++
+		if height == latestHeight {
+			tipStateRoot = blk.Header.StateRoot
+			haveTip = true
+		}
 
 		// R120-REPLAY-REWARDS (2026-10-20): epoch rewards MUST be applied
 		// before the empty-block skip. The epoch-boundary block is usually
@@ -5097,7 +5324,7 @@ func (n *Node) replayBlocksToRestoreState() error {
 		// skip discarded every epoch boundary and the replayed state never
 		// credited any epoch reward. A node restored this way computes state
 		// roots that differ from every proposer's root by the accumulated
-		// reward delta — permanently. Production hit: node-G 2026-10-20, whose
+		// reward delta — permanently. Observed on a production sealer whose
 		// live tip showed a constant computed-vs-header root mismatch and a
 		// R87-STATE-TRUST production lockout after the resync-era mismatch
 		// streak (32). Same derivation as the syncer path by construction:
@@ -5184,8 +5411,36 @@ func (n *Node) replayBlocksToRestoreState() error {
 		return fmt.Errorf("failed to commit replayed state: %w", err)
 	}
 
-	nodeLog.Info("✅ State restored: replayed %d blocks, %d/%d transactions successful",
-		latestHeight, successTxs, totalTxs)
+	// R10-01 acceptance: the whole point of a boot-time replay is to end with the
+	// state the chain head claims. The rest of this package already treats that
+	// comparison as the definition of a trustworthy state (the rebuild path checks
+	// the computed root against the header before it validates, and the
+	// persisted-state anchor only calls MarkStateVerified when the two match), so
+	// the replay is the last site that used to be allowed to skip it.
+	if gapHeight != 0 {
+		return fmt.Errorf("R10-01: state replay incomplete: height %d of [1,%d] unreadable (replayed %d blocks)",
+			gapHeight, latestHeight, replayedHeights)
+	}
+	if !haveTip {
+		return fmt.Errorf("R10-01: state replay never read the tip block %d — nothing to verify the restored root against", latestHeight)
+	}
+	computed := n.stateDB.Root()
+	if computed == (types.Hash{}) {
+		return fmt.Errorf("R10-01: restored state root is the zero hash at tip %d — the replay produced nothing verifiable", latestHeight)
+	}
+	if tipStateRoot == (types.Hash{}) {
+		return fmt.Errorf("R10-01: tip block %d carries no StateRoot — restored root %x cannot be verified against it",
+			latestHeight, computed[:8])
+	}
+	if computed != tipStateRoot {
+		return fmt.Errorf("R10-01: restored state root %x != tip block %d header StateRoot %x — state is NOT verified",
+			computed[:8], latestHeight, tipStateRoot[:8])
+	}
+	n.stateRestoreVerified = true
+	n.stateRestoreVerifiedHeight = latestHeight
+
+	nodeLog.Info("✅ State restored and verified against the chain head: replayed %d/%d blocks, %d/%d transactions successful, root %x matches tip block %d",
+		replayedHeights, latestHeight, successTxs, totalTxs, computed[:8], latestHeight)
 
 	return nil
 }
@@ -5393,6 +5648,42 @@ func (n *Node) startStakingPersistence(stakingFile string) {
 				if err := n.stakingManager.SaveToFile(stakingFile); err != nil {
 					nodeLog.Warn("failed to persist staking data on shutdown: %v", err)
 				}
+				return
+			}
+		}
+	}()
+}
+
+// startGovernanceHeightSync periodically pushes the node's current block
+// height to the governance manager so that cleanupLoop's R14-LOW auto-expire
+// branch can mark proposals that have passed EndHeight as Expired. Without
+// this call, GetCurrentHeight stays at 0 and auto-expiry is silently
+// skipped (backward-compatible fallback).
+//
+// R4-RES: same ticker pattern as startStakingPersistence (30s tick,
+// ctx.Done, recover, wg.Add/Done).
+func (n *Node) startGovernanceHeightSync() {
+	if n.governanceManager == nil {
+		return
+	}
+
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		defer func() {
+			if r := recover(); r != nil {
+				nodeLog.Error("panic in startGovernanceHeightSync: %v", r)
+			}
+		}()
+
+		for {
+			select {
+			case <-ticker.C:
+				n.governanceManager.SetCurrentHeight(n.CurrentHeight())
+			case <-n.ctx.Done():
+				n.governanceManager.SetCurrentHeight(n.CurrentHeight())
 				return
 			}
 		}
@@ -5997,24 +6288,40 @@ func (n *Node) initBridgeValidatorNetwork() error {
 //     look up the block at msg.BlockNumber in the local block store and
 //     compare its hash to msg.BlockHash. A mismatch indicates the source
 //     block was reorged away.
-//   - Ethereum side: uses a SyncCommitteeVerifier to verify sync committee
-//     signatures on block headers fetched from the Ethereum RPC node.
+//   - External-chain side: uses a SyncCommitteeVerifier to verify Dilithium3
+//     sync committee signatures on QAU-format headers fetched from the
+//     external chain's RPC node. This does not verify Ethereum's BLS12-381
+//     SyncAggregate; Ethereum consensus needs a dedicated BLS verifier.
 //
 // Nil-safe design: when n.headerSyncer is nil (light client not enabled),
 // Quantaureum header verification is skipped. When the sync committee
-// verifier has no committee configured, Ethereum header verification is
-// skipped for pre-sync-committee blocks and fails-closed for blocks that
+// verifier has no committee configured, external-chain header verification
+// is skipped for pre-sync-committee blocks and fails-closed for blocks that
 // carry sync committee signatures.
 //
-// The verifier and sync committee verifier are stored on the Node struct
-// so they can be updated at runtime (e.g., when Ethereum sync committee
-// data becomes available via light client sync).
+// R2-15: the verifier is injected but deliberately left without a committee
+// because the node has no external-chain committee feed. Until one is wired,
+// external-chain headers get reorg detection only (their block hash is still
+// compared against msg.BlockHash).
 //
 // BRDG-FIX (2026-07-16): On mainnet, strict mode is enabled and the
-// verifier MUST be fully configured (IsEnabled && HasQuantaureumLookup &&
-// HasEthereumSyncCommittee). If not fully configured, returns an error to
-// prevent node startup (fail-closed). This eliminates the fail-open path
-// where an unconfigured verifier silently accepts cross-chain messages.
+// verifier MUST be configured (IsEnabled && HasQuantaureumLookup &&
+// HasExternalChainSyncCommittee). If not, returns an error to prevent node
+// startup (fail-closed). This eliminates the fail-open path where an
+// unconfigured verifier silently accepts cross-chain messages.
+//
+// R3-02: a non-nil sync committee verifier with an empty committee cannot
+// verify signatures. Mainnet therefore checks
+// IsExternalChainSyncCommitteeReady and, when false, logs an explicit
+// degraded-mode warning instead of claiming that signature verification is
+// active. The header hash/reorg check remains enabled.
+//
+// R4-02 (2026-10-21): that warning was not enough. The node always injects a
+// committee-less verifier (there is no external-chain committee feed), so mainnet
+// startup could never reach the signature path while strict mode still reported
+// "configured". Degraded mainnet operation is now fail-closed: the node refuses
+// to start unless a committee is actually loaded or the operator accepts
+// hash-only verification via QAU_ALLOW_DEGRADED_BRIDGE_HEADER_VERIFICATION=1.
 func (n *Node) initBridgeHeaderVerifier(qb *bridge.QuantumBridge) error {
 	verifier := bridge.NewBridgeHeaderVerifier()
 
@@ -6028,13 +6335,15 @@ func (n *Node) initBridgeHeaderVerifier(qb *bridge.QuantumBridge) error {
 		nodeLog.Warn("Bridge header verifier: Quantaureum header lookup not available (light client not enabled) — reorg detection disabled")
 	}
 
-	// Create and inject the Ethereum sync committee verifier.
-	// Stored on Node so it can be updated when Ethereum sync committee
-	// data becomes available (UpdateCurrentCommittee/UpdateNextCommittee).
+	// Create and inject the external-chain sync committee verifier (QAU
+	// format, Dilithium3). No committee is populated: the local QAU committee
+	// is not the external chain's committee, and Ethereum BLS12-381 is not
+	// supported by this verifier. External-chain headers therefore get reorg
+	// detection only until a real committee feed (or BLS verifier) is wired.
 	syncCommittee := lightclient.NewSyncCommitteeVerifier()
 	n.bridgeSyncCommittee = syncCommittee
-	verifier.SetEthereumSyncCommittee(syncCommittee)
-	nodeLog.Info("Bridge header verifier: Ethereum sync committee verifier injected (will verify when committee is populated)")
+	verifier.SetExternalChainSyncCommittee(syncCommittee)
+	nodeLog.Warn("Bridge header verifier: external-chain sync committee verifier injected without a committee feed — sync committee signature checks are INACTIVE; external-chain headers only get hash/reorg verification")
 
 	// BRDG-FIX (2026-07-16): On mainnet, enable strict mode and
 	// assert the verifier is fully configured. This is the production
@@ -6046,17 +6355,29 @@ func (n *Node) initBridgeHeaderVerifier(qb *bridge.QuantumBridge) error {
 		verifier.SetStrictMode(true)
 		if !verifier.IsEnabled() {
 			return fmt.Errorf("bridge header verifier not enabled on mainnet (networkId=%d): "+
-				"both Quantaureum lookup and Ethereum sync committee are nil (BRDG-)", n.config.NetworkID)
+				"both Quantaureum lookup and external-chain sync committee are nil (BRDG-)", n.config.NetworkID)
 		}
 		if !verifier.HasQuantaureumLookup() {
 			return fmt.Errorf("bridge header verifier missing Quantaureum lookup on mainnet (networkId=%d): "+
 				"light client/headerSyncer not initialized — reorg detection required (BRDG-)", n.config.NetworkID)
 		}
-		if !verifier.HasEthereumSyncCommittee() {
-			return fmt.Errorf("bridge header verifier missing Ethereum sync committee on mainnet (networkId=%d): "+
+		if !verifier.HasExternalChainSyncCommittee() {
+			return fmt.Errorf("bridge header verifier missing external-chain sync committee on mainnet (networkId=%d): "+
 				"sync committee verifier not injected (BRDG-)", n.config.NetworkID)
 		}
-		nodeLog.Info("Bridge header verifier: strict mode ENABLED on mainnet (fail-closed for nil syncers)")
+		committeeReady := verifier.IsExternalChainSyncCommitteeReady()
+		if err := checkBridgeHeaderVerificationPolicy(n.config.NetworkID, committeeReady,
+			os.Getenv("QAU_ALLOW_DEGRADED_BRIDGE_HEADER_VERIFICATION")); err != nil {
+			nodeLog.Error("Bridge header verifier refuses to start: %v", err)
+			return err
+		}
+		if !committeeReady {
+			nodeLog.Warn("Bridge header verifier: external-chain sync committee has no members on mainnet (networkId=%d): "+
+				"external-chain headers are verified for block-hash/reorg only — sync committee signature verification is NOT active. "+
+				"Running in explicitly accepted degraded mode (R3-02/R4-02).", n.config.NetworkID)
+		} else {
+			nodeLog.Info("Bridge header verifier: strict mode ENABLED on mainnet (external-chain signatures verified, fail-closed for nil syncers)")
+		}
 	}
 
 	// Inject the verifier into all registered adapters.
@@ -7139,16 +7460,16 @@ func (n *Node) wireElectionVerifier() {
 			}
 			// R118-CATCHUP-HEAL (2026-10-20): a sealer that is RE-SYNCING
 			// history can hold a diverged VRF-accumulator trajectory for the
-			// range it has not yet re-imported (node-G 2026-10-19/20: after the
-			// full resync from scratch, every canonical block in a ~2k-block
-			// window was rejected as "proposer mismatch" — the expected
+			// range it has not yet re-imported (observed on a production sealer
+			// after a full resync from scratch: every canonical block in a
+			// ~2k-block window was rejected as "proposer mismatch" — the expected
 			// proposer derived from the stale accumulator disagreed with the
 			// canonical block for ALL six validators, not one fork's
 			// proposer). The R61 heal already repairs the accumulator after
 			// healThreshold consecutive rejects, but each rejected block is
 			// DROPPED and must survive a full peer re-delivery round trip
 			// (~30-60s per batch cycle) before it can be rejected/healed
-			// again — measured on node-G as 8 network round trips per epoch =
+			// again — measured as 8 network round trips per epoch =
 			// 4-8 minutes per 32-block epoch. QAU_HEAL_THRESHOLD=1 collapses
 			// that to the first reject per epoch: the block is healed
 			// immediately, SetEpochVRFAccumulator repairs the local
@@ -7451,7 +7772,7 @@ func (n *Node) blockProcessingLoop() {
 					// R117-STALLLOOP (2026-10-20): same reasoning as the takeNextBlock
 					// twin — never discard the next-expected window; see the full
 					// comment there. Clearing the seed blocks here is what armed the
-					// 60s clear-loop on node-G: each throw discarded the currentH+1 block
+					// 60s clear-loop: each throw discarded the currentH+1 block
 					// whose parent had also just been discarded, so every
 					// re-delivery arrived parentless and inserts never resumed.
 					const windowKeepProc = 8
@@ -7868,7 +8189,7 @@ func (n *Node) takeNextBlock() *encoding.Block {
 			// discarded), ProcessBlock returned ErrParentNotFound, inserts
 			// never advanced, and 30s later the whole buffer was cleared
 			// again: a self-sustaining 60s clear-loop that measured ~20-30
-			// blocks/min on node-G (2026-10-19/20, six full clears per 10 min,
+			// blocks/min on a production sealer (six full clears per 10 min,
 			// CPU 220% burned on re-decoding discarded work).
 			//
 			// Keep the blocks around the next expected height instead of
@@ -9763,6 +10084,36 @@ func (n *Node) ParallelQVM() *parallel.ParallelQVM {
 // MultiCache returns the multi-level cache
 func (n *Node) MultiCache() *cache.MultiLevelCache {
 	return n.multiCache
+}
+
+// flushStateForShutdown is the "flush-data" shutdown hook: it commits any
+// pending state change before the process exits.
+//
+// R6-03 (2026-10-21 sixth-round audit): Commit flushes the dirty journal and
+// resets the snapshot stack, so it is a state transition in its own right and
+// must hold the instance's execution frame (R4-07 contract). Nothing above this
+// hook joins the seal or import goroutines — cancel() is not a wait, and
+// Syncer.Stop only joins the syncer's own loops — so without the frame a
+// shutdown landing mid-block persisted a partially applied block as durable
+// state, cleared the stack from under the live frame (whose own RevertToSnapshot
+// then failed closed) and advanced the commit marker past the block that
+// produced it.
+//
+// A failed flush is logged and reported as success: refusing to shut down over
+// it would trap the operator, and the durability fail-safe (the commit-pending
+// marker plus RecoverConsistency on next start) is the recovery path.
+func (n *Node) flushStateForShutdown(_ context.Context) error {
+	if n.stateDB == nil {
+		return nil
+	}
+	err := n.stateDB.WithExecutionFrame(func() error {
+		_, err := n.stateDB.Commit()
+		return err
+	})
+	if err != nil {
+		nodeLog.Warn("Failed to commit state on shutdown: %v", err)
+	}
+	return nil
 }
 
 // ShutdownHandler returns the shutdown handler

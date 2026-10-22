@@ -266,6 +266,8 @@ func loadKey(keyFile string) (*crypto.PrivateKey, types.Address) {
 	if err != nil {
 		fatal("decode private key from %s: %v", keyFile, err)
 	}
+	// F-10: wipe the decoded key material once the parsed key owns a copy.
+	defer func() { _ = crypto.ZeroBytesSecure(privBytes) }()
 	privKey, err := crypto.PrivateKeyFromBytes(privBytes)
 	if err != nil {
 		fatal("parse private key from %s: %v", keyFile, err)

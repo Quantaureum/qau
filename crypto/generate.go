@@ -175,7 +175,7 @@ func GenerateKeyPairFromSeed(seed []byte) (*KeyPair, error) {
 	// R41-CR-005 fix applied to ImportKeyPair.
 	seedCopy := make([]byte, len(seed))
 	copy(seedCopy, seed)
-	defer zeroBytesSecure(seedCopy)
+	defer func() { _ = zeroBytesSecure(seedCopy) }()
 
 	reader := newShakeReader(seedCopy)
 	pub, priv, err := mode3.GenerateKey(reader)
@@ -700,15 +700,12 @@ func verifyKeyUsable(key *mode3.PrivateKey) (err error) {
 	if key == nil {
 		return ErrInvalidPrivateKey
 	}
-	// Try to derive the public key - this will fail if the key is invalid
-	pubInterface := key.Public()
-	if pubInterface == nil {
-		return errors.New("failed to derive public key from private key")
-	}
-	pub, ok := pubInterface.(*mode3.PublicKey)
-	if !ok {
-		return errors.New("failed to cast public key")
-	}
+	// Derive the public key. circl's mode3 PrivateKey.Public() constructs
+	// the key by value and never returns a nil interface, and the concrete
+	// type is always *mode3.PublicKey — the former nil/type-assertion
+	// branches were dead code (staticcheck SA4023). Any panic from a
+	// corrupted key is converted to an error by the recover() above.
+	pub := key.Public().(*mode3.PublicKey)
 	// R26-Crypto-C1 FIX: Perform sign/verify self-test to catch malformed keys
 	//
 	// CRYPTO-R9-L-REDO-02 (2026-07-19) FIX: Previously this used a fixed,
@@ -747,19 +744,19 @@ func verifyKeyUsable(key *mode3.PrivateKey) (err error) {
 		// FIX: Zero signature buffer on all exit paths — it may contain
 		// partial key-derived material written before the panic.
 		// R31-P3 FIX: Use zeroBytesSecure for consistency with Destroy/Zeroize.
-		zeroBytesSecure(sig)
+		_ = zeroBytesSecure(sig)
 		return fmt.Errorf("%w: %v", ErrInvalidPrivateKey, signPanicErr)
 	}
 	if !mode3.Verify(pub, testMsgSlice, sig) {
 		// FIX: Zero signature buffer on all exit paths — the signature
 		// contains cryptographic material derived from the private key.
 		// R31-P3 FIX: Use zeroBytesSecure for consistency with Destroy/Zeroize.
-		zeroBytesSecure(sig)
+		_ = zeroBytesSecure(sig)
 		return errors.New("key pair failed cryptographic self-test")
 	}
 	// FIX: Zero signature buffer after verification is complete.
 	// R31-P3 FIX: Use zeroBytesSecure for consistency with Destroy/Zeroize.
-	zeroBytesSecure(sig)
+	_ = zeroBytesSecure(sig)
 	return nil
 }
 
@@ -772,13 +769,14 @@ func PublicKeyFromBytes(b []byte) (*PublicKey, error) {
 		return nil, ErrInvalidPublicKey
 	}
 
-	// R37-P0-03 FIX (2026-07-30): Reject all-zero public keys. An all-zero
-	// key has t1=0, degenerating the Dilithium verification equation to
+	// R37-P0-03 FIX (2026-07-30): Reject degenerate public keys (t1=0). A
+	// zero t1 vector degenerates the Dilithium verification equation to
 	// w' = A·z — mode3.Verify then accepts keyless forged signatures
-	// (z=0, h=0) for ANY message. circl does not check for degenerate keys,
-	// so this entry point (used by tx verification, multisig, consensus key
-	// loading and keystore import) must.
-	if IsZeroPublicKeyBytes(b) {
+	// (z=0, h=0) for ANY message, even when rho is random. circl does not
+	// check for degenerate keys, so this entry point (used by tx verification,
+	// multisig, consensus key loading and keystore import) must.
+	// F-06: check the full t1 vector, not just the all-zero encoding.
+	if IsDegeneratePublicKeyBytes(b) {
 		return nil, ErrInvalidPublicKey
 	}
 

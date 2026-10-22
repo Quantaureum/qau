@@ -12,24 +12,6 @@ import (
 // mode3.Verify then accepts keyless forged signatures (z=0, h=0) for ANY
 // message. These tests pin the rejection at every entry point.
 
-func TestIsZeroPublicKeyBytes(t *testing.T) {
-	zero := make([]byte, Dilithium3PublicKeySize)
-	if !IsZeroPublicKeyBytes(zero) {
-		t.Error("all-zero 1952-byte key must be detected")
-	}
-	nonZero := make([]byte, Dilithium3PublicKeySize)
-	nonZero[Dilithium3PublicKeySize-1] = 0x01
-	if IsZeroPublicKeyBytes(nonZero) {
-		t.Error("non-zero key must not be flagged")
-	}
-	if IsZeroPublicKeyBytes(nil) {
-		t.Error("nil input must return false (handled by length checks)")
-	}
-	if IsZeroPublicKeyBytes(make([]byte, 10)) {
-		t.Error("wrong-length input must return false (handled by length checks)")
-	}
-}
-
 func TestPublicKeyFromBytes_RejectsZeroKey_R37P003(t *testing.T) {
 	zero := make([]byte, Dilithium3PublicKeySize)
 	pk, err := PublicKeyFromBytes(zero)

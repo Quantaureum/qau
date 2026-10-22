@@ -291,44 +291,13 @@ func TestDistributedTSSHasNoEnableSwitch(t *testing.T) {
 	}
 }
 
-// ── snapshotManagerAdapter with nil node ──
-
-func TestSnapshotManagerAdapter_NilNode(t *testing.T) {
-	adapter := newSnapshotManagerAdapter(nil)
-
-	_, err := adapter.CreateSnapshot(100)
-	if err == nil {
-		t.Error("expected error for nil node")
-	}
-
-	_, err = adapter.RestoreSnapshot(100)
-	if err == nil {
-		t.Error("expected error for nil node")
-	}
-}
-
-// ── snapshotManagerAdapter with nil stateDB ──
-
-func TestSnapshotManagerAdapter_NilStateDB(t *testing.T) {
-	cfg := &Config{Name: "test-snapshot-adapter", DataDir: t.TempDir()}
-	n, err := NewNode(cfg)
-	if err != nil {
-		t.Fatalf("NewNode failed: %v", err)
-	}
-	defer closeNodeDB(n)
-
-	adapter := newSnapshotManagerAdapter(n)
-
-	_, err = adapter.CreateSnapshot(100)
-	if err == nil {
-		t.Error("expected error for nil stateDB")
-	}
-
-	_, err = adapter.RestoreSnapshot(100)
-	if err == nil {
-		t.Error("expected error for nil stateDB")
-	}
-}
+// R6-01 (2026-10-21 sixth-round audit): snapshotManagerAdapter is gone. It fed
+// the caller's block height into StateDB.RevertToSnapshot(id), which indexes the
+// live dirty-state journal, not a height-keyed restore point. evm_snapshot and
+// evm_revert now refuse at the rpc boundary, so there is no adapter left to
+// exercise; the refusal is covered by rpc/r6_01_snapshot_refusal_test.go and the
+// journal-position contract of RevertToSnapshot stays pinned by
+// qaudb/state/state_db_test.go.
 
 // ── chainInfoAdapter extended tests ──
 

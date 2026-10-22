@@ -537,6 +537,7 @@ func TestResharedShareCarriesKeyAcrossRemove(t *testing.T) {
 	// Old LocalShare per member.
 	publicKey := make([]byte, 1952)
 	publicKey[0] = 0xAA
+	publicKey[32] = 0x01 // t1 must not be all-zero (F-06 degenerate-key rejection)
 	keyID := protocol.ThresholdKeyID{
 		Algorithm:  qcrypto.SignatureAlgorithmDilithium3Legacy,
 		Generation: 11,
@@ -664,6 +665,7 @@ func TestResharedShareCarriesKeyAcrossAdd(t *testing.T) {
 
 	publicKey := make([]byte, 1952)
 	publicKey[0] = 0xCC
+	publicKey[32] = 0x01 // t1 must not be all-zero (F-06 degenerate-key rejection)
 	keyID := protocol.ThresholdKeyID{
 		Algorithm:  qcrypto.SignatureAlgorithmDilithium3Legacy,
 		Generation: 20,

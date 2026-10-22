@@ -76,6 +76,33 @@ regression suite covers raw hex, JSON, prefixed, and mixed prefix/JSON forms.
 - Binary replacement should be performed through the deployment supervisor so
   the node is stopped and restarted deterministically.
 - Logging that is important for operation should use an unbuffered stream.
+- A `StateDB` instance admits exactly one top-level execution frame
+  (`BeginExecution` / `TryBeginExecution` / `WithExecutionFrame`). The dirty
+  journal and the position-based snapshot stack are shared per instance, so any
+  entry point that commits, reverts a snapshot, rolls state back to a height, or
+  writes accounts back into committed state must hold the frame for its whole
+  duration, or it corrupts a block transition that is running concurrently
+  (R4-07 C1, R6-03).
+- `StateDB.Copy()` must deep-copy every mutable field an instance guards with its
+  own `s.mu`. A field inherited by reference is one map behind two mutexes: the
+  producer's copy and the live StateDB commit concurrently, and the collision is a
+  fatal `concurrent map writes`, not a recoverable panic (R6-06: `stateSnapshots`
+  was shared this way). When adding a field to `StateDB`, decide explicitly
+  whether `Copy()` clones it or shares it on purpose, and say so at the site.
+- Anything presented as a proof must verify against the state root the node is
+  serving, before it is handed out. A backend that cannot prove, a proof that
+  does not verify, and a header that disagrees with the live root are errors; a
+  placeholder or empty proof is never an acceptable substitute for "no data"
+  (R6-02).
+- Match the claim to the data structure. Committed storage slots live in the
+  key-value store, not in the Verkle state trie, so no state-root-bound storage
+  proof exists: light clients are refused rather than handed a contradicting
+  exclusion proof, and `eth_getProof` storage entries are labelled `unverified`
+  instead of presented as proven (R6-05).
+- A registered surface that is not live refuses explicitly at its own boundary
+  (`-32603` plus a caller-facing reason) instead of performing a different,
+  destructive operation under the requested name, and its wiring seam is removed
+  rather than left half-connected (R5-05, R6-01).
 
 ## 15.9 Change Discipline
 

@@ -372,7 +372,7 @@ func (ft *FinalityTracker) FinalizeBlock(height uint64, blockHash types.Hash, vo
 	if totalVotes > maxVoteHistoryEntries {
 		// Evict oldest entries by finding the lowest height across all validators
 		for totalVotes > maxVoteHistoryEntries*9/10 { // shrink to 90%
-			var lowestHeight uint64 = ^uint64(0)
+			lowestHeight := ^uint64(0)
 			var lowestAddr types.Address
 			for addr, heights := range ft.voteHistory {
 				for h := range heights {

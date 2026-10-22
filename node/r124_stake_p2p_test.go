@@ -42,7 +42,7 @@ import (
 //	To = 0x...1001, Data = commission(4) || nonceLen(2) || nonce,
 //
 // Signature = Dilithium3(ComputeStakeAuthorizationHash(...)), GasPrice=1,
-// GasLimit=100000。
+// GasLimit=100000.
 func buildSignedStakeTxForP2P(t *testing.T, chainID uint64, nonce int64, senderStateNonce uint64) (*encoding.Transaction, error) {
 	t.Helper()
 

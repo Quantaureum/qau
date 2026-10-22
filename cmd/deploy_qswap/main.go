@@ -53,7 +53,9 @@
 //	QAU_VALIDATOR_NODES  - comma-separated SSH targets for tx fan-out
 //	                      (e.g. "operator@198.51.100.10,operator@203.0.113.20")
 //	QAU_SSH_KEY          - SSH identity file for peer fan-out (required iff
-//	                       QAU_VALIDATOR_NODES is set)
+//	                       QAU_VALIDATOR_NODES is set). Peer host keys are
+//	                       verified against ~/.ssh/known_hosts; populate it
+//	                       with every peer's key before enabling fan-out.
 //	QAU_DEPLOY_GAS       - gas limit per deployment (default 5,000,000; the
 //	                       Router initcode is ~19.7KB so legacy 500k is NOT
 //	                       enough. gasLimit in genesis is 20,000,000)
@@ -195,6 +197,8 @@ func loadKey(keyFile string) (*crypto.PrivateKey, types.Address) {
 	if err != nil {
 		fatal("decode private key from %s: %v", keyFile, err)
 	}
+	// F-10: wipe the decoded key material once the parsed key owns a copy.
+	defer func() { _ = crypto.ZeroBytesSecure(privBytes) }()
 	privKey, err := crypto.PrivateKeyFromBytes(privBytes)
 	if err != nil {
 		fatal("parse private key from %s: %v", keyFile, err)
@@ -394,7 +398,8 @@ func fanOutRawTx(txHex string) bool {
 		)
 		//nolint:gosec // G204: ops tool — targets come from QAU_VALIDATOR_NODES env, not untrusted input.
 		cmd := exec.Command("ssh",
-			"-o", "StrictHostKeyChecking=no",
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "BatchMode=yes",
 			"-o", "ConnectTimeout=8",
 			"-i", sshKeyPath(),
 			node, sshCmd,
@@ -435,7 +440,8 @@ func waitForReceipt(txHashHex string, timeoutSec int) map[string]interface{} {
 			)
 			//nolint:gosec // G204: ops tool — env-driven ssh, no untrusted input.
 			cmd := exec.Command("ssh",
-				"-o", "StrictHostKeyChecking=no",
+				"-o", "StrictHostKeyChecking=yes",
+				"-o", "BatchMode=yes",
 				"-o", "ConnectTimeout=8",
 				"-i", sshKeyPath(),
 				node, sshCmd,

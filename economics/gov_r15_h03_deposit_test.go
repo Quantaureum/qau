@@ -28,7 +28,7 @@ import (
 
 // mockDepositLocker records every LockDeposit/UnlockDeposit/SlashDeposit call
 // and optionally returns a configured error. Used to verify CreateProposal
-// actually charges the deposit before storing the proposal.
+// actually reserves the deposit against the proposer's balance before storing the proposal.
 //
 // CRIT-06 (R17): Extended to track Unlock/Slash calls and enforce idempotency
 // via the settled set (matching the production contract).

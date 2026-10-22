@@ -604,8 +604,11 @@ x-methods:
       returns: object
 
   accountAbstraction:
+    # Experimental: account abstraction is not live. No component consumes the
+    # bundles the bundler builds, so submissions are refused rather than
+    # accepted-then-dropped. See README "Experimental - not live".
     qau_sendUserOperation:
-      description: Send EIP-4337 user operation
+      description: Refused - account abstraction is not live; user operations are not bundled on chain yet (returns JSON-RPC error -32603)
       params:
         - name: userOp
           type: object
@@ -613,7 +616,7 @@ x-methods:
         - name: entryPoint
           type: string
           required: true
-      returns: string
+      returns: error
 
     qau_estimateUserOperationGas:
       description: Estimate gas for user operation

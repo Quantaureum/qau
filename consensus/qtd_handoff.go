@@ -74,7 +74,8 @@ func (qfs *QTDFinalityState) observeAnchoredGroupKeyHandoffLocked(epoch uint64, 
 	prev := qfs.groupKeyHistory
 	if len(prev) == 0 {
 		// First establishment: the offline-ceremony/ops channel is the trust
-		// source; no key_N to verify against, accept without a proof (S8 shape).
+		// source; no key_N to verify against, accept without a proof (the
+		// ceremony-node shape).
 		return nil
 	}
 	maxKnown := uint64(0)

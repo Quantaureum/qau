@@ -727,31 +727,61 @@ func TestPedersenHasher(t *testing.T) {
 	}
 }
 
-func TestVerkleTreeWithPedersenHasher(t *testing.T) {
-	SetHasher(PedersenHasher())
-	defer SetHasher(&sha3Hasher{})
+// R10-04 (2026-10-21 tenth-round audit): this test used to install the Pedersen
+// hasher process-wide through SetHasher and then assert that a Put/Get
+// round-tripped and that a proof verified. Those assertions hold under every
+// hash function, so they could not observe the swap they were named for — while
+// the swap itself mutated a lock-free global that nine production sites read
+// mid-build, and left LeafNode.recomputeHash hashing with SHA3-256 anyway. The
+// tree's hash function is not selectable any more; what matters is that it is
+// pinned and that both leaf-computation paths agree on it.
+func TestVerkleTreeUsesThePinnedHasher(t *testing.T) {
+	key := []byte("pinned_hasher_key")
+	value := []byte("pinned_hasher_value")
 
-	tree := NewVerkleTree(MaxTreeDepth)
-
-	key := []byte("pedersen_key")
-	value := []byte("pedersen_value")
-
-	tree.Put(key, value)
-
-	got, err := tree.Get(key)
-	if err != nil {
-		t.Fatal(err)
+	leaf := NewLeafNode(key, value)
+	want := (&sha3Hasher{}).HashLeaf(key, value)
+	if leaf.Hash() != want {
+		t.Fatalf("constructed leaf hash %x != pinned SHA3-256 leaf hash %x", leaf.Hash(), want)
+	}
+	if alt := PedersenHasher().HashLeaf(key, value); leaf.Hash() == alt {
+		t.Fatalf("leaf hash %x is indistinguishable from the Pedersen form — no domain separation to pin", alt)
 	}
 
-	if !bytes.Equal(got, value) {
-		t.Error("value mismatch with Pedersen hasher")
+	// The mixed-function hazard R10-04 removed, as a positive check: a leaf that
+	// goes through recomputeHash with no same-stem entries must land on exactly
+	// the hash its constructor produced. Under a swappable hasher these two code
+	// paths disagreed by construction.
+	leaf.recomputeHash()
+	if leaf.Hash() != want {
+		t.Fatalf("recomputeHash on a suffix-free leaf gave %x, construction gave %x", leaf.Hash(), want)
+	}
+	// And once a same-stem entry exists it must move the hash (R3-DATA-01).
+	leaf.SuffixValues = map[byte][]byte{0x01: []byte("same-stem value")}
+	leaf.recomputeHash()
+	if leaf.Hash() == want {
+		t.Fatal("a same-stem suffix entry left the leaf hash unchanged — it could be tampered with unnoticed")
 	}
 
-	proof, _ := tree.Prove(key)
-	root := tree.Root()
+	var children [BranchingFactor]types.Hash
+	copy(children[7][:], []byte("internal child"))
+	internal := NewInternalNode()
+	internal.Children = children
+	internal.recomputeHash()
+	if internal.Hash() != (&sha3Hasher{}).HashInternal(children) {
+		t.Fatalf("internal node hash %x != pinned form %x", internal.Hash(), (&sha3Hasher{}).HashInternal(children))
+	}
 
-	if !proof.Verify(root) {
-		t.Error("proof verification failed with Pedersen hasher")
+	var stem [StemSize]byte
+	copy(stem[:], []byte("pinned stem"))
+	childLeaf := NewLeafNode([]byte("extension child key"), []byte("extension child value"))
+	ext := NewExtensionNode(stem, 1, childLeaf)
+	if ext == nil {
+		t.Fatal("NewExtensionNode rejected a valid StemLen")
+	}
+	ext.recomputeHash()
+	if ext.Hash() != (&sha3Hasher{}).HashExtension(stem, childLeaf.Hash()) {
+		t.Fatalf("extension node hash %x != pinned form %x", ext.Hash(), (&sha3Hasher{}).HashExtension(stem, childLeaf.Hash()))
 	}
 }
 
@@ -1002,16 +1032,9 @@ func TestEmptyNode(t *testing.T) {
 	}
 }
 
-func TestGetHasher(t *testing.T) {
-	original := GetHasher()
-	if original == nil {
-		t.Error("expected non-nil hasher")
-	}
-	SetHasher(original)
-	if GetHasher() != original {
-		t.Error("hasher mismatch after reset")
-	}
-}
+// R10-04: TestGetHasher was removed together with the GetHasher/SetHasher pair
+// it exercised. It asserted that a setter round-trips its own argument, which is
+// true of every setter and said nothing about the consensus hash function.
 
 func TestNewVerkleProof(t *testing.T) {
 	p := NewVerkleProof([]byte("key"), []byte("value"), [][]byte{{0x01}})
@@ -1514,18 +1537,40 @@ func TestVerkleTree_Get_LeafCountNonExistent(t *testing.T) {
 	}
 }
 
-func TestVerkleStateDB_PedersenHasher_HashExtension(t *testing.T) {
-	SetHasher(PedersenHasher())
-	defer SetHasher(&sha3Hasher{})
+// R10-04: this test used to install the Pedersen hasher globally and then assert
+// that the root was non-zero, which any hash function satisfies. The Pedersen
+// implementation is still real code, so pin what a future versioned migration
+// would actually depend on: deterministic, non-degenerate, sensitive to each
+// input, and domain-separated from the function the tree uses today.
+func TestPedersenHasherDomainSeparation(t *testing.T) {
+	ped := PedersenHasher()
+	sha := &sha3Hasher{}
 
-	tree := NewVerkleTree(MaxTreeDepth)
-	tree.Put([]byte("key_a"), []byte("val_a"))
-	tree.Put([]byte("key_b"), []byte("val_b"))
-	tree.Put([]byte("key_c"), []byte("val_c"))
+	var stem [StemSize]byte
+	copy(stem[:], []byte("pedersen stem"))
+	var child types.Hash
+	copy(child[:], []byte("pedersen child"))
 
-	root := tree.Root()
-	if root == (types.Hash{}) {
-		t.Error("expected non-zero root with Pedersen hasher and multiple keys")
+	got := ped.HashExtension(stem, child)
+	if got == (types.Hash{}) {
+		t.Fatal("Pedersen HashExtension returned the zero hash")
+	}
+	if again := ped.HashExtension(stem, child); again != got {
+		t.Fatalf("Pedersen HashExtension is not deterministic: %x then %x", got, again)
+	}
+
+	movedChild := child
+	movedChild[0] ^= 0x01
+	if ped.HashExtension(stem, movedChild) == got {
+		t.Fatal("Pedersen HashExtension ignores the child hash")
+	}
+	movedStem := stem
+	movedStem[0] ^= 0x01
+	if ped.HashExtension(movedStem, child) == got {
+		t.Fatal("Pedersen HashExtension ignores the stem")
+	}
+	if got == sha.HashExtension(stem, child) {
+		t.Fatal("Pedersen and SHA3-256 extension hashes are indistinguishable — no domain separation")
 	}
 }
 

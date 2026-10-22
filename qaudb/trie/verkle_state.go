@@ -75,8 +75,7 @@ func (db *VerkleStateDB) GetStorage(addr types.Address, slot types.Hash) ([]byte
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	storageKey := string(addr[:])
-	storageTree, ok := db.storage[storageKey]
+	storageTree, ok := db.storage[string(addr[:])]
 	if !ok {
 		return nil, ErrKeyNotFound
 	}
@@ -103,8 +102,7 @@ func (db *VerkleStateDB) GetStorageRoot(addr types.Address) types.Hash {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	storageKey := string(addr[:])
-	storageTree, ok := db.storage[storageKey]
+	storageTree, ok := db.storage[string(addr[:])]
 	if !ok {
 		return types.Hash{}
 	}
@@ -277,8 +275,7 @@ func (db *VerkleStateDB) ProveStorage(addr types.Address, slot types.Hash) (*Ver
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	storageKey := string(addr[:])
-	storageTree, ok := db.storage[storageKey]
+	storageTree, ok := db.storage[string(addr[:])]
 	if !ok {
 		return nil, ErrKeyNotFound
 	}
@@ -587,8 +584,7 @@ func (db *VerkleStateDB) IterateStorage(addr types.Address, fn func(slot types.H
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	storageKey := string(addr[:])
-	storageTree, ok := db.storage[storageKey]
+	storageTree, ok := db.storage[string(addr[:])]
 	if !ok {
 		return nil
 	}
@@ -638,9 +634,13 @@ func (db *VerkleStateDB) Serialize() ([]byte, error) {
 	for k, v := range dump {
 		keyLen := uint32(len(k))
 		valLen := uint32(len(v))
-		binary.Write(buf, binary.BigEndian, keyLen)
+		if err := binary.Write(buf, binary.BigEndian, keyLen); err != nil {
+			return nil, err
+		}
 		buf.Write([]byte(k))
-		binary.Write(buf, binary.BigEndian, valLen)
+		if err := binary.Write(buf, binary.BigEndian, valLen); err != nil {
+			return nil, err
+		}
 		buf.Write(v)
 	}
 

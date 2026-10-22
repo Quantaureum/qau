@@ -71,22 +71,24 @@ const (
 	ReasonZeroPublicKey = "zero_public_key"
 )
 
-// IsZeroPublicKeyBytes reports, in constant time, whether b is an all-zero
-// Dilithium3 public key. An all-zero public key has t1=0, which degenerates
-// the Dilithium verification equation w' = A·z − c·t1·2^d to w' = A·z —
-// an attacker can then forge a valid signature for ANY message without the
-// private key by choosing z=0, h=0 and precomputing c = H(μ ‖ Encode(0))
-// (R37-P0-03, empirically verified against mode3.Verify). circl does NOT
-// reject degenerate keys, so every entry point must.
-//
-// Returns false for nil or wrong-length input (those are rejected by the
-// length checks at each call site).
-func IsZeroPublicKeyBytes(b []byte) bool {
+// Dilithium3PublicKeyT1Offset is the offset of the t1 vector inside the
+// serialized Dilithium3 public key: a 32-byte rho seed followed by
+// K*320 bytes of t1. t1 must not be all-zero: with t1=0 the verification
+// equation degenerates to w' = A·z regardless of rho, enabling keyless
+// forgeries.
+const Dilithium3PublicKeyT1Offset = 32
+
+// IsDegeneratePublicKeyBytes reports, in constant time, whether b carries an
+// all-zero t1 vector. This is the actual degenerate case behind R37-P0-03:
+// the rho seed may be random while t1 is still zero, so checking for an
+// entirely all-zero key would miss it. Returns false for nil or wrong-length
+// input (rejected by the length checks at each call site).
+func IsDegeneratePublicKeyBytes(b []byte) bool {
 	if len(b) != Dilithium3PublicKeySize {
 		return false
 	}
-	var zero [Dilithium3PublicKeySize]byte
-	return subtle.ConstantTimeCompare(b, zero[:]) == 1
+	var zero [Dilithium3PublicKeySize - Dilithium3PublicKeyT1Offset]byte
+	return subtle.ConstantTimeCompare(b[Dilithium3PublicKeyT1Offset:], zero[:]) == 1
 }
 
 // Verify verifies a signature against a message using the public key.
@@ -144,12 +146,13 @@ func Verify(publicKey *PublicKey, message, signature []byte) bool {
 		return false
 	}
 
-	// R37-P0-03 FIX (2026-07-30): Reject all-zero public keys. With t1=0 the
-	// verification equation degenerates to w' = A·z and mode3.Verify accepts
-	// keyless forgeries (z=0, h=0). PublicKeyFromBytes is the primary gate;
-	// this is defense-in-depth for any PublicKey constructed by other paths.
-	if IsZeroPublicKeyBytes(pkBytes) {
-		logging.Global().Warn("Dilithium3 Verify rejected: all-zero public key (keyless forgery vector)", map[string]any{
+	// R37-P0-03 FIX (2026-07-30): Reject degenerate public keys (t1=0). With
+	// t1=0 the verification equation degenerates to w' = A·z and mode3.Verify
+	// accepts keyless forgeries (z=0, h=0) even when rho is random.
+	// PublicKeyFromBytes is the primary gate; this is defense-in-depth for any
+	// PublicKey constructed by other paths.
+	if IsDegeneratePublicKeyBytes(pkBytes) {
+		logging.Global().Warn("Dilithium3 Verify rejected: degenerate public key with t1=0 (keyless forgery vector)", map[string]any{
 			"category": "SECURITY",
 			"reason":   ReasonZeroPublicKey,
 		})

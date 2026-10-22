@@ -8,7 +8,27 @@ info:
     All methods follow the JSON-RPC 2.0 specification.
     
     ## Authentication
-    Currently, the API does not require authentication. Rate limiting is applied per IP address.
+    Public methods require no authentication. Privileged methods do: the RPC
+    server keeps an admin whitelist (registered through Server.RegisterAdminMethod
+    in the rpc packages) and every call to a listed method must additionally pass
+    admin-level authorization. The gate is applied on HTTP, WebSocket and batch
+    requests alike, and when an admin method is registered but no auth manager is
+    configured the request is rejected rather than served unauthenticated.
+
+    ## Rate limiting
+    Enabled by default: 1000 requests/second globally, 100 requests/second per IP
+    (burst 50), with stricter per-method limits for expensive or security-sensitive
+    methods (eth_call and eth_estimateGas 20/s; eth_sendRawTransaction,
+    eth_sendTransaction and eth_getLogs 10/s; personal_importRawKey 2/s;
+    personal_unlockAccount and qau_signQuantumTransaction 5/s).
+    Repeated violations ban the source for an hour. Tunables include
+    TrustedProxies (for correct client-IP attribution behind a proxy) and
+    ExemptIPs — see rpc/ratelimit.go.
+
+    ## Method coverage
+    This document describes the core and light-client subsets. The authoritative
+    inventory of every method a node serves is docs/api/JSON_RPC_API.md, which is
+    derived from the handler registration call sites.
     
     ## Base URL
     - HTTP: `http://localhost:8545`
@@ -555,16 +575,105 @@ x-light-client-methods:
         description: Transaction hash
     returns: TxProofResponse
 
+  qau_light_verifyTxProof:
+    description: Check a transaction inclusion proof against a transaction root.
+      A failing check is data rather than an error, so the call succeeds and reports
+      `valid` false.
+    params:
+      - name: txHash
+        type: string
+        description: Transaction hash the proof claims to open to
+      - name: txIndex
+        type: number
+        description: Index of the transaction inside its block
+      - name: txRoot
+        type: string
+        description: Transaction root the branch is folded into and compared with
+      - name: proof
+        type: array
+        description: Hex-encoded branch hashes, as returned by qau_light_getTxProof
+      - name: positions
+        type: string
+        description: One byte per branch hash, its side flag; base64 in JSON
+    returns: Object with valid (boolean)
+
+  qau_light_getMultiTxProof:
+    description: Get inclusion proofs for several transactions in one call
+    params:
+      - name: txHashes
+        type: array
+        description: Transaction hashes, at least one and at most 100
+    returns: Array of TxProofResponse; -32000 if any transaction has no proof
+
+  qau_light_getSerializedTxProof:
+    description: Get a transaction inclusion proof as one opaque serialized blob,
+      for bandwidth-constrained clients. Parameters are positional, not named.
+    params:
+      - name: txHash
+        type: string
+        description: Transaction hash (positional argument 0)
+    returns: Object with proof (0x-hex blob decodable by the light client library)
+
   qau_light_getStateProof:
-    description: Get state proof for an account
+    description: Get a state-root-bound Verkle proof for an account. The node
+      verifies the proof against its live state root before returning it, and
+      reports an inability to prove as an error (`-32603 state proof unavailable`)
+      rather than as "state not found". An account that is absent from state is a
+      success whose `account` is null, carrying a verified exclusion proof.
     params:
       - name: address
         type: string
         description: Account address
       - name: storageKeys
         type: array
-        description: Optional storage keys to include
+        description: Not supported. Committed storage is not part of the Verkle
+          state trie on this node, so no state-root-bound storage proof exists;
+          a non-empty list fails with `-32603` and names the gap in `data`. Use
+          `eth_getStorageAt` for node-asserted values, or `eth_getProof` and treat
+          its storage entries as `unverified`.
     returns: StateProofResponse
+
+  qau_light_verifyStateProof:
+    description: Verify a state proof against a state root the caller supplies.
+      With `proofData` the node checks exactly that blob; without it the node
+      generates a fresh proof for the current state and checks it, which only
+      proves something for the state the node is on right now.
+    params:
+      - name: stateRoot
+        type: string
+        description: State root the proof must bind to
+      - name: address
+        type: string
+        description: Account address the proof is about
+      - name: proofData
+        type: string
+        description: Optional 0x-hex blob from qau_light_getSerializedStateProof
+    returns: Object with valid (boolean) and reason when the blob is about another address
+
+  qau_light_getMultiStateProof:
+    description: Get account state proofs for up to 50 addresses in one call
+    params:
+      - name: addresses
+        type: array
+        description: Account addresses, at least one and at most 50
+      - name: storageKeys
+        type: object
+        description: Not supported. Maps address to requested slots, but committed
+          storage is not in the Verkle state trie on this node, so naming any slot
+          fails the whole call with `-32603` (see qau_light_getStateProof).
+    returns: Array of StateProofResponse
+
+  qau_light_getSerializedStateProof:
+    description: Get a state proof as one opaque serialized blob
+    params:
+      - name: address
+        type: string
+        description: Account address
+      - name: storageKeys
+        type: array
+        description: Not supported, see qau_light_getStateProof; a malformed key
+          is rejected with `-32602` and a well-formed slot request fails with `-32603`
+    returns: Object with proof (0x-hex blob, verifiable with qau_light_verifyStateProof)
 
   qau_light_getCompactProof:
     description: Get bandwidth-optimized compact proof
@@ -577,7 +686,9 @@ x-light-client-methods:
         description: Transaction hash or address
       - name: keys
         type: array
-        description: Storage keys (for state proofs)
+        description: Storage keys (for state proofs). Not supported, see
+          qau_light_getStateProof; a malformed key is rejected with `-32602`
+          instead of being dropped from the requested set.
     returns: CompactProofResponse
 
   qau_light_batchRequest:
@@ -587,3 +698,20 @@ x-light-client-methods:
         type: array
         description: Array of request objects with method, params, and id
     returns: Array of response objects
+
+  qau_light_getSyncCommittee:
+    description: Get the current sync committee the light client should trust.
+      -32000 when the node has no committee verifier or no committee configured.
+    returns: Object with period, validatorCount and validatorPubKeys (hex)
+
+  qau_light_verifySyncCommitteeSig:
+    description: Check a block header's sync committee signature. `verified` is true
+      only when a configured committee actually signed the header; a header without
+      committee data comes back with `valid` and `verified` false and `reason`
+      no_committee, so it can never be mistaken for a signature-verified header.
+      Parameters are positional.
+    params:
+      - name: headerHex
+        type: string
+        description: Hex-encoded block header (positional argument 0)
+    returns: Object with valid, verified, and reason/error on failure

@@ -1,17 +1,30 @@
 // Quantaureum Node source, version 1.0.0.
 // Package state — Phase 4.4: Automatic State Pruning
 //
-// With 200K nodes and long chain history, state database grows unboundedly.
-// StatePruner automatically deletes state entries older than a configurable
-// number of epochs, keeping only the most recent state for active accounts.
+// NOT WIRED. Nothing in the node or cmd trees constructs a StatePruner, so as of
+// the 2026-10-21 tenth-round audit no running node prunes state, whatever
+// pruningConfig.enabled or --prune says. See node.PruningStatusLine for the
+// operator-facing statement of that fact (R10-03).
 //
-// Pruning strategy:
+// What this file contains is a pruning design plus an implementation that has
+// never been exercised in production: its only callers are its own tests. A
+// previous version of this header advertised "~95% storage reduction", a number
+// with no benchmark behind it and no deployment to measure — removed rather than
+// left as an unverified claim.
+//
+// Pruning strategy implemented here:
 //   - Keep state for the last N epochs (default: 64 epochs = ~6.8 hours)
 //   - Delete account states that haven't been modified in the window
 //   - Preserve genesis state
 //   - Run pruning in background goroutine every epoch transition
 //
-// This reduces state storage by ~95% while maintaining full node functionality.
+// Before any of this is wired into a live node, two conditions have to hold:
+//   - every delete must go through the StateDB durable-writer gate (R8-01/R9-01):
+//     pruneDatabaseDirect writes sp.database directly and would bypass it, racing
+//     block application and the shutdown close path;
+//   - pruneDatabaseDirect is the reference-count-free fallback and must stay
+//     unreachable by default (SetAllowUnsafeFallback), because deleting entries a
+//     trie still references makes the state root unreproducible.
 package state
 
 import (
@@ -339,7 +352,7 @@ func (sp *StatePruner) pruneDatabaseDirect(cutoffEpoch uint64) (uint64, uint64, 
 		blockBytes := key[len(snapPrefix) : len(snapPrefix)+8]
 		blockHeight := binary.BigEndian.Uint64(blockBytes)
 		if blockHeight < cutoffBlock {
-			batch.Delete(key)
+			_ = batch.Delete(key)
 			pruned++
 			bytesFreed += uint64(len(iter.Value()))
 			batchCount++

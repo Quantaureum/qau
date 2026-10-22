@@ -24,7 +24,7 @@ The project was started single-handedly by its author on **February 28, 2025** (
 | **Rollup support** | Built-in Rollup sequencer + L1 bridge contracts (QASM) |
 | **Cross-chain bridge** | Minimal-trust bridge based on Merkle proofs |
 | **Multisig wallet** | Native Dilithium multisig wallet contracts |
-| **Light client** | SPV light client based on Verkle tree proofs |
+| **Light client** | SPV light client with Verkle proofs bound to the state root (account-level scope; see SECURITY.md for what a proof does and does not attest to) |
 | **Multi-language SDK** | Go, Rust, C++, Java, Python, TypeScript |
 
 ## Architecture
@@ -51,7 +51,7 @@ The project was started single-handedly by its author on **February 28, 2025** (
 
 ### Requirements
 
-- **Go 1.26.4** or later
+- **Go 1.26.10** or later
 - Git
 
 ### Build
@@ -186,9 +186,17 @@ Follows Ethereum JSON-RPC conventions: `eth_blockNumber`, `eth_getBalance`, `eth
 | Quantum | `qau_signQuantumTransaction`, `qau_verifyQuantumTransaction` |
 | Multisig | `qau_isMultisigWallet`, `qau_getMultisigWallet` |
 | Staking | `qau_getUserStakes`, `qau_getPendingRewards`, `qau_getStakingContracts` |
-| Account Abstraction | `qau_supportedEntryPoints` |
+| Account Abstraction (experimental) | `qau_supportedEntryPoints` |
 
 Full API reference: [docs/api](docs/api/)
+
+> **Account abstraction is not live.** The ERC-4337 methods above are registered
+> for interface compatibility and the bundler is implemented, but no component
+> consumes the bundles it builds, so no user operation can be included in a
+> block. `eth_sendUserOperation` and `qau_sendUserOperation` refuse submissions
+> with `account abstraction is not live: user operations are not bundled on chain
+> yet` instead of returning a hash for work that cannot happen. Treat the whole
+> AA surface as unavailable until this note is removed.
 
 ## Testing
 

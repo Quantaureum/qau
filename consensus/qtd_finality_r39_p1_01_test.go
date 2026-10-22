@@ -14,6 +14,7 @@
 package consensus
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/quantaureum/qau/crypto"
@@ -34,8 +35,8 @@ func TestR39_P1_01_WriteSide_RejectsWrongLengthKey(t *testing.T) {
 	if len(stubKey) == crypto.Dilithium3PublicKeySize {
 		t.Fatalf("test stub is not the wrong length; fixture drift")
 	}
-	if crypto.IsZeroPublicKeyBytes(stubKey) {
-		t.Fatalf("test stub must be non-zero so the strict-LENGTH check (not the zero-key check) is what rejects it")
+	if !slices.ContainsFunc(stubKey, func(b byte) bool { return b != 0 }) {
+		t.Fatalf("test stub must be non-zero so the strict-LENGTH check (not the degenerate-key check) is what rejects it")
 	}
 
 	const activationEpoch uint64 = 9
@@ -120,8 +121,8 @@ func TestR39_P1_01_WriteSide_AcceptsCanonicalLengthKey(t *testing.T) {
 	if len(canonical) != crypto.Dilithium3PublicKeySize {
 		t.Fatalf("canonical len = %d, want %d", len(canonical), crypto.Dilithium3PublicKeySize)
 	}
-	if crypto.IsZeroPublicKeyBytes(canonical) {
-		t.Fatalf("canonical test key must be non-zero so the length check (not the zero-key check) is what accepts it")
+	if crypto.IsDegeneratePublicKeyBytes(canonical) {
+		t.Fatalf("canonical test key must be non-degenerate so the length check (not the degenerate-key check) is what accepts it")
 	}
 
 	const activationEpoch uint64 = 21

@@ -455,12 +455,19 @@ func (api *LightClientAPI) GetStateProof(ctx context.Context, params json.RawMes
 
 	proof, err := api.prover.GenerateStateProof(addr, storageKeys)
 	if err != nil {
-		return nil, rpc.NewError(rpc.ErrCodeNotFound, "state not found")
+		return nil, stateProofRPCError(err)
 	}
 
 	response := &StateProofResponse{
 		Address:       formatHexAddress(addr),
 		StorageProofs: make(map[string]*StorageResponse),
+	}
+
+	// R6-02: hand the caller the proof material itself. These fields were
+	// declared but never filled, so a light client could read this response as
+	// "proved state" while having received nothing it could re-verify offline.
+	if accountProofHex := hex.EncodeToString(marshalVerkleProof(proof.AccountProof)); accountProofHex != "" {
+		response.AccountProof = "0x" + accountProofHex
 	}
 
 	if proof.BlockHeader != nil {
@@ -478,10 +485,14 @@ func (api *LightClientAPI) GetStateProof(ctx context.Context, params json.RawMes
 	}
 
 	for key, entry := range proof.StorageProofs {
-		response.StorageProofs[formatHexHash(key)] = &StorageResponse{
+		storage := &StorageResponse{
 			Key:   formatHexHash(entry.Key),
 			Value: formatHexHash(entry.Value),
 		}
+		if storageProofHex := hex.EncodeToString(marshalVerkleProof(entry.Proof)); storageProofHex != "" {
+			storage.Proof = "0x" + storageProofHex
+		}
+		response.StorageProofs[formatHexHash(key)] = storage
 	}
 
 	return response, nil
@@ -537,7 +548,7 @@ func (api *LightClientAPI) VerifyStateProofRPC(ctx context.Context, params json.
 	// Generate and verify proof on the fly
 	proof, err := api.prover.GenerateStateProof(addr, nil)
 	if err != nil {
-		return nil, rpc.NewError(rpc.ErrCodeNotFound, "state not found")
+		return nil, stateProofRPCError(err)
 	}
 
 	valid := VerifyStateProof(stateRoot, proof)
@@ -648,23 +659,26 @@ func (api *LightClientAPI) GetMultiStateProof(ctx context.Context, params json.R
 	for addrStr, keys := range args.StorageKeys {
 		addr, err := parseAddress(addrStr)
 		if err != nil {
-			continue
+			return nil, rpc.NewErrorWithData(rpc.ErrCodeInvalidParams, "invalid address in storageKeys", err.Error())
 		}
 
-		hashKeys := make([]types.Hash, len(keys))
-		for i, k := range keys {
+		hashKeys := make([]types.Hash, 0, len(keys))
+		for _, k := range keys {
 			key, err := parseHash(k)
 			if err != nil {
-				continue
+				return nil, rpc.NewErrorWithData(rpc.ErrCodeInvalidParams, "invalid storage key", err.Error())
 			}
-			hashKeys[i] = key
+			hashKeys = append(hashKeys, key)
 		}
 		storageKeys[addr] = hashKeys
 	}
 
 	proofs, err := api.prover.GenerateMultiStateProof(addresses, storageKeys)
 	if err != nil {
-		return nil, rpc.NewError(rpc.ErrCodeNotFound, "states not found")
+		// R6-02: "states not found" was a claim about chain state. A prover
+		// failure (no trie, failing binding, refused storage slot) must surface
+		// as a proof failure, not as proof of absence.
+		return nil, stateProofRPCError(err)
 	}
 
 	responses := make([]*StateProofResponse, len(proofs))
@@ -672,6 +686,12 @@ func (api *LightClientAPI) GetMultiStateProof(ctx context.Context, params json.R
 		response := &StateProofResponse{
 			Address:       formatHexAddress(proof.Address),
 			StorageProofs: make(map[string]*StorageResponse),
+		}
+
+		// R6-02: same proof material as the single-account response, so the
+		// caller can re-verify every entry offline.
+		if accountProofHex := hex.EncodeToString(marshalVerkleProof(proof.AccountProof)); accountProofHex != "" {
+			response.AccountProof = "0x" + accountProofHex
 		}
 
 		if proof.BlockHeader != nil {
@@ -689,10 +709,14 @@ func (api *LightClientAPI) GetMultiStateProof(ctx context.Context, params json.R
 		}
 
 		for key, entry := range proof.StorageProofs {
-			response.StorageProofs[formatHexHash(key)] = &StorageResponse{
+			storage := &StorageResponse{
 				Key:   formatHexHash(entry.Key),
 				Value: formatHexHash(entry.Value),
 			}
+			if storageProofHex := hex.EncodeToString(marshalVerkleProof(entry.Proof)); storageProofHex != "" {
+				storage.Proof = "0x" + storageProofHex
+			}
+			response.StorageProofs[formatHexHash(key)] = storage
 		}
 
 		responses[i] = response
@@ -755,7 +779,7 @@ func (api *LightClientAPI) GetSerializedStateProof(ctx context.Context, params j
 
 	proof, err := api.prover.GenerateStateProof(addr, storageKeys)
 	if err != nil {
-		return nil, rpc.NewError(rpc.ErrCodeNotFound, "state not found")
+		return nil, stateProofRPCError(err)
 	}
 
 	serialized, err := MarshalStateProof(proof)
@@ -769,6 +793,19 @@ func (api *LightClientAPI) GetSerializedStateProof(ctx context.Context, params j
 }
 
 // Helper functions
+
+// stateProofRPCError reports a prover failure as "this node could not produce a
+// proof", never as "state not found".
+//
+// R6-02 (2026-10-21 sixth-round audit): all four state-proof handlers used to
+// collapse every prover error into ErrCodeNotFound "state not found". A light
+// client that reads that concludes the account is absent from the chain, which
+// is a claim only a verified EXCLUSION proof is allowed to make -- and the
+// prover returns that as a success with Account == nil. Proof-backend and
+// binding failures must stay visible as failures.
+func stateProofRPCError(err error) *rpc.Error {
+	return rpc.NewErrorWithData(rpc.ErrCodeInternal, "state proof unavailable", err.Error())
+}
 
 func parseAddress(s string) (types.Address, error) {
 	s = stripHexPrefix(s)
@@ -1162,14 +1199,17 @@ func (api *LightClientAPI) GetCompactProof(ctx context.Context, params json.RawM
 		for i, k := range args.Keys {
 			key, err := parseHash(k)
 			if err != nil {
-				continue
+				// R6-02: skipping an unparsable key silently shrank the requested
+				// proof set; the caller would read the compact response back as a
+				// proof over the keys it asked for.
+				return nil, rpc.NewErrorWithData(rpc.ErrCodeInvalidParams, "invalid storage key", err.Error())
 			}
 			storageKeys[i] = key
 		}
 
 		proof, err := api.prover.GenerateStateProof(addr, storageKeys)
 		if err != nil {
-			return nil, rpc.NewError(rpc.ErrCodeNotFound, "state not found")
+			return nil, stateProofRPCError(err)
 		}
 
 		// Serialize to compact format
@@ -1438,6 +1478,12 @@ func (api *LightClientAPI) GetSyncCommittee(ctx context.Context, params json.Raw
 }
 
 // VerifySyncCommitteeSig verifies a block header's sync committee signature.
+//
+// R3-01: the result is tri-state. "verified" is true only when a configured
+// committee actually verified the signature. A header without sync committee
+// data is accepted as a pre-sync-committee block by VerifyBlockHeader, but it
+// is reported here as valid=false/verified=false/reason="no_committee" — it
+// must not be mistaken for a signature-verified header.
 func (api *LightClientAPI) VerifySyncCommitteeSig(ctx context.Context, params json.RawMessage) (any, *rpc.Error) {
 	var args []any
 	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
@@ -1465,13 +1511,28 @@ func (api *LightClientAPI) VerifySyncCommitteeSig(ctx context.Context, params js
 	}
 
 	if err := verifier.VerifyBlockHeader(header); err != nil {
+		reason := "verification_failed"
+		if errors.Is(err, ErrSyncCommitteeNotAvailable) {
+			reason = "no_committee"
+		}
 		return map[string]any{
-			"valid": false,
-			"error": err.Error(),
+			"valid":    false,
+			"verified": false,
+			"reason":   reason,
+			"error":    err.Error(),
+		}, nil
+	}
+
+	if !verifier.HasActiveCommittee() {
+		return map[string]any{
+			"valid":    false,
+			"verified": false,
+			"reason":   "no_committee",
 		}, nil
 	}
 
 	return map[string]any{
-		"valid": true,
+		"valid":    true,
+		"verified": true,
 	}, nil
 }

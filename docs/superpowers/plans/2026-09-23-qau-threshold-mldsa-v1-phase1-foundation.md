@@ -21,7 +21,7 @@
 - Both experimental gates are required; v1 never falls back to legacy TSS.
 - V1 messages never serialize `ScShare`, `S2Share`, or `T0Share`.
 - Validation uses `CGO_ENABLED=0` and `.local-only/tmp/go-build-cache`.
-- Go binary: `C:/Users/yuant/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.6.windows-amd64/bin/go.exe`.
+- Go toolchain: pinned to the `go1.26.6` toolchain binary resolved via the Go module toolchain mechanism (no machine-specific path).
 
 ---
 

@@ -15,8 +15,8 @@ import (
 // (DKG not initialized / corrupt state) could pollute the history table
 // and later be served to VerifyBlock consumers. The R38-P1-01 write-side
 // chokepoint in setQTDSignerLocked now rejects all-zero keys via
-// crypto.IsZeroPublicKeyBytes (constant-time comparison, matching the R37
-// hardening at crypto/verify.go:73).
+// crypto.IsDegeneratePublicKeyBytes (constant-time t1 comparison, matching
+// the R37 hardening in crypto/verify.go).
 //
 // This test sets up an epochKeySigner whose GroupPublicKey returns an
 // exactly 1952-byte all-zero slice (the canonical degenerate "DKG not
@@ -36,8 +36,8 @@ func TestR38P101_QTD_WriteSide_RejectsAllZeroGroupKey(t *testing.T) {
 		t.Fatalf("testAllZeroDilithium3GroupKey len = %d, want %d",
 			len(degenerateKey), crypto.Dilithium3PublicKeySize)
 	}
-	if !crypto.IsZeroPublicKeyBytes(degenerateKey) {
-		t.Fatalf("testAllZeroDilithium3GroupKey must be recognized as all-zero by crypto.IsZeroPublicKeyBytes")
+	if !crypto.IsDegeneratePublicKeyBytes(degenerateKey) {
+		t.Fatalf("testAllZeroDilithium3GroupKey must be recognized as degenerate by crypto.IsDegeneratePublicKeyBytes")
 	}
 
 	const activationEpoch uint64 = 7
@@ -69,8 +69,8 @@ func TestR38P101_QTD_WriteSide_AcceptsRealGroupKey(t *testing.T) {
 	for i := range realKey {
 		realKey[i] = byte(i) // 0,1,2,...,255,0,1,2,...,255,... up to 1952
 	}
-	if crypto.IsZeroPublicKeyBytes(realKey) {
-		t.Fatalf("real test key should NOT be recognized as all-zero")
+	if crypto.IsDegeneratePublicKeyBytes(realKey) {
+		t.Fatalf("real test key should NOT be recognized as degenerate")
 	}
 
 	const activationEpoch uint64 = 11
@@ -155,8 +155,8 @@ func TestR38P101_QTD_ReadSide_AcceptsRealHistoricalKey(t *testing.T) {
 	for i := range realKey {
 		realKey[i] = byte(0xAA) ^ byte(i)
 	}
-	if crypto.IsZeroPublicKeyBytes(realKey) {
-		t.Fatalf("real test key should NOT be recognized as all-zero")
+	if crypto.IsDegeneratePublicKeyBytes(realKey) {
+		t.Fatalf("real test key should NOT be recognized as degenerate")
 	}
 
 	qfs.mu.Lock()

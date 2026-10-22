@@ -73,8 +73,17 @@ func (uo *UserOperation) Validate() error {
 	return nil
 }
 
+// Hash returns the identity of the user operation.
+//
+// F-16 (2026-10-21): hash the ENTIRE encoded operation. The previous
+// types.BytesToHash(uo.hashBytes(...)) kept only the trailing 32 bytes of the
+// protobuf stream, which are dominated by the entry point / chain ID fields.
+// Operations that differed in sender, nonce, gas or calldata therefore
+// collided: the bundler rejected legitimate follow-ups as duplicates and a
+// caller could shadow another sender's pending operation by reusing its tail
+// fields. Use the same SHA3-256 helper as transaction hashing.
 func (uo *UserOperation) Hash(entryPoint types.Address, chainID uint64) types.Hash {
-	return types.BytesToHash(uo.hashBytes(entryPoint, chainID))
+	return types.BytesToHash(hashData(uo.hashBytes(entryPoint, chainID)))
 }
 
 func (uo *UserOperation) hashBytes(entryPoint types.Address, chainID uint64) []byte {
@@ -259,6 +268,15 @@ func UnmarshalUserOperation(data []byte) (*UserOperation, error) {
 			uo.Signature, err = buf.DecodeBytes()
 			if err != nil {
 				return nil, err
+			}
+			// R5-07 (2026-10-21 fifth-round audit): cap the signature at decode
+			// time like the other variable-length fields above. Validate() also
+			// rejects an oversized signature, but the decoder is the boundary that
+			// decides how much memory a single message may retain before the
+			// caller gets control back (same rule as the bundle-count cap in
+			// UnmarshalUserOpBundle).
+			if len(uo.Signature) > MaxUserOpSignatureSize {
+				return nil, fmt.Errorf("%w: signature exceeds max size", ErrInvalidData)
 			}
 		case 13:
 			v, err := buf.DecodeVarint()

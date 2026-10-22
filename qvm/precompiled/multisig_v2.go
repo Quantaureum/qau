@@ -869,6 +869,14 @@ func (c *MultisigV2Precompiled) executeProposalV2(input []byte) ([]byte, error) 
 		// the proposal was approved against (R48-PRECOMPILE-REENTRANCY-01).
 		statusVal[31] = 0x03
 		stateDB.SetState(contract, statusKey, statusVal)
+		// R4-08 (2026-10-21 audit): the proposal executed successfully, so the
+		// journal entry taken around the external call has no remaining
+		// consumer. Release it instead of leaking a stack slot per execution.
+		if snapshotter != nil {
+			if releaser, ok := snapshotter.(interface{ ReleaseSnapshot(int) }); ok {
+				releaser.ReleaseSnapshot(snapID)
+			}
+		}
 		return encodeResult(true), nil
 	}
 

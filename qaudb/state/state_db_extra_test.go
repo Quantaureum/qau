@@ -203,19 +203,24 @@ func TestStateDB_SnapshotRevertNested(t *testing.T) {
 	}
 }
 
-func TestStateDB_RevertToSnapshotInvalidID(t *testing.T) {
+// TestStateDB_RevertToSnapshotUnknownIDPreservesState pins the R4-07 contract:
+// an unresolvable snapshot ID must not destroy the dirty journal (the legacy
+// fallback wiped every pending change, so one lost track of its snapshot could
+// discard writes staged by another in-flight frame). The state survives and the
+// next Commit fails closed instead.
+func TestStateDB_RevertToSnapshotUnknownIDPreservesState(t *testing.T) {
 	sdb := NewStateDB()
 	addr := extraTestAddr(0x12)
 
 	sdb.SetBalance(addr, big.NewInt(100))
 
-	// Invalid (negative) snapshot ID should fall back to clearing dirty state.
 	sdb.RevertToSnapshot(-1)
 
-	// After revert with invalid ID, dirty state is cleared.
-	// Balance read should return 0 (nothing committed).
-	if bal := sdb.GetBalance(addr); bal.Cmp(big.NewInt(0)) != 0 {
-		t.Errorf("after invalid revert: balance = %s, want 0", bal.String())
+	if bal := sdb.GetBalance(addr); bal.Cmp(big.NewInt(100)) != 0 {
+		t.Errorf("after unknown-id revert: balance = %s, want 100 (dirty state must survive)", bal.String())
+	}
+	if _, err := sdb.Commit(1); err == nil {
+		t.Error("expected Commit to fail closed after an unknown-id revert")
 	}
 }
 

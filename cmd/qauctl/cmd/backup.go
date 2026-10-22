@@ -18,12 +18,16 @@ func newBackupCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "backup",
 		Short: "Backup node data",
-		Long:  "Create backups of node data, including database and state snapshots.",
+		// R7-02 (2026-10-21 seventh-round audit): block-height state snapshots
+		// cannot be restored on this node, and the evm_snapshot RPC that used to
+		// back this wording refuses the call since R6-01 — so the command that
+		// advertised them was removed instead of shipping something that can only
+		// fail. The help text now describes what the tool actually does.
+		Long: "Archive the node data directory into a timestamped backup file.",
 	}
 
 	cmd.AddCommand(newBackupCreateCmd())
 	cmd.AddCommand(newBackupListCmd())
-	cmd.AddCommand(newBackupSnapshotCmd())
 
 	return cmd
 }
@@ -53,20 +57,6 @@ func newBackupListCmd() *cobra.Command {
 			return listBackups()
 		},
 	}
-}
-
-func newBackupSnapshotCmd() *cobra.Command {
-	var height int64
-	cmd := &cobra.Command{
-		Use:   "snapshot",
-		Short: "Create a state snapshot",
-		Long:  "Create a verifiable state snapshot at a specific height.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return createSnapshot(height)
-		},
-	}
-	cmd.Flags().Int64VarP(&height, "height", "n", -1, "Block height for snapshot (-1 for latest)")
-	return cmd
 }
 
 func getBackupDir() string {
@@ -186,26 +176,6 @@ func listBackups() error {
 			entry.Name())
 	}
 
-	return nil
-}
-
-func createSnapshot(height int64) error {
-	// Call RPC to create snapshot
-	var params any
-	if height >= 0 {
-		params = []any{height}
-	} else {
-		params = nil
-	}
-
-	fmt.Println("Creating state snapshot...")
-
-	result, err := rpcCall("evm_snapshot", params)
-	if err != nil {
-		return fmt.Errorf("failed to create snapshot: %w", err)
-	}
-
-	fmt.Printf("Snapshot created: %s\n", string(result))
 	return nil
 }
 

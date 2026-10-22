@@ -92,6 +92,17 @@ func (a *StateDBAdapter) Snapshot() int {
 	// from that ID to the index in accessSnapshots. This avoids assuming the
 	// StateDB returns sequential zero-based IDs.
 	stateDBID := a.StateDB.Snapshot()
+	// R5-04 (2026-10-21 fifth-round audit): a negative ID is the wrapped
+	// StateDB's depth-exhaustion sentinel — no journal entry exists, so the
+	// adapter must not book one either. Registering it used to append a ghost
+	// accessSnapshots entry and store snapshotIDMap[-1], which desynchronised
+	// the adapter stack from the underlying one (repeated -1 results also
+	// overwrote each other's mapping, so a later Revert/Release restored the
+	// access lists of the wrong frame). Returning the sentinel unchanged lets
+	// the caller's R4-08 guard reject the frame cleanly.
+	if stateDBID < 0 {
+		return -1
+	}
 	if a.snapshotIDMap == nil {
 		a.snapshotIDMap = make(map[int]int)
 	}
@@ -127,6 +138,30 @@ func (a *StateDBAdapter) RevertToSnapshot(snapshotID int) {
 	}
 
 	a.StateDB.RevertToSnapshot(snapshotID)
+}
+
+// ReleaseSnapshot drops the adapter's access-list journal for the given frame
+// and asks the wrapped StateDB to drop its snapshot, WITHOUT rewinding state.
+// R4-07 (2026-10-21 audit): a finished top-level frame (a transaction or a
+// discarded simulation) releases its own stack slot instead of leaking it. If
+// the wrapped StateDB has no release primitive the adapter leaves the underlying
+// stack untouched — reverting there would rewind state that must be kept.
+func (a *StateDBAdapter) ReleaseSnapshot(snapshotID int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if idx, ok := a.snapshotIDMap[snapshotID]; ok {
+		a.accessSnapshots = a.accessSnapshots[:idx]
+		for id, i := range a.snapshotIDMap {
+			if i >= idx {
+				delete(a.snapshotIDMap, id)
+			}
+		}
+	}
+
+	if releaser, ok := a.StateDB.(interface{ ReleaseSnapshot(int) }); ok {
+		releaser.ReleaseSnapshot(snapshotID)
+	}
 }
 
 // ConvertAddress converts qvm.Address to types.Address.

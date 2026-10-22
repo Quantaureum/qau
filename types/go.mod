@@ -1,6 +1,6 @@
 module github.com/quantaureum/qau/types
 
-go 1.26.4
+go 1.26.10
 
 require (
 	github.com/cloudflare/circl v1.6.3

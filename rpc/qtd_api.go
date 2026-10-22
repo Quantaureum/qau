@@ -51,8 +51,8 @@ func (api *TSSAPI) SetDevMode(enabled bool) {
 // (audit logs) can re-derive if needed.
 func hashShare(share []byte, salt []byte) string {
 	h := sha3.New256()
-	h.Write(share)
-	h.Write(salt)
+	_, _ = h.Write(share)
+	_, _ = h.Write(salt)
 	return hex.EncodeToString(h.Sum(nil))
 }
 

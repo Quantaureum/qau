@@ -18,11 +18,14 @@ func newRestoreCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore",
 		Short: "Restore node data",
-		Long:  "Restore node data from backups or snapshots.",
+		// R7-02 (2026-10-21 seventh-round audit): restoring a block-height state
+		// snapshot is not a capability this node has (evm_revert refuses since
+		// R6-01, see the rationale in rpc/api.go), so the subcommand that called it
+		// was removed rather than shipped as a guaranteed failure.
+		Long: "Restore node data from a backup archive.",
 	}
 
 	cmd.AddCommand(newRestoreBackupCmd())
-	cmd.AddCommand(newRestoreSnapshotCmd())
 	cmd.AddCommand(newRestoreVerifyCmd())
 
 	return cmd
@@ -42,20 +45,6 @@ func newRestoreBackupCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing data without confirmation")
 	cmd.Flags().BoolVar(&skipKeystore, "skip-keystore", false, "Skip restoring keystore")
-	return cmd
-}
-
-func newRestoreSnapshotCmd() *cobra.Command {
-	var height int64
-	cmd := &cobra.Command{
-		Use:   "snapshot",
-		Short: "Restore from a state snapshot",
-		Long:  "Restore state from a previously created snapshot.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return restoreSnapshot(height)
-		},
-	}
-	cmd.Flags().Int64VarP(&height, "height", "n", -1, "Snapshot height to restore (-1 for latest)")
 	return cmd
 }
 
@@ -193,26 +182,6 @@ func restoreBackup(backupPath string, force, skipKeystore bool) error {
 	fmt.Printf("  Files restored: %d\n", restoredFiles)
 	fmt.Printf("  Data directory: %s\n", dataDir)
 
-	return nil
-}
-
-func restoreSnapshot(height int64) error {
-	// Call RPC to restore from snapshot
-	var params any
-	if height >= 0 {
-		params = []any{height}
-	} else {
-		params = nil
-	}
-
-	fmt.Println("Restoring from snapshot...")
-
-	result, err := rpcCall("evm_revert", params)
-	if err != nil {
-		return fmt.Errorf("failed to restore snapshot: %w", err)
-	}
-
-	fmt.Printf("Snapshot restored: %s\n", string(result))
 	return nil
 }
 

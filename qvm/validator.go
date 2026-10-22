@@ -140,16 +140,12 @@ func (v *BytecodeValidator) Validate(code []byte) *ValidationResult {
 		}
 	}
 
-	// Second pass (strict mode): validate jump targets
+	// Second pass (strict mode): walk bytecode. JUMP/JUMPI targets live on the
+	// stack at runtime and cannot be verified statically, so this pass only
+	// skips push immediates to keep the walk aligned with instruction boundaries.
 	if v.strictMode {
 		for pc := 0; pc < len(code); {
 			op := OpCode(code[pc])
-
-			if op == JUMP || op == JUMPI {
-				// In strict mode, we can't statically verify all jumps
-				// because the target is on the stack at runtime
-				// We just note that jumps exist
-			}
 
 			if op.IsPush() {
 				pc += 1 + op.PushSize()

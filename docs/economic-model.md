@@ -395,7 +395,7 @@ Code locations:
 ---|---||
 | `economics/model/model.go` | issuance formulas, parameter presets (live / eth / legacy), fee model, per-validator attribution (`EpochIssuanceAttributed`) ||
 | `economics/model/projection.go` | multi-year projection, vesting unlocks, endogenous 1559 fee market, F solving, net-zero-burn solving ||
-| `cmd/econsim/` | CLI：`current` / `compare` / `table` / `project` / `solve` / `breakeven` |
+| `cmd/econsim/` | CLI: `current` / `compare` / `table` / `project` / `solve` / `breakeven` |
 | `consensus/econ_model_parity_test.go` | **locks the simulator to `QPOS.CalculateBaseReward` wei-for-wei** (caveat: no slashed members in the validator set, see §11.2 #5) ||
 
 Layering discipline: `economics/model` sits at L3 and **must not import `consensus`** (L5); the formulas are re-implemented, not called, avoiding a reverse dependency; parity tests guarantee no drift. All token arithmetic uses `math/big` integers with truncation order matching the consensus implementation; `float64` appears only in reporting (APY/ratios), never on any path that produces token quantities.

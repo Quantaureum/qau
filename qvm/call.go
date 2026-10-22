@@ -518,6 +518,13 @@ func (i *Interpreter) opCall(env *Environment) error {
 	// audit-fix R2-H1: snapshot BEFORE value transfer so that revert
 	// undoes both the transfer and the sub-call's state changes.
 	snapshot := env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the state journal is full, so this frame
+		// could not be journaled and would run with no rollback path. Refuse the
+		// call the way the call-depth guards do instead of executing unjournaled.
+		env.activeAddresses = env.activeAddresses[:savedActiveLen]
+		return env.stack.PushUint64(0)
+	}
 
 	// Transfer value
 	if hasValue {
@@ -606,6 +613,14 @@ func (i *Interpreter) opCall(env *Environment) error {
 		// CRIT-1 FIX: Restore activeAddresses on revert as well
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		env.stateDB.RevertToSnapshot(snapshot)
+	}
+
+	// R4-08 (2026-10-21 audit): the frame's journal entry has served its
+	// purpose — a reverted sub-call consumed it above, a successful one keeps
+	// its writes. Release the entry so a loop of successful external calls cannot
+	// exhaust the snapshot stack inside a single transaction.
+	if !result.Reverted {
+		releaseFrame(env.stateDB, snapshot)
 	}
 
 	// Store return data
@@ -956,9 +971,15 @@ func (i *Interpreter) opStaticCall(env *Environment) error {
 	// guard). Without this, a stateful precompile that slipped through the
 	// static check would leave its state mutations permanently applied.
 	staticSnapshot := env.stateDB.Snapshot()
+	if staticSnapshot < 0 {
+		// R4-08: see the opCall journaling guard.
+		return env.stack.PushUint64(0)
+	}
 	if executed, success, err := i.executePrecompiled(env, addr, input, callGas, outOffset, outSize, true); executed {
 		if !success {
 			env.stateDB.RevertToSnapshot(staticSnapshot)
+		} else {
+			releaseFrame(env.stateDB, staticSnapshot)
 		}
 		return err
 	}
@@ -979,6 +1000,11 @@ func (i *Interpreter) opStaticCall(env *Environment) error {
 	if result.GasUsed < callGas {
 		env.gas.Return(callGas - result.GasUsed)
 	}
+
+	// R4-08 (2026-10-21 audit): STATICCALL never rewinds state on a failed
+	// sub-call (the static guarantee is supposed to make writes impossible), so
+	// the journal entry has no remaining consumer — release it.
+	releaseFrame(env.stateDB, staticSnapshot)
 
 	// Store return data
 	env.returnData = result.ReturnData
@@ -1262,6 +1288,11 @@ func (i *Interpreter) opDelegateCall(env *Environment) error {
 	// This aligns DELEGATECALL with opCall (line 446) and opCallCode (line 607)
 	// which both take Snapshot before precompiled execution.
 	snapshot := env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the opCall journaling guard.
+		env.activeAddresses = env.activeAddresses[:savedActiveLen]
+		return env.stack.PushUint64(0)
+	}
 
 	// Check if the target is a precompiled contract.
 	// DELEGATECALL to a precompiled contract executes the precompiled logic
@@ -1275,6 +1306,9 @@ func (i *Interpreter) opDelegateCall(env *Environment) error {
 		if !success || err != nil {
 			// Precompiled failed — roll back any state changes it made.
 			env.stateDB.RevertToSnapshot(snapshot)
+		} else {
+			// R4-08: the frame succeeded, release its journal entry.
+			releaseFrame(env.stateDB, snapshot)
 		}
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		return err
@@ -1307,6 +1341,11 @@ func (i *Interpreter) opDelegateCall(env *Environment) error {
 		// CRIT-1 FIX: Restore activeAddresses on revert as well
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		env.stateDB.RevertToSnapshot(snapshot)
+	}
+
+	// R4-08 (2026-10-21 audit): release the consumed frame entry (see opCall).
+	if !result.Reverted {
+		releaseFrame(env.stateDB, snapshot)
 	}
 
 	// Store return data

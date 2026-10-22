@@ -190,8 +190,13 @@ type Syncer struct {
 	validatorPubKey  []byte
 
 	snapSyncing       bool
-	snapSyncCompleted bool // R??-SNAP-REGUARD (2026-08-17): prevents re-triggering snap sync after completion
-	snapTargetBlock   uint64
+	snapSyncCompleted bool // SNAP-REGUARD (2026-08-17): prevents re-triggering snap sync after completion
+	// R10-05 (2026-10-21 tenth-round audit): this guard was labelled with an audit
+	// round ID whose digits had been replaced by two literal question marks in the
+	// initial open-source release. The ID is unrecoverable from history, so the
+	// label now carries only the name and the date instead of a reference that
+	// resolves to nothing.
+	snapTargetBlock uint64
 	// R12-NODE-002: Store the target header for state root verification.
 	snapTargetHeader *encoding.BlockHeader
 	snapAccounts     map[types.Address][]byte
@@ -1573,6 +1578,17 @@ func (s *Syncer) applyBlockInternal(blk *encoding.Block, skipStateRootValidation
 		return nil
 	}
 
+	// R4-07 (2026-10-21 audit) FIX: claim the exclusive execution frame of the
+	// live StateDB for the whole block transition (transaction execution, epoch
+	// rewards and the commit). The dirty journal and the positional snapshot
+	// stack are per-instance, so a speculative simulation reverting in the middle
+	// of this loop used to rewind the journal of the transactions already
+	// applied, making the committed state root drop them. Consensus waits for
+	// the frame (speculation fails fast instead), so the import path can never
+	// be starved by RPC traffic.
+	releaseExecution := s.stateDB.BeginExecution()
+	defer releaseExecution()
+
 	// CONS-P0-02 FIX (R31, 2026-07-27): Propagate the block's timestamp to
 	// QPOS.lastKnownBlockTime so that subsequent consensus operations
 	// (SlashValidator, markValidatorForInvestigation, SyncPendingSlashes)
@@ -2283,7 +2299,7 @@ func (s *Syncer) checkSync() {
 		// sync with a pivot (network height - snapPivotDistance) — the geth
 		// snap-sync pivot strategy. Full mode opts out: it must execute every
 		// block from where the node currently is.
-		// R??-SNAP-REGUARD (2026-08-17): snapSyncCompleted prevents re-triggering
+		// SNAP-REGUARD (2026-08-17): snapSyncCompleted prevents re-triggering
 		// snap sync immediately after a successful snap sync. The flag is
 		// cleared once the gap shrinks below snapSyncThreshold (see below), so
 		// a genuinely new large gap later can still trigger a fresh snap sync.
@@ -2321,7 +2337,7 @@ func (s *Syncer) checkSync() {
 		s.syncing = false
 		atomic.StoreInt32(&s.syncActive, 0)
 		s.blockStore.SetSyncMode(false)
-		// R??-SNAP-REGUARD (2026-08-17): sync reached the network tip — clear
+		// SNAP-REGUARD (2026-08-17): sync reached the network tip — clear
 		// the snap-completed flag so a genuinely new large gap can trigger a
 		// fresh snap sync in the future.
 		if s.snapSyncCompleted {
@@ -2362,9 +2378,9 @@ func (s *Syncer) checkSync() {
 			// R115B-RESTART-REBUILD (2026-10-19): a node that restarts mid
 			// full-sync boots with syncing=false (the sync-completed transition
 			// happened in the previous process) while stateVerifiedHeight can be
-			// far behind the restored chain head — e.g. node-G 2026-10-19: reboot at
-			// head=220698 with verified=0 meant the wasSyncing-triggered rebuild
-			// never fired, the producer logged "state not verified yet"
+			// far behind the restored chain head — observed as a reboot at a
+			// non-zero head with verified=0, which meant the wasSyncing-triggered
+			// rebuild never fired, the producer logged "state not verified yet"
 			// forever, and no further blocks were requested. The gating
 			// question is the same one shouldRebuildAfterSync asks on the
 			// completion edge: is there an actually-unvalidated range above
@@ -3497,8 +3513,9 @@ func (s *Syncer) completeSnapSync() {
 	// letting unverified — and on mainnet twice observed, poisoned — account
 	// state become the node's canonical state: nonce walls at the first
 	// replayed transaction, R87-STATE-TRUST lockout, and a "state already
-	// persisted" boot that never re-applies genesis (incident docs
-	// s3-snap-pollution-incident-2026-10-15.md §A, 2026-10-17 node-A recurrence).
+	// persisted" boot that never re-applies genesis. (The incident write-ups
+	// for the two observed poisonings stay in the local-only archive: they bind
+	// site identities to heights, which has no place in a public repo.)
 	// Fail closed exactly like a root mismatch: discard the session's imports,
 	// clear every snap flag, and force full sync. The snap will not re-trigger
 	// because full sync is now on.
@@ -3554,7 +3571,7 @@ func (s *Syncer) completeSnapSync() {
 	}
 
 	syncLog.Info("Snap sync: imported %d/%d accounts, state root verified", importedCount, len(s.snapAccounts))
-	// R??-SNAP-REGUARD (2026-08-17): snap sync completed — set the flag to
+	// SNAP-REGUARD (2026-08-17): snap sync completed — set the flag to
 	// prevent checkSync from re-triggering snap sync on the next cycle.
 	// Also set stateVerifiedHeight to the snap target so rebuildState skips
 	// the range up to the pivot (the imported state is already correct).
@@ -4544,7 +4561,14 @@ func (s *Syncer) rebuildState(fromHeight, toHeight uint64) {
 		if s.stateDB != nil {
 			if lch := s.stateDB.LastCommittedHeight(); lch > baseline {
 				syncLog.Info("rebuildState: stateDB lch=%d ahead of verified baseline=%d, rolling back", lch, baseline)
-				if err := s.stateDB.RollbackToHeight(baseline); err != nil {
+				// R6-03 (2026-10-21 sixth-round audit): the rollback rewrites
+				// committed state, so it owns the execution frame for its duration.
+				// applyBlockInternal below takes the frame per block; nothing here
+				// nests, so this cannot self-deadlock.
+				err := s.stateDB.WithExecutionFrame(func() error {
+					return s.stateDB.RollbackToHeight(baseline)
+				})
+				if err != nil {
 					syncLog.Error("rebuildState: failed to rollback stateDB to baseline %d: %v (continuing anyway, rebuild may fail)", baseline, err)
 				}
 			}
@@ -4757,10 +4781,10 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 		// and marked the range verified. Feeding the trust tracker a MATCH
 		// here is not papering over a mismatch: without it, a node whose
 		// state derivation sits on the M4 side of the discrepancy (every
-		// freshly rebuilt node, e.g. node-G 2026-10-20) accumulates
-		// recordMismatch on every live tip block forever, crosses the
+		// freshly rebuilt node, e.g. one that just completed a full resync)
+		// accumulates recordMismatch on every live tip block forever, crosses the
 		// 32-streak limit, and R87-STATE-TRUST locks production — for the
-		// SAME state posture that the long-synced nodes A-F validators run
+		// SAME state posture that the long-synced validators run
 		// happily (their derivation happened to align once at genesis era
 		// and their live path reports match). The streak counter's purpose
 		// is to detect a node DRIFTING AWAY from the network; a node
@@ -4789,7 +4813,7 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	// (reportStateRoot) is bypassed during rebuildRange by design
 	// (skipStateRootValidation=true), so Node.recordStateRootMatch — the
 	// only thing that clears a soft R87-STATE-TRUST break — never ran for
-	// an entire rebuilt range. node-G (2026-10-20) finished a clean full
+	// an entire rebuilt range. A sealer (2026-10-20) finished a clean full
 	// resync with every segment root verified, yet stayed locked out of
 	// production on "sustained state-root mismatch streak" because the
 	// streak was earned during the earlier poisoned catch-up and nothing

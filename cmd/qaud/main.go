@@ -140,9 +140,11 @@ func printStatus(n *node.Node, cfg *node.Config) {
 	fmt.Printf("Is Syncing: %s\n", syncing)
 	fmt.Printf("Parallel Execution: %v (workers: %d)\n",
 		cfg.ParallelExecution.Enabled, cfg.ParallelExecution.NumWorkers)
-	if cfg.PruningConfig.Enabled {
-		fmt.Printf("State Pruning: enabled (%d blocks retention)\n", cfg.PruningConfig.RetentionBlocks)
-	}
+	// R10-03: this used to announce pruning as switched on straight from the config,
+	// which defaults to enabled — on a build where nothing prunes state. The wording
+	// now comes from the node package, which states the capability the binary
+	// actually has.
+	fmt.Println(node.PruningStatusLine(cfg.PruningConfig))
 	fmt.Println()
 }
 

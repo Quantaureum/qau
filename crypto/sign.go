@@ -66,7 +66,7 @@ func Sign(privateKey *PrivateKey, message []byte) ([]byte, error) {
 		// partial key-derived data written before the panic.
 		// R41-CR-003 FIX: Use zeroBytesSecure (three-pass wipe) instead of
 		// zeroBytes (single-pass), consistent with kyber.go error paths.
-		zeroBytesSecure(signature)
+		_ = zeroBytesSecure(signature)
 		// SECURITY FIX Q-B-004 / CRYPTO-R9-H5 / CRITICAL FIX: Remove Fatal() call that creates DoS vector.
 		// Panic in signing path should return error, NOT shut down the node.
 		// An attacker can trigger ANY panic to shut down all validator nodes.

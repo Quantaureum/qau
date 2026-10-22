@@ -803,6 +803,19 @@ func (a *contractCallerAdapter) Call(req *rpc.ContractCallRequest) (*rpc.Contrac
 	if sdb == nil {
 		return nil, fmt.Errorf("stateDB not available")
 	}
+	// R4-07 (2026-10-21 audit) FIX: the live StateDB journals dirty state and
+	// snapshots in ONE positional stack shared with consensus block application.
+	// A simulation that reverts while a block is being applied rewinds the
+	// dirty journal of the transactions already in that block, so the validator
+	// commits a state root that silently dropped them. Read-only execution
+	// therefore has to own an exclusive execution frame, and it must fail fast
+	// rather than queue: speculation may never delay consensus.
+	release, ok := sdb.TryBeginExecution()
+	if !ok {
+		return nil, fmt.Errorf("node busy: state execution frame unavailable")
+	}
+	defer release()
+
 	code := sdb.GetCode(req.To)
 	if len(code) == 0 {
 		// No code at address, return empty result (like Ethereum)
@@ -862,6 +875,15 @@ func (a *contractCallerAdapter) Call(req *rpc.ContractCallRequest) (*rpc.Contrac
 
 	// Execute contract call using QVM
 	stateAdapter := &qvmasync.StateDBAdapter{StateDB: sdb}
+	// R4-07 (2026-10-21 audit): STATICCALL must not leave any trace behind.
+	// Executor.Execute journals a snapshot for its own frame and — on the
+	// success path — nobody pops it, so every eth_call used to grow the shared
+	// stack until Snapshot() started returning the depth-exhaustion sentinel.
+	// Owning a frame snapshot here and reverting it unconditionally both
+	// enforces the read-only guarantee and keeps the stack balanced.
+	frame := stateAdapter.Snapshot()
+	defer stateAdapter.RevertToSnapshot(frame)
+
 	result := a.qvmExec.StaticCall(stateAdapter, caller, callee, req.Data, gas, blockCtx, 0)
 
 	return &rpc.ContractCallResult{
@@ -1539,57 +1561,6 @@ func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs
 	return a.tss.SignWithRetry(message, participantIDs)
 }
 
-// snapshotManagerAdapter adapts Node to rpc.SnapshotManager
-type snapshotManagerAdapter struct {
-	node *Node
-}
-
-func newSnapshotManagerAdapter(n *Node) *snapshotManagerAdapter {
-	return &snapshotManagerAdapter{node: n}
-}
-
-func (a *snapshotManagerAdapter) CreateSnapshot(blockHeight uint64) (map[string]any, error) {
-	if a.node == nil || a.node.stateDB == nil {
-		return nil, fmt.Errorf("node or stateDB not available")
-	}
-
-	// Create the snapshot
-	if err := a.node.stateDB.CreateSnapshot(blockHeight); err != nil {
-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
-	}
-
-	// Get pruning stats for info
-	enabled, keepBlocks, lastPruned, snapshotCount := a.node.stateDB.GetPruningStats()
-
-	result := map[string]any{
-		"success":        true,
-		"blockHeight":    blockHeight,
-		"snapshotCount":  snapshotCount,
-		"pruningEnabled": enabled,
-		"keepBlocks":     keepBlocks,
-		"lastPruned":     lastPruned,
-	}
-
-	return result, nil
-}
-
-func (a *snapshotManagerAdapter) RestoreSnapshot(blockHeight uint64) (map[string]any, error) {
-	if a.node == nil || a.node.stateDB == nil {
-		return nil, fmt.Errorf("node or stateDB not available")
-	}
-
-	// Revert to the snapshot at the given block height
-	a.node.stateDB.RevertToSnapshot(int(blockHeight))
-
-	result := map[string]any{
-		"success":     true,
-		"blockHeight": blockHeight,
-		"message":     "State reverted to snapshot",
-	}
-
-	return result, nil
-}
-
 // errConsensusStakeMutationNotBlockDerived refuses every attempt to mutate the
 // consensus validator set from outside block processing.
 //
@@ -1717,7 +1688,15 @@ func (a *forkRecoveryBackend) RollbackToFork(forkHeight uint64) (int, error) {
 	// Roll back stateDB to the same forkHeight so balances, contract
 	// storage, and nonces are reset to their state at forkHeight-1.
 	if a.node.stateDB != nil {
-		if err := a.node.stateDB.RollbackToHeight(forkHeight); err != nil {
+		// R6-03 (2026-10-21 sixth-round audit): this runs on the RPC goroutine of
+		// a live node, so it must own the StateDB execution frame before rewriting
+		// committed accounts. Without it, a rollback interleaved with a block
+		// transition restored pre-fork values underneath a journal that still held
+		// the post-fork writes, and that journal was committed afterwards.
+		err := a.node.stateDB.WithExecutionFrame(func() error {
+			return a.node.stateDB.RollbackToHeight(forkHeight)
+		})
+		if err != nil {
 			nodeLog.Error("ForkRecovery: stateDB.RollbackToHeight(%d) failed: %v", forkHeight, err)
 			return deleted, fmt.Errorf("stateDB.RollbackToHeight: %w", err)
 		}

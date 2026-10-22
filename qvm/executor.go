@@ -302,7 +302,7 @@ func (e *Executor) executeWithJIT(ctx *ExecutionContext, stateDB StateDB) (resul
 	// replace it. The named return also ensures that if a panic occurs AFTER
 	// result has been assigned (e.g., during the final return statement
 	// construction), we still overwrite it with the error result.
-	var snapshot int = -1 // sentinel: -1 means no snapshot taken yet
+	snapshot := -1 // sentinel: -1 means no snapshot taken yet
 	// R14-LOW (2026-07-21): env is declared here (before the defer) so the
 	// panic recovery path can access env.logs. It stays nil if the panic
 	// occurs during jitCompiler.Compile (before env is constructed below).
@@ -401,6 +401,13 @@ func (e *Executor) executeWithJIT(ctx *ExecutionContext, stateDB StateDB) (resul
 	}
 
 	snapshot = stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): with no journal entry the panic and
+		// ErrInvalidOpcode recovery paths below could not roll the frame back.
+		// Run the interpreter instead — its frame rollback is owned by the
+		// caller's snapshot — which is semantically equivalent.
+		return e.interpreter.Execute(ctx, stateDB)
+	}
 
 	env = &Environment{
 		ctx:         ctx,
@@ -535,6 +542,13 @@ func (e *Executor) executeWithJIT(ctx *ExecutionContext, stateDB StateDB) (resul
 		result.Err = ErrExecutionReverted
 	}
 
+	// R4-08 (2026-10-21 audit): a frame that completed without reverting keeps
+	// its writes, so its journal entry has no remaining consumer. Release it
+	// instead of leaking a stack slot per completed frame.
+	if !result.Reverted {
+		releaseFrame(stateDB, snapshot)
+	}
+
 	return result
 }
 
@@ -548,6 +562,10 @@ func (e *Executor) executeWithJIT(ctx *ExecutionContext, stateDB StateDB) (resul
 func (e *Executor) ExecuteWithRollback(ctx *ExecutionContext, stateDB StateDB) *ExecutionResult {
 	// Take a snapshot before execution
 	snapshot := stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: the journal is full, so this frame has no rollback path.
+		return &ExecutionResult{Err: ErrDepthExceeded, GasUsed: ctx.Gas}
+	}
 
 	// Execute the contract
 	result := e.Execute(ctx, stateDB)
@@ -562,6 +580,9 @@ func (e *Executor) ExecuteWithRollback(ctx *ExecutionContext, stateDB StateDB) *
 			result.GasUsed = ctx.Gas
 		}
 		// For REVERT, preserve the actual gas used from execution
+	} else {
+		// R4-08: release the completed frame entry (see executeWithJIT).
+		releaseFrame(stateDB, snapshot)
 	}
 
 	return result
@@ -740,6 +761,11 @@ func (e *Executor) CallWithRollback(
 
 	// Take snapshot for potential rollback
 	snapshot := stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: the journal is full, so this frame has no rollback path. Fail
+		// the call instead of executing unjournaled.
+		return &ExecutionResult{Err: ErrDepthExceeded, GasUsed: gas}
+	}
 
 	// Get contract code
 	code := stateDB.GetCode(callee)
@@ -788,6 +814,8 @@ func (e *Executor) CallWithRollback(
 					GasUsed: gasUsed,
 				}
 			}
+			// R4-08: the precompile call succeeded — release the frame entry.
+			releaseFrame(stateDB, snapshot)
 			return &ExecutionResult{
 				ReturnData: output,
 				GasUsed:    gasUsed,
@@ -798,6 +826,9 @@ func (e *Executor) CallWithRollback(
 		if value != nil && value.Sign() > 0 {
 			callerBalance := stateDB.GetBalance(caller)
 			if callerBalance.Cmp(value) < 0 {
+				// R4-08: nothing was modified, so drop the frame entry instead of
+				// leaking it on this early return.
+				releaseFrame(stateDB, snapshot)
 				return &ExecutionResult{
 					Err:     ErrInsufficientBalance,
 					GasUsed: gas,
@@ -821,6 +852,9 @@ func (e *Executor) CallWithRollback(
 				gasUsed = gas
 			}
 		}
+		// R4-08: the frame is complete (a plain value transfer), so release its
+		// journal entry — this branch used to leak one slot per call.
+		releaseFrame(stateDB, snapshot)
 		return &ExecutionResult{
 			GasUsed: gasUsed,
 		}
@@ -877,6 +911,9 @@ func (e *Executor) CallWithRollback(
 		if !result.Reverted {
 			result.GasUsed = gas // All gas is consumed on non-revert failures
 		}
+	} else {
+		// R4-08: release the completed frame entry (see executeWithJIT).
+		releaseFrame(stateDB, snapshot)
 	}
 
 	return result
@@ -1161,6 +1198,14 @@ func (e *Executor) Create(
 
 	// audit-fix R10-M3: snapshot before state mutations so we can revert on failure
 	snapshot := stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the journal is full, so this CREATE frame
+		// would deploy with no rollback path. Fail instead.
+		return &ExecutionResult{
+			Err:     ErrDepthExceeded,
+			GasUsed: gas,
+		}, Address{}
+	}
 
 	// R37-P3-21 FIX (2026-07-31): EIP-161 — a newly created contract account
 	// starts with nonce 1 (matches go-ethereum create()). Previously the
@@ -1338,6 +1383,10 @@ func (e *Executor) Create(
 	// Store the code
 	stateDB.SetCode(contractAddr, deployedCode)
 
+	// R4-08 (2026-10-21 audit): deployment succeeded, so the CREATE frame's
+	// journal entry has no remaining consumer — release it.
+	releaseFrame(stateDB, snapshot)
+
 	return result, contractAddr
 }
 
@@ -1422,6 +1471,14 @@ func (e *Executor) Create2(
 
 	// audit-fix R10-M3: snapshot before state mutations so we can revert on failure
 	snapshot := stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the journal is full, so this CREATE frame
+		// would deploy with no rollback path. Fail instead.
+		return &ExecutionResult{
+			Err:     ErrDepthExceeded,
+			GasUsed: gas,
+		}, Address{}
+	}
 
 	// R37-P3-21 FIX (2026-07-31): EIP-161 — a newly created contract account
 	// starts with nonce 1 (matches go-ethereum create2()). See Create() for
@@ -1581,6 +1638,10 @@ func (e *Executor) Create2(
 
 	// Store the code
 	stateDB.SetCode(contractAddr, deployedCode)
+
+	// R4-08 (2026-10-21 audit): deployment succeeded, so the CREATE frame's
+	// journal entry has no remaining consumer — release it.
+	releaseFrame(stateDB, snapshot)
 
 	return result, contractAddr
 }

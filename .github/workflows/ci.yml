@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.26.9']
+        go-version: ['1.26.10']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
@@ -59,24 +59,23 @@ jobs:
       # 93 tests) sum to >=700s under -race on 2-core CI runners, easily
       # exceeding the 10m -timeout of fast packages. Pulled out to its
       # own 30m step matching simulation.
-      # R77-CI-SPLIT (2026-10-07): Also exclude node — the Dilithium3 v1
-      # ceremony/reshare/seam suites brought real PQ crypto costs into the
-      # package. Measured on this workflow: with -race the node suite blew
-      # through even a 45m timeout, so its step runs without -race and in
-      # -short mode (the one timing-sensitive exchange network test skips
-      # itself in short mode; every developer-local non-short run still
-      # exercises it, and the live devnet acceptance gates the same path).
+      # F-04 (2026-10-21): Also exclude node — its DKG/seam tests alone take
+      # ~18 minutes locally, so the fast-package 10m budget killed the run
+      # mid-test and CI looked like a crash. It now has its own 30m step.
       - name: Test (fast packages)
         run: go test $(go list ./... | grep -vE '/(core|encoding|consensus|simulation|p2p|node)(/|$)') -timeout 10m -race
-      - name: Test (node)
-        run: go test ./node/... -timeout 45m -short
       - name: Test (encoding)
         run: go test ./encoding/... -timeout 30m -race
+      # R2-14: crypto and types are separate modules in go.work, so
+      # `go list ./...` from the root never includes them. Without these
+      # steps their crypto-boundary and transaction-encoding regressions
+      # would not be gated by CI at all.
+      - name: Test (crypto)
+        run: go test ./crypto/... -timeout 20m -race
+      - name: Test (types)
+        run: go test ./types/... -timeout 20m -race
       - name: Test (consensus)
-        # R77-CI-SHORT (2026-10-07): add -short — the LargeScale latency-budget
-        # tests self-gate on testing.Short() and cannot hold their budgets on
-        # shared 2-core -race runners (machine-dependent, not correctness).
-        run: go test ./consensus/... -timeout 30m -race -short
+        run: go test ./consensus/... -timeout 30m -race
       - name: Test (core)
         run: go test ./core/... -timeout 45m -race
       - name: Test (simulation)
@@ -98,6 +97,11 @@ jobs:
         run: go test ./simulation/... -timeout 5m -race -short
       - name: Test (p2p)
         run: go test ./p2p/... -timeout 30m -race
+      - name: Test (node)
+        # F-04: DKG/seam-heavy suite; measured ~18m in -short mode, so it gets
+        # the same generous budget as the other heavy packages instead of
+        # sharing the 10m fast-package alarm.
+        run: go test ./node/... -timeout 30m -race
       - name: Lint
         # R42-CI-RACE-10 (2026-08-20): golangci-lint v1.x (built with go1.23)
         # cannot handle a Go 1.26 target ("the Go language version used to
@@ -110,6 +114,12 @@ jobs:
         run: |
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.0
           golangci-lint run ./...
+      - name: Lint (strict: crypto/consensus/rpc/qaudb/qvm)
+        # F-08: errcheck + staticcheck on the security-critical packages.
+        # The repository-wide config stays lenient for legacy test files; this
+        # step fails on any unchecked error or staticcheck finding in the
+        # packages that handle keys, consensus, RPC input, and state.
+        run: golangci-lint run -c .golangci-strict.yml ./crypto/... ./consensus/... ./rpc/... ./qaudb/... ./qvm/...
 
   security:
     runs-on: ubuntu-latest
@@ -123,7 +133,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: true
       - name: Security Scan
         run: |
@@ -136,7 +146,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: true
       - name: Fuzzing (short)
         run: |

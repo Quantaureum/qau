@@ -402,3 +402,12 @@ docker-compose.override.yml
 
 # ----- Yan agent session artifacts (local only)
 /.yanagent/
+
+# ----- lore assistant memory file (R10-06): an assistant's working notes written
+# at the repository root. It is agent state, not project source or documentation,
+# so it belongs in the excluded area, never in git. Ignored so a bulk `git add`
+# cannot re-commit it after a session recreates it.
+/.lore.md
+
+# ----- p2p proof-of-work replay cache (runtime state, machine-specific nodeId/nonce)
+/p2p/pow_cache.json

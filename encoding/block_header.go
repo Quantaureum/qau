@@ -7,6 +7,7 @@ import (
 	"math/big"
 
 	"github.com/quantaureum/qau/types"
+	"golang.org/x/crypto/sha3"
 )
 
 // BlockHeader field numbers (protobuf compatible)
@@ -59,6 +60,37 @@ const (
 	// signature over the (epoch, key) pair, present on rotation anchors.
 	fieldHeaderQTDGroupKeyProof = 35
 )
+
+// BlockHeaderSigningRoot returns the SHA3-256 hash of the header with every
+// signature and post-signing field cleared. This is the blockRoot bound into
+// block and sync committee signatures.
+//
+// R2-15 FIX: the sync committee producer and verifier now share this helper.
+// Before it, the verifier hashed the header including SyncCommitteeSig/Bits
+// (a self-reference: the signer cannot know its own signature in advance) and
+// the two sides disagreed about which fields are covered.
+func BlockHeaderSigningRoot(h *BlockHeader) (types.Hash, error) {
+	if h == nil {
+		return types.Hash{}, fmt.Errorf("%w: nil header", ErrInvalidData)
+	}
+	signing := *h
+	signing.Signature = nil
+	signing.SyncCommitteeSig = nil
+	signing.SyncCommitteeBits = nil
+	signing.QTDSignature = nil
+	signing.ExecutiveSealers = nil
+	signing.ReviewAttestationRoot = types.Hash{}
+	signing.FinalityType = 0
+	signing.QTDGroupKey = nil
+	signing.QTDGroupKeyProof = nil
+
+	rawData, err := MarshalBlockHeader(&signing)
+	if err != nil {
+		return types.Hash{}, err
+	}
+	sum := sha3.Sum256(rawData)
+	return types.BytesToHash(sum[:]), nil
+}
 
 // MarshalBlockHeader serializes a BlockHeader to bytes using protobuf wire format
 func MarshalBlockHeader(h *BlockHeader) ([]byte, error) {

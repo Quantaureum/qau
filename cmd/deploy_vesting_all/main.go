@@ -78,6 +78,8 @@ func loadValidatorNodes() []string {
 // Fails closed with a fatal error if QAU_SSH_KEY is unset and there are
 // peer nodes to reach; returns "" when there are no peer nodes (so local-only
 // operation never requires an SSH key).
+// Host keys are verified against ~/.ssh/known_hosts (StrictHostKeyChecking=yes);
+// populate known_hosts with every peer's key before using peer fan-out.
 // validatorNodes are loaded from the QAU_VALIDATOR_NODES environment variable
 // as comma-separated SSH targets for optional peer RPC fan-out.
 var validatorNodes = loadValidatorNodes()
@@ -442,6 +444,8 @@ func loadKey(keyFile string) (*crypto.PrivateKey, types.Address) {
 	if err != nil {
 		fatal("Failed to decode private key from %s: %v", keyFile, err)
 	}
+	// F-10: wipe the decoded key material once the parsed key owns a copy.
+	defer func() { _ = crypto.ZeroBytesSecure(privBytes) }()
 
 	privKey, err := crypto.PrivateKeyFromBytes(privBytes)
 	if err != nil {
@@ -522,7 +526,8 @@ func sendRawTransaction(txHex string) interface{} {
 		)
 		//nolint:gosec // G204: ops tool — ssh target/args come from QAU_VALIDATOR_NODES + QAU_SSH_KEY env (R50), not untrusted input.
 		cmd := exec.Command("ssh",
-			"-o", "StrictHostKeyChecking=no",
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "BatchMode=yes",
 			"-o", "ConnectTimeout=5",
 			"-i", sshKeyPath(),
 			node, sshCmd,
@@ -627,7 +632,8 @@ func waitForReceipt(txHashHex string, timeoutSec int) map[string]interface{} {
 			)
 			//nolint:gosec // G204: ops tool — see submitCommitment; env-driven ssh, no untrusted input.
 			cmd := exec.Command("ssh",
-				"-o", "StrictHostKeyChecking=no",
+				"-o", "StrictHostKeyChecking=yes",
+				"-o", "BatchMode=yes",
 				"-o", "ConnectTimeout=5",
 				"-i", sshKeyPath(),
 				node, sshCmd,

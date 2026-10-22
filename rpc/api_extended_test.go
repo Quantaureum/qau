@@ -121,26 +121,9 @@ func (m *mockContractCaller) Call(req *ContractCallRequest) (*ContractCallResult
 	return &ContractCallResult{ReturnData: m.returnData, GasUsed: m.gasUsed}, nil
 }
 
-type mockSnapshotManager struct {
-	snapshots map[uint64]map[string]any
-}
-
-func newMockSnapshotManager() *mockSnapshotManager {
-	return &mockSnapshotManager{snapshots: make(map[uint64]map[string]any)}
-}
-
-func (m *mockSnapshotManager) CreateSnapshot(blockHeight uint64) (map[string]any, error) {
-	snap := map[string]any{"height": blockHeight, "id": "snap-1"}
-	m.snapshots[blockHeight] = snap
-	return snap, nil
-}
-
-func (m *mockSnapshotManager) RestoreSnapshot(blockHeight uint64) (map[string]any, error) {
-	if s, ok := m.snapshots[blockHeight]; ok {
-		return s, nil
-	}
-	return nil, nil
-}
+// R6-01 (2026-10-21 sixth-round audit): the SnapshotManager seam was removed --
+// evm_snapshot/evm_revert now refuse unconditionally, so there is nothing left
+// to stub.
 
 // ── Helper: create API with all mocks ──
 
@@ -155,7 +138,6 @@ func newTestAPIFull() *API {
 	api.SetEnforceAdminAuth(false) // R25-003: disable admin auth for test
 	api.SetStakingManager(newMockStakingManager())
 	api.SetContractCaller(newMockContractCaller())
-	api.SetSnapshotManager(newMockSnapshotManager())
 	return api
 }
 
@@ -589,13 +571,6 @@ func TestSetContractCaller_Nil(t *testing.T) {
 	api.SetContractCaller(nil) // should not panic
 }
 
-// ── SetSnapshotManager nil check ──
-
-func TestSetSnapshotManager_Nil(t *testing.T) {
-	api := newTestAPI()
-	api.SetSnapshotManager(nil) // should not panic
-}
-
 // ── SetPrivacyManager nil check ──
 
 func TestSetPrivacyManager_Nil(t *testing.T) {
@@ -680,33 +655,54 @@ func TestSupportedEntryPoints(t *testing.T) {
 }
 
 // ── CreateSnapshot / RestoreSnapshot ──
+// R6-01: both methods refuse, regardless of wiring. See rpc/r6_01_snapshot_refusal_test.go
+// for the full matrix.
 
-func TestCreateSnapshot_NoManager(t *testing.T) {
+func requireSnapshotRefused(t *testing.T, result any, rpcErr *Error) {
+	t.Helper()
+	if result != nil {
+		t.Fatalf("result = %v, want nil", result)
+	}
+	if rpcErr == nil {
+		t.Fatal("expected refusal, got none")
+	}
+	if rpcErr.Code != ErrCodeInternal {
+		t.Errorf("code = %d, want %d", rpcErr.Code, ErrCodeInternal)
+	}
+	if rpcErr.Message != ErrStateSnapshotNotSupportedRPC {
+		t.Errorf("message = %q, want %q", rpcErr.Message, ErrStateSnapshotNotSupportedRPC)
+	}
+	if rpcErr.Data == nil {
+		t.Error("refusal must explain why the feature cannot be honoured")
+	}
+}
+
+func TestCreateSnapshot_Refused(t *testing.T) {
 	api := newTestAPI()
 	params, _ := json.Marshal([]string{"0x1"})
-	_, err := api.CreateSnapshot(ctx(), params)
-	requireErr(t, nil, err)
+	result, rpcErr := api.CreateSnapshot(ctx(), params)
+	requireSnapshotRefused(t, result, rpcErr)
 }
 
-func TestRestoreSnapshot_NoManager(t *testing.T) {
+func TestRestoreSnapshot_Refused(t *testing.T) {
 	api := newTestAPI()
 	params, _ := json.Marshal([]string{"0x1"})
-	_, err := api.RestoreSnapshot(ctx(), params)
-	requireErr(t, nil, err)
+	result, rpcErr := api.RestoreSnapshot(ctx(), params)
+	requireSnapshotRefused(t, result, rpcErr)
 }
 
-func TestCreateSnapshot_WithManager(t *testing.T) {
+func TestCreateSnapshot_RefusedWithFullyWiredAPI(t *testing.T) {
 	api := newTestAPIFull()
 	params, _ := json.Marshal([]string{"0x1"})
-	result, err := api.CreateSnapshot(ctx(), params)
-	requireOK(t, result, err)
+	result, rpcErr := api.CreateSnapshot(ctx(), params)
+	requireSnapshotRefused(t, result, rpcErr)
 }
 
-func TestRestoreSnapshot_WithManager(t *testing.T) {
+func TestRestoreSnapshot_RefusedWithFullyWiredAPI(t *testing.T) {
 	api := newTestAPIFull()
 	params, _ := json.Marshal([]string{"0x1"})
-	result, err := api.RestoreSnapshot(ctx(), params)
-	requireOK(t, result, err)
+	result, rpcErr := api.RestoreSnapshot(ctx(), params)
+	requireSnapshotRefused(t, result, rpcErr)
 }
 
 // ── QPOSStatus ──

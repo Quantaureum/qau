@@ -64,10 +64,11 @@ type DiscordConfigFile struct {
 
 // PagerDutyConfigFile for PagerDuty channel
 type PagerDutyConfigFile struct {
-	Enabled     bool   `json:"enabled"`
-	RoutingKey  string `json:"routing_key"`
-	ServiceName string `json:"service_name"`
-	Environment string `json:"environment"`
+	Enabled      bool   `json:"enabled"`
+	RoutingKey   string `json:"routing_key"`
+	ServiceName  string `json:"service_name"`
+	Environment  string `json:"environment"`
+	DashboardURL string `json:"dashboard_url"`
 }
 
 // WebhookConfigFile for generic webhook channel
@@ -168,10 +169,11 @@ func CreateAlertManager(configPath string) (*AlertManager, error) {
 
 	if config.Channels.PagerDuty.Enabled {
 		manager.AddChannel(NewPagerDutyChannel(&PagerDutyConfig{
-			Enabled:     true,
-			RoutingKey:  expandEnvVars(config.Channels.PagerDuty.RoutingKey),
-			ServiceName: config.Channels.PagerDuty.ServiceName,
-			Environment: config.Channels.PagerDuty.Environment,
+			Enabled:      true,
+			RoutingKey:   expandEnvVars(config.Channels.PagerDuty.RoutingKey),
+			ServiceName:  config.Channels.PagerDuty.ServiceName,
+			Environment:  config.Channels.PagerDuty.Environment,
+			DashboardURL: expandEnvVars(config.Channels.PagerDuty.DashboardURL),
 		}))
 	}
 

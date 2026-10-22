@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
@@ -105,7 +107,9 @@ func TestR78_UnstakeTxPassesCanonicalBlockValidator(t *testing.T) {
 	api := newUnstakeAPI(pool)
 
 	const chainID = uint64(1668) // newMockChainInfo
-	const nonce = "f9478462af1f13c2d1c063050454d55f0befcafe1234567890abcdef012345678"
+	// F-01: auth nonces carry a signed unix deadline in "<deadline>:<random>" form.
+	nonce := fmt.Sprintf("%d:%s", time.Now().Add(5*time.Minute).Unix(),
+		"f9478462af1f13c2d1c063050454d55f0befcafe1234567890abcdef012345678")
 	amount := new(big.Int).Mul(big.NewInt(32), big.NewInt(1e18))
 	unstakeContract := stakingSystemContract(0x02)
 

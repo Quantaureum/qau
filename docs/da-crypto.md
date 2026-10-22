@@ -3,7 +3,7 @@
 > Scope: Quantaureum quantum blockchain L1 — Data Availability (Danksharding) subsystem
 > Version: P4-3 / 2026-07-15
 > Review status: **Pending cryptographic advisor review** (P4-3 DoD: "The cryptographic scheme has been reviewed by a cryptographic advisor")
-> Related code: `encoding/blob_tx.go`、`encoding/erasure_code.go`、`encoding/gf16.go`、`consensus/da_committee.go`、`consensus/pqvrf.go`、`crypto/`
+> Related code: `encoding/blob_tx.go`, `encoding/erasure_code.go`, `encoding/gf16.go`, `consensus/da_committee.go`, `consensus/pqvrf.go`, `crypto/`
 
 ---
 
@@ -273,8 +273,8 @@ The following items require the cryptographic advisor to explicitly sign off dur
   - `encoding/gf16.go` — GF(2^16) arithmetic
   - `consensus/da_committee.go` — DA committee, dual-mode aggregate signature, `DAMaxTransitionSignatures`
   - `consensus/pqvrf.go` — PQVRF (Dilithium3 Sign-then-KDF)
-  - `crypto/dilithium.go`、`crypto/kyber.go`、`crypto/gmqtd_sign.go` — quantum cryptography primitives
+  - `crypto/dilithium.go`, `crypto/kyber.go`, `crypto/gmqtd_sign.go` — quantum cryptography primitives
 - Standards:
   - FIPS 204 (ML-DSA / Dilithium3)
   - FIPS 203 (ML-KEM / Kyber768)
-- Related documents：`docs/WHITEPAPER.md`、`wallet/tss/qtd_paper.md`、`SECURITY.md`
+- Related documents: `docs/WHITEPAPER.md`, `wallet/tss/qtd_paper.md`, `SECURITY.md`

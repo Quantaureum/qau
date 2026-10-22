@@ -11,9 +11,9 @@ import (
 // (shouldRebuildAfterSync requires wasSyncing), which already happened inside
 // the previous process — so after a restart NOBODY ever launched the rebuild:
 // the producer logged "state not verified yet (verified=0)" forever and the
-// node never requested the remaining blocks. Production hit: node-G 2026-10-19,
-// reboot at head=220698, verified=0, wedged 11+ minutes until manual restart
-// with the fix.
+// node never requested the remaining blocks. Observed on a production sealer:
+// a reboot at a non-zero head with verified=0 wedged the producer for 11+
+// minutes until a manual restart with the fix.
 //
 // The fix adds a rescue branch to checkSync's caught-up path: when not
 // syncing, never was syncing this round, and no rebuild is running/pending,

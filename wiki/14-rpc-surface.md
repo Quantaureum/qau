@@ -24,7 +24,7 @@
 | `eth_getTransactionCount` | nonce |
 | `eth_getCode` | contract code |
 | `eth_getStorageAt` | storage slot |
-| `eth_getProof` | state proof |
+| `eth_getProof` | account proof bound to the state root; storage entries are node-asserted values carrying `"unverified": true` (committed slots are not in the state trie — R6-05) |
 
 ## 14.3 Transactions
 
@@ -78,15 +78,21 @@
 | `eth_sign` | sign a message |
 | `eth_signTypedData` / `_v1` / `_v3` / `_v4` | structured-data signing |
 
-## 14.9 Account Abstraction (ERC-4337)
+## 14.9 Account Abstraction (ERC-4337) — experimental, not live
+
+No component in the node consumes the bundles the bundler builds, so no user
+operation can be included in a block. Submissions are refused outright instead
+of accepted and silently dropped; the query and estimate methods keep working as
+local read/estimate endpoints and return `null` for anything that was never
+admitted.
 
 | Method | Description |
 |------|------|
-| `eth_sendUserOperation` | submit a UserOperation |
+| `eth_sendUserOperation` | **refused** — `-32603 account abstraction is not live: user operations are not bundled on chain yet` |
 | `eth_estimateUserOperationGas` | estimate |
-| `eth_getUserOperationByHash` / `eth_getUserOperationReceipt` | query |
+| `eth_getUserOperationByHash` / `eth_getUserOperationReceipt` | query (always `null` while AA is not live) |
 | `eth_supportedEntryPoints` | list of EntryPoints |
-| `qau_sendUserOperation` / `qau_estimateUserOperationGas` / `qau_getUserOperationByHash` / `qau_getUserOperationReceipt` / `qau_supportedEntryPoints` | **qau_ aliases** (backward compatible) |
+| `qau_sendUserOperation` / `qau_estimateUserOperationGas` / `qau_getUserOperationByHash` / `qau_getUserOperationReceipt` / `qau_supportedEntryPoints` | **qau_ aliases** (same handlers, same refusal) |
 
 ## 14.10 Staking / Economics (qau_)
 
@@ -175,6 +181,7 @@
 | `admin_peers` / `admin_nodeInfo` / `admin_mint` | admin (HMAC) |
 | `personal_newAccount` / `personal_listAccounts` / `personal_unlockAccount` / `personal_lockAccount` / `personal_sendTransaction` / `personal_sign` / `personal_importRawKey` | local accounts |
 | `debug_traceTransaction` / `debug_traceCall` / `debug_traceBlockByNumber` / `debug_traceBlockByHash` | debugging |
+| `evm_snapshot` / `evm_revert` | registered and admin-gated, but refuse unconditionally: block-height snapshots cannot be restored on this node (R6-01). Use `debug_rollbackChainToHeight` for fork recovery |
 
 ## 14.18 New RPC Specification
 

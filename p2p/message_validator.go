@@ -689,28 +689,43 @@ func (v *MessageValidator) IsDuplicate(msgHash string) bool {
 	// Record this message
 	v.seenMessages[msgHash] = time.Now()
 
-	// LRU eviction: if we're approaching capacity, evict oldest entries until below 90%
-	// SECURITY FIX (L-5): Previously only deleted 1 entry which could leave the map
-	// at capacity indefinitely. Now loop until size drops below 90% of max.
-	for len(v.seenMessages) >= v.maxSeenMessages && v.maxSeenMessages > 0 {
-		var oldestHash string
-		var oldestTime time.Time = time.Now()
-
+	// Bounded LRU eviction. SECURITY (R12-01): the previous loop evicted ONE
+	// entry per full map scan while holding seenMessagesMu, walking the map from
+	// maxSeenMessages down to 90% of it. That is O(cap * evict) ~= 10^9 map
+	// iterations inside a single IsDuplicate call, which stalls ValidateMessage
+	// for every peer for seconds. A remote peer can drive the map to the cap
+	// cheaply because IsDuplicate is invoked before format validation, so even
+	// distinct malformed payloads each insert a new entry (see the msgHash keying
+	// in ValidateMessage). Mirror the proven lastMessages sweep instead: a single
+	// pass drops every entry past the 30s dedup window (those no longer dedup
+	// anything); only if STILL at capacity do we sort once and batch-drop the
+	// oldest 10%. Each sweep is then O(n log n) under one lock hold, not O(n^2).
+	if len(v.seenMessages) >= v.maxSeenMessages && v.maxSeenMessages > 0 {
+		cutoff := time.Now().Add(-30 * time.Second)
 		for h, ts := range v.seenMessages {
-			if ts.Before(oldestTime) {
-				oldestHash = h
-				oldestTime = ts
+			if ts.Before(cutoff) {
+				delete(v.seenMessages, h)
 			}
 		}
-
-		if oldestHash != "" {
-			delete(v.seenMessages, oldestHash)
-		} else {
-			break
-		}
-
-		if len(v.seenMessages) < (v.maxSeenMessages*9)/10 {
-			break
+		if len(v.seenMessages) >= v.maxSeenMessages {
+			type seenEntry struct {
+				hash string
+				t    time.Time
+			}
+			entries := make([]seenEntry, 0, len(v.seenMessages))
+			for h, t := range v.seenMessages {
+				entries = append(entries, seenEntry{h, t})
+			}
+			sort.Slice(entries, func(i, j int) bool {
+				return entries[i].t.Before(entries[j].t)
+			})
+			evictCount := v.maxSeenMessages / 10
+			if evictCount < 1 {
+				evictCount = 1
+			}
+			for i := 0; i < evictCount && i < len(entries); i++ {
+				delete(v.seenMessages, entries[i].hash)
+			}
 		}
 	}
 

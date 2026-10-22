@@ -1085,7 +1085,7 @@ func (pe *ParallelExecutor) applyFinalState(txs []*encoding.Transaction) {
 			case nonceKey:
 				nonceAddrs[key.addr] = struct{}{}
 			case storageKeyWrapper:
-				sk := storageKey{addr: key.addr, key: key.key}
+				sk := storageKey(key)
 				storageKeys[sk] = struct{}{}
 			case codeKey:
 				codeAddrs[key.addr] = struct{}{}

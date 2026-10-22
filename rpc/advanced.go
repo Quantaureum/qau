@@ -727,13 +727,14 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 	// Parse block range
 	var fromBlock, toBlock uint64
 
-	if filter.FromBlock == "" || filter.FromBlock == "latest" {
+	switch filter.FromBlock {
+	case "", "latest":
 		if api.blockReader != nil {
 			fromBlock = api.blockReader.GetLatestHeight()
 		}
-	} else if filter.FromBlock == "earliest" {
+	case "earliest":
 		fromBlock = 0
-	} else {
+	default:
 		var err error
 		fromBlock, err = parseHexToUint64(filter.FromBlock)
 		if err != nil {
@@ -741,13 +742,14 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 		}
 	}
 
-	if filter.ToBlock == "" || filter.ToBlock == "latest" {
+	switch filter.ToBlock {
+	case "", "latest":
 		if api.blockReader != nil {
 			toBlock = api.blockReader.GetLatestHeight()
 		}
-	} else if filter.ToBlock == "earliest" {
+	case "earliest":
 		toBlock = 0
-	} else {
+	default:
 		var err error
 		toBlock, err = parseHexToUint64(filter.ToBlock)
 		if err != nil {

@@ -687,6 +687,20 @@ func (ep *EntryPoint) SimulateValidation(uo *encoding.UserOperation, stateDB Sta
 		return nil, err
 	}
 
+	// R4-RES: admission-time validation (SimulateValidation) and execution
+	// (handleSingleOp) share the same trust boundary for sender contracts, so
+	// this guard is byte-identical to handleSingleOp's codeless check — a
+	// sender with no code and no InitCode can never validate, regardless of
+	// which path the bundler takes. Keep the two checks in sync; they must
+	// agree on which senders are admissible or an attacker can probe the
+	// divergence between simulation and execution.
+	if len(stateDB.GetCode(Address(uo.Sender))) == 0 && len(uo.InitCode) == 0 {
+		return &UserOpValidationResult{
+			Valid:           false,
+			ValidationError: ErrSenderNotContract,
+		}, nil
+	}
+
 	snapshot := stateDB.Snapshot()
 	defer stateDB.RevertToSnapshot(snapshot)
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 var defaultBucket = []byte("qaudb")
@@ -111,7 +112,7 @@ func isLockTimeoutError(err error) bool {
 		return false
 	}
 	// Preferred path: bbolt wraps ErrTimeout with %w so errors.Is unwraps it.
-	if errors.Is(err, bolt.ErrTimeout) {
+	if errors.Is(err, berrors.ErrTimeout) {
 		return true
 	}
 	// Fallback: heuristic string match against the error message.

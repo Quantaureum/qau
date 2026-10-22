@@ -171,8 +171,10 @@ func queryNodeStatus() error {
 		verStr = "unknown"
 	}
 
-	// eth_networkId
-	netResult, err := rpcCall("eth_networkId", nil)
+	// R7-02 (2026-10-21 seventh-round audit): this used to call eth_networkId,
+	// which this node never registered — the server answers -32601 and the whole
+	// status command aborted. net_version is the registered network-ID method.
+	netResult, err := rpcCall("net_version", nil)
 	if err != nil {
 		return fmt.Errorf("failed to get network ID: %w", err)
 	}

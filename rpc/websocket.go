@@ -640,32 +640,22 @@ func (ws *WebSocketServer) checkOrigin(r *http.Request) bool {
 	// future auditors and developers understand the security posture.
 	if len(origins) == 0 {
 		log.Printf("[WARN] WebSocket: allowedOrigins not configured, restricting to localhost only")
-		// Only allow if request is from localhost
-		// R7-C4 FIX: 0.0.0.0 is a bind address, not a loopback origin, and
-		// must not be treated as localhost for origin checks.
-		host := r.Host
-		// FIX: Use net.SplitHostPort for robust Host header parsing.
-		// Previous strings.HasPrefix approach had edge cases:
-		// - "localhost" without port was rejected (no colon to match "localhost:")
-		// - Case-sensitive: "LOCALHOST:8080" was rejected
-		// - "[::1]:8080" required a separate prefix check
-		// SplitHostPort correctly handles all these cases including IPv6 brackets.
-		hostname, _, splitErr := net.SplitHostPort(host)
-		if splitErr != nil {
-			// No port — the entire string is the hostname
-			hostname = host
+		// F-15: never trust r.Host for the localhost decision — a reverse proxy
+		// or direct client can set it to "localhost" from anywhere. Browsers
+		// always send Origin, so the browser case is decided by the Origin
+		// header alone. Origin-less clients are accepted only when the TCP peer
+		// itself is loopback (local tools and same-host reverse proxies).
+		if origin == "" {
+			remoteHost, _, splitErr := net.SplitHostPort(r.RemoteAddr)
+			if splitErr != nil {
+				remoteHost = r.RemoteAddr
+			}
+			ip := net.ParseIP(strings.Trim(remoteHost, "[]"))
+			return ip != nil && ip.IsLoopback()
 		}
-		hostname = strings.ToLower(hostname)
-		isLocalhost := hostname == "localhost" ||
-			hostname == "127.0.0.1" ||
-			hostname == "::1"
-		if isLocalhost {
-			return true
-		}
-		// Also check Origin header for localhost. P3-12: reuse the shared
-		// isLocalhostOrigin() helper so the localhost definition is identical to
-		// setCORSHeaders() in server.go (uses Hostname() to strip any port).
-		if origin != "" && isLocalhostOrigin(origin) {
+		// P3-12: reuse the shared isLocalhostOrigin() helper so the localhost
+		// definition is identical to setCORSHeaders() in server.go.
+		if isLocalhostOrigin(origin) {
 			return true
 		}
 		return false // reject non-localhost when no origins configured
@@ -681,12 +671,11 @@ func (ws *WebSocketServer) checkOrigin(r *http.Request) bool {
 		}
 		// FIX: use exact case-sensitive match, consistent with
 		// setCORSHeaders() in server.go (which uses `o == origin`).
-		// P3-N2 VERIFIED RESOLVED: The earlier Host-vs-Origin confusion is
-		// fully fixed — origin matching now uses exact string equality
-		// (`origin == allowed`), NOT strings.EqualFold and NOT a u.Host
-		// comparison. The localhost fallback above correctly keys off r.Host
-		// (the actual request host) only when no origins are configured. No
-		// further change needed; this comment documents the resolution.
+		// The earlier Host-vs-Origin confusion is fully fixed — origin matching
+		// uses exact string equality (`origin == allowed`), NOT
+		// strings.EqualFold and NOT a u.Host comparison. When no origins are
+		// configured, the localhost fallback keys off the TCP peer address
+		// (r.RemoteAddr), never r.Host (R2-12).
 		if origin == allowed {
 			return true
 		}
@@ -1182,13 +1171,14 @@ func (ws *WebSocketServer) readMessage(conn *WSConn) ([]byte, error) {
 	if opcode == 9 || opcode == 10 {
 		// Read the masked payload for the control frame. The RFC checks above
 		// ensure payloadLen is already within the 125-byte control-frame limit.
-		if payloadLen == 126 {
+		switch payloadLen {
+		case 126:
 			ext := make([]byte, 2)
 			if _, err := io.ReadFull(conn.reader, ext); err != nil {
 				return nil, err
 			}
 			payloadLen = int(binary.BigEndian.Uint16(ext))
-		} else if payloadLen == 127 {
+		case 127:
 			ext := make([]byte, 8)
 			if _, err := io.ReadFull(conn.reader, ext); err != nil {
 				return nil, err
@@ -1285,13 +1275,14 @@ func (ws *WebSocketServer) readMessage(conn *WSConn) ([]byte, error) {
 	}
 
 	// Extended payload length
-	if payloadLen == 126 {
+	switch payloadLen {
+	case 126:
 		ext := make([]byte, 2)
 		if _, err := io.ReadFull(conn.reader, ext); err != nil {
 			return nil, err
 		}
 		payloadLen = int(binary.BigEndian.Uint16(ext))
-	} else if payloadLen == 127 {
+	case 127:
 		ext := make([]byte, 8)
 		if _, err := io.ReadFull(conn.reader, ext); err != nil {
 			return nil, err

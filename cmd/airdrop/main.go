@@ -27,6 +27,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -35,11 +36,13 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
+	"github.com/quantaureum/qau/txpool"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -118,17 +121,18 @@ func fatal(format string, args ...any) {
 // ---------------------------------------------------------------------------
 
 type signer struct {
-	priv        *crypto.PrivateKey
-	pubKey      []byte
-	fromAddr    types.Address
-	fromHex     string
-	chainID     uint64
-	rpcURL      string
-	nextNonce   uint64
-	qauDecimals *big.Int
+	priv           *crypto.PrivateKey
+	pubKey         []byte
+	fromAddr       types.Address
+	fromHex        string
+	chainID        uint64
+	rpcURL         string
+	nextNonce      uint64
+	qauDecimals    *big.Int
+	confirmTimeout time.Duration
 }
 
-func newSigner(keyFile string, chainID uint64, rpcURL string) (*signer, error) {
+func newSigner(keyFile string, chainID uint64, rpcURL string, confirmTimeout time.Duration) (*signer, error) {
 	data, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read key file: %w", err)
@@ -142,6 +146,14 @@ func newSigner(keyFile string, chainID uint64, rpcURL string) (*signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode private key: %w", err)
 	}
+	// F-10: wipe the decoded key material once the parsed key owns a copy.
+	defer func() { _ = crypto.ZeroBytesSecure(privBytes) }()
+	// Accept qaud/dev_export_keys style priv+pub concatenated keyfiles: when
+	// the blob is exactly privSize+pubSize long, the public half is redundant
+	// (re-derived from the private key below) and dropped.
+	if len(privBytes) == crypto.Dilithium3PrivateKeySize+crypto.Dilithium3PublicKeySize {
+		privBytes = privBytes[:crypto.Dilithium3PrivateKeySize]
+	}
 	privKey, err := crypto.PrivateKeyFromBytes(privBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
@@ -151,13 +163,14 @@ func newSigner(keyFile string, chainID uint64, rpcURL string) (*signer, error) {
 	fromAddr := pubKey.Address()
 
 	s := &signer{
-		priv:        privKey,
-		pubKey:      pubKey.Bytes(),
-		fromAddr:    fromAddr,
-		fromHex:     fromAddr.ToHexAddress(),
-		chainID:     chainID,
-		rpcURL:      rpcURL,
-		qauDecimals: new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
+		priv:           privKey,
+		pubKey:         pubKey.Bytes(),
+		fromAddr:       fromAddr,
+		fromHex:        fromAddr.ToHexAddress(),
+		chainID:        chainID,
+		rpcURL:         rpcURL,
+		qauDecimals:    new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
+		confirmTimeout: confirmTimeout,
 	}
 
 	// Seed the nonce counter from the chain.
@@ -183,8 +196,10 @@ func (s *signer) fetchNonce() (uint64, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
+	// "pending" includes accepted-but-unmined transactions, so a resync after
+	// an ambiguous submit does not hand out a nonce that is already in flight.
 	if err := rpcJSON(s.rpcURL, "eth_getTransactionCount",
-		[]any{s.fromHex, "latest"}, &res); err != nil {
+		[]any{s.fromHex, "pending"}, &res); err != nil {
 		return 0, err
 	}
 	if res.Error.Message != "" {
@@ -195,6 +210,20 @@ func (s *signer) fetchNonce() (uint64, error) {
 		return 0, fmt.Errorf("parse nonce %q: %w", res.Result, err)
 	}
 	return n, nil
+}
+
+// resyncNonce refreshes the local cursor from the chain after a failure that
+// may have consumed the commit nonce (R2-09). Otherwise the next commit reuses
+// a consumed nonce and every following payment in the batch fails. When the
+// RPC is unreachable, advance past the commit nonce as a best effort.
+func (s *signer) resyncNonce() {
+	if nonce, err := s.fetchNonce(); err == nil {
+		if nonce > s.nextNonce {
+			s.nextNonce = nonce
+		}
+		return
+	}
+	s.nextNonce++
 }
 
 func (s *signer) fetchBalance() (*big.Int, error) {
@@ -218,39 +247,110 @@ func (s *signer) fetchBalance() (*big.Int, error) {
 	return bal, nil
 }
 
-// sendTransfer builds, signs, and submits one transfer; it returns the tx
-// hash once the node accepts the transaction.
+// sendTransfer pays one registration using the chain's commit-reveal
+// (front-running protection) flow, which is mandatory for transfers at or
+// above the txpool threshold (10 QAU — any payout qualifies):
+//
+//	① commit tx  (TxTypeCommit, nonce N, To=zero, Data=SHA3(to‖value‖salt))
+//	② wait for the commit to be included, then for MinRevealBlocks to pass
+//	③ reveal tx  (TxTypeTransfer, nonce N+1, Data=32-byte salt)
+//
+// Returns the REVEAL tx hash (the tx that moves the funds) once the node
+// accepts it; the caller confirms the receipt before writing it back.
 func (s *signer) sendTransfer(to types.Address, amountQau *big.Int) (string, error) {
 	amountWei := new(big.Int).Mul(amountQau, s.qauDecimals)
 
-	tx := &encoding.Transaction{
+	salt := make([]byte, txpool.CRV2SaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("generate reveal salt: %w", err)
+	}
+
+	commitHash := txpool.ComputeCommitHash(to, amountWei, salt)
+	zeroAddr := types.Address{}
+
+	commitTx := &encoding.Transaction{
+		Version:  1,
+		Type:     encoding.TxTypeCommit,
+		Nonce:    s.nextNonce,
+		From:     s.fromAddr,
+		To:       &zeroAddr,
+		Value:    big.NewInt(0),
+		GasLimit: 40000,
+		GasPrice: big.NewInt(1),
+		Data:     commitHash[:],
+		ChainID:  s.chainID,
+	}
+	if err := s.signTx(commitTx); err != nil {
+		return "", fmt.Errorf("sign commit: %w", err)
+	}
+	commitAccepted, err := s.sendRaw(commitTx)
+	if err != nil {
+		return "", fmt.Errorf("send commit: %w", err)
+	}
+
+	ok, commitBlock := s.waitForReceipt(commitAccepted.Hash().String(), s.confirmTimeout)
+	if !ok {
+		// The commit was accepted, so its nonce is consumed even though the
+		// receipt is unknown; resync before the next payment.
+		s.resyncNonce()
+		return "", fmt.Errorf("commit tx %s not confirmed in time", commitAccepted.Hash().String())
+	}
+
+	// MinRevealBlocks is 1 on this network: the reveal must land at least
+	// one block after the commit's inclusion block.
+	if err := s.waitBlock(commitBlock+1, s.confirmTimeout); err != nil {
+		return "", fmt.Errorf("waiting reveal window: %w", err)
+	}
+
+	revealTx := &encoding.Transaction{
 		Version:  1,
 		Type:     encoding.TxTypeTransfer,
-		Nonce:    s.nextNonce,
+		Nonce:    s.nextNonce + 1,
 		From:     s.fromAddr,
 		To:       &to,
 		Value:    amountWei,
-		GasLimit: 21000,
-		GasPrice: big.NewInt(1), // same as cmd/transfer: 1 wei
+		GasLimit: 40000,
+		GasPrice: big.NewInt(1),
+		Data:     salt,
 		ChainID:  s.chainID,
 	}
+	if err := s.signTx(revealTx); err != nil {
+		s.resyncNonce()
+		return "", fmt.Errorf("sign reveal: %w", err)
+	}
+	if _, err := s.sendRaw(revealTx); err != nil {
+		// The commit nonce is consumed; the reveal may or may not have been
+		// accepted. Resync from the chain so the batch can continue.
+		s.resyncNonce()
+		return "", fmt.Errorf("send reveal: %w", err)
+	}
 
+	txHash := revealTx.Hash().String()
+	s.nextNonce += 2
+	return txHash, nil
+}
+
+// signTx signs a transaction with the payout Dilithium3 key.
+func (s *signer) signTx(tx *encoding.Transaction) error {
 	signingHash, err := tx.SigningHash()
 	if err != nil {
-		return "", fmt.Errorf("signing hash: %w", err)
+		return fmt.Errorf("signing hash: %w", err)
 	}
 	sig, err := crypto.Sign(s.priv, signingHash[:])
 	if err != nil {
-		return "", fmt.Errorf("sign: %w", err)
+		return fmt.Errorf("sign: %w", err)
 	}
 	tx.Signature = sig
 	tx.PublicKey = s.pubKey
+	return nil
+}
 
+// sendRaw marshals and submits one signed transaction via eth_sendRawTransaction.
+func (s *signer) sendRaw(tx *encoding.Transaction) (*encoding.Transaction, error) {
 	txBytes, err := encoding.MarshalTransaction(tx)
 	if err != nil {
-		return "", fmt.Errorf("marshal tx: %w", err)
+		return nil, fmt.Errorf("marshal tx: %w", err)
 	}
-
 	var res struct {
 		Result string `json:"result"`
 		Error  struct {
@@ -259,25 +359,38 @@ func (s *signer) sendTransfer(to types.Address, amountQau *big.Int) (string, err
 	}
 	if err := rpcJSON(s.rpcURL, "eth_sendRawTransaction",
 		[]any{"0x" + hex.EncodeToString(txBytes)}, &res); err != nil {
-		return "", err
+		return nil, err
 	}
 	if res.Error.Message != "" {
-		// Nonce-related errors here mean the local counter drifted from
-		// the chain; the caller can re-sync and retry.
-		return "", fmt.Errorf("RPC error: %s", res.Error.Message)
+		return nil, fmt.Errorf("RPC error: %s", res.Error.Message)
 	}
 	if res.Result == "" {
-		return "", fmt.Errorf("node returned no transaction hash")
+		return nil, fmt.Errorf("node returned no transaction hash")
 	}
+	return tx, nil
+}
 
-	txHash := tx.Hash().String()
-	s.nextNonce++
-	return txHash, nil
+// waitBlock waits until the chain head reaches height h (or the timeout).
+func (s *signer) waitBlock(h uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var res struct {
+			Result string `json:"result"`
+		}
+		if err := rpcJSON(s.rpcURL, "eth_blockNumber", []any{}, &res); err == nil && strings.HasPrefix(res.Result, "0x") {
+			if n, err := strconv.ParseUint(res.Result[2:], 16, 64); err == nil && n >= h {
+				return nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for block %d", h)
 }
 
 // waitForReceipt polls for the receipt and reports whether the tx was
-// confirmed on chain with status 0x1.
-func (s *signer) waitForReceipt(txHash string, timeout time.Duration) bool {
+// confirmed on chain with status 0x1, plus the inclusion block number (0
+// when unknown).
+func (s *signer) waitForReceipt(txHash string, timeout time.Duration) (bool, uint64) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var res struct {
@@ -286,15 +399,22 @@ func (s *signer) waitForReceipt(txHash string, timeout time.Duration) bool {
 		if err := rpcJSON(s.rpcURL, "eth_getTransactionReceipt",
 			[]any{txHash}, &res); err == nil {
 			var receipt struct {
-				Status string `json:"status"`
+				Status      string `json:"status"`
+				BlockNumber string `json:"blockNumber"`
 			}
 			if json.Unmarshal(res.Result, &receipt) == nil && receipt.Status != "" {
-				return receipt.Status == "0x1"
+				var incl uint64
+				if strings.HasPrefix(receipt.BlockNumber, "0x") {
+					if n, err := strconv.ParseUint(receipt.BlockNumber[2:], 16, 64); err == nil {
+						incl = n
+					}
+				}
+				return receipt.Status == "0x1", incl
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return false
+	return false, 0
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +524,7 @@ func main() {
 	}
 
 	// 2. Initialize the signer (validates key/nonce/balance).
-	s, err := newSigner(cfg.keyFile, cfg.chainID, cfg.rpcURL)
+	s, err := newSigner(cfg.keyFile, cfg.chainID, cfg.rpcURL, cfg.confirmTimeout)
 	if err != nil {
 		fatal("failed to initialize signer: %v", err)
 	}
@@ -443,16 +563,19 @@ func main() {
 		}
 		fmt.Printf("  → #%d submitted %s, waiting for confirmation...\n", r.ID, txHash)
 
-		if !s.waitForReceipt(txHash, cfg.confirmTimeout) {
+		ok, _ := s.waitForReceipt(txHash, cfg.confirmTimeout)
+		if !ok {
 			fmt.Printf("  ✗ #%d receipt timeout (tx %s state unknown — resolve manually)\n", r.ID, txHash)
 			failures = append(failures, map[string]any{"id": r.ID, "note": "receipt timeout, tx " + txHash})
 			sentFail++
 			continue
 		}
 
-		// 4. Write the txHash back to the website.
+		// 4. Write the txHash back to the website. The site validates the
+		// EVM-style 0x-prefixed form (InputValidator.isValidTxHash), while
+		// tx.Hash().String() returns bare 64-hex — normalize at the boundary.
 		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
-			cfg.adminKey, "POST", map[string]any{"id": r.ID, "txHash": txHash}, nil); err != nil {
+			cfg.adminKey, "POST", map[string]any{"id": r.ID, "txHash": "0x" + txHash}, nil); err != nil {
 			fmt.Printf("  ⚠ #%d on chain but write-back failed (tx %s): %v — record manually\n", r.ID, txHash, err)
 			// An on-chain transfer is never rolled back when the write-back
 			// fails; resolve manually, and mark the record as sent before

@@ -9,7 +9,8 @@ import (
 
 // R117-STALLLOOP (2026-10-20): both stall-clear sites used to discard the
 // ENTIRE sync buffer, including the currentH+1 block that is the only key to
-// resuming inserts. The consequence on node-G was a self-sustaining 60s loop:
+// resuming inserts. The consequence on a production sealer was a
+// self-sustaining 60s loop:
 // clear throws away block N+1 and N+1's parent (which the insert loop had
 // not written yet) → every re-delivery arrives parentless →
 // ErrParentNotFound → no insert advances → 30s later, clear again.

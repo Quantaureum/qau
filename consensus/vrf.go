@@ -331,7 +331,7 @@ func hashProofOptimized(proof []byte) types.Hash {
 		hasher = sha3.NewLegacyKeccak256()
 	}
 	hasher.Reset()
-	hasher.Write(proof)
+	_, _ = hasher.Write(proof)
 	var out types.Hash
 	copy(out[:], hasher.Sum(nil)[:types.HashLength])
 	return out

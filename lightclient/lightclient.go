@@ -28,9 +28,15 @@ var (
 	ErrTxNotFound             = errors.New("transaction not found")
 	ErrStateNotFound          = errors.New("state not found")
 	ErrInvalidStateProof      = errors.New("invalid state proof")
-	ErrSyncInProgress         = errors.New("sync in progress")
-	ErrNotSynced              = errors.New("not synced")
-	ErrNoTrustedValidator     = errors.New("no trusted validator configured")
+	// ErrProofNotSupported is returned by the SPV prover when the node's state
+	// backend cannot produce a state-root-bound proof at all (no live Verkle
+	// trie). R6-02 (2026-10-21 sixth-round audit): callers must treat this as
+	// "no proof available", never as "state not found", and must not fall back
+	// to a placeholder proof.
+	ErrProofNotSupported  = errors.New("state proof backend unavailable")
+	ErrSyncInProgress     = errors.New("sync in progress")
+	ErrNotSynced          = errors.New("not synced")
+	ErrNoTrustedValidator = errors.New("no trusted validator configured")
 )
 
 // Checkpoint represents a trusted checkpoint for fast sync
@@ -371,12 +377,12 @@ func (s *HeaderSyncer) VerifyHeaderChain(headers []*encoding.BlockHeader) error 
 			return ErrInvalidHeader
 		}
 
-		// Verify sync committee signature if available
+		// R3-01: a header carrying sync committee data must never be accepted
+		// while no committee is loaded. VerifyBlockHeader already returns
+		// ErrSyncCommitteeNotAvailable for that case; propagating the error
+		// keeps the whole chain fail-closed instead of skipping the header.
 		if s.syncCommitteeVerifier != nil {
 			if err := s.syncCommitteeVerifier.VerifyBlockHeader(curr); err != nil {
-				if err == ErrSyncCommitteeNotAvailable {
-					continue // Skip if no committee data yet
-				}
 				return fmt.Errorf("sync committee verification failed at height %d: %w", curr.Height, err)
 			}
 		}

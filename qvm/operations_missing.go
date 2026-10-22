@@ -619,6 +619,13 @@ func (i *Interpreter) opCallCode(env *Environment) error {
 	// transfer so revert undoes it). This matches opCall's ordering where
 	// Snapshot is taken after MaxCallDepth and PushActiveAddress checks.
 	snapshot := env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the state journal is full, so this frame
+		// could not be journaled. Refuse the call like the depth guards do
+		// instead of running a frame with no rollback path.
+		env.activeAddresses = env.activeAddresses[:savedActiveLen]
+		return env.stack.PushUint64(0)
+	}
 
 	// FIX: CALLCODE transfers value from caller to target address,
 	// consistent with EVM Yellow Paper and JIT path ( fix).
@@ -703,6 +710,9 @@ func (i *Interpreter) opCallCode(env *Environment) error {
 		// R5-P3-2 FIX: Use the success return value instead of Peek-ing the stack.
 		if !success {
 			env.stateDB.RevertToSnapshot(snapshot)
+		} else {
+			// R4-08: the frame succeeded, release its journal entry.
+			releaseFrame(env.stateDB, snapshot)
 		}
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		return err
@@ -729,6 +739,11 @@ func (i *Interpreter) opCallCode(env *Environment) error {
 		// CRIT-1 FIX: Restore activeAddresses on revert as well
 		env.activeAddresses = env.activeAddresses[:savedActiveLen]
 		env.stateDB.RevertToSnapshot(snapshot)
+	}
+
+	// R4-08 (2026-10-21 audit): release the consumed frame entry (see opCall).
+	if !result.Reverted {
+		releaseFrame(env.stateDB, snapshot)
 	}
 
 	// Store return data
@@ -1312,6 +1327,12 @@ func (i *Interpreter) opCreateGeneric(env *Environment, isCreate2 bool) error {
 
 	// Take a snapshot before making any changes
 	snapshot := env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): see the opCall journaling guard — a CREATE
+		// frame that cannot be journaled must fail instead of deploying with no
+		// rollback path.
+		return env.stack.Push(AddressToWord(Address{}))
+	}
 
 	// FIX: Use env.ctx.Address (the current contract executing CREATE)
 	// instead of env.ctx.Caller (who called this contract). In EVM, the CREATE
@@ -1742,6 +1763,10 @@ func (i *Interpreter) opCreateGeneric(env *Environment, isCreate2 bool) error {
 	if createResult != nil {
 		env.logs = append(env.logs, createResult.Logs...)
 	}
+
+	// R4-08 (2026-10-21 audit): deployment succeeded, so the CREATE frame's
+	// journal entry has no remaining consumer — release it.
+	releaseFrame(env.stateDB, snapshot)
 
 	// Push contract address on success
 	return env.stack.Push(AddressToWord(contractAddr))

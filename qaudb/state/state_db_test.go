@@ -580,28 +580,149 @@ func TestSnapshot_RevertToSnapshot_Nested(t *testing.T) {
 	}
 }
 
-func TestRevertToSnapshot_InvalidID(t *testing.T) {
+func TestRevertToSnapshot_InvalidIDPreservesState(t *testing.T) {
 	sdb := NewStateDB()
 	addr := testAddr(1)
 	sdb.SetBalance(addr, big.NewInt(100))
 
-	// Invalid snapshot ID should clear all dirty state (legacy behavior)
+	// R4-07 (2026-10-21 audit): an unresolvable snapshot ID must not destroy
+	// dirty state (the legacy fallback wiped every pending change). Instead the
+	// next Commit fails closed.
 	sdb.RevertToSnapshot(-1)
-	if sdb.GetBalance(addr).Cmp(big.NewInt(0)) != 0 {
-		t.Errorf("expected zero balance after invalid snapshot revert, got %s", sdb.GetBalance(addr))
+	if sdb.GetBalance(addr).Cmp(big.NewInt(100)) != 0 {
+		t.Errorf("dirty state must survive an unknown snapshot id, got %s", sdb.GetBalance(addr))
+	}
+	if _, err := sdb.Commit(1); err == nil {
+		t.Error("expected Commit to fail closed after an unknown snapshot revert")
 	}
 }
 
-func TestRevertToSnapshot_IDTooLarge(t *testing.T) {
+func TestRevertToSnapshot_IDTooLargePreservesState(t *testing.T) {
 	sdb := NewStateDB()
 	addr := testAddr(1)
 	sdb.SetBalance(addr, big.NewInt(100))
 
-	// Snapshot ID larger than stack should also clear all dirty state
+	// A snapshot ID past the top of the stack means this frame's entry was
+	// already discarded by another frame: touch nothing, fail the Commit closed.
 	sdb.RevertToSnapshot(999)
-	if sdb.GetBalance(addr).Cmp(big.NewInt(0)) != 0 {
-		t.Errorf("expected zero balance after too-large snapshot revert, got %s", sdb.GetBalance(addr))
+	if sdb.GetBalance(addr).Cmp(big.NewInt(100)) != 0 {
+		t.Errorf("dirty state must survive a too-large snapshot id, got %s", sdb.GetBalance(addr))
 	}
+	if _, err := sdb.Commit(1); err == nil {
+		t.Error("expected Commit to fail closed after a too-large snapshot revert")
+	}
+}
+
+// TestRevertToSnapshot_DepthExhaustionRollsBackOutermostFrame pins the
+// id<0 branch when snapshots ARE still journaled: the caller could not journal
+// its own frame (depth exhaustion), so the in-flight frame chain is abandoned
+// by restoring the outermost snapshot instead of zeroing everything.
+func TestRevertToSnapshot_DepthExhaustionRollsBackOutermostFrame(t *testing.T) {
+	sdb := NewStateDB()
+	addr := testAddr(1)
+	outerAddr := testAddr(2)
+
+	// Frame that completed earlier: its writes are already part of the block.
+	sdb.SetBalance(outerAddr, big.NewInt(700))
+	frame := sdb.Snapshot() // outermost outstanding snapshot
+	if frame != 0 {
+		t.Fatalf("expected the first snapshot id to be 0, got %d", frame)
+	}
+
+	sdb.SetBalance(addr, big.NewInt(100))
+	_ = sdb.Snapshot() // nested frame
+
+	// Depth-exhaustion sentinel: the in-flight frames are rolled back to the
+	// outermost snapshot, and the earlier account's write survives.
+	sdb.RevertToSnapshot(-1)
+	if sdb.GetBalance(addr).Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("in-flight frame writes must be rolled back, got %s", sdb.GetBalance(addr))
+	}
+	if sdb.GetBalance(outerAddr).Cmp(big.NewInt(700)) != 0 {
+		t.Errorf("previously staged writes must survive, got %s", sdb.GetBalance(outerAddr))
+	}
+	if sdb.SnapshotDepth() != 0 {
+		t.Errorf("expected the abandoned frame chain to clear the stack, got depth %d", sdb.SnapshotDepth())
+	}
+	if _, err := sdb.Commit(1); err != nil {
+		t.Errorf("Commit must stay available after a sound outermost rollback: %v", err)
+	}
+}
+
+// TestReleaseSnapshot_KeepsWritesAndBalancesStack verifies that releasing a
+// finished frame drops its journal slot without rewinding anything (R4-07: a
+// long-lived StateDB otherwise drifts to maxSnapshotDepth).
+func TestReleaseSnapshot_KeepsWritesAndBalancesStack(t *testing.T) {
+	sdb := NewStateDB()
+	addr := testAddr(1)
+
+	sdb.SetBalance(addr, big.NewInt(100))
+	frame := sdb.Snapshot()
+	sdb.SetBalance(addr, big.NewInt(250))
+	_ = sdb.Snapshot() // leaked nested frame
+
+	sdb.ReleaseSnapshot(frame)
+
+	if sdb.SnapshotDepth() != 0 {
+		t.Fatalf("expected the frame and everything nested in it to be released, got depth %d", sdb.SnapshotDepth())
+	}
+	if sdb.GetBalance(addr).Cmp(big.NewInt(250)) != 0 {
+		t.Fatalf("ReleaseSnapshot must not rewind state, got %s", sdb.GetBalance(addr))
+	}
+	// Releasing an unknown id is inert.
+	sdb.ReleaseSnapshot(42)
+	if sdb.GetBalance(addr).Cmp(big.NewInt(250)) != 0 {
+		t.Fatalf("unknown release must be inert, got %s", sdb.GetBalance(addr))
+	}
+}
+
+// TestCommit_ClearsSnapshotStack verifies that a commit invalidates the
+// outstanding snapshots, which all journaled pre-commit dirty state (R4-07).
+func TestCommit_ClearsSnapshotStack(t *testing.T) {
+	sdb := NewStateDB()
+	addr := testAddr(1)
+
+	sdb.SetBalance(addr, big.NewInt(100))
+	_ = sdb.Snapshot()
+	if sdb.SnapshotDepth() != 1 {
+		t.Fatalf("expected one journaled snapshot, got %d", sdb.SnapshotDepth())
+	}
+	if _, err := sdb.Commit(1); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+	if sdb.SnapshotDepth() != 0 {
+		t.Fatalf("Commit must reset the snapshot stack, got depth %d", sdb.SnapshotDepth())
+	}
+}
+
+// TestExecutionFrameIsExclusive verifies the R4-07 execution lock: only one
+// top-level frame may be live on a StateDB at a time, speculative callers fail
+// fast while consensus holds the frame.
+func TestExecutionFrameIsExclusive(t *testing.T) {
+	sdb := NewStateDB()
+
+	release := sdb.BeginExecution()
+	if _, ok := sdb.TryBeginExecution(); ok {
+		release()
+		t.Fatal("TryBeginExecution must fail while the frame is held")
+	}
+	release()
+
+	second, ok := sdb.TryBeginExecution()
+	if !ok {
+		t.Fatal("TryBeginExecution must succeed once the frame is released")
+	}
+	if _, ok := sdb.TryBeginExecution(); ok {
+		second()
+		t.Fatal("two speculative frames must not be live at the same time")
+	}
+	second()
+
+	third, ok := sdb.TryBeginExecution()
+	if !ok {
+		t.Fatal("the frame must be reusable after release")
+	}
+	third()
 }
 
 // ==================== Revert ====================
@@ -632,12 +753,19 @@ func TestRevert_ClearsSnapshotStack(t *testing.T) {
 
 	sdb.Revert()
 
-	// After Revert, snapshot stack is cleared.
-	// RevertToSnapshot with previously valid ID should now clear everything.
+	// After Revert, the snapshot stack is cleared.
+	if sdb.SnapshotDepth() != 0 {
+		t.Fatalf("expected the snapshot stack to be cleared after Revert, got depth %d", sdb.SnapshotDepth())
+	}
+	// R4-07: an id that was valid before Revert is now unresolvable, so the new
+	// dirty state must survive and Commit must fail closed instead of wiping it.
 	sdb.SetBalance(testAddr(1), big.NewInt(200))
 	sdb.RevertToSnapshot(0) // was valid before Revert, now invalid
-	if sdb.GetBalance(testAddr(1)).Cmp(big.NewInt(0)) != 0 {
-		t.Error("expected snapshot stack to be cleared after Revert")
+	if sdb.GetBalance(testAddr(1)).Cmp(big.NewInt(200)) != 0 {
+		t.Error("expected a stale snapshot id to leave the dirty state untouched")
+	}
+	if _, err := sdb.Commit(1); err == nil {
+		t.Error("expected Commit to fail closed after the stale snapshot revert")
 	}
 }
 
@@ -829,12 +957,20 @@ func TestRollbackToHeight_ClearsSnapshots(t *testing.T) {
 		t.Fatalf("unexpected rollback error: %v", err)
 	}
 
-	// After rollback, snapshot stack is cleared.
-	// RevertToSnapshot with id 0 should clear everything (invalid snapshot)
+	// After rollback, snapshot stack is cleared. An ID that was valid before
+	// the rollback is now unresolvable: R4-07 guarantees it leaves state intact
+	// and fails the next Commit closed instead of wiping the dirty journal.
+	if sdb.SnapshotDepth() != 0 {
+		t.Fatalf("rollback must clear the snapshot stack, got depth %d", sdb.SnapshotDepth())
+	}
 	sdb.SetBalance(addr, big.NewInt(500))
 	sdb.RevertToSnapshot(0) // was valid before rollback, now invalid
-	// Balance should be cleared (from db/cache, not 500)
-	// This verifies snapshot stack was cleared by rollback
+	if sdb.GetBalance(addr).Cmp(big.NewInt(500)) != 0 {
+		t.Errorf("stale snapshot id must not wipe pending writes, got %s", sdb.GetBalance(addr))
+	}
+	if _, err := sdb.Commit(2); err == nil {
+		t.Error("expected Commit to fail closed after a stale snapshot id")
+	}
 }
 
 func TestRollbackToHeight_NoErrorOnEmptyHeight(t *testing.T) {

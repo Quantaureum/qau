@@ -8,9 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/quantaureum/qau/crypto"
@@ -24,10 +22,10 @@ type DeFiAPI struct {
 	blockReader BlockReader
 	chainID     uint64
 
-	// audit-fix R4-M1: nonce tracking for replay protection on signed DeFi operations.
-	// audit-fix M-3: track insertion time so eviction removes oldest entries.
-	nonceMu    sync.Mutex
-	usedNonces map[types.Address]map[string]time.Time // address -> nonce -> insertion time
+	// Replay protection for signed DeFi operations. The signed nonce carries
+	// the request deadline and reservations are persisted by the node when a
+	// replay store is configured.
+	replay *authReplayGuard
 
 	// FIX: optional admin allowlist for state-mutating DeFi operations.
 	// When non-empty, only addresses in this set may perform admin-gated
@@ -42,13 +40,6 @@ type DeFiAPI struct {
 	enforceAdminAuth bool
 }
 
-// maxNoncesPerAddress is the maximum number of tracked nonces per address.
-// audit-fix R4-M1: bounded to prevent unbounded memory growth.
-const maxNoncesPerAddress = 10000
-
-// maxDeFiTrackedAddresses is the maximum number of addresses tracked for DeFi nonces.
-const maxDeFiTrackedAddresses = 100000
-
 // NewDeFiAPI creates a new DeFi API
 func NewDeFiAPI(dm *economics.DeFiManager, br BlockReader) *DeFiAPI {
 	// FIX: Default enforceAdminAuth to true (fail-closed).
@@ -56,9 +47,17 @@ func NewDeFiAPI(dm *economics.DeFiManager, br BlockReader) *DeFiAPI {
 	return &DeFiAPI{
 		defiManager:      dm,
 		blockReader:      br,
-		usedNonces:       make(map[types.Address]map[string]time.Time),
+		replay:           newAuthReplayGuard("defi"),
 		enforceAdminAuth: true, //  fail-closed by default
 	}
+}
+
+// SetAuthReplayStore wires the persistent replay cache shared by all RPC APIs.
+func (api *DeFiAPI) SetAuthReplayStore(store *AuthReplayStore) {
+	if api.replay == nil {
+		api.replay = newAuthReplayGuard("defi")
+	}
+	api.replay.setStore(store)
 }
 
 func (api *DeFiAPI) SetChainID(id uint64) {
@@ -173,64 +172,34 @@ func (api *DeFiAPI) verifyDeFiSignature(method string, userAddr types.Address, n
 	if signature == "" || pubKeyHex == "" {
 		return fmt.Errorf("signature and publicKey are required for state-mutating DeFi operations")
 	}
-	if nonce == "" {
-		return fmt.Errorf("nonce is required for replay protection")
+	// The deadline is embedded in the nonce and therefore covered by the
+	// Dilithium3 signature. Expired requests are rejected before any nonce
+	// reservation or expensive cryptographic work.
+	deadline, err := ParseAuthNonceDeadline(nonce, time.Now())
+	if err != nil {
+		return err
 	}
-
-	// LOW-2 FIX: Reserve the nonce under lock with a "pending" marker (zero time).
-	// This closes the window between check and record where concurrent requests
-	// with the same nonce could both pass the uniqueness check.
-	// If signature verification fails, we roll back by deleting the pending entry.
-	api.nonceMu.Lock()
-	// FIX: check global limit regardless of whether address exists
-	if len(api.usedNonces) > maxDeFiTrackedAddresses {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("too many tracked addresses (memory limit)")
-	}
-	if api.usedNonces[userAddr] == nil {
-		api.usedNonces[userAddr] = make(map[string]time.Time)
-	}
-	// M-NEW-1 FIX: Evict nonces older than 10 minutes for time-based expiration.
-	const defiNonceTTL = 10 * time.Minute
-	now := time.Now()
-	for k, ts := range api.usedNonces[userAddr] {
-		if !ts.IsZero() && now.Sub(ts) > defiNonceTTL {
-			delete(api.usedNonces[userAddr], k)
-		}
-	}
-	if _, used := api.usedNonces[userAddr][nonce]; used {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("nonce already used (replay detected)")
-	}
-	// LOW-2 FIX: Mark nonce as pending (zero time = pending, non-zero = confirmed).
-	// Concurrent requests with the same nonce will see it as "used" and be rejected.
-	api.usedNonces[userAddr][nonce] = time.Time{} // zero Time = pending marker
-	api.nonceMu.Unlock()
 
 	// Parse signature
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
 	if err != nil {
-		api.rollbackPendingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid signature hex: %w", err)
 	}
 
 	// Parse public key
 	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
 	if err != nil {
-		api.rollbackPendingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid publicKey hex: %w", err)
 	}
 
 	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
 	if err != nil {
-		api.rollbackPendingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
 	}
 
 	// Verify the public key corresponds to the claimed address
 	derivedAddr := pubKey.Address()
 	if derivedAddr != userAddr {
-		api.rollbackPendingNonce(userAddr, nonce)
 		return fmt.Errorf("public key does not match claimed address")
 	}
 
@@ -241,50 +210,17 @@ func (api *DeFiAPI) verifyDeFiSignature(method string, userAddr types.Address, n
 
 	// Verify Dilithium3 signature
 	if !crypto.Verify(pubKey, message, sigBytes) {
-		api.rollbackPendingNonce(userAddr, nonce)
 		return fmt.Errorf("signature verification failed")
 	}
 
-	// LOW-2 FIX: Confirm the nonce by updating its timestamp from pending (zero) to now.
-	api.nonceMu.Lock()
-	// audit-fix M-3: evict oldest nonces (by insertion time) if limit reached,
-	// so that recently-used nonces are always retained for replay detection.
-	if len(api.usedNonces[userAddr]) >= maxNoncesPerAddress {
-		type nonceEntry struct {
-			nonce string
-			ts    time.Time
-		}
-		entries := make([]nonceEntry, 0, len(api.usedNonces[userAddr]))
-		for k, ts := range api.usedNonces[userAddr] {
-			if !ts.IsZero() {
-				entries = append(entries, nonceEntry{k, ts})
-			}
-		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].ts.Before(entries[j].ts)
-		})
-		for i := 0; i < len(entries)/2; i++ {
-			delete(api.usedNonces[userAddr], entries[i].nonce)
-		}
+	// Reserve only after the signature checks out: unauthenticated traffic must
+	// not drive persistent write transactions (R2-03). A concurrent duplicate
+	// still loses the race here, so a nonce is consumed at most once.
+	if err := api.replay.reserve(userAddr, nonce, deadline); err != nil {
+		return err
 	}
-	api.usedNonces[userAddr][nonce] = time.Now()
-	api.nonceMu.Unlock()
 
 	return nil
-}
-
-// rollbackPendingNonce removes a pending nonce reservation when signature verification fails.
-// LOW-2 FIX: This prevents nonces from being permanently consumed by failed requests,
-// while still blocking concurrent requests during the verification window.
-func (api *DeFiAPI) rollbackPendingNonce(userAddr types.Address, nonce string) {
-	api.nonceMu.Lock()
-	defer api.nonceMu.Unlock()
-	if nonces, ok := api.usedNonces[userAddr]; ok {
-		// Only delete if still in pending state (zero time) — don't delete confirmed nonces
-		if ts, exists := nonces[nonce]; exists && ts.IsZero() {
-			delete(nonces, nonce)
-		}
-	}
 }
 
 // extractDeFiAuth extracts nonce, signature and publicKey from args for authenticated operations.

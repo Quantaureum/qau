@@ -1,0 +1,38 @@
+# F-08 (2026-10-21): strict static-analysis pass over the security- and
+# correctness-critical package trees. .golangci.yml intentionally keeps the
+# staged global rollout (govet/gosec/hygiene) while errcheck/staticcheck are
+# cleaned up package by package; this file turns both on for the trees that
+# matter most and is wired into CI as its own step:
+#
+#   golangci-lint run -c .golangci-strict.yml \
+#     ./crypto/... ./consensus/... ./rpc/... ./qaudb/... ./qvm/...
+#
+# Test files are excluded from this first pass: the production code is what
+# guards funds/consensus, and the errcheck cleanup for test fixtures would be
+# large, low-value churn. Revisit once the remaining trees are migrated.
+version: "2"
+run:
+  go: "1.26"
+  modules-download-mode: readonly
+linters:
+  default: none
+  enable:
+    - errcheck
+    - staticcheck
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - staticcheck
+        path: _test\.go
+issues:
+  max-issues-per-linter: 200
+  max-same-issues: 200
+severity:
+  default: warning

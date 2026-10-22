@@ -65,6 +65,7 @@ func testReshareNodeLocalShare(t *testing.T, all map[dilithium3v1.RSSGroupMask]d
 	}
 	publicKey := make([]byte, 1952)
 	publicKey[0] = 0xAA
+	publicKey[32] = 0x01 // t1 must not be all-zero (F-06 degenerate-key rejection)
 	return &dilithium3v1.LocalShare{
 		Protocol: protocol.ThresholdProtocolDilithium3V1,
 		Key: protocol.ThresholdKeyID{

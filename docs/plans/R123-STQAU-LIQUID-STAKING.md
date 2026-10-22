@@ -69,14 +69,14 @@ R122 §8 upon landing.
 | transaction type | `TxTypeStake`; `To` must equal `0x…1001` (R38-P0-02 strict AND check) | `node/node.go:5203` ||
 | posting path | `syncStakingFromBlock` -> `AddStakeFromTx` -> QPOS `AddStakingValidator` | `node/node.go:5158,5209,5226` ||
 | minimum stake | 32 QAU (new stakers; top-ups unrestricted for existing) | `economics/staking.go:282`, `consensus/validator_manager.go:75` ||
-| commission | 100–1500 bps（1%–15%） | `economics/staking.go:288-292` |
+| commission | 100–1500 bps (1%–15%) | `economics/staking.go:288-292` |
 | unbonding period | 151,200 blocks = 21 days @12s/slot | `economics/staking.go:279` ||
 | unlock check | `currentHeight >= request.UnlockHeight` | `economics/staking.go:1692` ||
 
 ### 1.2 Reward flow (EM-2, deterministic recomputation)
 
 - Formula: `stake × 31 / sqrt(total_staked)` (gwei), 87.5% attester / 12.5% proposer
-  （`consensus/epoch.go:356` `CalculateBaseReward`，`consensus/block.go:59`）。
+  (`consensus/epoch.go:356` `CalculateBaseReward`, `consensus/block.go:59`).
 - The **epoch boundary block header embeds the attestation census**; every node deterministically recomputes the same rewards
   (`node/syncer.go:1412` `applyEpochRewards`, CNS-EPH-001) -> **credited directly via `stateDB.AddBalance`
   to the validator address (native balance)**. Rewards never pass through any QVM contract.
@@ -281,13 +281,13 @@ The gas ceiling follows the R122 convention: GasLimit 5M per tx (`QAU_DEPLOY_GAS
 - [x] `qswap_smoke` extension segments all green (§4.4) ✅ stQAU segment + reorg-settle defenses
 - [x] **First-pool creation + swap out exact to wei** (aligned with R122's acceptance bar)
   ✅ stQAU/wQAU pool opened at 23.6:20.3; swap exit out matches getAmountOut exactly (same-source gas diff);
-      unlock=head+151200 drift=0；lock-rate implied==live rate
+      unlock=head+151200 drift=0; lock-rate implied==live rate
 
 ### Phase 4 — mainnet runbook + docs (1d)
 - [x] `QSWAP-Mainnet-Runbook.md`: the stQAU section (deployment parameters, operator SOP, key-separation guidance —
   owner key ≠ validator key ≠ wallet key) ✅ one-command five-contract deploy + §3b operator SOP +
   stQAU ABI table + the four localtest pitfalls
-      owner key ≠ validator key ≠ wallet key）
+      owner key ≠ validator key ≠ wallet key)
 - [x] Note added to R122 §8 on the numbering shift (already present); this document's status -> Done ✅
 
 **Dependency ordering**: R122's mainnet write-back (after the 72h window) does **not** block R123 development, but before the first pool opens

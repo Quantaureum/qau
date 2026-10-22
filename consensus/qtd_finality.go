@@ -411,7 +411,7 @@ func (qfs *QTDFinalityState) setQTDSignerLocked(signer ThresholdKeySigner, activ
 		// to consumers that call mode3.Verify / crypto.Verify against
 		// it. We block the all-zero seed here at the write-side single
 		// chokepoint so the table NEVER carries the degenerate key —
-		// constant-time comparison via crypto.IsZeroPublicKeyBytes (same
+		// constant-time comparison via crypto.IsDegeneratePublicKeyBytes (same
 		// helper used by the canonical R37 hardening at
 		// crypto/verify.go:73). We intentionally do NOT enforce a
 		// strict `len == Dilithium3PublicKeySize` length guard here:
@@ -437,7 +437,7 @@ func (qfs *QTDFinalityState) setQTDSignerLocked(signer ThresholdKeySigner, activ
 		// implementation. Strict length + non-zero is the canonical Dilithium3
 		// group-key invariant.
 		if gpk := signer.GroupPublicKey(); len(gpk) == crypto.Dilithium3PublicKeySize {
-			if crypto.IsZeroPublicKeyBytes(gpk) {
+			if crypto.IsDegeneratePublicKeyBytes(gpk) {
 				// len==Dilithium3PublicKeySize AND all-zero — the
 				// canonical degenerate "DKG not initialized" key.
 				// Reject at the chokepoint: do NOT write it into the
@@ -2033,7 +2033,7 @@ func (qfs *QTDFinalityState) SetQTDSignerForEpoch(signer ThresholdKeySigner, act
 // Re-rooting purges every entry whose key differs from key, then installs key
 // at epoch. Fresh tables (empty) are left alone except for the install.
 func (qfs *QTDFinalityState) ReRootGroupKeyCustody(epoch uint64, key []byte) {
-	if qfs == nil || len(key) != crypto.Dilithium3PublicKeySize || crypto.IsZeroPublicKeyBytes(key) {
+	if qfs == nil || len(key) != crypto.Dilithium3PublicKeySize || crypto.IsDegeneratePublicKeyBytes(key) {
 		return
 	}
 	qfs.mu.Lock()
@@ -2130,7 +2130,7 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 			// "EMPTY group key" test in qtd_h03_test.go.
 			return nil
 		}
-		if crypto.IsZeroPublicKeyBytes(key) {
+		if crypto.IsDegeneratePublicKeyBytes(key) {
 			qtdLogger.Warn("R38-P1-01: QTD group key read-back rejected (all zeros)",
 				map[string]any{
 					"epoch":  epoch,
@@ -2197,9 +2197,9 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 // (so the anchor continues an unbroken chain of custody), or we hold no keys
 // at all and the anchored epoch equals the lowest boundary we have seen this
 // sync (an observer's first establishment; its legitimacy source is the offline
-// ceremony's deployment record, which is how verify-only class nodes got their keys
-// before this path existed). A skip-ahead anchor (epoch E > maxKnown+1 with
-// history present) is REFUSED, not adopted: a rotation-money-forwarding from an
+// ceremony's deployment record, which is how ceremony-only observer nodes got
+// their keys before this path existed). A skip-ahead anchor (epoch
+// E > maxKnown+1 with history present) is REFUSED, not adopted: a rotation-money-forwarding from an
 // anchoring point you never established must not teach observers a new key.
 // Already-known keys are cross-checked (a mismatch is reported and rejected,
 // never silently overwritten). All inputs pass the write-side length/non-zero
@@ -2213,7 +2213,7 @@ func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []
 	if qfs == nil || len(key) == 0 {
 		return false
 	}
-	if len(key) != crypto.Dilithium3PublicKeySize || crypto.IsZeroPublicKeyBytes(key) {
+	if len(key) != crypto.Dilithium3PublicKeySize || crypto.IsDegeneratePublicKeyBytes(key) {
 		qtdLogger.Warn("QTD anchored group key rejected (bad length/zero)",
 			map[string]any{"epoch": epoch, "len": len(key)})
 		return false

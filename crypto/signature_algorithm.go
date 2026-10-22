@@ -86,7 +86,7 @@ func VerifySignatureForAlgorithm(
 	if len(signature) != algorithm.SignatureSize() {
 		return fmt.Errorf("%w: %s signature length", ErrInvalidSignature, algorithm)
 	}
-	if IsZeroPublicKeyBytes(publicKey) {
+	if IsDegeneratePublicKeyBytes(publicKey) {
 		return fmt.Errorf("%w: %s public key is zero", ErrInvalidPublicKey, algorithm)
 	}
 

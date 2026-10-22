@@ -55,7 +55,14 @@ type DB interface {
 
 - Pedersen commitment serves as the commitment scheme, together with `ipa.go` (Inner Product Argument).
 - The root is updated once per block commit and written into the block header's state_root.
-- Used for RPC `eth_getProof` / cross-chain bridge proof generation.
+- Leaves are **accounts** (`nonce`, `balance`, `codeHash`, `storageRoot`). Committed
+  storage slots go to the bolt key-value store under a separate prefix and are never
+  state-trie keys; state reconstruction from disk iterates accounts only. So a proof
+  generated against `state_root` can speak about accounts, not about slot contents —
+  `ProveStorage` returns an exclusion proof for a slot that holds a value (R6-05).
+- Used for RPC `eth_getProof` / cross-chain bridge proof generation, with the scope
+  above: `eth_getProof` storage entries carry `"unverified": true` and the light-client
+  state-proof methods refuse `storageKeys` outright.
 
 ### 3.1.5 `qaudb/cache/`
 

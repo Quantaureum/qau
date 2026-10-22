@@ -917,7 +917,7 @@ func (q *QPOS) MarkPendingDeactivationAddr(addr types.Address) {
 // isPendingDeactivation checks if a validator (by index) is pending
 // deactivation. Caller must hold q.mu (read or write).
 func (q *QPOS) isPendingDeactivation(validatorIndex int) bool {
-	if q.pendingDeactivationAddrs == nil || len(q.pendingDeactivationAddrs) == 0 {
+	if len(q.pendingDeactivationAddrs) == 0 {
 		return false
 	}
 	v := q.validators.GetValidatorByIndex(validatorIndex)
@@ -951,7 +951,7 @@ func (q *QPOS) CleanupStalePendingDeactivation() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.pendingDeactivationAddrs == nil || len(q.pendingDeactivationAddrs) == 0 {
+	if len(q.pendingDeactivationAddrs) == 0 {
 		return
 	}
 

@@ -371,6 +371,12 @@ func (a *jitEnvAdapter) Call(caller jit.Address, addr jit.Address, input []byte,
 	// This is NOT the original tx sender (Origin) — it's the contract that
 	// executed the CALL opcode. Using Origin here would be incorrect.
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08 (2026-10-21 audit): the state journal is full, so fail the call
+		// instead of running a frame with no rollback path. Mirrors the
+		// interpreter's opCall guard so both execution paths agree.
+		return nil, gas, fmt.Errorf("state journal depth exhausted")
+	}
 	if value != nil && value.Sign() > 0 {
 		callerBalance := a.env.stateDB.GetBalance(a.env.ctx.Address)
 		if callerBalance.Cmp(value) < 0 {
@@ -431,6 +437,10 @@ func (a *jitEnvAdapter) Call(caller jit.Address, addr jit.Address, input []byte,
 	// V21-005 FIX: Revert value transfer on error
 	if result.Err != nil {
 		a.env.stateDB.RevertToSnapshot(snapshot)
+	} else {
+		// R4-08 (2026-10-21 audit): the frame succeeded, release its journal
+		// entry instead of leaking a stack slot per completed sub-call.
+		releaseFrame(a.env.stateDB, snapshot)
 	}
 
 	var err error
@@ -455,6 +465,10 @@ func (a *jitEnvAdapter) CallCode(caller jit.Address, addr jit.Address, input []b
 
 	// FIX: Value transfer and state snapshot/revert (was missing)
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the Call guard.
+		return nil, gas, fmt.Errorf("state journal depth exhausted")
+	}
 	if value != nil && value.Sign() > 0 {
 		callerBalance := a.env.stateDB.GetBalance(a.env.ctx.Address)
 		if callerBalance.Cmp(value) < 0 {
@@ -518,6 +532,9 @@ func (a *jitEnvAdapter) CallCode(caller jit.Address, addr jit.Address, input []b
 	// FIX: Revert value transfer on error
 	if result.Err != nil {
 		a.env.stateDB.RevertToSnapshot(snapshot)
+	} else {
+		// R4-08: release the completed frame entry (see Call).
+		releaseFrame(a.env.stateDB, snapshot)
 	}
 
 	var err error
@@ -594,6 +611,10 @@ func (a *jitEnvAdapter) DelegateCall(caller jit.Address, addr jit.Address, input
 	// pollute the caller's storage via DELEGATECALL to a contract that REVERTs
 	// partway through, bypassing reentrancy locks or authorization checks.
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the Call guard.
+		return nil, gas, fmt.Errorf("state journal depth exhausted")
+	}
 
 	result := a.interpreter.Execute(callCtx, a.env.stateDB)
 	a.lastReturnData = result.ReturnData
@@ -601,6 +622,9 @@ func (a *jitEnvAdapter) DelegateCall(caller jit.Address, addr jit.Address, input
 	// QVM-FIX: Roll back state on error, matching Call's behavior.
 	if result.Err != nil {
 		a.env.stateDB.RevertToSnapshot(snapshot)
+	} else {
+		// R4-08: release the completed frame entry (see Call).
+		releaseFrame(a.env.stateDB, snapshot)
 	}
 
 	var err error
@@ -667,6 +691,10 @@ func (a *jitEnvAdapter) StaticCall(caller jit.Address, addr jit.Address, input [
 	// to slip through the ReadOnly check. The snapshot + revert pattern is
 	// a defense-in-depth measure matching Call/DelegateCall behavior.
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the Call guard.
+		return nil, gas, fmt.Errorf("state journal depth exhausted")
+	}
 
 	result := a.interpreter.Execute(callCtx, a.env.stateDB)
 	a.lastReturnData = result.ReturnData
@@ -674,6 +702,9 @@ func (a *jitEnvAdapter) StaticCall(caller jit.Address, addr jit.Address, input [
 	// QVM-FIX: Roll back state on error, matching Call's behavior.
 	if result.Err != nil {
 		a.env.stateDB.RevertToSnapshot(snapshot)
+	} else {
+		// R4-08: release the completed frame entry (see Call).
+		releaseFrame(a.env.stateDB, snapshot)
 	}
 
 	var err error
@@ -752,9 +783,14 @@ func (a *jitEnvAdapter) Create(caller jit.Address, input []byte, gas uint64, val
 	// (opCreateGeneric line 1378-1379) correctly does both halves via
 	// AddBalance on the contract account; mirror that here.
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the Call guard.
+		return nil, jit.Address{}, gas, fmt.Errorf("state journal depth exhausted")
+	}
 	if value != nil && value.Sign() > 0 {
 		callerBalance := a.env.stateDB.GetBalance(qCaller)
 		if callerBalance.Cmp(value) < 0 {
+			releaseFrame(a.env.stateDB, snapshot)
 			return nil, jit.Address{}, gas, fmt.Errorf("insufficient balance for value transfer")
 		}
 		a.env.stateDB.SetBalance(qCaller, new(big.Int).Sub(callerBalance, value))
@@ -943,6 +979,10 @@ func (a *jitEnvAdapter) Create(caller jit.Address, input []byte, gas uint64, val
 		a.env.txCreatedContracts[contractAddr] = true
 	}
 
+	// R4-08 (2026-10-21 audit): deployment succeeded, so the CREATE frame's
+	// journal entry has no remaining consumer — release it.
+	releaseFrame(a.env.stateDB, snapshot)
+
 	return result.ReturnData, addrToJIT(contractAddr), result.GasUsed, nil
 }
 
@@ -1003,9 +1043,14 @@ func (a *jitEnvAdapter) AuthCall(caller jit.Address, addr jit.Address, input []b
 
 	// Value transfer with snapshot/revert
 	snapshot := a.env.stateDB.Snapshot()
+	if snapshot < 0 {
+		// R4-08: see the Call guard.
+		return nil, gas, fmt.Errorf("state journal depth exhausted")
+	}
 	if value != nil && value.Sign() > 0 {
 		callerBalance := a.env.stateDB.GetBalance(qCaller)
 		if callerBalance.Cmp(value) < 0 {
+			releaseFrame(a.env.stateDB, snapshot)
 			return nil, gas, fmt.Errorf("insufficient balance for value transfer")
 		}
 		a.env.stateDB.SetBalance(qCaller, new(big.Int).Sub(callerBalance, value))
@@ -1014,7 +1059,7 @@ func (a *jitEnvAdapter) AuthCall(caller jit.Address, addr jit.Address, input []b
 	}
 
 	// Determine effective caller: authorized address if set, otherwise current
-	var effectiveCaller Address = qCaller
+	effectiveCaller := qCaller
 	if a.env.authorizedAddress != nil {
 		effectiveCaller = *a.env.authorizedAddress
 	}
@@ -1046,6 +1091,9 @@ func (a *jitEnvAdapter) AuthCall(caller jit.Address, addr jit.Address, input []b
 
 	if result.Err != nil {
 		a.env.stateDB.RevertToSnapshot(snapshot)
+	} else {
+		// R4-08: release the completed frame entry (see Call).
+		releaseFrame(a.env.stateDB, snapshot)
 	}
 
 	a.lastReturnData = result.ReturnData

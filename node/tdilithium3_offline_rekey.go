@@ -54,7 +54,7 @@ func parseTDilithium3TrustedGroupKey(encoded string) ([]byte, error) {
 	if len(key) != qcrypto.Dilithium3PublicKeySize {
 		return nil, fmt.Errorf("%d bytes, want %d", len(key), qcrypto.Dilithium3PublicKeySize)
 	}
-	if qcrypto.IsZeroPublicKeyBytes(key) {
+	if qcrypto.IsDegeneratePublicKeyBytes(key) {
 		return nil, fmt.Errorf("all-zero key")
 	}
 	return key, nil

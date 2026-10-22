@@ -61,7 +61,7 @@ func VerifyBinary(binaryPath string, signaturePath string, publicKeyHex string) 
 	// never fires in production. But if a configuration mistake / disk
 	// corruption produced an all-zero pubkey hex, mode3.Verify might
 	// accept a forged zero signature — fail-closed here eliminates that.
-	if crypto.IsZeroPublicKeyBytes(pubKeyBytes) {
+	if crypto.IsDegeneratePublicKeyBytes(pubKeyBytes) {
 		return fmt.Errorf("invalid public key: all zeros (unconfigured or tampered)")
 	}
 

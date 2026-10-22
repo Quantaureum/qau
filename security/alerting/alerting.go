@@ -810,6 +810,11 @@ type PagerDutyConfig struct {
 	RoutingKey  string // Integration/Routing key from PagerDuty
 	ServiceName string
 	Environment string
+	// DashboardURL is the operator's alert dashboard, referenced by the event
+	// "links". It is deliberately unset by default: an incident must not carry a
+	// destination that the deployment never declared, so Send omits the links
+	// array entirely when this is empty.
+	DashboardURL string
 }
 
 // PagerDutyChannel sends alerts to PagerDuty
@@ -835,6 +840,21 @@ func (p *PagerDutyChannel) IsEnabled() bool {
 }
 
 func (p *PagerDutyChannel) Close() error { return nil }
+
+// dashboardLinks returns the PagerDuty event links array. When no dashboard is
+// configured it yields a nil slice so the field marshals to JSON null and the
+// event carries no fabricated destination.
+func dashboardLinks(dashboardURL string) []map[string]string {
+	if dashboardURL == "" {
+		return nil
+	}
+	return []map[string]string{
+		{
+			"href": dashboardURL,
+			"text": "View in Dashboard",
+		},
+	}
+}
 
 func (p *PagerDutyChannel) Send(alert *Alert) error {
 	if !p.IsEnabled() {
@@ -874,12 +894,7 @@ func (p *PagerDutyChannel) Send(alert *Alert) error {
 				"details":     alert.Details,
 			},
 		},
-		"links": []map[string]string{
-			{
-				"href": "https://quantaureum.io/alerts",
-				"text": "View in Dashboard",
-			},
-		},
+		"links": dashboardLinks(p.config.DashboardURL),
 	}
 
 	data, err := json.Marshal(payload)

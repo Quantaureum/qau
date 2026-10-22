@@ -85,12 +85,14 @@ func GetVotingSystemCaller() types.Address {
 var (
 	// DefaultVoteTimeout is the default timeout for vote collection (2 seconds per requirement 5.1)
 	DefaultVoteTimeout = 2 * time.Second
+)
 
-	// QuorumThresholdNumerator is the numerator for quorum threshold (2/3)
-	QuorumThresholdNumerator = big.NewInt(2)
-
-	// QuorumThresholdDenominator is the denominator for quorum threshold (2/3)
-	QuorumThresholdDenominator = big.NewInt(3)
+// F-12: quorum is fixed at 2/3. These are constants (not exported *big.Int
+// variables) so another package cannot mutate the global quorum semantics at
+// runtime; big.Int values are built on demand at each use site.
+const (
+	quorumThresholdNumerator   int64 = 2
+	quorumThresholdDenominator int64 = 3
 )
 
 // VoteType represents the type of vote
@@ -764,12 +766,12 @@ func NewVoteSet(height uint64, round uint32, blockHash types.Hash, totalStake *b
 	// "at least 2/3" semantics. For N=3: ceil(2*3/3) = 2, so weight
 	// >= 2 reaches quorum (matches 3*voted >= 2*total). For N=6:
 	// ceil(2*6/3) = 4, weight >= 4 reaches quorum.
-	threshold := new(big.Int).Mul(totalStake, QuorumThresholdNumerator)
-	threshold.Div(threshold, QuorumThresholdDenominator)
+	threshold := new(big.Int).Mul(totalStake, big.NewInt(quorumThresholdNumerator))
+	threshold.Div(threshold, big.NewInt(quorumThresholdDenominator))
 	// Add 1 when there is a remainder (i.e. 2*totalStake not divisible by 3)
 	// to round up to the ceiling.
-	product := new(big.Int).Mul(totalStake, QuorumThresholdNumerator)
-	remainder := new(big.Int).Mod(product, QuorumThresholdDenominator)
+	product := new(big.Int).Mul(totalStake, big.NewInt(quorumThresholdNumerator))
+	remainder := new(big.Int).Mod(product, big.NewInt(quorumThresholdDenominator))
 	if remainder.Sign() != 0 {
 		threshold.Add(threshold, big.NewInt(1))
 	}

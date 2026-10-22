@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,7 +49,13 @@ var (
 	// are independent invariants and the audit's edge case only fires when
 	// the stake check passes (proposer holds the deposit exactly) but the
 	// free-balance check fails (no gas for Vote / ExecuteProposal txns).
-	ErrInsufficientFreeBalance     = errors.New("insufficient free balance for governance gas coverage")
+	ErrInsufficientFreeBalance = errors.New("insufficient free balance for governance gas coverage")
+	// R4-RES: returned by CreateProposal when the wired DepositLocker's
+	// LockDeposit fails (e.g. the reservation against the proposer's free
+	// balance cannot be applied). Kept separate from
+	// ErrInsufficientVotePower so callers can distinguish a deposit-lock
+	// failure from a genuine stake/vote-power failure.
+	ErrDepositLockFailed           = errors.New("deposit lock failed")
 	ErrProposalExists              = errors.New("proposal already exists")
 	ErrInvalidProposalType         = errors.New("invalid proposal type")
 	ErrParameterNotSupported       = errors.New("parameter not in governance whitelist")
@@ -98,6 +105,10 @@ const GovernanceProposalSignatureMethod = "qau_createProposal"
 //   - ProposerSig:    3293-byte Dilithium3 signature (crypto.Dilithium3SignatureSize).
 //   - Nonce:          the same base-10 uint64 string embedded in the signed
 //     message and used as the on-chain ProposerNonce.
+//   - Deadline:       base-10 unix timestamp (seconds) after which the
+//     signature must no longer be accepted. It is part of the
+//     signed message and therefore cannot be shortened or
+//     extended by a relay.
 //   - ChainID:        domain-separation tag (must match the chainID the
 //     RPC layer used when verifying). Cross-chain replay is
 //     rejected because the signed message includes this tag.
@@ -109,7 +120,7 @@ const GovernanceProposalSignatureMethod = "qau_createProposal"
 // The signed message format MUST byte-for-byte match what
 // rpc/governance_api.go verifyGovernanceSignature constructs:
 //
-//	"QAU-" + method + "|" + chainID + "|" + proposerHex + "|" + nonce + "|" + authParams
+//	"QAU-" + method + "|" + chainID + "|" + proposerHex + "|" + nonce + "|" + deadline + "|" + authParams
 //
 // where authParams = proposerHex + "|" + type + "|" + title + "|" +
 // description + "|" + deposit + "|" + totalVotePower + "|" + changesJSON.
@@ -117,8 +128,47 @@ type ProposalSignature struct {
 	ProposerPubKey []byte
 	ProposerSig    []byte
 	Nonce          string
+	Deadline       string
 	ChainID        uint64
 	TotalVotePower string
+}
+
+// proposalSignatureMaxValidity bounds how far in the future a proposal
+// signature deadline may sit, matching rpc.authDeadlineMaxValidity.
+const proposalSignatureMaxValidity = 10 * time.Minute
+
+// proposalSignaturePastSkew tolerates clock skew for signatures that were
+// produced just before they reached the node.
+const proposalSignaturePastSkew = 30 * time.Second
+
+// verifyProposalDeadline enforces the signed deadline at the core layer so a
+// caller that bypasses the RPC layer cannot use an expired signature.
+func verifyProposalDeadline(raw string, now time.Time) error {
+	if raw == "" {
+		return fmt.Errorf("%w: deadline is required", ErrGovernanceSignatureInvalid)
+	}
+	if len(raw) > 10 {
+		return fmt.Errorf("%w: invalid deadline", ErrGovernanceSignatureInvalid)
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return fmt.Errorf("%w: invalid deadline", ErrGovernanceSignatureInvalid)
+		}
+	}
+	deadlineUnix, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || deadlineUnix <= 0 {
+		return fmt.Errorf("%w: invalid deadline", ErrGovernanceSignatureInvalid)
+	}
+	deadline := time.Unix(deadlineUnix, 0)
+	if now.After(deadline.Add(proposalSignaturePastSkew)) {
+		return fmt.Errorf("%w: signature deadline expired at %s",
+			ErrGovernanceSignatureInvalid, deadline.UTC().Format(time.RFC3339))
+	}
+	if deadline.After(now.Add(proposalSignatureMaxValidity)) {
+		return fmt.Errorf("%w: signature deadline is too far in the future",
+			ErrGovernanceSignatureInvalid)
+	}
+	return nil
 }
 
 // ProposalType defines the type of governance proposal
@@ -480,11 +530,14 @@ type VotePowerAdjustedEvent struct {
 	Timestamp    int64
 }
 
-// DepositLocker abstracts the chain-state operation that actually charges a
-// governance proposal deposit. The economics package cannot perform balance
-// transfers directly (dependency direction: economics sits below the execution
-// layer), so CreateProposal delegates the charge to a DepositLocker wired by
-// the node integration layer.
+// DepositLocker abstracts the chain-state operation that reserves a
+// governance proposal deposit against the proposer's free balance. The
+// economics package cannot perform balance transfers directly (dependency
+// direction: economics sits below the execution layer), so CreateProposal
+// delegates the reservation to a DepositLocker wired by the node integration
+// layer. Reservation (lock) happens at proposal creation; actual settlement
+// (refund on reject via UnlockDeposit, burn on malicious slash via
+// SlashDeposit) happens at execution time.
 //
 // GOV-R15-H03 (2026-07-27) IMPLEMENT: previously CreateProposal recorded the
 // deposit on the Proposal struct but never actually charged it, allowing a
@@ -727,12 +780,24 @@ func (gm *GovernanceManager) cleanupLoop() {
 				for id, p := range gm.proposals {
 					if p.Status == ProposalStatusActive && currentHeight > p.EndHeight {
 						p.Status = ProposalStatusExpired
+						// Expired is terminal: release the deposit reservation
+						// so the proposer can create new proposals.
+						gm.releaseDepositLocked(p)
 						expiredIDs = append(expiredIDs, id)
 					}
 				}
 				if len(expiredIDs) > 0 {
 					log.Printf("governance cleanupLoop: auto-expired %d active proposals past EndHeight at height %d",
 						len(expiredIDs), currentHeight)
+				}
+				// R4-RES: persist the state transitions (status → Expired +
+				// deposit release) so a crash between the in-memory update
+				// and the next periodic Save cannot resurrect expired
+				// proposals as Active. The next sweep will pick up any
+				// remaining Active proposals, so a failed save here is
+				// non-fatal — just logged.
+				if err := gm.saveUnlocked(); err != nil {
+					log.Printf("governance cleanupLoop: failed to persist after auto-expire: %v", err)
 				}
 			}
 
@@ -746,6 +811,9 @@ func (gm *GovernanceManager) cleanupLoop() {
 				}
 			}
 			for _, id := range stalePassedIDs {
+				// Stale passed proposals are being discarded without ever
+				// executing; release their deposit reservations first.
+				gm.releaseDepositLocked(gm.proposals[id])
 				delete(gm.proposals, id)
 				delete(gm.votes, id)
 			}
@@ -823,6 +891,20 @@ func (gm *GovernanceManager) SetProductionMode(enabled bool) {
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
 	gm.productionMode = enabled
+}
+
+// releaseDepositLocked releases a proposal's deposit reservation after a
+// terminal state transition. Callers must hold gm.mu; the DepositLocker owns
+// its own lock, so this cannot deadlock. A release failure is logged rather
+// than returned: the proposal transition must still be persisted, and a
+// stale reservation only over-reserves the proposer until it is repaired.
+func (gm *GovernanceManager) releaseDepositLocked(p *Proposal) {
+	if gm.depositLocker == nil || p == nil || p.Deposit == nil || p.Deposit.Sign() <= 0 {
+		return
+	}
+	if err := gm.depositLocker.UnlockDeposit(p.Proposer, p.Deposit, p.ID); err != nil {
+		log.Printf("governance: failed to release deposit lock for proposal %d: %v", p.ID, err)
+	}
 }
 
 // InitializeParameters sets the initial economic parameters
@@ -1553,7 +1635,7 @@ func (gm *GovernanceManager) CreateProposal(
 	// compatibility with tests.
 	if gm.depositLocker != nil {
 		if err := gm.depositLocker.LockDeposit(proposer, deposit, proposal.ID); err != nil {
-			return nil, fmt.Errorf("%w: deposit lock failed: %v", ErrInsufficientVotePower, err)
+			return nil, fmt.Errorf("%w: %v", ErrDepositLockFailed, err)
 		}
 	} else if gm.productionMode {
 		// R42-GOVDEP-01 (2026-08-03): FAIL-CLOSED on mainnet/testnet when
@@ -1762,6 +1844,7 @@ func (gm *GovernanceManager) FinalizeProposal(proposalID uint64, totalVotePower 
 
 	if totalVotes.Cmp(quorumRequired) < 0 {
 		proposal.Status = ProposalStatusRejected
+		gm.releaseDepositLocked(proposal)
 		return nil
 	}
 
@@ -1771,6 +1854,7 @@ func (gm *GovernanceManager) FinalizeProposal(proposalID uint64, totalVotePower 
 	votesExcludingAbstain := new(big.Int).Add(proposal.YesVotes, proposal.NoVotes)
 	if votesExcludingAbstain.Sign() == 0 {
 		proposal.Status = ProposalStatusRejected
+		gm.releaseDepositLocked(proposal)
 		return nil
 	}
 
@@ -1785,6 +1869,7 @@ func (gm *GovernanceManager) FinalizeProposal(proposalID uint64, totalVotePower 
 		proposal.Status = ProposalStatusPassed
 	} else {
 		proposal.Status = ProposalStatusRejected
+		gm.releaseDepositLocked(proposal)
 	}
 
 	if err := gm.saveUnlocked(); err != nil {
@@ -1906,6 +1991,9 @@ func (gm *GovernanceManager) ExecuteProposal(proposalID uint64, currentHeight ui
 	}
 
 	proposal.Status = ProposalStatusExecuted
+	// The proposal reached its terminal executed state: release the deposit
+	// reservation so the proposer's balance is available for new proposals.
+	gm.releaseDepositLocked(proposal)
 
 	// audit-fix R3-L11: evict old finalized proposals to prevent unbounded memory growth
 	gm.evictOldProposals()
@@ -1956,6 +2044,10 @@ func (gm *GovernanceManager) evictOldProposals() {
 			evictCount = 1
 		}
 		for _, id := range finalizedIDs[:evictCount] {
+			// Release is idempotent, so this is a safety net for proposals
+			// that reached a terminal status through a path that did not
+			// already return the reservation.
+			gm.releaseDepositLocked(gm.proposals[id])
 			delete(gm.proposals, id)
 			delete(gm.votes, id)
 		}
@@ -2247,7 +2339,7 @@ func (gm *GovernanceManager) verifyProposalSignatureLocked(
 	// crypto layer would otherwise reject it inside PublicKeyFromBytes, but
 	// surfacing it here gives a clearer error and prevents the
 	// crypto.PublicKeyFromBytes path from being probed with degenerate input.
-	if crypto.IsZeroPublicKeyBytes(sig.ProposerPubKey) {
+	if crypto.IsDegeneratePublicKeyBytes(sig.ProposerPubKey) {
 		return fmt.Errorf("%w: proposer public key is all-zero",
 			ErrGovernanceSignatureInvalid)
 	}
@@ -2271,9 +2363,16 @@ func (gm *GovernanceManager) verifyProposalSignatureLocked(
 			ErrGovernanceSignatureInvalid, derivedAddr[:], proposer[:])
 	}
 
-	// 4. Reconstruct the signed message. The format MUST match
+	// 4. Enforce the signed deadline before rebuilding the message. The
+	// deadline is covered by the signature, so it cannot be altered without
+	// invalidating ProposerSig.
+	if err := verifyProposalDeadline(sig.Deadline, time.Now()); err != nil {
+		return err
+	}
+
+	// 5. Reconstruct the signed message. The format MUST match
 	// rpc/governance_api.go verifyGovernanceSignature exactly:
-	//   message = "QAU-" + method + "|" + chainID + "|" + proposerHex + "|" + nonce + "|" + authParams
+	//   message = "QAU-" + method + "|" + chainID + "|" + proposerHex + "|" + nonce + "|" + deadline + "|" + authParams
 	//   authParams = proposerHex + "|" + type + "|" + title + "|" + description + "|" + deposit + "|" + totalVotePower + "|" + changesJSON
 	//
 	// proposalsHex here uses types.Address.ToHexAddress() (same method the
@@ -2298,11 +2397,11 @@ func (gm *GovernanceManager) verifyProposalSignatureLocked(
 	authParams := fmt.Sprintf("%s|%d|%s|%s|%s|%s|%s",
 		proposerHex, uint8(proposalType), title, description, depositStr,
 		totalVotePowerStr, string(changesJSON))
-	message := []byte(fmt.Sprintf("QAU-%s|%d|%s|%s|%s",
+	message := []byte(fmt.Sprintf("QAU-%s|%d|%s|%s|%s|%s",
 		GovernanceProposalSignatureMethod, sig.ChainID, proposerHex,
-		sig.Nonce, authParams))
+		sig.Nonce, sig.Deadline, authParams))
 
-	// 5. Verify the Dilithium3 signature.
+	// 6. Verify the Dilithium3 signature.
 	if !crypto.Verify(pubKey, message, sig.ProposerSig) {
 		return fmt.Errorf("%w: Dilithium3 verify returned false for proposer %x nonce %s",
 			ErrGovernanceSignatureInvalid, proposer[:], sig.Nonce)

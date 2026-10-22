@@ -2185,8 +2185,14 @@ func (sc *ShardChain) CreateReceipt(msg *CrossShardMessage, txHash types.Hash, b
 	// P0-3 (2026-07-13): Persist receipt for cross-shard message tracking.
 	if sc.stateStore != nil {
 		if err := sc.stateStore.PutReceipt(sc.shardID, msg.ID, receipt); err != nil {
-			// Non-fatal: receipt is still in memory, but won't survive restart.
-			// We don't fail the whole call since the receipt was created.
+			// Non-fatal: the receipt is still in memory but will not survive
+			// a restart, so surface the persistence failure without failing
+			// the whole call.
+			shardLogger.Warn("failed to persist cross-shard receipt", map[string]any{
+				"shard_id":   sc.shardID,
+				"message_id": msg.ID.String(),
+				"error":      err.Error(),
+			})
 		}
 	}
 

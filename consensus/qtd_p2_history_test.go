@@ -33,8 +33,8 @@ import (
 // invariant.
 //
 // The seed byte lets different tests use distinct keys so round-trip
-// corruption checks remain meaningful. The returned key is non-zero in
-// every byte (so crypto.IsZeroPublicKeyBytes returns false) but is NOT a
+// corruption checks remain meaningful. The returned key is non-degenerate
+// (so crypto.IsDegeneratePublicKeyBytes returns false) but is NOT a
 // real Dilithium3 public key — these tests verify storage/retrieval and
 // epoch attribution, NOT cryptographic verification (cryptographic
 // verification uses the real signer in qtd_h03_test.go and the

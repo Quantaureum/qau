@@ -259,17 +259,18 @@ func BatchVerifyIPA(basis *PedersenBasis, commitments []*PedersenCommitment, bs 
 		randomizer[i] = challenge
 	}
 
-	for i := range commitments {
-		ok, err := VerifyIPAProof(basis, commitments[i], bs[i], cs[i], proofs[i])
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
+	// VerifyIPAProof is currently a fail-closed stub that ALWAYS returns
+	// (false, error) — R26-045 — so the batch is itself fail-closed and
+	// cannot verify anything yet. staticcheck SA4023 flags any err != nil
+	// branch on the stub as always-true, so the error is propagated without
+	// branching. An empty batch has nothing to check and verifies vacuously
+	// (preserved from the pre-refactor behavior). When the real verifier
+	// lands, replace this with per-item verification in a loop.
+	if len(commitments) == 0 {
+		return true, nil
 	}
-
-	return true, nil
+	_, err := VerifyIPAProof(basis, commitments[0], bs[0], cs[0], proofs[0])
+	return false, err
 }
 
 func innerProduct(a, b []*big.Int) *big.Int {

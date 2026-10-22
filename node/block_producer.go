@@ -1677,9 +1677,21 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 	}
 
 	// Copy state for isolated block building (like Ethereum's prepareWork)
+	//
+	// R7-01 (2026-10-21 seventh-round audit): CopyForBuild, not Copy. The build
+	// is discarded below if the tip moved while we were working, and a plain
+	// Copy() shares the durable database — every CommitWithBlock in buildBlock
+	// would have already landed on the live disk by then.
 	var stateCopy *state.StateDB
 	if bp.node.stateDB != nil {
-		stateCopy = bp.node.stateDB.Copy()
+		stateCopy = bp.node.stateDB.CopyForBuild()
+		if stateCopy == nil {
+			// CopyForBuild only refuses when the working state could not be
+			// isolated from live disk state. Building anyway would propose a
+			// block whose execution writes state the node may then throw away.
+			bpLog.Error("Cannot isolate build state (R7-01); skipping slot %d", slot)
+			return
+		}
 	}
 
 	bp.node.mu.Unlock()
@@ -1725,6 +1737,41 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 			bp.node.mu.Unlock()
 			bpLog.Info("%s: Parent changed while building block (was %x, now %x), discarding",
 				nodeName, parentHash[:8], currentTipHash[:8])
+			// R7-01: the discarded build never reaches the shared database. Its
+			// buffered writes are dropped with the copy, so the live state keeps
+			// reading the parent's committed accounts and storage.
+			return
+		}
+	}
+
+	// R7-01: the block is being adopted — only now do its state writes become
+	// durable.
+	//
+	// R8-01 (2026-10-21 eighth-round audit): Promote refuses with
+	// ErrStaleBuildState when the shared database moved on since this copy was
+	// taken — the import path commits outside node.mu (handleIncomingBlock calls
+	// ProcessBlock unlocked and only switches the head afterwards), so a block
+	// can become durable while we are between the tip check and the promote. That
+	// is a normal race: discard, the next slot builds on the new tip.
+	//
+	// Any OTHER promote failure is not normal: the replay may have reached disk
+	// half-applied and applied data cannot be un-applied, so local state no
+	// longer matches this node's head. Stop producing (R87-STATE-TRUST) instead
+	// of proposing further blocks on top of state we cannot describe.
+	if stateCopy != nil {
+		if err := stateCopy.Promote(); err != nil {
+			bp.node.mu.Unlock()
+			if errors.Is(err, state.ErrStaleBuildState) {
+				bpLog.Info("%s: build state for block %d went stale before it could be promoted, discarding: %v",
+					nodeName, newBlock.Header.Height, err)
+				return
+			}
+			bpLog.Error("%s: R7-01: cannot promote build state for block %d, discarding: %v",
+				nodeName, newBlock.Header.Height, err)
+			bp.node.markStateTrustBroken(fmt.Sprintf(
+				"cannot promote the state of produced block %d: %v — the durable replay may be "+
+					"half-applied, so on-disk state no longer matches this node's head",
+				newBlock.Header.Height, err))
 			return
 		}
 	}
@@ -3019,7 +3066,8 @@ func (bp *BlockProducer) buildBlock(
 	// embedded a root that excluded pending modifications, while validators
 	// recompute the root AFTER CommitWithBlock (which applies dirty state first),
 	// yielding a different root and a WARN on every block. Since stateDB here is
-	// an isolated copy (blockBuildState.stateDB, from StateDB.Copy()), it is safe
+	// an isolated copy (blockBuildState.stateDB, from StateDB.CopyForBuild —
+	// R7-01: its writes are buffered until the block is adopted), it is safe
 	// to commit it here before deriving the root, mirroring exactly what the
 	// validator path (syncer.applyBlockInternal -> CommitWithBlock) does.
 	var stateRoot types.Hash
@@ -3784,9 +3832,16 @@ func (bp *BlockProducer) produceBlock(slot uint64) {
 		txs = bp.node.txPool.SelectTransactions(bp.node.config.MaxGasLimit)
 	}
 
+	// R7-01: build on an isolated copy (see tryProduceBlock). This legacy path
+	// adopts whatever it builds, so it also promotes before handing the copy to
+	// the node.
 	var stateCopy *state.StateDB
 	if bp.node.stateDB != nil {
-		stateCopy = bp.node.stateDB.Copy()
+		stateCopy = bp.node.stateDB.CopyForBuild()
+		if stateCopy == nil {
+			bpLog.Error("Cannot isolate build state (R7-01); skipping slot %d", slot)
+			return
+		}
 	}
 
 	buildState := &blockBuildState{
@@ -3797,6 +3852,26 @@ func (bp *BlockProducer) produceBlock(slot uint64) {
 	newBlock := bp.buildBlock(slot, parentHeight, parentHash, txs, buildState)
 	if newBlock == nil {
 		return
+	}
+
+	// R8-01/R8-02: same promote contract as tryProduceBlock. This legacy path
+	// adopts whatever it builds, so a stale build is discarded and any other
+	// promote failure breaks state trust instead of installing half-applied state.
+	if stateCopy != nil {
+		if err := stateCopy.Promote(); err != nil {
+			if errors.Is(err, state.ErrStaleBuildState) {
+				bpLog.Info("R8-01: build state for block %d went stale before it could be promoted, discarding: %v",
+					newBlock.Header.Height, err)
+				return
+			}
+			bpLog.Error("R7-01: cannot promote build state for block %d, discarding: %v",
+				newBlock.Header.Height, err)
+			bp.node.markStateTrustBroken(fmt.Sprintf(
+				"cannot promote the state of produced block %d: %v — the durable replay may be "+
+					"half-applied, so on-disk state no longer matches this node's head",
+				newBlock.Header.Height, err))
+			return
+		}
 	}
 
 	if stateCopy != nil {
@@ -3848,24 +3923,13 @@ func (bp *BlockProducer) produceBlock(slot uint64) {
 // These fields are post-signing metadata (like Signature itself) and must
 // not be part of the signed data.
 func (bp *BlockProducer) computeSigningData(header *encoding.BlockHeader) []byte {
-	headerCopy := *header
-	headerCopy.Signature = nil
-	headerCopy.SyncCommitteeSig = nil
-	headerCopy.SyncCommitteeBits = nil
-	headerCopy.QTDSignature = nil
-	headerCopy.ExecutiveSealers = nil
-	headerCopy.ReviewAttestationRoot = types.Hash{}
-	headerCopy.FinalityType = 0
-	headerCopy.QTDGroupKey = nil
-	headerCopy.QTDGroupKeyProof = nil
-
-	rawData, err := encoding.MarshalBlockHeader(&headerCopy)
-	if err != nil || len(rawData) == 0 {
+	// R2-15: share the signature-stripping hash with the sync committee
+	// verifier so both sides derive the same blockRoot.
+	root, err := encoding.BlockHeaderSigningRoot(header)
+	if err != nil {
 		return nil
 	}
-
-	hash := sha3.Sum256(rawData)
-	return hash[:]
+	return root[:]
 }
 
 // computeRANDAOReveal computes the RANDAO reveal for this proposer.
@@ -3929,6 +3993,13 @@ func (a *stateDBAdapter) Snapshot() int {
 
 func (a *stateDBAdapter) RevertToSnapshot(id int) {
 	a.stateDB.RevertToSnapshot(id)
+}
+
+// ReleaseSnapshot drops the snapshot frame with the given id (and everything
+// nested inside it) without rewinding state, so a finished transaction stops
+// occupying a slot of the shared snapshot stack (R4-07, 2026-10-21 audit).
+func (a *stateDBAdapter) ReleaseSnapshot(id int) {
+	a.stateDB.ReleaseSnapshot(id)
 }
 
 // audit-fix R12-TOCTOU: Atomic nonce increment to prevent race conditions

@@ -19,7 +19,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/quantaureum/qau/crypto"
@@ -38,12 +37,25 @@ import (
 // R38-P2-04 DEEP FIX (2026-08-02).
 var ErrProofNotSupported = fmt.Errorf("state reader does not support stateRoot-aware proofs")
 
-// maxStakingNoncesPerAddress is the maximum number of tracked nonces per address.
-// audit-fix NEW-18: bounded to prevent unbounded memory growth.
-const maxStakingNoncesPerAddress = 10000
+// ErrUserOpsNotLiveRPC is the caller-facing message for the AA methods that
+// are registered but not wired to a block producer. R5-05 (2026-10-21
+// fifth-round audit). Mirrors txpool.ErrUserOpsNotLive, which backs the same
+// decision at the pool boundary; the two live in different packages because
+// the rpc layer must answer before it reaches a pool (and must keep answering
+// even if a pool implementation happily accepts).
+const ErrUserOpsNotLiveRPC = "account abstraction is not live: user operations are not bundled on chain yet"
 
-// maxStakingTrackedAddresses is the maximum number of addresses tracked for staking nonces.
-const maxStakingTrackedAddresses = 100000
+// ErrStateSnapshotNotSupportedRPC is the caller-facing refusal for evm_snapshot
+// and evm_revert. R6-01 (2026-10-21 sixth-round audit): neither method can do
+// what its name promises on this node. evm_snapshot stores height -> current
+// root in StateDB.stateSnapshots, a map nothing ever reads back (only pruning
+// and fork rollback delete from it), so it cannot restore anything; and
+// evm_revert(height) feeds that height to StateDB.RevertToSnapshot, whose
+// argument is a position in the live dirty-state journal, not a block height.
+// Same shape as the R5-05 decision: refuse at the rpc boundary and at the
+// adapter, independently, rather than performing a destructive operation that
+// is not the one being asked for.
+const ErrStateSnapshotNotSupportedRPC = "evm state snapshot/restore is not supported: block-height snapshots cannot be restored on this node"
 
 // slotsPerEpoch is the number of slots per QPOS epoch.
 // This MUST match consensus.SlotsPerEpoch (currently 32). If consensus
@@ -60,14 +72,13 @@ const DefaultGasPriceWei = 1_000_000_000 // 1 Gwei = 10^9 wei
 // API provides the core RPC API methods
 type API struct {
 	// Backend interfaces (to be injected)
-	stateReader     StateReader
-	blockReader     BlockReader
-	txPool          TxPool
-	chainInfo       ChainInfo
-	accountManager  AccountManager
-	stakingManager  StakingManager
-	contractCaller  ContractCaller
-	snapshotManager SnapshotManager
+	stateReader    StateReader
+	blockReader    BlockReader
+	txPool         TxPool
+	chainInfo      ChainInfo
+	accountManager AccountManager
+	stakingManager StakingManager
+	contractCaller ContractCaller
 
 	// consensusStakeUpdater propagates staking changes to the consensus layer
 	// (ValidatorManager). Without this, qau_stake only updates the economics
@@ -79,9 +90,10 @@ type API struct {
 	// debug_rollbackChainToHeight. nil = endpoint disabled.
 	forkRecoveryMgr ForkRecoveryManager
 
-	// audit-fix NEW-18: nonce tracking for replay protection on signed staking operations.
-	stakingNonceMu    sync.Mutex
-	stakingUsedNonces map[types.Address]map[string]time.Time
+	// Replay protection for signed staking operations. The signed nonce
+	// carries the request deadline and reservations are persisted by the node
+	// when a replay store is configured.
+	stakingReplay *authReplayGuard
 
 	// R131: optional backend for the validator-key registry status RPC.
 	// Injected by node startup; nil → endpoint reports "unavailable".
@@ -176,12 +188,6 @@ type BlockReader interface {
 	GetTransactionReceipt(hash types.Hash) (any, error)
 	GetBlockByHeightRange(from, to uint64) ([]any, error)
 	GetGasLimit() uint64
-}
-
-// SnapshotManager provides snapshot creation and restoration capabilities
-type SnapshotManager interface {
-	CreateSnapshot(blockHeight uint64) (map[string]any, error)
-	RestoreSnapshot(blockHeight uint64) (map[string]any, error)
 }
 
 // ForkRecoveryManager provides fork-recovery operations that combine block-store
@@ -330,19 +336,27 @@ type StakingConfig struct {
 // NewAPI creates a new API instance
 func NewAPI(state StateReader, blocks BlockReader, pool TxPool, chain ChainInfo, accMgr AccountManager) *API {
 	return &API{
-		stateReader:       state,
-		blockReader:       blocks,
-		txPool:            pool,
-		chainInfo:         chain,
-		accountManager:    accMgr,
-		stakingUsedNonces: make(map[types.Address]map[string]time.Time),
-		privacyMgr:        privacy.NewPrivacyManager(privacy.DefaultPrivacyConfig()),
+		stateReader:    state,
+		blockReader:    blocks,
+		txPool:         pool,
+		chainInfo:      chain,
+		accountManager: accMgr,
+		stakingReplay:  newAuthReplayGuard("staking"),
+		privacyMgr:     privacy.NewPrivacyManager(privacy.DefaultPrivacyConfig()),
 		// FIX: default gas price is now configurable (was hardcoded 1 Gwei).
 		// FIX: Use named constant instead of magic number.
 		defaultGasPrice: big.NewInt(DefaultGasPriceWei),
 
 		enforceAdminAuth: true, //  fail-closed by default
 	}
+}
+
+// SetAuthReplayStore wires the persistent replay cache shared by all RPC APIs.
+func (api *API) SetAuthReplayStore(store *AuthReplayStore) {
+	if api.stakingReplay == nil {
+		api.stakingReplay = newAuthReplayGuard("staking")
+	}
+	api.stakingReplay.setStore(store)
 }
 
 // SetDefaultGasPrice sets the default gas price used as fallback when dynamic
@@ -397,14 +411,6 @@ func (api *API) SetContractCaller(cc ContractCaller) {
 		return
 	}
 	api.contractCaller = cc
-}
-
-// SetSnapshotManager sets the snapshot manager for the API (for qau_createSnapshot/qau_restoreSnapshot)
-func (api *API) SetSnapshotManager(sm SnapshotManager) {
-	if sm == nil {
-		return
-	}
-	api.snapshotManager = sm
 }
 
 // SetForkRecoveryManager sets the backend for debug_rollbackChainToHeight
@@ -523,64 +529,13 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 	if signature == "" || pubKeyHex == "" {
 		return fmt.Errorf("signature and publicKey are required for state-mutating staking operations")
 	}
-	if nonce == "" {
-		return fmt.Errorf("nonce is required for replay protection")
-	}
 
-	// Check nonce hasn't been used before
-	api.stakingNonceMu.Lock()
-	// R48-H-H1 FIX: Restructured to check limits BEFORE inserting.
-	// 1. Check if this address would exceed the global address limit
-	// 2. Check if this nonce was already used
-	// 3. Evict oldest nonces for this address if at per-address limit, BEFORE inserting
-	// Previously: global limit used `>` (off-by-one), and eviction happened after insertion.
-	if api.stakingUsedNonces[userAddr] == nil {
-		// New address: check global address count limit
-		// R48-H-H1 FIX: Use >= to enforce strict limit (was >, allowed N+1)
-		if len(api.stakingUsedNonces) >= maxStakingTrackedAddresses {
-			api.stakingNonceMu.Unlock()
-			return fmt.Errorf("too many tracked addresses (memory limit)")
-		}
-		api.stakingUsedNonces[userAddr] = make(map[string]time.Time)
+	// The deadline is embedded in the nonce and therefore covered by the
+	// signature (canonical stake/unstake digests bind the nonce byte-for-byte).
+	deadline, err := ParseAuthNonceDeadline(nonce, time.Now())
+	if err != nil {
+		return err
 	}
-	// M-NEW-1 FIX: Evict nonces older than 10 minutes for time-based expiration.
-	// This ensures replay protection works even after the in-memory limit eviction
-	// removes old entries, and provides bounded temporal protection.
-	const stakingNonceTTL = 10 * time.Minute
-	now := time.Now()
-	for k, ts := range api.stakingUsedNonces[userAddr] {
-		if now.Sub(ts) > stakingNonceTTL {
-			delete(api.stakingUsedNonces[userAddr], k)
-		}
-	}
-	// Check replay
-	if _, used := api.stakingUsedNonces[userAddr][nonce]; used {
-		api.stakingNonceMu.Unlock()
-		return fmt.Errorf("nonce already used (replay detected)")
-	}
-	// Evict oldest nonces BEFORE inserting if at limit
-	if len(api.stakingUsedNonces[userAddr]) >= maxStakingNoncesPerAddress {
-		type nonceEntry struct {
-			nonce string
-			ts    time.Time
-		}
-		entries := make([]nonceEntry, 0, len(api.stakingUsedNonces[userAddr]))
-		for k, ts := range api.stakingUsedNonces[userAddr] {
-			entries = append(entries, nonceEntry{k, ts})
-		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].ts.Before(entries[j].ts)
-		})
-		// R48-H-H1 FIX: Evict oldest half BEFORE insert to keep count bounded
-		for i := 0; i < len(entries)/2; i++ {
-			delete(api.stakingUsedNonces[userAddr], entries[i].nonce)
-		}
-	}
-	// LOW-2 FIX: Reserve nonce with pending marker (zero time) instead of confirmed time.
-	// This blocks concurrent requests for the same nonce, but allows rollback if
-	// signature verification fails, preventing nonce consumption by invalid requests.
-	api.stakingUsedNonces[userAddr][nonce] = time.Time{} // zero Time = pending
-	api.stakingNonceMu.Unlock()
 
 	// Parse signature
 	// R32-P2-02 FIX (2026-07-28): Defense-in-depth — reject signatures
@@ -589,35 +544,29 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 	// and governance_api.go:224.
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
 	if err != nil {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid signature hex: %w", err)
 	}
 	if len(sigBytes) != crypto.Dilithium3SignatureSize {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid signature length: got %d, want %d", len(sigBytes), crypto.Dilithium3SignatureSize)
 	}
 
 	// Parse public key
 	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
 	if err != nil {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid publicKey hex: %w", err)
 	}
 	if len(pubKeyBytes) != crypto.Dilithium3PublicKeySize {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid publicKey length: got %d, want %d", len(pubKeyBytes), crypto.Dilithium3PublicKeySize)
 	}
 
 	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
 	if err != nil {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
 	}
 
 	// Verify the public key corresponds to the claimed address
 	derivedAddr := pubKey.Address()
 	if derivedAddr != userAddr {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("public key does not match claimed address")
 	}
 
@@ -652,7 +601,6 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 		amountStr = parts[0]
 		if method == "stake" {
 			if len(parts) < 2 {
-				api.rollbackStakingNonce(userAddr, nonce)
 				return fmt.Errorf("stake canonical verify: missing commission in params")
 			}
 			commissionStr = parts[1]
@@ -663,7 +611,6 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 			// fall back to hex (consistent with RPC entry parsing)
 			amount, ok = new(big.Int).SetString(strings.TrimPrefix(strings.TrimPrefix(amountStr, "0x"), "0X"), 16)
 			if !ok {
-				api.rollbackStakingNonce(userAddr, nonce)
 				return fmt.Errorf("stake canonical verify: cannot parse amount %q", amountStr)
 			}
 		}
@@ -671,7 +618,6 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 		if method == "stake" {
 			c, err2 := strconv.ParseUint(commissionStr, 10, 32)
 			if err2 != nil {
-				api.rollbackStakingNonce(userAddr, nonce)
 				return fmt.Errorf("stake canonical verify: invalid commission %q: %w", commissionStr, err2)
 			}
 			commission = c
@@ -696,7 +642,6 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 			amount, uint32(commission), nonce,
 		)
 		if err != nil {
-			api.rollbackStakingNonce(userAddr, nonce)
 			return fmt.Errorf("stake canonical verify: %w", err)
 		}
 		// R43-RPC-LEGACY-01 (2026-08-03): route through the canonical
@@ -724,16 +669,13 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 			uint32(commission), nonce, pubKeyBytes, sigBytes,
 		)
 		if !verified {
-			api.rollbackStakingNonce(userAddr, nonce)
 			return fmt.Errorf("signature verification failed (canonical)")
 		}
-		// LOW-2 FIX: Confirm the nonce.
-		api.stakingNonceMu.Lock()
-		if nonces, ok := api.stakingUsedNonces[userAddr]; ok {
-			nonces[nonce] = time.Now()
-		}
-		api.stakingNonceMu.Unlock()
-		return nil
+		// R2-03 FIX: reserve only after the signature checks out, so
+		// unauthenticated traffic cannot drive persistent write transactions.
+		// A concurrent duplicate still loses the race here, so a nonce is
+		// consumed at most once.
+		return api.stakingReplay.reserve(userAddr, nonce, deadline)
 	}
 
 	// Legacy string-domain path — still used by claimRewards, which has
@@ -745,31 +687,14 @@ func (api *API) verifyStakingSignature(method string, userAddr types.Address, no
 
 	// Verify Dilithium3 signature
 	if !crypto.Verify(pubKey, message, sigBytes) {
-		api.rollbackStakingNonce(userAddr, nonce)
 		return fmt.Errorf("signature verification failed")
 	}
 
-	// LOW-2 FIX: Confirm the nonce by updating from pending (zero) to actual timestamp
-	api.stakingNonceMu.Lock()
-	if nonces, ok := api.stakingUsedNonces[userAddr]; ok {
-		nonces[nonce] = time.Now()
-	}
-	api.stakingNonceMu.Unlock()
-
-	return nil
-}
-
-// rollbackStakingNonce removes a pending nonce reservation when signature verification fails.
-// LOW-2 FIX: prevents nonces from being permanently consumed by failed requests.
-func (api *API) rollbackStakingNonce(userAddr types.Address, nonce string) {
-	api.stakingNonceMu.Lock()
-	defer api.stakingNonceMu.Unlock()
-	if nonces, ok := api.stakingUsedNonces[userAddr]; ok {
-		// Only delete if still in pending state (zero time)
-		if ts, exists := nonces[nonce]; exists && ts.IsZero() {
-			delete(nonces, nonce)
-		}
-	}
+	// R2-03 FIX: reserve only after the signature checks out, so
+	// unauthenticated traffic cannot drive persistent write transactions. A
+	// concurrent duplicate still loses the race here, so a nonce is consumed
+	// at most once.
+	return api.stakingReplay.reserve(userAddr, nonce, deadline)
 }
 
 // extractStakingAuth extracts nonce, signature and publicKey from args for authenticated staking operations.
@@ -964,6 +889,14 @@ func (api *API) RegisterHandlers(server *Server) {
 	// R7-C2 FIX: Snapshot create/restore are destructive state operations. They
 	// roll the chain DB back to an arbitrary height (restore) and must never be
 	// reachable by non-admin callers. Admin-gate both.
+	// R6-01 (2026-10-21 sixth-round audit): both handlers now refuse. The
+	// height-keyed snapshot backend they used to call cannot restore committed
+	// state (its height -> root map is never read back) and its "revert" fed a
+	// block height into the live dirty-state journal indexer, so it either
+	// poisoned the next Commit or rewound somebody else's in-flight frame. The
+	// methods stay registered and admin-gated so callers get a clear refusal
+	// instead of a method-not-found, and the injection point for a real
+	// implementation is gone rather than half-wired.
 	server.RegisterAdminMethod("evm_snapshot")
 	server.RegisterAdminMethod("evm_revert")
 	server.RegisterHandler("evm_snapshot", api.CreateSnapshot)
@@ -1289,28 +1222,19 @@ func (api *API) SendRawTransaction(ctx context.Context, params json.RawMessage) 
 	return formatHexHash(hash), nil
 }
 
+// SendUserOperation refuses every submission while account abstraction is
+// dark. R5-05 (2026-10-21 fifth-round audit): nothing in the node consumes
+// Bundler.BundleChannel(), so the old behaviour accepted an operation, kept it
+// in an in-memory set that no block producer ever read, and returned a hash
+// that could never resolve to a receipt via GetUserOperationReceipt. Callers
+// (and the wallets/bundlers sitting behind them) acted on that success as if
+// the operation were on its way on chain. Refusing up front is the honest
+// answer. Both registered names — eth_sendUserOperation and
+// qau_sendUserOperation — share this handler, so both are covered here.
+// The txpool refuses independently as well; see txpool.ErrUserOpsNotLive.
 func (api *API) SendUserOperation(ctx context.Context, params json.RawMessage) (any, *Error) {
-	var args []map[string]any
-	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
-		return nil, ErrInvalidParams
-	}
-
-	uoParams := args[0]
-	uo, err := parseUserOperation(uoParams)
-	if err != nil {
-		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid user operation", err.Error())
-	}
-
-	if err := api.requireTxPool(); err != nil {
-		return nil, err
-	}
-
-	if err := api.txPool.AddUserOperation(uo); err != nil {
-		return nil, NewError(ErrCodeInvalidTx, "transaction validation failed") // FIX: generic message, err details logged internally
-	}
-
-	uoHash := uo.Hash(qvm.EntryPointAddress, api.chainInfo.ChainID())
-	return formatHexHash(uoHash), nil
+	return nil, NewErrorWithData(ErrCodeInternal, ErrUserOpsNotLiveRPC,
+		"the method is registered for ERC-4337 compatibility but no bundler is wired to the chain; user operations will not be included in any block")
 }
 
 func (api *API) EstimateUserOperationGas(ctx context.Context, params json.RawMessage) (any, *Error) {
@@ -3462,75 +3386,34 @@ func (api *API) UpdateCommission(ctx context.Context, params json.RawMessage) (a
 	}, nil
 }
 
-// CreateSnapshot creates a state snapshot at the specified block height
+// CreateSnapshot answers evm_snapshot. It refuses: see
+// ErrStateSnapshotNotSupportedRPC (R6-01).
 func (api *API) CreateSnapshot(ctx context.Context, params json.RawMessage) (any, *Error) {
-	if api.snapshotManager == nil {
-		return nil, NewError(ErrCodeInternal, "snapshot manager not available")
-	}
-
-	var args []any
-	if err := json.Unmarshal(params, &args); err != nil {
-		// No params = snapshot at latest height
-	}
-
-	var height uint64
-	if len(args) > 0 {
-		switch v := args[0].(type) {
-		case float64:
-			height = uint64(v)
-		case string:
-			h, err := parseBlockNumber(v, api.blockReader)
-			if err != nil {
-				return nil, NewError(ErrCodeInvalidParams, "invalid block height")
-			}
-			height = h
-		}
-	} else {
-		// Default to latest block
-		if api.blockReader != nil {
-			height = api.blockReader.GetLatestHeight()
-		}
-	}
-
-	result, err := api.snapshotManager.CreateSnapshot(height)
-	if err != nil {
-		//  err.Error() in Data is stripped by sanitizeError in production
-		return nil, NewErrorWithData(ErrCodeInternal, "failed to create snapshot", err.Error())
-	}
-
-	return result, nil
+	// R6-01 (2026-10-21 sixth-round audit): the refusal is unconditional and
+	// happens before the manager is consulted, so it holds for every backend,
+	// including a stub. The previous behaviour was to take the caller's height
+	// (defaulting to the chain tip) and record currentRoot under it in the
+	// StateDB height -> root map. That map is never read for a restore, so the
+	// call only ever produced a misleading {"success": true} plus one more
+	// entry in a map that pruning has to walk.
+	return nil, NewErrorWithData(ErrCodeInternal, ErrStateSnapshotNotSupportedRPC,
+		"evm_snapshot stores a height-keyed state root that nothing reads back; use debug_rollbackChainToHeight for fork recovery, and note it is admin-gated")
 }
 
-// RestoreSnapshot restores state from a snapshot at the specified block height
+// RestoreSnapshot answers evm_revert. It refuses: see
+// ErrStateSnapshotNotSupportedRPC (R6-01).
 func (api *API) RestoreSnapshot(ctx context.Context, params json.RawMessage) (any, *Error) {
-	if api.snapshotManager == nil {
-		return nil, NewError(ErrCodeInternal, "snapshot manager not available")
-	}
-
-	var args []any
-	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
-		return nil, ErrInvalidParams
-	}
-
-	var height uint64
-	switch v := args[0].(type) {
-	case float64:
-		height = uint64(v)
-	case string:
-		h, err := parseBlockNumber(v, api.blockReader)
-		if err != nil {
-			return nil, NewError(ErrCodeInvalidParams, "invalid block height")
-		}
-		height = h
-	}
-
-	result, err := api.snapshotManager.RestoreSnapshot(height)
-	if err != nil {
-		//  err.Error() in Data is stripped by sanitizeError in production
-		return nil, NewErrorWithData(ErrCodeInternal, "failed to restore snapshot", err.Error())
-	}
-
-	return result, nil
+	// R6-01 (2026-10-21 sixth-round audit): this handler used to pass the
+	// caller's block height straight into StateDB.RevertToSnapshot(id), which
+	// indexes the live dirty-state journal. With no journal entry at that
+	// position it poisoned the next authoritative Commit (fail closed); with an
+	// entry present -- i.e. while a block transition or a simulation held the
+	// state -- it rewound and truncated ANOTHER caller's journal, dropping
+	// transactions that were already applied. Both outcomes are strictly worse
+	// than refusing, and neither restores committed state at a height, which is
+	// what the method name promises.
+	return nil, NewErrorWithData(ErrCodeInternal, ErrStateSnapshotNotSupportedRPC,
+		"evm_revert would rewind the live journal at a journal position, not restore committed state at a block height")
 }
 
 // RollbackChainToFork is the handler for debug_rollbackChainToHeight

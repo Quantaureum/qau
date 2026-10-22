@@ -2,6 +2,8 @@
 package alerting
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -341,4 +343,29 @@ func (m *mockChannel) Close() error    { return nil }
 func (m *mockChannel) Send(alert *Alert) error {
 	m.sent = append(m.sent, alert)
 	return nil
+}
+
+// TestR11_02_PagerDutyDashboardLinkIsConfigDriven proves the behavioral half of
+// the R11-02 fix: the PagerDuty event must carry a dashboard link only when an
+// operator configured one, and must never ship a fabricated destination. Before
+// the fix Send hardcoded a dashboard URL that pointed at an undeclared host.
+func TestR11_02_PagerDutyDashboardLinkIsConfigDriven(t *testing.T) {
+	if got := dashboardLinks(""); got != nil {
+		t.Fatalf("dashboardLinks with no URL must be nil, got %#v", got)
+	}
+
+	withURL := dashboardLinks("https://dashboard.example.com/alerts")
+	if len(withURL) != 1 || withURL[0]["href"] != "https://dashboard.example.com/alerts" {
+		t.Fatalf("dashboardLinks must surface the configured href, got %#v", withURL)
+	}
+
+	// An unconfigured channel marshals to an event whose links field is null, so
+	// there is no invented endpoint travelling with the alert.
+	empty, err := json.Marshal(map[string]any{"links": dashboardLinks("")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(empty), "http") {
+		t.Fatalf("empty dashboard must not embed any href, got %s", empty)
+	}
 }

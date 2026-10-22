@@ -121,9 +121,9 @@ func (s *EncryptedSession) exportSecret(label string, context []byte) ([32]byte,
 	digest := sha3.New256()
 	digest.Write([]byte("quantaureum-validator-session-exporter-v1"))
 	digest.Write(s.exporterKey[:])
-	binary.Write(digest, binary.BigEndian, uint32(len(label)))
+	_ = binary.Write(digest, binary.BigEndian, uint32(len(label)))
 	digest.Write([]byte(label))
-	binary.Write(digest, binary.BigEndian, uint32(len(context)))
+	_ = binary.Write(digest, binary.BigEndian, uint32(len(context)))
 	digest.Write(context)
 	var result [32]byte
 	copy(result[:], digest.Sum(nil))
@@ -136,7 +136,7 @@ func (s *EncryptedSession) zeroize() {
 	}
 	s.keyMu.Lock()
 	defer s.keyMu.Unlock()
-	crypto.ZeroBytesSecure(s.exporterKey[:])
+	_ = crypto.ZeroBytesSecure(s.exporterKey[:])
 }
 
 // TSSAuthSigner provides Dilithium3 authentication for TSS share transport.
@@ -434,11 +434,11 @@ func (vke *ValidatorKeyExchange) InitiateSession(peerAddr types.Address) ([]byte
 		return nil, fmt.Errorf("invalid peer Kyber public key: %w", err)
 	}
 
-	sharedSecret, ciphertext, err := vke.localKyber.Private.Exchange(peerKyberPub)
+	sharedSecret, ciphertext, err := crypto.KyberEncapsulate(peerKyberPub)
 	if err != nil {
-		return nil, fmt.Errorf("Kyber encapsulation failed: %w", err)
+		return nil, fmt.Errorf("kyber encapsulation failed: %w", err)
 	}
-	defer crypto.ZeroBytesSecure(sharedSecret)
+	defer func() { _ = crypto.ZeroBytesSecure(sharedSecret) }()
 
 	sessionID := sessionID(vke.localAddr, peerAddr)
 
@@ -448,7 +448,7 @@ func (vke *ValidatorKeyExchange) InitiateSession(peerAddr types.Address) ([]byte
 	}
 
 	exporterKey := deriveValidatorSessionExporter(sharedSecret, vke.localAddr, peerAddr)
-	defer crypto.ZeroBytesSecure(exporterKey[:])
+	defer func() { _ = crypto.ZeroBytesSecure(exporterKey[:]) }()
 	session, err := newEncryptedSession(peerAddr, sendKey, recvKey, exporterKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
@@ -473,9 +473,9 @@ func (vke *ValidatorKeyExchange) CompleteSession(peerAddr types.Address, ciphert
 
 	sharedSecret, err := vke.localKyber.Private.Decapsulate(ciphertext)
 	if err != nil {
-		return fmt.Errorf("Kyber decapsulation failed: %w", err)
+		return fmt.Errorf("kyber decapsulation failed: %w", err)
 	}
-	defer crypto.ZeroBytesSecure(sharedSecret)
+	defer func() { _ = crypto.ZeroBytesSecure(sharedSecret) }()
 
 	sessionID := sessionID(peerAddr, vke.localAddr)
 
@@ -485,7 +485,7 @@ func (vke *ValidatorKeyExchange) CompleteSession(peerAddr types.Address, ciphert
 	}
 
 	exporterKey := deriveValidatorSessionExporter(sharedSecret, peerAddr, vke.localAddr)
-	defer crypto.ZeroBytesSecure(exporterKey[:])
+	defer func() { _ = crypto.ZeroBytesSecure(exporterKey[:]) }()
 	session, err := newEncryptedSession(peerAddr, sendKey, recvKey, exporterKey)
 	if err != nil {
 		return fmt.Errorf("failed to create session: %w", err)
@@ -565,7 +565,7 @@ func (vke *ValidatorKeyExchange) RotateLocalKey() error {
 	}
 
 	if vke.localKyber != nil && vke.localKyber.Private != nil {
-		vke.localKyber.Private.Zeroize()
+		_ = vke.localKyber.Private.Zeroize()
 	}
 	vke.localKyber = kp
 
@@ -649,7 +649,9 @@ func (vke *ValidatorKeyExchange) SyncFromValidatorSet(vs *ValidatorSet) {
 		if len(v.KyberPublicKeyBytes) == 0 {
 			continue
 		}
-		vke.RegisterKyberKey(v.Address, v.KyberPublicKeyBytes)
+		// Invalid, conflicting, or non-active entries cannot be registered;
+		// they are also re-synced on the next call, so a failure is non-fatal.
+		_ = vke.RegisterKyberKey(v.Address, v.KyberPublicKeyBytes)
 	}
 }
 
@@ -762,7 +764,7 @@ func CreateValidatorKyberRegistration(addr types.Address) ([]byte, *crypto.Kyber
 
 	pubBytes, err := kp.Public.Bytes()
 	if err != nil {
-		kp.Private.Zeroize()
+		_ = kp.Private.Zeroize()
 		return nil, nil, fmt.Errorf("failed to serialize Kyber public key: %w", err)
 	}
 
@@ -844,11 +846,11 @@ func (vke *ValidatorKeyExchange) SealForPeer(peerAddr types.Address, plaintext [
 		return nil, fmt.Errorf("invalid peer Kyber public key: %w", err)
 	}
 
-	sharedSecret, kyberCiphertext, err := localKyber.Private.Exchange(peerKyberPub)
+	sharedSecret, kyberCiphertext, err := crypto.KyberEncapsulate(peerKyberPub)
 	if err != nil {
-		return nil, fmt.Errorf("Kyber encapsulation failed: %w", err)
+		return nil, fmt.Errorf("kyber encapsulation failed: %w", err)
 	}
-	defer crypto.ZeroBytesSecure(sharedSecret)
+	defer func() { _ = crypto.ZeroBytesSecure(sharedSecret) }()
 
 	aesKey := deriveOneShotKey(sharedSecret, localAddr[:], peerAddr[:])
 
@@ -928,9 +930,9 @@ func (vke *ValidatorKeyExchange) OpenFromPeer(peerAddr types.Address, ciphertext
 
 	sharedSecret, err := localKyber.Private.Decapsulate(kyberCiphertext)
 	if err != nil {
-		return nil, fmt.Errorf("Kyber decapsulation failed: %w", err)
+		return nil, fmt.Errorf("kyber decapsulation failed: %w", err)
 	}
-	defer crypto.ZeroBytesSecure(sharedSecret)
+	defer func() { _ = crypto.ZeroBytesSecure(sharedSecret) }()
 
 	aesKey := deriveOneShotKey(sharedSecret, peerAddr[:], localAddr[:])
 

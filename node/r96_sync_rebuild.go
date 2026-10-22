@@ -216,8 +216,8 @@ func (s *Syncer) isRebuilding() bool {
 // full-sync boots with syncing=false while stateVerifiedHeight can be far
 // behind the restored chain head; the edge-triggered rebuild already fired
 // inside the previous process, so nobody would ever verify the remaining
-// range. Production hit: node-G 2026-10-19, reboot at head=220698 with verified=0
-// wedged the producer on "state not verified yet" forever.
+// range. Observed on a production sealer: a reboot at a non-zero head with
+// verified=0 wedged the producer on "state not verified yet" forever.
 //
 // The condition mirrors shouldRebuildAfterSync's substantive question —
 // "is there work?" — with two differences:

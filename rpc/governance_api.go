@@ -9,10 +9,8 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/quantaureum/qau/crypto"
@@ -26,68 +24,33 @@ type GovernanceAPI struct {
 	blockReader BlockReader
 	chainID     uint64
 
-	nonceMu    sync.Mutex
-	usedNonces map[types.Address]map[string]time.Time
-
-	// GOV-R7-08 (Low): nonceTTL is the replay-protection window for
-	// confirmed governance nonces. Confirmed nonces older than nonceTTL
-	// are eligible for eviction during the per-call cleanup in
-	// verifyGovernanceSignature. Defaults to 10 minutes (the previous
-	// hardcoded value) and can be overridden via SetNonceTTL for
-	// high-latency networks (longer window) or test environments
-	// (shorter window) without recompiling.
-	nonceTTL time.Duration
+	// Replay protection for signed governance requests. The request carries an
+	// explicit deadline that is bound into the signed message, and the node
+	// persists reservations when a replay store is configured.
+	replay *authReplayGuard
 }
-
-const maxGovernanceNoncesPerAddress = 10000
-const maxGovernanceTrackedAddresses = 100000
-
-// isNoncePending returns true if the nonce timestamp indicates a pending
-// reservation (awaiting signature verification).
-// L13-020 FIX: Centralizes the time.Time{} zero-value sentinel check
-// to prevent future refactoring mistakes. The zero value of time.Time
-// (Go year 1, NOT Unix epoch 1970) marks a nonce as "pending"; any
-// non-zero value means the nonce is confirmed (signature verified).
-// All callers MUST use these helpers instead of bare ts.IsZero() checks.
-func isNoncePending(ts time.Time) bool {
-	return ts.IsZero()
-}
-
-// isNonceConfirmed returns true if the nonce has been confirmed
-// (signature verified and timestamp recorded).
-func isNonceConfirmed(ts time.Time) bool {
-	return !ts.IsZero()
-}
-
-// defaultGovernanceNonceTTL is the default replay-protection window for
-// confirmed governance nonces. Override per-instance with SetNonceTTL.
-const defaultGovernanceNonceTTL = 10 * time.Minute
 
 // NewGovernanceAPI creates a new Governance API.
 func NewGovernanceAPI(gm *economics.GovernanceManager, br BlockReader) *GovernanceAPI {
 	return &GovernanceAPI{
 		gm:          gm,
 		blockReader: br,
-		usedNonces:  make(map[types.Address]map[string]time.Time),
-		nonceTTL:    defaultGovernanceNonceTTL,
+		replay:      newAuthReplayGuard("governance"),
 	}
+}
+
+// SetAuthReplayStore wires the persistent replay cache shared by all RPC APIs.
+func (api *GovernanceAPI) SetAuthReplayStore(store *AuthReplayStore) {
+	if api.replay == nil {
+		api.replay = newAuthReplayGuard("governance")
+	}
+	api.replay.setStore(store)
 }
 
 // SetChainID sets the chain ID used in governance signature messages to prevent
 // cross-chain replay of governance signatures.
 func (api *GovernanceAPI) SetChainID(id uint64) {
 	api.chainID = id
-}
-
-// SetNonceTTL overrides the replay-protection window for confirmed governance
-// nonces. A longer window tolerates high-latency RPC paths; a shorter window
-// tightens the replay window (useful in tests). Must be > 0; passing 0 keeps
-// the default to avoid accidentally disabling replay protection.
-func (api *GovernanceAPI) SetNonceTTL(ttl time.Duration) {
-	if ttl <= 0 {
-		ttl = defaultGovernanceNonceTTL
-	}
-	api.nonceTTL = ttl
 }
 
 // R24-018: This method uses a non-standard name. The convention across
@@ -160,7 +123,7 @@ func parseGovAddress(s string) (types.Address, error) {
 // CRITICAL C-2 FIX: all state-mutating governance RPC calls require Dilithium3 signature
 // verification proving ownership of the address being operated on, with nonce-based
 // replay protection.
-func (api *GovernanceAPI) verifyGovernanceSignature(method string, userAddr types.Address, nonce, params string, signature, pubKeyHex string) error {
+func (api *GovernanceAPI) verifyGovernanceSignature(method string, userAddr types.Address, nonce, deadline, params, signature, pubKeyHex string) error {
 	if signature == "" || pubKeyHex == "" {
 		return fmt.Errorf("signature and publicKey are required for state-mutating operations")
 	}
@@ -168,55 +131,18 @@ func (api *GovernanceAPI) verifyGovernanceSignature(method string, userAddr type
 		return fmt.Errorf("nonce is required for replay protection")
 	}
 
-	api.nonceMu.Lock()
-	if len(api.usedNonces) > maxGovernanceTrackedAddresses {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("too many tracked addresses (memory limit)")
+	deadlineAt, err := ParseAuthDeadline(deadline, time.Now())
+	if err != nil {
+		return err
 	}
-	if api.usedNonces[userAddr] == nil {
-		api.usedNonces[userAddr] = make(map[string]time.Time)
-	}
-	// GOV-R7-08: nonceTTL is now an instance field (settable via
-	// SetNonceTTL) instead of a hardcoded const, allowing operators to
-	// adjust the replay-protection window without recompiling.
-	nonceTTL := api.nonceTTL
-	if nonceTTL <= 0 {
-		nonceTTL = defaultGovernanceNonceTTL
-	}
-	now := time.Now()
-	for k, ts := range api.usedNonces[userAddr] {
-		// L13-013 FIX: Skip pending (zero-time) nonces in TTL cleanup.
-		// Pending nonces await signature verification and must NOT be evicted
-		// by a concurrent request's cleanup, which would reopen a TOCTOU
-		// window allowing the same nonce to be reused.
-		if isNonceConfirmed(ts) && now.Sub(ts) > nonceTTL {
-			delete(api.usedNonces[userAddr], k)
-		}
-	}
-	if _, used := api.usedNonces[userAddr][nonce]; used {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("nonce already used (replay detected)")
-	}
-	// L13-020 FIX: time.Time{} (zero value) marks this nonce as "pending"
-	// (awaiting signature verification). The isNoncePending() helper centralizes
-	// this sentinel check. The TTL cleanup above explicitly skips pending nonces
-	// via isNonceConfirmed(ts), so pending entries survive concurrent cleanup.
-	// This is safe because: (1) cleanup runs BEFORE insertion in this function;
-	// (2) isNoncePending/isNonceConfirmed are the ONLY way to check nonce state;
-	// (3) the double-check at the second lock (see L19-005 below) re-verifies
-	// the pending state before confirming.
-	api.usedNonces[userAddr][nonce] = time.Time{}
-	api.nonceMu.Unlock()
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
 	if err != nil {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("invalid signature hex: %w", err)
 	}
 
 	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
 	if err != nil {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("invalid publicKey hex: %w", err)
 	}
 
@@ -224,82 +150,43 @@ func (api *GovernanceAPI) verifyGovernanceSignature(method string, userAddr type
 	// crypto.PublicKeyFromBytes checks this internally, but early rejection
 	// provides clearer error messages and avoids unnecessary processing.
 	if len(pubKeyBytes) != crypto.Dilithium3PublicKeySize {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("invalid public key length: expected %d bytes, got %d", crypto.Dilithium3PublicKeySize, len(pubKeyBytes))
 	}
 
 	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
 	if err != nil {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
 	}
 
 	derivedAddr := pubKey.Address()
 	if derivedAddr != userAddr {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("public key does not match claimed address")
 	}
 
 	// L9-007 FIX: Include ChainID and QAU-{method} domain prefix to prevent
 	// cross-chain replay and cross-method signature confusion.
-	message := []byte(fmt.Sprintf("QAU-%s|%d|%s|%s|%s", method, api.chainID, userAddr.ToHexAddress(), nonce, params))
+	// F-01 FIX: The deadline is part of the signed message, so an accepted
+	// signature cannot outlive the window its signer authorized.
+	message := []byte(fmt.Sprintf("QAU-%s|%d|%s|%s|%s|%s", method, api.chainID, userAddr.ToHexAddress(), nonce, deadline, params))
 
 	if !crypto.Verify(pubKey, message, sigBytes) {
-		api.rollbackPendingGovernanceNonce(userAddr, nonce)
 		return fmt.Errorf("signature verification failed")
 	}
 
-	api.nonceMu.Lock()
-	// L13-013 FIX: Re-verify the nonce is still in pending state before
-	// confirming. This closes the TOCTOU window between the initial pending
-	// reservation (first lock) and this confirmation (second lock).
-	// L19-005 FIX: This double-check pattern (reserve -> verify -> confirm)
-	// is the standard defense against nonce TOCTOU races. Between the first
-	// lock release and this second lock acquire, a concurrent request cannot
-	// reuse the nonce (it sees the pending entry and is rejected at line 136),
-	// and the TTL cleanup cannot evict it (isNonceConfirmed skips pending).
-	if ts, exists := api.usedNonces[userAddr][nonce]; !exists || isNonceConfirmed(ts) {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("nonce reservation invalid or lost (possible replay)")
+	// R2-03 FIX: reserve only after the signature checks out, so
+	// unauthenticated traffic cannot drive persistent write transactions. A
+	// concurrent duplicate still loses the race here, so a nonce is consumed
+	// at most once.
+	if err := api.replay.reserve(userAddr, nonce, deadlineAt); err != nil {
+		return err
 	}
-	if len(api.usedNonces[userAddr]) >= maxGovernanceNoncesPerAddress {
-		type nonceEntry struct {
-			nonce string
-			ts    time.Time
-		}
-		entries := make([]nonceEntry, 0, len(api.usedNonces[userAddr]))
-		for k, ts := range api.usedNonces[userAddr] {
-			entries = append(entries, nonceEntry{k, ts})
-		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].ts.Before(entries[j].ts)
-		})
-		for i := 0; i < len(entries)/2; i++ {
-			delete(api.usedNonces[userAddr], entries[i].nonce)
-		}
-	}
-	api.usedNonces[userAddr][nonce] = time.Now()
-	api.nonceMu.Unlock()
 
 	return nil
 }
 
-// rollbackPendingGovernanceNonce removes a pending nonce reservation when verification fails.
-func (api *GovernanceAPI) rollbackPendingGovernanceNonce(userAddr types.Address, nonce string) {
-	api.nonceMu.Lock()
-	defer api.nonceMu.Unlock()
-	if nonces, ok := api.usedNonces[userAddr]; ok {
-		// L13-020 FIX: Only roll back pending nonces (isNoncePending check).
-		// Confirmed nonces must NOT be deleted (they are replay-protected).
-		if ts, exists := nonces[nonce]; exists && isNoncePending(ts) {
-			delete(nonces, nonce)
-		}
-	}
-}
-
 // CreateProposal creates a new governance proposal.
 // CRITICAL C-2 FIX: requires Dilithium3 signature verification.
-// Params: {proposer, type, title, description, changes, deposit, nonce, signature, publicKey}
+// Params: {proposer, type, title, description, changes, deposit, nonce, deadline, signature, publicKey}
 func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMessage) (any, *Error) {
 	if api.gm == nil {
 		return nil, &Error{Code: -32601, Message: "governance not available"}
@@ -319,6 +206,7 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 		Deposit        string                      `json:"deposit"`
 		TotalVotePower string                      `json:"totalVotePower"`
 		Nonce          string                      `json:"nonce"`
+		Deadline       string                      `json:"deadline"`
 		Signature      string                      `json:"signature"`
 		PublicKey      string                      `json:"publicKey"`
 	}
@@ -359,10 +247,15 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 	// Proposer="0xAB"+Title=""); (2) omitted Type, Description, and Changes,
 	// allowing an attacker to reuse a signature for a proposal with the same
 	// Title/Deposit but different (potentially malicious) parameter changes.
+	// R3-05: reconstruct authParams from the canonical forms that the core
+	// layer uses (proposer.ToHexAddress(), deposit.String()). Using the raw
+	// request strings made a signature over a non-canonical address/deposit
+	// pass the RPC check and then fail the core check after the nonce had
+	// already been reserved.
 	changesJSON, _ := json.Marshal(req.Changes)
 	authParams := fmt.Sprintf("%s|%d|%s|%s|%s|%s|%s",
-		req.Proposer, req.Type, req.Title, req.Description, req.Deposit, req.TotalVotePower, string(changesJSON))
-	if verr := api.verifyGovernanceSignature("qau_createProposal", proposer, req.Nonce, authParams, req.Signature, req.PublicKey); verr != nil {
+		proposer.ToHexAddress(), req.Type, req.Title, req.Description, deposit.String(), req.TotalVotePower, string(changesJSON))
+	if verr := api.verifyGovernanceSignature("qau_createProposal", proposer, req.Nonce, req.Deadline, authParams, req.Signature, req.PublicKey); verr != nil {
 		return nil, &Error{Code: -32603, Message: "signature verification required: " + verr.Error()}
 	}
 
@@ -376,15 +269,14 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 
 	// R41-L3ECON-05 (2026-08-03) FIX: parse the on-chain ProposerNonce from
 	// req.Nonce (the SAME string that verifyGovernanceSignature already
-	// embedded into the Dilithium3 signed message + checked against the
-	// in-process usedNonces replay cache). Pairing the on-chain counter
-	// with the signed nonce means:
+	// embedded into the Dilithium3 signed message + reserved in the replay
+	// store). Pairing the on-chain counter with the signed nonce means:
 	//   - An attacker cannot bump the on-chain counter without the
 	//     proposer's Dilithium3 key (the bumped nonce would not pass
 	//     verifyGovernanceSignature's signature check).
-	//   - A node restart that loses the in-process `usedNonces` is
-	//     still protected by the on-chain strict-monotonic counter
-	//     (CreateProposal rejects `proposerNonce <= last recorded`).
+	//   - A node restart that loses in-memory state is still protected by
+	//     the on-chain strict-monotonic counter (CreateProposal rejects
+	//     `proposerNonce <= last recorded`).
 	// We require the nonce string to parse strictly as a base-10 unsigned
 	// uint64; any other format is a client error (rejected before
 	// touching chain state).
@@ -396,8 +288,8 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 	// R43-GOVSIG-01 (2026-08-03): forward the Dilithium3 signature material
 	// into the core economics layer so CreateProposal verifies it AGAIN at
 	// the core (defense in depth). The RPC layer's verifyGovernanceSignature
-	// already checked the signature against the in-process usedNonces replay
-	// cache; the core layer re-checks the signature against the on-chain
+	// already checked the signature and reserved the nonce in the replay
+	// store; the core layer re-checks the signature against the on-chain
 	// ProposerNonce state and the pub→addr binding. A caller that bypasses
 	// the RPC path (and therefore skips verifyGovernanceSignature) is still
 	// blocked at the core because production callers MUST pass a non-nil
@@ -423,6 +315,7 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 		ProposerPubKey: pubKeyBytes,
 		ProposerSig:    sigBytes,
 		Nonce:          req.Nonce,
+		Deadline:       req.Deadline,
 		ChainID:        api.chainID,
 		TotalVotePower: req.TotalVotePower,
 	}
@@ -448,7 +341,7 @@ func (api *GovernanceAPI) CreateProposal(ctx context.Context, params json.RawMes
 
 // CastVote casts a vote on a proposal.
 // CRITICAL C-2 FIX: requires Dilithium3 signature verification.
-// Params: {proposalId, voter, option, votePower, nonce, signature, publicKey}
+// Params: {proposalId, voter, option, votePower, nonce, deadline, signature, publicKey}
 func (api *GovernanceAPI) CastVote(ctx context.Context, params json.RawMessage) (any, *Error) {
 	if api.gm == nil {
 		return nil, &Error{Code: -32601, Message: "governance not available"}
@@ -465,6 +358,7 @@ func (api *GovernanceAPI) CastVote(ctx context.Context, params json.RawMessage) 
 		Option     uint8  `json:"option"`
 		VotePower  string `json:"votePower"`
 		Nonce      string `json:"nonce"`
+		Deadline   string `json:"deadline"`
 		Signature  string `json:"signature"`
 		PublicKey  string `json:"publicKey"`
 	}
@@ -482,16 +376,18 @@ func (api *GovernanceAPI) CastVote(ctx context.Context, params json.RawMessage) 
 		votePower = big.NewInt(0)
 	}
 
-	// R37-P3-37 FIX (2026-07-31): Include VoteOption in the signed payload,
-	// with pipe delimiters to prevent field-collision ambiguity. Previously
-	// authParams used string concatenation (ProposalID+Voter+VotePower) which:
-	// (1) allowed collision attacks (e.g. ProposalID=1+Voter="0xAB" produces
-	// the same string as ProposalID=10+Voter="xAB"); (2) omitted Option,
-	// allowing an attacker to capture a signed "Yes" vote and replay it as a
-	// "No" vote — the signature would still verify because the authParams did
-	// not bind the vote option.
-	authParams := fmt.Sprintf("%d|%s|%d|%s", req.ProposalID, req.Voter, req.Option, req.VotePower)
-	if verr := api.verifyGovernanceSignature("qau_castVote", voter, req.Nonce, authParams, req.Signature, req.PublicKey); verr != nil {
+	// R37-P3-37 FIX (2026-07-31) + R4-RES: Include VoteOption in the signed
+	// payload, with pipe delimiters to prevent field-collision ambiguity.
+	// Previously authParams used string concatenation (ProposalID+Voter+
+	// VotePower) which (1) allowed collision attacks (e.g. ProposalID=1+
+	// Voter="0xAB" produces the same string as ProposalID=10+Voter="xAB")
+	// and (2) omitted Option, allowing an attacker to capture a signed "Yes"
+	// vote and replay it as a "No" vote. Voter is now normalized through
+	// ToHexAddress() to match the CreateProposal/Finalize R3-05 fix — the
+	// signature must bind the same address representation that the node
+	// records on-chain.
+	authParams := fmt.Sprintf("%d|%s|%d|%s", req.ProposalID, voter.ToHexAddress(), req.Option, req.VotePower)
+	if verr := api.verifyGovernanceSignature("qau_castVote", voter, req.Nonce, req.Deadline, authParams, req.Signature, req.PublicKey); verr != nil {
 		return nil, &Error{Code: -32603, Message: "signature verification required: " + verr.Error()}
 	}
 
@@ -518,7 +414,7 @@ func (api *GovernanceAPI) CastVote(ctx context.Context, params json.RawMessage) 
 
 // FinalizeProposal finalizes a proposal after voting ends.
 // CRITICAL C-2 FIX: requires Dilithium3 signature verification.
-// Params: {proposalId, totalVotePower, caller, nonce, signature, publicKey}
+// Params: {proposalId, totalVotePower, caller, nonce, deadline, signature, publicKey}
 func (api *GovernanceAPI) FinalizeProposal(ctx context.Context, params json.RawMessage) (any, *Error) {
 	if api.gm == nil {
 		return nil, &Error{Code: -32601, Message: "governance not available"}
@@ -534,6 +430,7 @@ func (api *GovernanceAPI) FinalizeProposal(ctx context.Context, params json.RawM
 		TotalVotePower string `json:"totalVotePower"`
 		Caller         string `json:"caller"`
 		Nonce          string `json:"nonce"`
+		Deadline       string `json:"deadline"`
 		Signature      string `json:"signature"`
 		PublicKey      string `json:"publicKey"`
 	}
@@ -554,7 +451,7 @@ func (api *GovernanceAPI) FinalizeProposal(ctx context.Context, params json.RawM
 	// L9-008 FIX: Bind caller address into the FinalizeProposal signature message
 	// and use delimiters to prevent field-collision ambiguity.
 	authParams := fmt.Sprintf("%d|%s|%s", req.ProposalID, caller.ToHexAddress(), req.TotalVotePower)
-	if verr := api.verifyGovernanceSignature("qau_finalizeProposal", caller, req.Nonce, authParams, req.Signature, req.PublicKey); verr != nil {
+	if verr := api.verifyGovernanceSignature("qau_finalizeProposal", caller, req.Nonce, req.Deadline, authParams, req.Signature, req.PublicKey); verr != nil {
 		return nil, &Error{Code: -32603, Message: "signature verification required: " + verr.Error()}
 	}
 
@@ -577,7 +474,7 @@ func (api *GovernanceAPI) FinalizeProposal(ctx context.Context, params json.RawM
 
 // ExecuteProposal executes a passed proposal.
 // CRITICAL C-2 FIX: requires Dilithium3 signature verification.
-// Params: {proposalId, caller, nonce, signature, publicKey}
+// Params: {proposalId, caller, nonce, deadline, signature, publicKey}
 func (api *GovernanceAPI) ExecuteProposal(ctx context.Context, params json.RawMessage) (any, *Error) {
 	if api.gm == nil {
 		return nil, &Error{Code: -32601, Message: "governance not available"}
@@ -592,6 +489,7 @@ func (api *GovernanceAPI) ExecuteProposal(ctx context.Context, params json.RawMe
 		ProposalID uint64 `json:"proposalId"`
 		Caller     string `json:"caller"`
 		Nonce      string `json:"nonce"`
+		Deadline   string `json:"deadline"`
 		Signature  string `json:"signature"`
 		PublicKey  string `json:"publicKey"`
 	}
@@ -605,7 +503,7 @@ func (api *GovernanceAPI) ExecuteProposal(ctx context.Context, params json.RawMe
 	}
 
 	authParams := fmt.Sprintf("%d", req.ProposalID)
-	if verr := api.verifyGovernanceSignature("qau_executeProposal", caller, req.Nonce, authParams, req.Signature, req.PublicKey); verr != nil {
+	if verr := api.verifyGovernanceSignature("qau_executeProposal", caller, req.Nonce, req.Deadline, authParams, req.Signature, req.PublicKey); verr != nil {
 		return nil, &Error{Code: -32603, Message: "signature verification required: " + verr.Error()}
 	}
 

@@ -88,7 +88,8 @@ func (api *DebugAPI) TraceBlockByNumber(blockNum string, opts *TraceOpts) ([]any
 	if blockNum == "latest" || blockNum == "" {
 		height = api.blockReader.GetLatestHeight()
 	} else {
-		fmt.Sscanf(blockNum, "%d", &height)
+		// Invalid input keeps the zero height (pre-existing behavior).
+		_, _ = fmt.Sscanf(blockNum, "%d", &height)
 	}
 
 	blockRaw, err := api.blockReader.GetBlockByHeight(height)

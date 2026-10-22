@@ -110,11 +110,11 @@ func TestBridgeHeaderVerifier_NilSafe(t *testing.T) {
 	if err := v.VerifyQuantaureumHeader(100, "0xabc"); err != nil {
 		t.Fatalf("VerifyQuantaureumHeader should be nil when not configured, got: %v", err)
 	}
-	if err := v.VerifyEthereumHeader(nil); err != nil {
-		t.Fatalf("VerifyEthereumHeader should be nil when not configured, got: %v", err)
+	if err := v.VerifyExternalChainHeader(nil); err != nil {
+		t.Fatalf("VerifyExternalChainHeader should be nil when not configured, got: %v", err)
 	}
-	if err := v.VerifyEthereumHeaderByNumber(context.Background(), nil, 100, "0xabc"); err != nil {
-		t.Fatalf("VerifyEthereumHeaderByNumber should be nil when not configured, got: %v", err)
+	if err := v.VerifyExternalChainHeaderByNumber(context.Background(), nil, 100, "0xabc"); err != nil {
+		t.Fatalf("VerifyExternalChainHeaderByNumber should be nil when not configured, got: %v", err)
 	}
 }
 
@@ -193,30 +193,30 @@ func TestBridgeHeaderVerifier_EthereumSyncCommittee(t *testing.T) {
 	v := NewBridgeHeaderVerifier()
 
 	// Not configured → skip
-	if err := v.VerifyEthereumHeader(&encoding.BlockHeader{}); err != nil {
+	if err := v.VerifyExternalChainHeader(&encoding.BlockHeader{}); err != nil {
 		t.Fatalf("expected nil when not configured, got: %v", err)
 	}
 
 	// Configured with nil header → error
-	v.SetEthereumSyncCommittee(&mockSyncCommitteeChecker{err: nil})
-	if err := v.VerifyEthereumHeader(nil); err == nil {
+	v.SetExternalChainSyncCommittee(&mockSyncCommitteeChecker{err: nil})
+	if err := v.VerifyExternalChainHeader(nil); err == nil {
 		t.Fatal("expected error for nil header, got nil")
 	}
 
 	// Configured with valid header, checker returns nil → pass
-	if err := v.VerifyEthereumHeader(&encoding.BlockHeader{}); err != nil {
+	if err := v.VerifyExternalChainHeader(&encoding.BlockHeader{}); err != nil {
 		t.Fatalf("expected nil for valid header, got: %v", err)
 	}
 
 	// Configured with checker returning error → fail
-	v.SetEthereumSyncCommittee(&mockSyncCommitteeChecker{err: fmt.Errorf("insufficient signatures")})
-	if err := v.VerifyEthereumHeader(&encoding.BlockHeader{}); err == nil {
+	v.SetExternalChainSyncCommittee(&mockSyncCommitteeChecker{err: fmt.Errorf("insufficient signatures")})
+	if err := v.VerifyExternalChainHeader(&encoding.BlockHeader{}); err == nil {
 		t.Fatal("expected error from checker, got nil")
 	}
 }
 
 // TestBridgeHeaderVerifier_EthereumByNumber_ReorgDetected verifies that
-// VerifyEthereumHeaderByNumber detects a block hash mismatch (reorg).
+// VerifyExternalChainHeaderByNumber detects a block hash mismatch (reorg).
 func TestBridgeHeaderVerifier_EthereumByNumber_ReorgDetected(t *testing.T) {
 	header := makeTestHeader(50)
 	actualHash := block.ComputeBlockHash(header)
@@ -225,10 +225,10 @@ func TestBridgeHeaderVerifier_EthereumByNumber_ReorgDetected(t *testing.T) {
 	fetcher := &mockHeaderFetcher{header: header}
 
 	v := NewBridgeHeaderVerifier()
-	v.SetEthereumSyncCommittee(&mockSyncCommitteeChecker{err: nil})
+	v.SetExternalChainSyncCommittee(&mockSyncCommitteeChecker{err: nil})
 
 	// Correct hash → should pass
-	if err := v.VerifyEthereumHeaderByNumber(context.Background(), fetcher, 50, actualHashHex); err != nil {
+	if err := v.VerifyExternalChainHeaderByNumber(context.Background(), fetcher, 50, actualHashHex); err != nil {
 		t.Fatalf("expected nil for correct hash, got: %v", err)
 	}
 	if fetcher.calledN != 50 {
@@ -237,7 +237,7 @@ func TestBridgeHeaderVerifier_EthereumByNumber_ReorgDetected(t *testing.T) {
 
 	// Wrong hash → should fail with "reorg detected"
 	wrongHash := "0x" + "00" + actualHashHex[4:] // flip first byte
-	err := v.VerifyEthereumHeaderByNumber(context.Background(), fetcher, 50, wrongHash)
+	err := v.VerifyExternalChainHeaderByNumber(context.Background(), fetcher, 50, wrongHash)
 	if err == nil {
 		t.Fatal("expected error for wrong hash, got nil")
 	}
@@ -252,9 +252,9 @@ func TestBridgeHeaderVerifier_EthereumByNumber_FetchError(t *testing.T) {
 	fetcher := &mockHeaderFetcher{err: fmt.Errorf("RPC timeout")}
 
 	v := NewBridgeHeaderVerifier()
-	v.SetEthereumSyncCommittee(&mockSyncCommitteeChecker{err: nil})
+	v.SetExternalChainSyncCommittee(&mockSyncCommitteeChecker{err: nil})
 
-	err := v.VerifyEthereumHeaderByNumber(context.Background(), fetcher, 50, "0xabc")
+	err := v.VerifyExternalChainHeaderByNumber(context.Background(), fetcher, 50, "0xabc")
 	if err == nil {
 		t.Fatal("expected error from fetcher, got nil")
 	}
@@ -273,7 +273,7 @@ func TestBridgeHeaderVerifier_Setters(t *testing.T) {
 	if v.HasQuantaureumLookup() {
 		t.Fatal("expected no Quantaureum lookup initially")
 	}
-	if v.HasEthereumSyncCommittee() {
+	if v.HasExternalChainSyncCommittee() {
 		t.Fatal("expected no Ethereum sync committee initially")
 	}
 
@@ -285,9 +285,9 @@ func TestBridgeHeaderVerifier_Setters(t *testing.T) {
 		t.Fatal("expected HasQuantaureumLookup=true")
 	}
 
-	v.SetEthereumSyncCommittee(&mockSyncCommitteeChecker{})
-	if !v.HasEthereumSyncCommittee() {
-		t.Fatal("expected HasEthereumSyncCommittee=true")
+	v.SetExternalChainSyncCommittee(&mockSyncCommitteeChecker{})
+	if !v.HasExternalChainSyncCommittee() {
+		t.Fatal("expected HasExternalChainSyncCommittee=true")
 	}
 }
 

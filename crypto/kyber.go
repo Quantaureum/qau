@@ -62,15 +62,19 @@ const (
 // and zeroing them in the Put() path is unnecessary. If this invariant ever
 // changes (e.g., a future caller writes key material into the buffer), the
 // Put() path MUST zero the buffer before returning it to the pool.
+// SA6002 FIX: The pools store *[]byte (a pointer) rather than []byte so that
+// Put does not box the slice header into an interface per call.
 var kyberZeroPubBufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, KyberPublicKeySize)
+		buf := make([]byte, KyberPublicKeySize)
+		return &buf
 	},
 }
 
 var kyberZeroPrivBufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, KyberPrivateKeySize)
+		buf := make([]byte, KyberPrivateKeySize)
+		return &buf
 	},
 }
 
@@ -913,8 +917,9 @@ func (k *KyberPublicKey) Equal(other *KyberPublicKey) bool {
 	// skip the ConstantTimeCompare entirely.
 	// CRYPTO-002 FIX / R43-CR-001 FIX: Use sync.Pool instead of make() on
 	// every call to avoid heap pressure on the hot signature-verification path.
-	zeroPubBuf := kyberZeroPubBufPool.Get().([]byte)
-	defer kyberZeroPubBufPool.Put(zeroPubBuf)
+	zeroPubBufPtr := kyberZeroPubBufPool.Get().(*[]byte)
+	zeroPubBuf := *zeroPubBufPtr
+	defer func() { kyberZeroPubBufPool.Put(zeroPubBufPtr) }()
 	// R47-CR-01 FIX: Use separate halves of the zero buffer to prevent
 	// aliasing when both keys are nil. Previously kBytes and otherBytes
 	// both pointed to the same buffer, causing ConstantTimeCompare to
@@ -994,8 +999,9 @@ func (k *KyberPrivateKey) Equal(other *KyberPrivateKey) bool {
 	// to ensure consistent execution path regardless of nil state.
 	// CRYPTO-002 FIX / R43-CR-001 FIX: Use sync.Pool instead of make() on
 	// every call to avoid heap pressure on the hot signature-verification path.
-	zeroPrivBuf := kyberZeroPrivBufPool.Get().([]byte)
-	defer kyberZeroPrivBufPool.Put(zeroPrivBuf)
+	zeroPrivBufPtr := kyberZeroPrivBufPool.Get().(*[]byte)
+	zeroPrivBuf := *zeroPrivBufPtr
+	defer func() { kyberZeroPrivBufPool.Put(zeroPrivBufPtr) }()
 	// R47-CR-01 FIX: Use separate halves to prevent aliasing (same as pub).
 	half := len(zeroPrivBuf) / 2
 	kBytes := zeroPrivBuf[:half]

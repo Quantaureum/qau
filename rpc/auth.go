@@ -263,6 +263,12 @@ func DefaultAuthConfig() *AuthConfig {
 			// CRV2: qau_submitCommitment was deleted — commitments are ordinary
 			// TxTypeCommit transactions submitted through eth_sendRawTransaction,
 			// so there is no commitment RPC left to allowlist.
+			// R5-05 (2026-10-21): these AA entries stay for interface stability
+			// only. Account abstraction is not live — no component consumes built
+			// bundles — and qau_sendUserOperation now refuses with "account
+			// abstraction is not live". Note the eth_* aliases registered alongside
+			// them in api.go are NOT public here, so an unauthenticated ERC-4337
+			// client reaches eth_sendUserOperation only with an API key.
 			"qau_sendUserOperation",
 			"qau_estimateUserOperationGas",
 			"qau_getUserOperationByHash",
@@ -459,6 +465,10 @@ type AuthManager struct {
 	// defense-in-depth so admin authorization cannot be granted to a
 	// non-admin method by a misrouted/direct call. Protected by am.mu.
 	adminMethods map[string]bool
+	// F-20: emit a single high-signal warning the first time an admin method
+	// is authorized while authentication is disabled, so operators are not
+	// left assuming admin calls were actually verified.
+	authDisabledWarnOnce sync.Once
 }
 
 // NewAuthManager creates a new authentication manager
@@ -1539,6 +1549,10 @@ func (am *AuthManager) ValidateAdminRequest(r *http.Request, method string) erro
 	defer am.mu.RUnlock()
 
 	if !am.config.Enabled {
+		am.authDisabledWarnOnce.Do(func() {
+			log.Printf("[RPC][SECURITY WARNING] authentication is disabled: admin methods are NOT authenticated. " +
+				"Expose this endpoint only on localhost or a trusted development network.")
+		})
 		return nil
 	}
 

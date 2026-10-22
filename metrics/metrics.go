@@ -533,6 +533,16 @@ type Metrics struct {
 	WSActiveSubscriptions atomic.Int64
 	HandshakeFailures     atomic.Uint64
 
+	// R5-05 (2026-10-21 fifth-round audit): account abstraction is not live.
+	// The node always constructs and starts a Bundler, but until this round no
+	// component read Bundler.BundleChannel(), so every bundle the bundler built
+	// was discarded in a default: select branch with no log and no counter. The
+	// admission path is now gated at the rpc and pool boundaries; this counter
+	// makes any future drop observable, so the next person who wires a bundle
+	// consumer sees the symptom instead of debugging silence. Expected to stay
+	// at zero while AA is dark.
+	AABundlesDropped atomic.Uint64
+
 	// State metrics
 	StateSize     atomic.Int64
 	AccountCount  atomic.Int64
@@ -1712,6 +1722,13 @@ func (m *Metrics) AddHandshakeFailure() {
 	m.HandshakeFailures.Add(1)
 }
 
+// AddAABundleDropped increments the counter for user-operation bundles that
+// found BundleChannel() full (or, in practice, unread) and were discarded.
+// Called by the txpool bundler. R5-05.
+func (m *Metrics) AddAABundleDropped() {
+	m.AABundlesDropped.Add(1)
+}
+
 // SetTxPoolSize sets the transaction pool size
 func (m *Metrics) SetTxPoolSize(size int) {
 	m.TxPoolSize.Store(int64(size))
@@ -1979,6 +1996,11 @@ func (m *Metrics) writePrometheusMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(w, "# TYPE qau_p2p_handshake_failures_total counter\n")
 	fmt.Fprintf(w, "qau_p2p_handshake_failures_total%s %d\n", labels, m.HandshakeFailures.Load())
 
+	// R5-05: AA bundles discarded because nothing consumed BundleChannel().
+	fmt.Fprintf(w, "# HELP qau_aa_bundles_dropped_total Total user-operation bundles discarded instead of handed to a block producer\n")
+	fmt.Fprintf(w, "# TYPE qau_aa_bundles_dropped_total counter\n")
+	fmt.Fprintf(w, "qau_aa_bundles_dropped_total%s %d\n", labels, m.AABundlesDropped.Load())
+
 	avgLatency := m.GetAverageRPCLatency()
 	fmt.Fprintf(w, "# HELP qau_rpc_latency_seconds Average RPC latency in seconds\n")
 	fmt.Fprintf(w, "# TYPE qau_rpc_latency_seconds gauge\n")
@@ -2221,6 +2243,8 @@ func (m *Metrics) Snapshot() map[string]any {
 		"ws_active_connections":   m.WSActiveConnections.Load(),
 		"ws_active_subscriptions": m.WSActiveSubscriptions.Load(),
 		"p2p_handshake_failures":  m.HandshakeFailures.Load(),
+		// R5-05: AA bundles discarded because nothing consumed BundleChannel().
+		"aa_bundles_dropped": m.AABundlesDropped.Load(),
 		// State metrics
 		"state_size":     m.StateSize.Load(),
 		"account_count":  m.AccountCount.Load(),

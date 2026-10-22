@@ -176,12 +176,12 @@ When `isProposer=true` appears in the logs or the block height keeps increasing,
 
 ### 5.1 Environment Preparation
 
-#### Install Go 1.26+
+#### Install Go 1.26.10+
 
 ```bash
-# Download and install Go 1.26+
-wget https://go.dev/dl/go1.26.0.linux-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.0.linux-arm64.tar.gz
+# Download and install Go 1.26.10+ (1.26.10 fixes GO-2026-6809 in crypto/x509)
+wget https://go.dev/dl/go1.26.10.linux-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.10.linux-arm64.tar.gz
 
 # Configure environment variables
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
@@ -191,7 +191,7 @@ source ~/.bashrc
 
 # Verify the installation
 go version
-# Output: go version go1.26.0 linux/arm64
+# Output: go version go1.26.10 linux/arm64
 ```
 
 #### Build qaud (Node Daemon)

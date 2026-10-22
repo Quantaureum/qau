@@ -990,7 +990,7 @@ func MigrateKeyFile(keyFile *KeyFile, password []byte) (*KeyFile, error) {
 	// if the caller's slice shares backing memory.
 	pwd := make([]byte, len(password))
 	copy(pwd, password)
-	defer zeroBytesSecure(pwd)
+	defer func() { _ = zeroBytesSecure(pwd) }()
 
 	// R30-P4 FIX: Use defer for privateKey zeroization to ensure cleanup
 	// even on panic. Previously, privateKey.Zeroize() was called manually
@@ -1000,7 +1000,7 @@ func MigrateKeyFile(keyFile *KeyFile, password []byte) (*KeyFile, error) {
 	var err error
 	defer func() {
 		if privateKey != nil {
-			privateKey.Zeroize()
+			_ = privateKey.Zeroize()
 		}
 	}()
 

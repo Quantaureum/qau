@@ -1289,7 +1289,25 @@ func (s *QTDSession) Round2Aggregate(reveals []*Round2Reveal) (*QTDSignature, er
 // Verify verifies a QTD signature against a message and public key.
 // Supports both standard format (3293 bytes, hintCount ≤ Omega) and
 // full-bitmap format (4064 bytes, arbitrary hintCount).
-func (s *QTDSession) Verify(sig *QTDSignature, message []byte, pubKey *mode3.PublicKey) bool {
+//
+// R5-02 (2026-10-21 fifth-round audit): the whole check runs under recover.
+// Measured in TestR5_02_CirclAndQTDVerifierPanicProbe the only input shape that
+// actually panics is a nil public key — mode3.Verify and
+// CheckGMQTDFullSignature both dereference it — whereas right-length but
+// structurally malformed signatures made the verifiers return false without
+// panicking. A nil key is a caller-state error rather than remote input, so the
+// guard is defense in depth: a panic must still be reported as "not verified",
+// never as a crash of the verifying node. Consensus reaches Dilithium3
+// verification through crypto.PublicKey.Verify (already guarded), so this closes
+// the gap for the remaining direct QTD callers rather than a currently reachable
+// remote path.
+func (s *QTDSession) Verify(sig *QTDSignature, message []byte, pubKey *mode3.PublicKey) (verified bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERROR: QTDSession.Verify rejected by panic guard (R5-02): %v", r)
+			verified = false
+		}
+	}()
 	if sig == nil || pubKey == nil {
 		return false
 	}

@@ -57,8 +57,8 @@ func (api *API) SignQuantumTransaction(ctx context.Context, params json.RawMessa
 	// Parse value (decimal string, hex string, or number)
 	value := new(big.Int)
 	if len(txReq.Value) > 0 {
-		switch {
-		case txReq.Value[0] == '"':
+		switch txReq.Value[0] {
+		case '"':
 			var valStr string
 			if err := json.Unmarshal(txReq.Value, &valStr); err != nil {
 				return nil, NewError(ErrCodeInvalidParams, "invalid value")
@@ -89,8 +89,8 @@ func (api *API) SignQuantumTransaction(ctx context.Context, params json.RawMessa
 	// Parse gas price
 	gasPrice := new(big.Int)
 	if len(txReq.GasPrice) > 0 {
-		switch {
-		case txReq.GasPrice[0] == '"':
+		switch txReq.GasPrice[0] {
+		case '"':
 			var gpStr string
 			if err := json.Unmarshal(txReq.GasPrice, &gpStr); err == nil {
 				gpStr = strings.TrimSpace(gpStr)
@@ -101,7 +101,8 @@ func (api *API) SignQuantumTransaction(ctx context.Context, params json.RawMessa
 				}
 			}
 		default:
-			json.Unmarshal(txReq.GasPrice, gasPrice)
+			// Malformed input falls back to the default gas price below.
+			_ = json.Unmarshal(txReq.GasPrice, gasPrice)
 		}
 	}
 	if gasPrice.Sign() <= 0 {

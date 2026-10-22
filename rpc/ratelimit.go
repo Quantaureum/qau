@@ -389,7 +389,7 @@ func (rl *RateLimiter) checkIPLimit(ip string) bool {
 			// specific IP was recently active (evict oldest entry for new IP)
 			if len(rl.ipShards[shardIdx]) >= shardMaxIPs {
 				var oldestIP string
-				var oldestTime time.Time = time.Now().Add(time.Hour)
+				oldestTime := time.Now().Add(time.Hour)
 				for ip, e := range rl.ipShards[shardIdx] {
 					if e.lastUpdate.Before(oldestTime) && now.After(e.bannedUntil) {
 						oldestTime = e.lastUpdate

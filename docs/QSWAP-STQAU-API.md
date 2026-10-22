@@ -67,7 +67,7 @@ deposit()                     0xd0e30db0    (payable)
 withdraw(uint256)             0x2e1a7d4d
 ```
 
-### stQAU（R123）
+### stQAU (R123)
 
 ```
 deposit()                     0xd0e30db0

@@ -94,7 +94,7 @@ func (key ThresholdKeyID) Validate() error {
 	if len(key.PublicKey) != key.Algorithm.PublicKeySize() {
 		return fmt.Errorf("%w: wrong public key length", ErrInvalidThresholdKey)
 	}
-	if qcrypto.IsZeroPublicKeyBytes(key.PublicKey) {
+	if qcrypto.IsDegeneratePublicKeyBytes(key.PublicKey) {
 		return fmt.Errorf("%w: zero public key", ErrInvalidThresholdKey)
 	}
 	return nil

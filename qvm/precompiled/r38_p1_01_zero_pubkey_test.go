@@ -18,7 +18,7 @@ import (
 // only, so a QVM contract passing an all-zero 1952-byte pubkey could
 // trigger the DKG-uninitialized forgery surface from contract-readable code.
 //
-// R38-P1-01 added a constant-time crypto.IsZeroPublicKeyBytes rejection
+// R38-P1-01 added a constant-time crypto.IsDegeneratePublicKeyBytes rejection
 // at the entry of dilithiumVerifyCached (after the cache lookup — so a
 // forged zero-pubkey cache miss still has to undergo the gate, and a
 // poisoned positive cache entry cannot exist because the gate runs only
@@ -28,8 +28,8 @@ import (
 // without panicking.
 func TestR38P101_DilithiumVerifyCached_RejectsAllZeroPubKey(t *testing.T) {
 	zeroPubKey := make([]byte, crypto.Dilithium3PublicKeySize)
-	if !crypto.IsZeroPublicKeyBytes(zeroPubKey) {
-		t.Fatalf("fixture itself is not recognized as all-zero by crypto.IsZeroPublicKeyBytes — fixture wrong")
+	if !crypto.IsDegeneratePublicKeyBytes(zeroPubKey) {
+		t.Fatalf("fixture itself is not recognized as degenerate by crypto.IsDegeneratePublicKeyBytes — fixture wrong")
 	}
 	sig := make([]byte, crypto.Dilithium3SignatureSize)
 	// Unique hash per invocation so cache miss is guaranteed:

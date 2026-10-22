@@ -29,6 +29,17 @@ type StorageProof struct {
 	Key   string   `json:"key"`
 	Value string   `json:"value"`
 	Proof []string `json:"proof"`
+
+	// Unverified is true when Proof is NOT cryptographically bound to the
+	// account StateRoot, exactly as the result-level flag of the same name.
+	// R6-05 (2026-10-21 sixth-round audit): on this node committed storage never
+	// reaches the Verkle state trie — StateDB.Commit writes slots to BoltDB
+	// under storagePrefix++addr++0xFF++slot while every stateTrie.Put key (in
+	// Commit's verkleUpdates loop and in the RecoverConsistency rebuild) is an
+	// account address. So no storage entry can be state-root-bound today and
+	// this is always true; the field exists so a future trie-backed storage
+	// implementation can turn it off per entry instead of per response.
+	Unverified bool `json:"unverified"`
 }
 
 type AccountProofResult struct {
@@ -73,7 +84,8 @@ func (api *ProofAPI) GetProof(address string, storageKeys []string, blockNum str
 	if blockNum == "latest" || blockNum == "" {
 		height = api.blockReader.GetLatestHeight()
 	} else {
-		fmt.Sscanf(blockNum, "%d", &height)
+		// Invalid input keeps the zero height (pre-existing behavior).
+		_, _ = fmt.Sscanf(blockNum, "%d", &height)
 	}
 
 	// R38-P2-04 FIX (2026-08-02): Resolve the canonical StateRoot for the
@@ -143,15 +155,21 @@ func (api *ProofAPI) GetProof(address string, storageKeys []string, blockNum str
 	for _, keyHex := range storageKeys {
 		key := hexToHash(keyHex)
 		val := api.stateReader.GetState(addr, key)
-		// R38-P2-04 DEEP FIX: prefer stateRoot-aware storage proof when
-		// available, mirror account path. Storage proofs share the same
-		// Verkle proof backend as accounts.
-		verifiedStorageProof, _ := api.stateReader.ProveStorage(addr, key)
+		// R6-05: the storage path is NOT mirrored onto ProveStorage the way the
+		// account path is. ProveStorage walks the state trie with a key that is
+		// never inserted there, so it can only ever answer with an EXCLUSION
+		// proof — a proof that contradicts the non-zero Value reported beside it,
+		// and which a light client would accept as verification that the slot is
+		// empty. The synthetic path stays (it proves nothing about canonical
+		// state either) but every entry is labelled unverified, and the
+		// result-level flag is forced so a caller that only checks that one flag
+		// rejects the response instead of trusting it.
 		storageProof := buildStorageProof(addr, key, val)
-		if verifiedStorageProof != nil {
-			storageProof.Proof = serializeVerkleProof(verifiedStorageProof)
-		}
+		storageProof.Unverified = true
 		result.StorageProof = append(result.StorageProof, storageProof)
+	}
+	if len(result.StorageProof) > 0 {
+		result.Unverified = true
 	}
 
 	return result, nil
@@ -250,7 +268,9 @@ func buildAccountProof(addr types.Address, balance *big.Int, nonce uint64, codeH
 
 	accountKey := append([]byte("account:"), addr[:]...)
 	accountData := serializeAccountData(balance, nonce, codeHash)
-	tree.Put(accountKey, accountData)
+	if err := tree.Put(accountKey, accountData); err != nil {
+		return []string{}
+	}
 
 	proof, err := tree.Prove(accountKey)
 	if err != nil {
@@ -274,7 +294,13 @@ func buildStorageProof(addr types.Address, key, value types.Hash) StorageProof {
 
 	storageKey := append(append([]byte("storage:"), addr[:]...), key[:]...)
 	storageData := value[:]
-	tree.Put(storageKey, storageData)
+	if err := tree.Put(storageKey, storageData); err != nil {
+		return StorageProof{
+			Key:   "0x" + hex.EncodeToString(key[:]),
+			Value: "0x0",
+			Proof: []string{},
+		}
+	}
 
 	proof, err := tree.Prove(storageKey)
 	if err != nil {

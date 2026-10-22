@@ -2,11 +2,11 @@
 package lightclient
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 
+	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
 )
@@ -61,8 +61,19 @@ func (v *SyncCommitteeVerifier) GetCurrentCommittee() *SyncCommitteeInfo {
 	return v.currentCommittee
 }
 
+// HasActiveCommittee reports whether a non-empty sync committee is loaded.
+// Callers must not treat a nil VerifyBlockHeader result as signature-verified
+// when this returns false: the header was accepted as a pre-sync-committee
+// block, not verified.
+func (v *SyncCommitteeVerifier) HasActiveCommittee() bool {
+	return v.currentCommittee != nil && len(v.currentCommittee.ValidatorPubKeys) > 0
+}
+
 // VerifyBlockHeader verifies a block header using the sync committee signature.
-// Returns true if the sync committee signature is valid.
+// It returns nil only when the signature was verified, or when no committee is
+// loaded and the header carries no sync committee data (pre-sync-committee
+// block). It returns ErrSyncCommitteeNotAvailable when the header carries sync
+// committee data but no committee is configured.
 func (v *SyncCommitteeVerifier) VerifyBlockHeader(header *encoding.BlockHeader) error {
 	if header == nil {
 		return ErrInvalidHeader
@@ -125,7 +136,10 @@ func (v *SyncCommitteeVerifier) VerifyBlockHeader(header *encoding.BlockHeader) 
 	}
 
 	// Compute the signing data (same as what committee members signed)
-	signingData := computeSyncCommitteeSigningData(header)
+	signingData, err := computeSyncCommitteeSigningData(header)
+	if err != nil {
+		return fmt.Errorf("compute sync committee signing data: %w", err)
+	}
 
 	// Verify each signature
 	sigIdx := 0
@@ -152,53 +166,24 @@ func (v *SyncCommitteeVerifier) VerifyBlockHeader(header *encoding.BlockHeader) 
 	return nil
 }
 
-// syncCommitteeDomainTag is the domain separation tag prepended to sync
-// committee signing data. It binds signatures to the Quantaureum sync
-// committee context, preventing reuse of the same signature for other
-// signing purposes (e.g., attestation, block proposal) that might use a
-// similar data layout.
-const syncCommitteeDomainTag = "QuantaureumSyncCommittee"
-
-// computeSyncCommitteeSigningData computes the data that sync committee members sign.
+// computeSyncCommitteeSigningData returns the exact payload that sync
+// committee members sign and the verifier checks.
 //
-// AUDIT-FULL ROUND4 (2026-08-15) INFO-02: The comment below about "mainnet
-// would also verify on testnet" refers to the pre-fix behavior. The BRDG-10
-// fix (domain separation tag + ChainID) already resolved this — no further
-// action needed. Non-defect informational finding.
-//
-// AUDIT (2026) BRDG-10 FIX: Add domain separation tag and ChainID to
-// prevent cross-chain replay and cross-context signature reuse. Previously
-// the signing data was only [slot(8) + blockRoot(32) + epoch(8)] with no
-// domain tag or chain identifier — a signature valid for Quantaureum
-// mainnet would also verify on testnet (or any chain using the same slot/
-// blockRoot/epoch layout), and the same byte sequence could be replayed
-// in any other signing context that happens to use the same layout.
-//
-// Format (length-prefixed domain separation per RFC 8701 §4.2 to prevent
-// concatenation ambiguity):
-//
-//	domain || uint32(len(message)) || message
-//
-// where message = slot(8) || blockRoot(32) || epoch(8) || chainID(8).
-func computeSyncCommitteeSigningData(header *encoding.BlockHeader) []byte {
-	blockHash := computeHeaderHash(header)
-
-	// Message body: slot || blockRoot || epoch || chainID
-	const msgLen = 8 + 32 + 8 + 8
-	var msg [msgLen]byte
-	binary.BigEndian.PutUint64(msg[0:8], header.Slot)
-	copy(msg[8:40], blockHash[:])
-	binary.BigEndian.PutUint64(msg[40:48], header.Epoch)
-	binary.BigEndian.PutUint64(msg[48:56], header.ChainID)
-
-	// Length-prefixed domain separation: domain || uint32(len(message)) || message
-	var buf bytes.Buffer
-	buf.WriteString(syncCommitteeDomainTag)
-	var msgLenBytes [4]byte
-	binary.BigEndian.PutUint32(msgLenBytes[:], msgLen)
-	buf.Write(msgLenBytes[:])
-	buf.Write(msg[:])
-	return buf.Bytes()
+// R2-15 FIX: both sides now reuse consensus.BuildSyncCommitteeMessage (the
+// producer's builder) and derive blockRoot from
+// encoding.BlockHeaderSigningRoot, which clears SyncCommitteeSig/Bits and the
+// other post-signing fields. The previous implementation used a different
+// domain tag and field order than the producer, and it hashed the header
+// including the sync committee signature itself — a self-reference no honest
+// signer could satisfy.
+func computeSyncCommitteeSigningData(header *encoding.BlockHeader) ([]byte, error) {
+	blockRoot, err := encoding.BlockHeaderSigningRoot(header)
+	if err != nil {
+		return nil, err
+	}
+	return consensus.BuildSyncCommitteeMessage(
+		header.ChainID, header.Epoch, header.Height, header.Slot, blockRoot,
+	), nil
 }
 
 // countSetBits counts the number of set bits in a bitfield.

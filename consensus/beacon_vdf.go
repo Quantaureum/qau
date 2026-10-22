@@ -154,7 +154,7 @@ func newShakeStream(seed []byte) *shakeStream {
 // nextWord returns the next little-endian u64 from the stream.
 func (s *shakeStream) nextWord() uint64 {
 	if s.n == 0 {
-		s.d.Read(s.buf[:])
+		_, _ = s.d.Read(s.buf[:])
 	}
 	w := uint64(0)
 	for k := 0; k < 8; k++ {
@@ -218,7 +218,7 @@ func DeriveCRSMatrix(seed [32]byte, q uint64) vdf.Matrix {
 	pre.Write([]byte(vdfCRSDomain))
 	pre.Write(seed[:])
 	sum := make([]byte, 64)
-	pre.Read(sum)
+	_, _ = pre.Read(sum)
 	st := newShakeStream(sum)
 
 	m := make(vdf.Matrix, vdf.ModuleSize)
@@ -252,7 +252,7 @@ func EpochSeed(image vdf.StateVector) [32]byte {
 		}
 	}
 	var seed [32]byte
-	h.Read(seed[:])
+	_, _ = h.Read(seed[:])
 	return seed
 }
 

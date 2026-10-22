@@ -73,24 +73,32 @@ func TestSTATE_R12001_SnapshotRestoresStorageCache(t *testing.T) {
 	s.RevertToSnapshot(snapID2)
 }
 
-// TestSTATE_R12001_InvalidSnapshotClearsStorageCache verifies that
-// RevertToSnapshot with an invalid ID clears the storageCache (legacy
-// "wipe everything" fallback).
-func TestSTATE_R12001_InvalidSnapshotClearsStorageCache(t *testing.T) {
+// TestSTATE_R12001_InvalidSnapshotPreservesStorageCache verifies that
+// RevertToSnapshot with an unresolvable ID leaves the storage cache (and every
+// other pending structure) untouched. R4-07 (2026-10-21 audit) replaced the
+// legacy "wipe everything" fallback with a non-destructive branch plus a
+// fail-closed Commit: a stale/unknown ID used to destroy state owned by other
+// execution frames.
+func TestSTATE_R12001_InvalidSnapshotPreservesStorageCache(t *testing.T) {
 	memDB := db.NewMemDB()
 	s := NewStateDB(memDB)
 
 	addr := types.Address{0xBB}
 	key := types.Hash{0x03}
 
-	// Populate cache.
-	_ = s.GetStorage(addr, key)
+	// Populate cache with a write that belongs to the current frame.
+	s.SetStorage(addr, key, types.Hash{0x77})
 
-	// Revert with invalid ID — should clear everything including cache.
+	// Revert with an ID past the top of the (empty) stack: nothing may be
+	// discarded, because there is no sound restore point.
 	s.RevertToSnapshot(999)
 
-	// Verify state is still usable (no panic, no corruption).
-	_ = s.GetStorage(addr, key)
+	if got := s.GetStorage(addr, key); got != (types.Hash{0x77}) {
+		t.Fatalf("pending storage must survive an unknown-id revert, got %x", got)
+	}
+	if _, err := s.Commit(1); err == nil {
+		t.Fatal("expected Commit to fail closed after an unknown-id revert")
+	}
 }
 
 // TestSTATE_R12001_NestedSnapshotsPreserveCacheState verifies that nested

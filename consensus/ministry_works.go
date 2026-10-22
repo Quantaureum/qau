@@ -418,7 +418,7 @@ func (mw *MinistryWorks) RecordCrossChainTx(caller types.Address, bridgeID uint6
 		// cannot permanently block new cross-chain tx recording.
 		// Preference order: completed → failed → pending (with warning).
 		const sentinel = ^uint64(0)
-		var oldestCompleted, oldestFailed, oldestPending uint64 = sentinel, sentinel, sentinel
+		oldestCompleted, oldestFailed, oldestPending := sentinel, sentinel, sentinel
 		for id, tx := range mw.crossChainTx {
 			switch tx.Status {
 			case "completed":

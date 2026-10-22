@@ -645,7 +645,7 @@ func computeBeaconRandomness(epoch uint64, contributions map[types.Address]*Beac
 	}
 
 	var result [32]byte
-	h.Read(result[:])
+	_, _ = h.Read(result[:])
 	return result
 }
 

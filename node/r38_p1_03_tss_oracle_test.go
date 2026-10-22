@@ -118,7 +118,7 @@ func TestR38P103_CanonicalBinding_ChangesWithOriginalMessage(t *testing.T) {
 // makeCanonicalBindingPayload builds a valid SessionInit payload from
 // the aggregator's point of view. Returns the payload (a legacy frame
 // with the canonicalMessage + binding tail) so the test can feed it
-// decodeTSSSessionInitBound + verifyTSSSessionInitBinding。
+// decodeTSSSessionInitBound + verifyTSSSessionInitBinding.
 func makeCanonicalBindingPayload(
 	t *testing.T,
 	aggrChainID, aggrSlot uint64,

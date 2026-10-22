@@ -212,7 +212,7 @@ func (q *QPOS) evictStaleCommitteeCacheLocked() {
 		}
 	}
 	if len(q.committeeCache) > MaxCommitteeCacheSize*2 {
-		var oldestSlot uint64 = ^uint64(0)
+		oldestSlot := ^uint64(0)
 		for s := range q.committeeCache {
 			if s < oldestSlot {
 				oldestSlot = s

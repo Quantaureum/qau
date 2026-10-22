@@ -48,13 +48,13 @@ func (api *FeeAPI) FeeHistory(ctx context.Context, params json.RawMessage) (any,
 	var positional []json.RawMessage
 	if err := json.Unmarshal(params, &positional); err == nil && len(positional) >= 2 {
 		if len(positional) > 0 {
-			json.Unmarshal(positional[0], &blockCountStr)
+			_ = json.Unmarshal(positional[0], &blockCountStr)
 		}
 		if len(positional) > 1 {
-			json.Unmarshal(positional[1], &newestBlockStr)
+			_ = json.Unmarshal(positional[1], &newestBlockStr)
 		}
 		if len(positional) > 2 {
-			json.Unmarshal(positional[2], &rewardPercentiles)
+			_ = json.Unmarshal(positional[2], &rewardPercentiles)
 		}
 	} else {
 		// Try named object format

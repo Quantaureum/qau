@@ -172,6 +172,12 @@ Challenger node                          RollupEngine
 - Maintains an in-memory `batchHash → AnchorRecord` mapping
 - Used for development and testing
 - The challenge period uses the L1 block height (submitHeight + challengeBlocks)
+- **F-18 startup gate:** the node refuses to start the rollup on non-devnet
+  networks (`NetworkID` != 1333) because the in-memory anchor does not commit
+  batch data to L1. Production deployments must wire a real `L1Anchor`;
+  running without one requires the explicit opt-in
+  `QAU_ALLOW_MEMORY_L1_ANCHOR=1`, which accepts that the challenge window has
+  no on-chain commitment and logs a loud warning at startup.
 
 ### Production Replacement: QASM Contract
 ```go

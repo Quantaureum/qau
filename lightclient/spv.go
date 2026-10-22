@@ -3,6 +3,7 @@
 package lightclient
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
@@ -262,47 +263,91 @@ func hashPair(left, right types.Hash) types.Hash {
 	return sha3.Sum256(data)
 }
 
-// GenerateStateProof generates a proof of account state
+// GenerateStateProof generates a state-root-bound proof for one account.
+//
+// R6-02 (2026-10-21 sixth-round audit): this used to be assembled from
+// StateDB.GetAccountWithProof / GetStateWithProof, both of which fill
+// VerkleProof.Proof with the literal placeholder `[][]byte{}, // Simplified`.
+// A placeholder carries no path from the root, so trie.VerifyProof rejects it
+// (validateStructure needs len(Path) == len(Siblings)+1) and every consumer of
+// VerifyStateProof -- SPVVerifier.VerifyAccountExists, the
+// qau_light_verifyStateProof RPC, the serialized-proof helpers -- could never
+// confirm the "proof" it had just been handed. Storage lookups were worse still:
+// a failing GetStateWithProof was swallowed by `continue`, so a slot the node
+// could not prove simply vanished from the response. And the account came from
+// the dirty overlay, so mid-block the reported data could differ from the
+// committed leaf while the attached header was the last sealed block.
+//
+// The proof now comes from the canonical trie (StateDB.ProveAccount, whose
+// Path[0] is the state root -- pinned by
+// rpc/r38_p2_04_deep_proof_state_bound_test.go), and the reported account is
+// read back out of the proved leaf. A backend that cannot prove, a proof that
+// does not verify against the live root, or a tip header that disagrees with
+// that root is an error -- never a pseudo-proof.
+//
+// R6-05 (2026-10-21): storage slot requests are refused outright. Committed
+// storage goes to BoltDB under storagePrefix ++ addr ++ 0xFF ++ slot and NEVER
+// into the Verkle state trie -- every stateTrie.Put key on both the Commit
+// path (verkleUpdates carries account addresses only) and the
+// RecoverConsistency rebuild is an account address. StateDB.ProveStorage can
+// therefore only ever return an EXCLUSION proof for a slot the node reads back
+// non-zero: a proof that contradicts its own value field. Shipping that to a
+// light client is worse than admitting "cannot prove", so the prover refuses
+// until storage becomes part of the state trie.
 func (p *SPVProver) GenerateStateProof(addr types.Address, storageKeys []types.Hash) (*StateProof, error) {
 	if p.stateDB == nil {
 		return nil, ErrStateNotFound
 	}
+	if len(storageKeys) > 0 {
+		return nil, fmt.Errorf("%w: %d storage slot(s) requested for %x: committed storage is not part of the Verkle state trie on this node, so no state-root-bound storage proof exists",
+			ErrProofNotSupported, len(storageKeys), addr[:8])
+	}
+
+	root := p.stateDB.Root()
 
 	// Get latest block header
 	var header *encoding.BlockHeader
 	if p.blockStore != nil {
 		blk, err := p.blockStore.GetLatestBlock()
-		if err == nil {
+		if err == nil && blk != nil && blk.Header != nil {
+			if blk.Header.StateRoot != root {
+				return nil, fmt.Errorf("%w: tip header state root %x does not match the live state root %x",
+					ErrInvalidStateProof, blk.Header.StateRoot[:], root[:])
+			}
 			header = blk.Header
 		}
 	}
 
-	// Get account with proof
-	account, accountProof, err := p.stateDB.GetAccountWithProof(addr)
-	if err != nil && err != state.ErrAccountNotFound {
-		return nil, err
+	accountProof, err := p.stateDB.ProveAccount(addr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProofNotSupported, err)
+	}
+	if !trie.VerifyProof(root, accountProof) {
+		return nil, fmt.Errorf("%w: account proof does not verify against the live state root %x",
+			ErrInvalidStateProof, root[:])
 	}
 
 	proof := &StateProof{
 		Address:       addr,
 		BlockHeader:   header,
-		Account:       account,
 		AccountProof:  accountProof,
 		StorageProofs: make(map[types.Hash]*StorageProofEntry),
 	}
 
-	// Generate storage proofs if requested
-	for _, key := range storageKeys {
-		value, storageProof, err := p.stateDB.GetStateWithProof(addr, key)
+	// Report the account the proof binds to, not the overlay copy. An exclusion
+	// proof legitimately means "this address is absent from committed state",
+	// so Account stays nil and VerifyAccountExists fails closed on it.
+	if !accountProof.IsExclusion {
+		if len(accountProof.Value) == 0 {
+			return nil, fmt.Errorf("%w: inclusion proof for %x carries no account leaf",
+				ErrInvalidStateProof, addr[:8])
+		}
+		account, err := state.DecodeAccount(accountProof.Value)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("%w: proved account leaf for %x does not decode: %v",
+				ErrInvalidStateProof, addr[:8], err)
 		}
-
-		proof.StorageProofs[key] = &StorageProofEntry{
-			Key:   key,
-			Value: value,
-			Proof: storageProof,
-		}
+		proof.Account = account
 	}
 
 	return proof, nil
@@ -314,19 +359,34 @@ func VerifyStateProof(stateRoot types.Hash, proof *StateProof) bool {
 		return false
 	}
 
+	// R6-02: the envelope claims an address; the path it carries must be for
+	// that address. Without this binding a valid proof for one account could be
+	// presented as another account's state.
+	if !bytes.Equal(proof.AccountProof.Key, proof.Address[:]) {
+		return false
+	}
+
 	// Verify account proof
 	if !trie.VerifyProof(stateRoot, proof.AccountProof) {
 		return false
 	}
 
-	// If account exists, verify storage proofs
-	if proof.Account != nil {
-		for _, entry := range proof.StorageProofs {
-			if entry.Proof != nil {
-				if !trie.VerifyProof(proof.Account.StorageRoot, entry.Proof) {
-					return false
-				}
-			}
+	// R6-02: storage slots live in the SAME flat key space as accounts --
+	// StateDB.ProveStorage walks the state trie with
+	// storagePrefix ++ addr ++ 0xFF ++ slot -- so a storage proof is bound to
+	// the state root. The previous version verified entries against
+	// proof.Account.StorageRoot, which no honest prover can satisfy, and skipped
+	// the whole loop when the account was absent, so an envelope could claim any
+	// number of "storage proofs" without a single one being checked.
+	for key, entry := range proof.StorageProofs {
+		if entry == nil || entry.Proof == nil {
+			return false
+		}
+		if !bytes.Equal(entry.Proof.Key, state.StorageProofKey(proof.Address, key)) {
+			return false
+		}
+		if !trie.VerifyProof(stateRoot, entry.Proof) {
+			return false
 		}
 	}
 
@@ -683,144 +743,275 @@ func UnmarshalStateProof(data []byte) (*StateProof, error) {
 	return proof, nil
 }
 
+// verkleProofWireVersion tags the full-fidelity Verkle proof encoding.
+//
+// R6-04 (2026-10-21 sixth-round audit): version 1 carried only
+// Key/Value/Path/Siblings. VerkleProof.Verify also reads IsExclusion,
+// ExtensionStems, StemHash, InclusionLeaf and ExclusionEvidence; without them an
+// exclusion proof decodes as a failed inclusion attempt, an extension level
+// loses the stem the verifier has to match against the query key, and a
+// suffix-indexed leaf cannot be recomputed at all. So a proof that verified on
+// the prover's machine was un-verifiable for the light client it was shipped
+// to, even once the prover was honest about what it produced (R6-02). Untagged
+// (version 1) input is rejected rather than half-decoded.
+const verkleProofWireVersion byte = 0x02
+
 // marshalVerkleProof serializes a Verkle proof
 func marshalVerkleProof(proof *trie.VerkleProof) []byte {
 	if proof == nil {
 		return nil
 	}
 
-	// Format: [keyLen(4)] [key] [valueLen(4)] [value] [pathCount(4)] [path...] [siblingsCount(4)] [siblings...]
-	pathCount := len(proof.Path)
-	siblingsCount := len(proof.Siblings)
-
-	// Calculate size
-	size := 4 + len(proof.Key) + 4 + len(proof.Value) + 4 + (pathCount * 32) + 4
-	for _, siblings := range proof.Siblings {
-		size += 4 + (len(siblings) * 32)
+	// Commitments mark an IPA-backed proof. trie.VerkleProof.Verify fails closed
+	// on those (IPA verification is still a stub), so encoding one would hand
+	// the caller material that promises more than it can prove.
+	if len(proof.Commitments) > 0 {
+		return nil
 	}
 
-	buf := make([]byte, size)
-	offset := 0
+	// Format: [version(1)] [keyLen(4)] [key] [valueLen(4)] [value]
+	//         [pathCount(4)] [path...] [siblingsCount(4)] [width(4)] [idx(4) hash(32)]...
+	//         [extCount(4)] [stem(31) stemLen(4)]... [isExclusion(1)] [stemHash(32)]
+	//         [leafLen(4)] [leaf] [hasEvidence(1)]
+	//         [evidenceType(1) extStem(31) extStemLen(4) child(32) leafLen(4) leaf]
+	buf := make([]byte, 0, 256)
+	putU32 := func(v uint32) {
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], v)
+		buf = append(buf, b[:]...)
+	}
+	putBytes := func(b []byte) {
+		putU32(uint32(len(b))) // #nosec G115 -- length of a slice that is about to be appended
+		buf = append(buf, b...)
+	}
+	putHash := func(h types.Hash) {
+		buf = append(buf, h[:]...)
+	}
 
-	// Key
-	binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(proof.Key))) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-	offset += 4
-	copy(buf[offset:offset+len(proof.Key)], proof.Key)
-	offset += len(proof.Key)
+	buf = append(buf, verkleProofWireVersion)
+	putBytes(proof.Key)
+	putBytes(proof.Value)
 
-	// Value
-	binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(proof.Value))) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-	offset += 4
-	copy(buf[offset:offset+len(proof.Value)], proof.Value)
-	offset += len(proof.Value)
-
-	// Path
-	binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(pathCount)) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-	offset += 4
+	putU32(uint32(len(proof.Path))) // #nosec G115 -- bounded by MaxVerklePathDepth on both sides
 	for _, h := range proof.Path {
-		copy(buf[offset:offset+32], h[:])
-		offset += 32
+		putHash(h)
 	}
 
-	// Siblings
-	binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(siblingsCount)) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-	offset += 4
+	putU32(uint32(len(proof.Siblings))) // #nosec G115 -- bounded by MaxVerkleSiblings on both sides
 	for _, siblings := range proof.Siblings {
-		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(siblings))) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-		offset += 4
+		putU32(uint32(len(siblings))) // #nosec G115 -- bounded by MaxVerkleSiblingWidth on both sides
 		for _, sib := range siblings {
-			binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(sib.Idx)) // #nosec G115 -- safe conversion: value range verified or bit-shift extraction
-			offset += 4
-			copy(buf[offset:offset+32], sib.Hash[:])
-			offset += 32
+			putU32(uint32(sib.Idx)) // #nosec G115 -- branch index in [0, BranchingFactor)
+			putHash(sib.Hash)
 		}
+	}
+
+	putU32(uint32(len(proof.ExtensionStems))) // #nosec G115 -- one entry per tree level
+	for _, ext := range proof.ExtensionStems {
+		buf = append(buf, ext.Stem[:]...)
+		putU32(uint32(ext.StemLen)) // #nosec G115 -- stem length in [0, trie.StemSize]
+	}
+
+	if proof.IsExclusion {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	putHash(proof.StemHash)
+	putBytes(proof.InclusionLeaf)
+
+	if proof.ExclusionEvidence == nil {
+		buf = append(buf, 0)
+	} else {
+		evidence := proof.ExclusionEvidence
+		buf = append(buf, 1, byte(evidence.Type))
+		buf = append(buf, evidence.ExtensionStem[:]...)
+		putU32(uint32(evidence.ExtensionStemLen)) // #nosec G115 -- stem length in [0, trie.StemSize]
+		putHash(evidence.ExtensionChild)
+		putBytes(evidence.EncodedLeaf)
 	}
 
 	return buf
 }
 
-// unmarshalVerkleProof deserializes a Verkle proof
+// unmarshalVerkleProof deserializes a Verkle proof. Malformed, oversized or
+// unsupported input yields nil so that callers fail closed instead of
+// half-restoring a proof that would then be checked against a state root.
 func unmarshalVerkleProof(data []byte) *trie.VerkleProof {
-	if len(data) < 16 {
+	if len(data) < 1 || data[0] != verkleProofWireVersion {
 		return nil
+	}
+	data = data[1:]
+
+	offset := 0
+
+	putBounds := func(n uint32) bool { return uint64(offset)+uint64(n) <= uint64(len(data)) }
+
+	nextU32 := func() (uint32, bool) {
+		if len(data) < offset+4 {
+			return 0, false
+		}
+		v := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+		return v, true
+	}
+	nextBytes := func(maxLen uint64) ([]byte, bool) {
+		v, ok := nextU32()
+		if !ok || uint64(v) > maxLen || !putBounds(v) {
+			return nil, false
+		}
+		out := make([]byte, v)
+		copy(out, data[offset:offset+int(v)])
+		offset += int(v)
+		return out, true
+	}
+	nextHash := func() (types.Hash, bool) {
+		var h types.Hash
+		if !putBounds(32) {
+			return h, false
+		}
+		copy(h[:], data[offset:offset+32])
+		offset += 32
+		return h, true
+	}
+	nextFlag := func() (bool, bool) {
+		if len(data) < offset+1 {
+			return false, false
+		}
+		set := data[offset] != 0
+		offset++
+		return set, true
 	}
 
 	proof := &trie.VerkleProof{}
-	offset := 0
 
-	// Key
-	keyLen := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	if len(data) < offset+int(keyLen) {
+	key, ok := nextBytes(uint64(len(data)))
+	if !ok {
 		return nil
 	}
-	proof.Key = make([]byte, keyLen)
-	copy(proof.Key, data[offset:offset+int(keyLen)])
-	offset += int(keyLen)
+	proof.Key = key
 
-	// Value
-	if len(data) < offset+4 {
+	value, ok := nextBytes(uint64(len(data)))
+	if !ok {
 		return nil
 	}
-	valueLen := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	if len(data) < offset+int(valueLen) {
-		return nil
-	}
-	proof.Value = make([]byte, valueLen)
-	copy(proof.Value, data[offset:offset+int(valueLen)])
-	offset += int(valueLen)
+	proof.Value = value
 
-	// Path
-	if len(data) < offset+4 {
-		return nil
-	}
-	pathCount := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	// audit-fix NEW-27: cap path count to prevent OOM from crafted data
-	if pathCount > MaxVerklePathDepth {
+	pathCount, ok := nextU32()
+	if !ok || pathCount > MaxVerklePathDepth {
 		return nil
 	}
 	proof.Path = make([]types.Hash, pathCount)
 	for i := uint32(0); i < pathCount; i++ {
-		if len(data) < offset+32 {
+		h, ok := nextHash()
+		if !ok {
 			return nil
 		}
-		copy(proof.Path[i][:], data[offset:offset+32])
-		offset += 32
+		proof.Path[i] = h
 	}
 
-	// Siblings
-	if len(data) < offset+4 {
-		return nil
-	}
-	siblingsCount := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	// audit-fix NEW-27: cap siblings count to prevent OOM from crafted data
-	if siblingsCount > MaxVerkleSiblings {
+	siblingsCount, ok := nextU32()
+	if !ok || siblingsCount > MaxVerkleSiblings {
 		return nil
 	}
 	proof.Siblings = make([][]trie.SiblingWithIdx, siblingsCount)
 	for i := uint32(0); i < siblingsCount; i++ {
-		if len(data) < offset+4 {
+		siblingCount, ok := nextU32()
+		if !ok || siblingCount > MaxVerkleSiblingWidth {
 			return nil
 		}
-		siblingCount := binary.BigEndian.Uint32(data[offset : offset+4])
-		offset += 4
-		// audit-fix NEW-27: cap inner sibling width
-		if siblingCount > MaxVerkleSiblingWidth {
-			return nil
-		}
-		proof.Siblings[i] = make([]trie.SiblingWithIdx, siblingCount)
+		level := make([]trie.SiblingWithIdx, siblingCount)
 		for j := uint32(0); j < siblingCount; j++ {
-			if len(data) < offset+36 {
+			idx, ok := nextU32()
+			if !ok {
 				return nil
 			}
-			proof.Siblings[i][j].Idx = int(binary.BigEndian.Uint32(data[offset : offset+4]))
-			offset += 4
-			copy(proof.Siblings[i][j].Hash[:], data[offset:offset+32])
-			offset += 32
+			h, ok := nextHash()
+			if !ok {
+				return nil
+			}
+			level[j] = trie.SiblingWithIdx{Idx: int(idx), Hash: h} // #nosec G115 -- branch index fits in int
 		}
+		proof.Siblings[i] = level
+	}
+
+	extCount, ok := nextU32()
+	if !ok || extCount > MaxVerkleSiblings {
+		return nil
+	}
+	if extCount > 0 {
+		proof.ExtensionStems = make([]trie.ExtensionLevelData, extCount)
+		for i := uint32(0); i < extCount; i++ {
+			if !putBounds(trie.StemSize) {
+				return nil
+			}
+			copy(proof.ExtensionStems[i].Stem[:], data[offset:offset+trie.StemSize])
+			offset += trie.StemSize
+			stemLen, ok := nextU32()
+			if !ok {
+				return nil
+			}
+			proof.ExtensionStems[i].StemLen = int(stemLen) // #nosec G115 -- stem length in [0, trie.StemSize]
+		}
+	}
+
+	isExclusion, ok := nextFlag()
+	if !ok {
+		return nil
+	}
+	proof.IsExclusion = isExclusion
+
+	stemHash, ok := nextHash()
+	if !ok {
+		return nil
+	}
+	proof.StemHash = stemHash
+
+	// Bound the carried leaf material the way trie.VerkleProof.Verify does, so
+	// a crafted envelope cannot make this node allocate beyond the proof limits.
+	leaf, ok := nextBytes(trie.MaxProofTotalBytes)
+	if !ok {
+		return nil
+	}
+	proof.InclusionLeaf = leaf
+
+	hasEvidence, ok := nextFlag()
+	if !ok {
+		return nil
+	}
+	if hasEvidence {
+		if len(data) < offset+1 {
+			return nil
+		}
+		evidence := &trie.ExclusionEvidence{Type: trie.ExclusionType(data[offset])}
+		offset++
+		if !putBounds(trie.StemSize) {
+			return nil
+		}
+		copy(evidence.ExtensionStem[:], data[offset:offset+trie.StemSize])
+		offset += trie.StemSize
+		stemLen, ok := nextU32()
+		if !ok {
+			return nil
+		}
+		evidence.ExtensionStemLen = int(stemLen) // #nosec G115 -- stem length in [0, trie.StemSize]
+		child, ok := nextHash()
+		if !ok {
+			return nil
+		}
+		evidence.ExtensionChild = child
+		encodedLeaf, ok := nextBytes(trie.MaxProofTotalBytes)
+		if !ok {
+			return nil
+		}
+		evidence.EncodedLeaf = encodedLeaf
+		proof.ExclusionEvidence = evidence
+	}
+
+	if offset != len(data) {
+		// Trailing bytes mean the sender and receiver disagree about the format;
+		// accepting them would silently verify a truncated proof.
+		return nil
 	}
 
 	return proof
@@ -949,7 +1140,15 @@ func (p *SPVProver) GenerateMultiTxProof(txHashes []types.Hash) ([]*TxInclusionP
 	return proofs, nil
 }
 
-// GenerateMultiStateProof generates proofs for multiple accounts
+// GenerateMultiStateProof generates proofs for multiple accounts.
+//
+// R6-02: failures are propagated instead of skipped. The previous `continue`
+// with the comment "Skip accounts that can't be found" silently shrank the
+// response, so a caller could not tell "this account is absent from state"
+// (which is provable, as an exclusion proof) apart from "this node could not
+// prove it" -- and an RPC layer that mapped the resulting short list to
+// "states not found" turned a backend failure into a false statement about
+// chain state.
 func (p *SPVProver) GenerateMultiStateProof(addresses []types.Address, storageKeys map[types.Address][]types.Hash) ([]*StateProof, error) {
 	proofs := make([]*StateProof, 0, len(addresses))
 
@@ -957,7 +1156,7 @@ func (p *SPVProver) GenerateMultiStateProof(addresses []types.Address, storageKe
 		keys := storageKeys[addr]
 		proof, err := p.GenerateStateProof(addr, keys)
 		if err != nil {
-			continue // Skip accounts that can't be found
+			return nil, fmt.Errorf("account %x: %w", addr[:8], err)
 		}
 		proofs = append(proofs, proof)
 	}

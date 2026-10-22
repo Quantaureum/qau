@@ -12,19 +12,25 @@ const tssCanonicalBindingDomain = "QAU-TSS-v1"
 
 func ComputeTSSCanonicalBinding(chainID, epoch, slot uint64, proposer types.Address, domainTag string, originalMessage []byte) [32]byte {
 	h := sha256.New()
-	binary.Write(h, binary.BigEndian, uint64(len(tssCanonicalBindingDomain)))
+	writeUint64 := func(v uint64) {
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], v)
+		h.Write(buf[:])
+	}
+
+	writeUint64(uint64(len(tssCanonicalBindingDomain)))
 	h.Write([]byte(tssCanonicalBindingDomain))
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, chainID)
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, epoch)
-	binary.Write(h, binary.BigEndian, uint64(8))
-	binary.Write(h, binary.BigEndian, slot)
-	binary.Write(h, binary.BigEndian, uint64(len(proposer)))
+	writeUint64(8)
+	writeUint64(chainID)
+	writeUint64(8)
+	writeUint64(epoch)
+	writeUint64(8)
+	writeUint64(slot)
+	writeUint64(uint64(len(proposer)))
 	h.Write(proposer[:])
-	binary.Write(h, binary.BigEndian, uint64(len(domainTag)))
+	writeUint64(uint64(len(domainTag)))
 	h.Write([]byte(domainTag))
-	binary.Write(h, binary.BigEndian, uint64(len(originalMessage)))
+	writeUint64(uint64(len(originalMessage)))
 	h.Write(originalMessage)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))

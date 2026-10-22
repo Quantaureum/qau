@@ -14,10 +14,12 @@
 //     lightclient.HeaderSyncer) to look up the block header at msg.BlockNumber
 //     in the local block store and compare its hash to msg.BlockHash.
 //     A mismatch indicates a reorg.
-//   - Ethereum side: uses a SyncCommitteeChecker (satisfied by
-//     lightclient.SyncCommitteeVerifier) to verify sync committee signatures
-//     on the block header. The adapter fetches the header via
-//     eth_getBlockByNumber and maps it to encoding.BlockHeader.
+//   - External-chain side: uses a SyncCommitteeChecker (satisfied by
+//     lightclient.SyncCommitteeVerifier) to verify Dilithium3 sync committee
+//     signatures over QAU-format headers (encoding.BlockHeader). This is the
+//     format used by QAU-homogeneous external chains; it is NOT Ethereum's
+//     BLS12-381 SyncAggregate (which lives in beacon blocks, not execution
+//     headers). Ethereum consensus requires a dedicated BLS verifier.
 //
 // To avoid an import cycle (bridge → lightclient → rpc → bridge), this file
 // defines interfaces that the lightclient types satisfy. The bridge package
@@ -25,8 +27,10 @@
 // the setter methods.
 //
 // The verifier is nil-safe: when not configured (nil), header verification is
-// skipped. In production, node startup MUST inject both syncers. Tests cover
-// the reorg scenario (block hash mismatch → rejection).
+// skipped. In production, node startup MUST inject both syncers. Note that an
+// injected sync committee verifier with no committee loaded cannot verify
+// signatures; callers must check IsExternalChainSyncCommitteeReady and treat
+// ready=false as reorg-detection-only (R3-02).
 package bridge
 
 import (
@@ -56,6 +60,14 @@ type SyncCommitteeChecker interface {
 	VerifyBlockHeader(header *encoding.BlockHeader) error
 }
 
+// SyncCommitteeReadiness is optionally implemented by a SyncCommitteeChecker
+// that can report whether a non-empty committee is actually loaded. A checker
+// without a committee cannot verify signatures, so strict-mode startup checks
+// must use this interface instead of a non-nil pointer check (R3-02).
+type SyncCommitteeReadiness interface {
+	HasActiveCommittee() bool
+}
+
 // HeaderFetcher fetches block headers from a blockchain by block number.
 // Implemented by chain adapters that have RPC access to the target chain.
 // Used by BridgeHeaderVerifier to fetch headers for sync committee verification.
@@ -76,17 +88,17 @@ type HeaderFetcher interface {
 //   - When NOT configured (nil) and strictMode is false (test default), header
 //     verification is skipped. Production deployments MUST inject both syncers
 //     during node startup via SetQuantaureumHeaderLookup and
-//     SetEthereumSyncCommittee, AND enable strictMode via SetStrictMode(true).
+//     SetExternalChainSyncCommittee, AND enable strictMode via SetStrictMode(true).
 //   - AUDIT (2026 security review) BRDG-FIX: When strictMode is true (production),
 //     nil syncers cause Verify* methods to return an error (fail-closed),
 //     eliminating the fail-open path where an unconfigured verifier silently
-//     accepts messages. Additionally, VerifyEthereumHeaderByNumber requires
+//     accepts messages. Additionally, VerifyExternalChainHeaderByNumber requires
 //     a non-empty blockHashHex (no legacy exemption for messages without a
 //     block hash).
 type BridgeHeaderVerifier struct {
-	mu                    sync.RWMutex
-	quantaureumLookup     HeaderLookup
-	ethereumSyncCommittee SyncCommitteeChecker
+	mu                         sync.RWMutex
+	quantaureumLookup          HeaderLookup
+	externalChainSyncCommittee SyncCommitteeChecker
 	// strictMode enforces fail-closed behavior when syncers are nil.
 	// Default false (test backward compatibility). Set to true in production
 	// via SetStrictMode(true) during node startup.
@@ -95,7 +107,7 @@ type BridgeHeaderVerifier struct {
 }
 
 // NewBridgeHeaderVerifier creates a new header verifier with no syncers
-// configured. Use SetQuantaureumHeaderLookup and SetEthereumSyncCommittee to
+// configured. Use SetQuantaureumHeaderLookup and SetExternalChainSyncCommittee to
 // inject the syncers during node startup.
 func NewBridgeHeaderVerifier() *BridgeHeaderVerifier {
 	return &BridgeHeaderVerifier{}
@@ -111,14 +123,15 @@ func (v *BridgeHeaderVerifier) SetQuantaureumHeaderLookup(l HeaderLookup) {
 	v.quantaureumLookup = l
 }
 
-// SetEthereumSyncCommittee injects the Ethereum sync committee verifier
-// (typically a *lightclient.SyncCommitteeVerifier). When set,
-// VerifyEthereumHeader verifies sync committee signatures on block headers
-// fetched from the Ethereum chain.
-func (v *BridgeHeaderVerifier) SetEthereumSyncCommittee(sc SyncCommitteeChecker) {
+// SetExternalChainSyncCommittee injects the external-chain sync committee
+// verifier (typically a *lightclient.SyncCommitteeVerifier). The verifier
+// checks Dilithium3 signatures over QAU-format headers; it does not implement
+// Ethereum's BLS12-381 committee. When set, VerifyExternalChainHeader verifies
+// sync committee signatures on headers fetched from the external chain.
+func (v *BridgeHeaderVerifier) SetExternalChainSyncCommittee(sc SyncCommitteeChecker) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.ethereumSyncCommittee = sc
+	v.externalChainSyncCommittee = sc
 }
 
 // IsEnabled returns true if any header verification is configured.
@@ -126,7 +139,7 @@ func (v *BridgeHeaderVerifier) SetEthereumSyncCommittee(sc SyncCommitteeChecker)
 func (v *BridgeHeaderVerifier) IsEnabled() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.quantaureumLookup != nil || v.ethereumSyncCommittee != nil
+	return v.quantaureumLookup != nil || v.externalChainSyncCommittee != nil
 }
 
 // SetStrictMode toggles fail-closed behavior for nil syncers.
@@ -156,12 +169,38 @@ func (v *BridgeHeaderVerifier) HasQuantaureumLookup() bool {
 	return v.quantaureumLookup != nil
 }
 
-// HasEthereumSyncCommittee returns true if the Ethereum sync committee
-// verifier is configured.
-func (v *BridgeHeaderVerifier) HasEthereumSyncCommittee() bool {
+// HasExternalChainSyncCommittee returns true if the external-chain sync
+// committee verifier is configured. A configured verifier may still have no
+// committee loaded; use IsExternalChainSyncCommitteeReady to check whether
+// signature verification can actually run.
+func (v *BridgeHeaderVerifier) HasExternalChainSyncCommittee() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.ethereumSyncCommittee != nil
+	return v.externalChainSyncCommittee != nil
+}
+
+// IsExternalChainSyncCommitteeReady returns true when an external-chain sync
+// committee verifier is configured AND it reports an active (non-empty)
+// committee. A checker that does not implement SyncCommitteeReadiness is
+// assumed ready, since it may verify with an aggregate key instead of a
+// member list.
+//
+// R3-02: mainnet strict mode previously accepted a non-nil verifier with an
+// empty committee, so startup reported "strict mode ENABLED" while signature
+// checks were silently skipped. Callers must treat ready=false as degraded:
+// external-chain headers get hash/reorg checks only.
+func (v *BridgeHeaderVerifier) IsExternalChainSyncCommitteeReady() bool {
+	v.mu.RLock()
+	sc := v.externalChainSyncCommittee
+	v.mu.RUnlock()
+
+	if sc == nil {
+		return false
+	}
+	if readiness, ok := sc.(SyncCommitteeReadiness); ok {
+		return readiness.HasActiveCommittee()
+	}
+	return true
 }
 
 // VerifyQuantaureumHeader verifies that a Quantaureum block at the given
@@ -212,63 +251,70 @@ func (v *BridgeHeaderVerifier) VerifyQuantaureumHeader(blockNumber uint64, block
 	return nil
 }
 
-// VerifyEthereumHeader verifies an Ethereum block header using sync committee
-// signatures. The caller must provide the header (typically fetched via RPC).
+// VerifyExternalChainHeader verifies an external-chain block header using sync
+// committee signatures. The caller must provide the header (typically fetched
+// via RPC). The header must be in QAU format; an Ethereum execution header has
+// no SyncCommitteeSig/Bits fields and a populated QAU-format committee rejects
+// it (Ethereum consensus requires a BLS12-381 verifier, R2-15).
 //
-// Returns nil if the Ethereum sync committee is not configured (verification
-// disabled). In production, the sync committee MUST be configured for header
-// verification.
+// Returns nil if the external-chain sync committee is not configured
+// (verification disabled). In production, the sync committee MUST be
+// configured for header verification.
 //
 // Returns an error if:
 //   - header is nil
 //   - sync committee verification fails (insufficient signatures, invalid sig, etc.)
-func (v *BridgeHeaderVerifier) VerifyEthereumHeader(header *encoding.BlockHeader) error {
+func (v *BridgeHeaderVerifier) VerifyExternalChainHeader(header *encoding.BlockHeader) error {
 	v.mu.RLock()
-	sc := v.ethereumSyncCommittee
+	sc := v.externalChainSyncCommittee
 	strict := v.strictMode
 	v.mu.RUnlock()
 
 	if sc == nil {
 		if strict {
 			// BRDG-FIX (2026-07-16): fail-closed in production.
-			return fmt.Errorf("ethereum sync committee not configured (strict mode): cannot verify header (BRDG-)")
+			return fmt.Errorf("external-chain sync committee not configured (strict mode): cannot verify header (BRDG-)")
 		}
 		return nil // not configured, skip (test default)
 	}
 	if header == nil {
-		return fmt.Errorf("ethereum header is nil")
+		return fmt.Errorf("external-chain header is nil")
 	}
 	return sc.VerifyBlockHeader(header)
 }
 
-// VerifyEthereumHeaderByNumber fetches the Ethereum block header at the given
-// height via the provided HeaderFetcher, verifies its hash matches blockHashHex
-// (reorg detection), and then verifies the sync committee signature.
+// VerifyExternalChainHeaderByNumber fetches the external-chain block header at
+// the given height via the provided HeaderFetcher, verifies its hash matches
+// blockHashHex (reorg detection), and then passes the header to the sync
+// committee checker.
 //
-// This is the complete SPV verification for Ethereum messages:
-// 1. Fetch the header from the Ethereum RPC node
-// 2. Verify the block hash matches what the message claims (reorg detection)
-// 3. Verify the sync committee signature on the header (header validity)
+// Verification steps:
+//  1. Fetch the header from the external chain's RPC node
+//  2. Verify the block hash matches what the message claims (reorg detection)
+//  3. Ask the sync committee checker to verify the header. If the checker has
+//     no committee loaded, it accepts QAU-format headers without sync committee
+//     data as pre-committee blocks — i.e. no signature verification happens.
+//     IsExternalChainSyncCommitteeReady reports that degraded state.
 //
-// Returns nil if the Ethereum sync committee is not configured and strict mode
-// is disabled (test default). In production (strict mode enabled), returns an
-// error if the sync committee is not configured or if blockHashHex is empty
+// Returns nil if the external-chain sync committee is not configured and
+// strict mode is disabled (test default). In production (strict mode enabled),
+// returns an error if the sync committee is not configured or if blockHashHex is empty
 // (no legacy exemption for messages without a block hash).
-func (v *BridgeHeaderVerifier) VerifyEthereumHeaderByNumber(
+func (v *BridgeHeaderVerifier) VerifyExternalChainHeaderByNumber(
 	ctx context.Context,
 	fetcher HeaderFetcher,
 	blockNumber uint64,
 	blockHashHex string,
 ) error {
 	v.mu.RLock()
-	sc := v.ethereumSyncCommittee
+	sc := v.externalChainSyncCommittee
 	strict := v.strictMode
 	v.mu.RUnlock()
 
 	if sc == nil {
 		if strict {
 			// BRDG-FIX (2026-07-16): fail-closed in production.
-			return fmt.Errorf("ethereum sync committee not configured (strict mode): cannot verify header at height %d (BRDG-)", blockNumber)
+			return fmt.Errorf("external-chain sync committee not configured (strict mode): cannot verify header at height %d (BRDG-)", blockNumber)
 		}
 		return nil // not configured, skip (test default)
 	}
@@ -285,7 +331,7 @@ func (v *BridgeHeaderVerifier) VerifyEthereumHeaderByNumber(
 
 	header, err := fetcher.FetchHeader(ctx, blockNumber)
 	if err != nil {
-		return fmt.Errorf("failed to fetch ethereum header at height %d: %w", blockNumber, err)
+		return fmt.Errorf("failed to fetch external chain header at height %d: %w", blockNumber, err)
 	}
 
 	// Step 1: Verify block hash matches (reorg detection).
@@ -295,7 +341,7 @@ func (v *BridgeHeaderVerifier) VerifyEthereumHeaderByNumber(
 		expectedHex := strings.TrimPrefix(blockHashHex, "0x")
 		actualHex := hex.EncodeToString(actualHash[:])
 		if !strings.EqualFold(actualHex, expectedHex) {
-			return fmt.Errorf("ethereum block hash mismatch at height %d: expected %s, got %s (reorg detected)",
+			return fmt.Errorf("external chain block hash mismatch at height %d: expected %s, got %s (reorg detected)",
 				blockNumber, expectedHex, actualHex)
 		}
 	}

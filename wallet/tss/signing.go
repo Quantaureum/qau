@@ -74,18 +74,9 @@ func (m *TSSManager) VerifyCombinedSignature(signature []byte, message []byte) e
 		return ErrSignatureVerificationFailed
 	}
 
-	var pk mode3.PublicKey
-	// R38-P1-01 FIX (2026-08-01): use `!=` instead of `<`. A too-long
-	// `groupPK.PubKey` would silently satisfy the old `<` gate, then
-	// `Unpack` would only consume the first `mode3.PublicKeySize` bytes
-	// while the trailing bytes were ignored — masking a corrupted/stale
-	// key that failed the canonical crypto.PublicKeyFromBytes length
-	// check. Mirroring the canonical hardening at crypto/generate.go:768.
 	if len(groupPK.PubKey) != mode3.PublicKeySize {
 		return fmt.Errorf("%w: public key wrong length (%d bytes, expected %d)", ErrSignatureVerificationFailed, len(groupPK.PubKey), mode3.PublicKeySize)
 	}
-	pk.Unpack((*[mode3.PublicKeySize]byte)(groupPK.PubKey))
-
 	// R38-P1-01 (2026-08-01) FIX: Reject all-zero public keys. A zero
 	// public key unpacks successfully but mode3.Verify may accept a
 	// zero signature, allowing an attacker to forge signatures when
@@ -93,11 +84,16 @@ func (m *TSSManager) VerifyCombinedSignature(signature []byte, message []byte) e
 	// completes or after a corrupt state reset). Use the canonical
 	// constant-time helper from the crypto package — matches the R37
 	// sibling-path hardening at crypto/verify.go:73.
-	if crypto.IsZeroPublicKeyBytes(groupPK.PubKey) {
+	if crypto.IsDegeneratePublicKeyBytes(groupPK.PubKey) {
 		return fmt.Errorf("%w: group public key is all zeros (DKG not initialized?)", ErrSignatureVerificationFailed)
 	}
+	// R4-04: unpack through the panic-guarded helper.
+	pk, err := unpackDilithium3PublicKey(groupPK.PubKey)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSignatureVerificationFailed, err)
+	}
 
-	return verifyWithPubKey(&pk, message, signature)
+	return verifyWithPubKey(pk, message, signature)
 }
 
 // VerifySignatureWithPublicKey verifies a signature against an explicitly
@@ -122,32 +118,88 @@ func (m *TSSManager) VerifySignatureWithPublicKey(pubKey []byte, message []byte,
 	if len(pubKey) != mode3.PublicKeySize {
 		return fmt.Errorf("%w: provided public key wrong length (%d bytes, expected %d)", ErrSignatureVerificationFailed, len(pubKey), mode3.PublicKeySize)
 	}
-	var pk mode3.PublicKey
-	pk.Unpack((*[mode3.PublicKeySize]byte)(pubKey[:mode3.PublicKeySize]))
-
 	// R38-P1-01 (2026-08-01) FIX: Reject all-zero public keys. Use the
-	// canonical constant-time helper from crypto.IsZeroPublicKeyBytes.
-	if crypto.IsZeroPublicKeyBytes(pubKey[:mode3.PublicKeySize]) {
+	// canonical constant-time helper from crypto.IsDegeneratePublicKeyBytes.
+	if crypto.IsDegeneratePublicKeyBytes(pubKey) {
 		return fmt.Errorf("%w: provided public key is all zeros", ErrSignatureVerificationFailed)
 	}
+	// R4-04: unpack through the panic-guarded helper. pubKey reaches here
+	// straight from a peer-supplied header / the QTD history table.
+	pk, err := unpackDilithium3PublicKey(pubKey)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSignatureVerificationFailed, err)
+	}
 
-	return verifyWithPubKey(&pk, message, signature)
+	return verifyWithPubKey(pk, message, signature)
+}
+
+// unpackDilithium3PublicKey parses a raw Dilithium3 public key.
+//
+// R4-04 (2026-10-21): unpack through a panic guard, matching the canonical
+// loader in crypto.PublicKeyFromBytes. Measured in the fifth round against
+// circl v1.6.3 (TestR5_01_CirclPanicProbe), Unpack did NOT panic on any of the
+// right-length but structurally malformed keys probed — the panic face that did
+// reproduce is a nil *mode3.PublicKey being dereferenced by Verify. So the
+// original R4-04 framing ("a malformed group key crashes the consensus path
+// remotely") is not supported by evidence; this guard is kept as defense in
+// depth, because the keys here do originate off-node (peer block headers, the
+// QTD history table) and any future panic in the math must reach the caller as
+// a verification error. The length and degenerate-key gates stay at the call
+// sites so their distinct error vocabulary is preserved.
+func unpackDilithium3PublicKey(raw []byte) (*mode3.PublicKey, error) {
+	if len(raw) != mode3.PublicKeySize {
+		return nil, fmt.Errorf("public key wrong length (%d bytes, expected %d)", len(raw), mode3.PublicKeySize)
+	}
+	var pk mode3.PublicKey
+	var panicErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicErr = fmt.Errorf("public key unpack panicked (malformed key data): %v", r)
+			}
+		}()
+		pk.Unpack((*[mode3.PublicKeySize]byte)(raw))
+	}()
+	if panicErr != nil {
+		return nil, panicErr
+	}
+	return &pk, nil
 }
 
 // verifyWithPubKey is the shared inner verifier for VerifyCombinedSignature
 // and VerifySignatureWithPublicKey. It accepts an already-unpacked public key
 // so callers can pass either the current group key or a historical one.
+//
+// R4-04: the underlying circl/QTD verifiers run under recover, matching
+// crypto.Verify. Probing in the fifth round showed a malformed signature does
+// not by itself panic (mode3.Verify returned false for all 9 malformed
+// signatures); the reproduced panic is a nil key dereference. The guard
+// therefore normalizes caller-state errors into a verification failure instead
+// of crashing the verifying node, and stays as defense in depth for the math
+// paths underneath.
 func verifyWithPubKey(pk *mode3.PublicKey, message, signature []byte) error {
 	var ok bool
-	switch len(signature) {
-	case 3293:
-		ok = mode3.Verify(pk, message, signature)
-	case crypto.GMQTDCombinedSignatureSize:
-		// Security fix (Round 4): remove production debug logging.
-		// Previously [TSS-DEBUG] logs here included hex fragments of messages, public keys, and signatures,
-		// potentially leaking sensitive material into production logs. For debugging, build with the
-		// "-tags debug" tag and re-enable logging in the debug build.
-		ok = qtd.CheckGMQTDFullSignature(pk, message, signature)
+	var panicErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicErr = fmt.Errorf("signature verification panic (possible malformed signature or key): %v", r)
+				ok = false
+			}
+		}()
+		switch len(signature) {
+		case 3293:
+			ok = mode3.Verify(pk, message, signature)
+		case crypto.GMQTDCombinedSignatureSize:
+			// Security fix (Round 4): remove production debug logging.
+			// Previously [TSS-DEBUG] logs here included hex fragments of messages, public keys, and signatures,
+			// potentially leaking sensitive material into production logs. For debugging, build with the
+			// "-tags debug" tag and re-enable logging in the debug build.
+			ok = qtd.CheckGMQTDFullSignature(pk, message, signature)
+		}
+	}()
+	if panicErr != nil {
+		return fmt.Errorf("%w: %v", ErrSignatureVerificationFailed, panicErr)
 	}
 
 	if !ok {

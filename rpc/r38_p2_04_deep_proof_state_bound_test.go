@@ -132,6 +132,11 @@ func TestR38P2_04_Deep_StateDBProveAccountBindsToRoot(t *testing.T) {
 
 // TestR38P2_04_Deep_StateDBProveStorageBindsToRoot mirrors the above for
 // the storage-slot proof path. Skipped when s.stateTrie is nil.
+//
+// What this test actually pins is that the returned proof is *root-bound*, not
+// that it proves a storage value: committed slots live in the key-value store,
+// never in the Verkle state trie (R6-05), so ProveStorage yields an exclusion
+// proof — correctly bound to StateRoot, but a statement about absence.
 func TestR38P2_04_Deep_StateDBProveStorageBindsToRoot(t *testing.T) {
 	sdb := newStateDBWithRealStateTrieForTest(t)
 	if sdb == nil {
@@ -144,8 +149,8 @@ func TestR38P2_04_Deep_StateDBProveStorageBindsToRoot(t *testing.T) {
 	sdb.SetBalance(addr, big.NewInt(1))
 	sdb.SetNonce(addr, 1)
 	sdb.SetState(addr, slot, value)
-	// Commit so stateTrie sees the storage entry. Same rationale as the
-	// account test above — dirtyAccounts walked into Verkle tree on Commit.
+	// Commit so the account leaf reaches the state trie; the slot goes to the
+	// key-value store only (see the IsExclusion check below — R6-05).
 	if _, err := sdb.Commit(1); err != nil {
 		t.Fatalf("StateDB.Commit: %v", err)
 	}
@@ -163,6 +168,12 @@ func TestR38P2_04_Deep_StateDBProveStorageBindsToRoot(t *testing.T) {
 	}
 	if proof.Path[0] != root {
 		t.Fatalf("storage proof.Path[0]=%x does NOT equal StateDB.Root()=%x — the ProveStorage path is NOT stateRoot-bound; light clients verifying against StateRoot would reject a legitimate proof, or worse accept a fabricated proof verified against a different root", proof.Path[0], root)
+	}
+	// R6-05: the slot is committed but not in the state trie, so the only proof
+	// the state trie can produce here is an exclusion of it. Shipping this
+	// alongside the real value would tell a light client the slot is empty.
+	if !proof.IsExclusion {
+		t.Fatal("committed storage is now part of the state trie — relax the refusal in lightclient.GenerateStateProof, the per-entry Unverified label in rpc/proof_api.go and the R6-05 tests together")
 	}
 }
 

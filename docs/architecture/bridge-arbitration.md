@@ -229,6 +229,15 @@ A cross-chain message passes through the following stages from submission to exe
 1. **Stage 1 (SetCommittedRoot)**: the governance address sets the Merkle root through voting
 2. **Stage 2 (FetchMerkleRootFromChain)**: reads the root directly from the on-chain contract (`eth_getStorageAt` at slot `keccak256("merkleRoot")`)
 
+**Committee readiness (R3-02 / R4-02):** step 3 above only runs when the injected
+`SyncCommitteeChecker` actually has a committee loaded. `IsExternalChainSyncCommitteeReady()`
+reports that state; a verifier without a committee treats QAU-format headers that carry no
+sync committee data as pre-committee blocks, i.e. step 2 (block hash / reorg) is the only
+check performed. The node has no external-chain committee feed yet, so on mainnet startup
+refuses to bring the bridge up in that degraded state unless the operator sets
+`QAU_ALLOW_DEGRADED_BRIDGE_HEADER_VERIFICATION=1`, which is logged as an explicit
+degraded-mode decision. Testnet/devnet keep the permissive behaviour.
+
 ## 6. Persistence Architecture
 
 ```

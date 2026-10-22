@@ -869,10 +869,7 @@ func (api *PersonalAPI) ImportRawKey(ctx context.Context, params json.RawMessage
 	// L10-022: Validate key format before attempting to parse.
 	// Key must start with "dilithium3:" prefix (after optional "0x" prefix)
 	// and have the correct hex length (11904 hex chars = privKey + pubKey).
-	keyToValidate := keyHex
-	if strings.HasPrefix(keyToValidate, "0x") {
-		keyToValidate = keyToValidate[2:]
-	}
+	keyToValidate := strings.TrimPrefix(keyHex, "0x")
 	if !strings.HasPrefix(keyToValidate, "dilithium3:") {
 		// RP-06 FIX: Return a generic error message instead of revealing the
 		// expected key prefix, which leaks format information to callers.

@@ -848,10 +848,16 @@ func TestSTATE_R12002_Transient_CopyPreserves(t *testing.T) {
 // Cross-feature: invalid snapshot fallback
 // ---------------------------------------------------------------------------
 
-// TestSTATE_R12002_InvalidSnapshotClearsAllTxState verifies that calling
-// RevertToSnapshot with an invalid ID falls back to clearing all per-tx
-// state (access list, logs, selfdestructs, transient storage).
-func TestSTATE_R12002_InvalidSnapshotClearsAllTxState(t *testing.T) {
+// TestSTATE_R12002_InvalidSnapshotPreservesAllTxState verifies that calling
+// RevertToSnapshot with an unresolvable ID leaves the per-tx state (access
+// list, logs, selfdestructs, transient storage) and the dirty journal intact
+// and instead fails the next Commit closed.
+//
+// R4-07 (2026-10-21 audit): the legacy fallback wiped everything, so a caller
+// that had lost track of its snapshot (concurrent frame, stale id after
+// Commit/Revert, exhausted depth) destroyed the state of OTHER frames — in
+// production, the transactions already applied in the block being imported.
+func TestSTATE_R12002_InvalidSnapshotPreservesAllTxState(t *testing.T) {
 	s := NewStateDB()
 	addr := types.BytesToAddress([]byte{0x01})
 	key := types.BytesToHash([]byte{0xaa})
@@ -862,21 +868,24 @@ func TestSTATE_R12002_InvalidSnapshotClearsAllTxState(t *testing.T) {
 	s.SelfDestruct(addr)
 	s.SetTransientState(addr, key, val)
 
-	// Revert to an invalid (negative) snapshot ID.
+	// Revert to an invalid (negative) snapshot ID with an empty stack: there is
+	// no sound restore point, so nothing may be discarded.
 	s.RevertToSnapshot(-1)
 
-	// All per-tx state should be cleared.
-	if s.AddressInAccessList(addr) {
-		t.Fatalf("after invalid revert: access list should be empty")
+	if !s.AddressInAccessList(addr) {
+		t.Fatalf("after unknown-id revert: access list must be untouched")
 	}
-	if len(s.GetLogs()) != 0 {
-		t.Fatalf("after invalid revert: logs should be empty")
+	if len(s.GetLogs()) != 1 {
+		t.Fatalf("after unknown-id revert: logs must be untouched, got %d", len(s.GetLogs()))
 	}
-	if s.HasSelfDestructed(addr) {
-		t.Fatalf("after invalid revert: selfdestructs should be empty")
+	if !s.HasSelfDestructed(addr) {
+		t.Fatalf("after unknown-id revert: selfdestruct markers must be untouched")
 	}
-	if got := s.GetTransientState(addr, key); got != (types.Hash{}) {
-		t.Fatalf("after invalid revert: transient should be zero, got %x", got)
+	if got := s.GetTransientState(addr, key); got != val {
+		t.Fatalf("after unknown-id revert: transient must stay %x, got %x", val, got)
+	}
+	if _, err := s.Commit(1); err == nil {
+		t.Fatalf("expected Commit to fail closed after an unknown-id revert")
 	}
 }
 

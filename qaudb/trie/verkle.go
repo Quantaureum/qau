@@ -126,8 +126,27 @@ func (h *sha3Hasher) HashExtension(stem [StemSize]byte, child types.Hash) types.
 	return hash
 }
 
-// defaultHasher is the global SHA3-256 hasher instance
-var defaultHasher NodeHasher = &sha3Hasher{}
+// defaultHasher is the single node hash function used by every tree in this
+// process.
+//
+// R10-04 (2026-10-21 tenth-round audit): this used to be typed as the NodeHasher
+// interface and swapped at runtime by an exported SetHasher. Both were removed:
+//   - The variable is read from nine production hash sites while blocks are
+//     being applied, with no lock around it, so a swap mid-build was a data race
+//     on a consensus-critical value.
+//   - The abstraction it promised was already broken. LeafNode.recomputeHash
+//     folds suffix values with a direct SHA3-256 write instead of going through
+//     this variable, so a swapped-in hasher would hash freshly created leaves
+//     under the new function and updated or decoded leaves under SHA3-256. Two
+//     honest nodes replaying the same transactions would then disagree on the
+//     state root, which is a chain split, not a feature.
+//
+// It is now a concrete *sha3Hasher, so a different implementation cannot be
+// assigned to it here without failing to compile. Migrating the state hash
+// function is a versioned, height-gated protocol change; a process-global setter
+// is not how that happens. PedersenHasher stays available as a value for tests
+// and for that future migration work.
+var defaultHasher = &sha3Hasher{}
 
 // TreeNode is the interface for all Verkle tree nodes
 type TreeNode interface {
@@ -450,7 +469,14 @@ func DecodeExtensionNode(data []byte) (*ExtensionNode, error) {
 		return nil, ErrInvalidNode
 	}
 	stemLen := int(binary.BigEndian.Uint32(data[1:5]))
-	if stemLen < 0 || stemLen > StemSize {
+	// R5-08 (2026-10-21 fifth-round audit): the decoder must enforce the same
+	// invariant as NewExtensionNode (R32-P2-06): StemLen is the number of stem
+	// bytes this extension consumes, so 0 means the traversal makes no progress.
+	// The recursion backstop in walk/insert/delete/proveWalk bounds the damage,
+	// but a zero-stem extension read back from disk is corrupt by construction,
+	// so reject it here rather than handing callers a node their own constructor
+	// would refuse to build.
+	if stemLen <= 0 || stemLen > StemSize {
 		return nil, ErrInvalidNode
 	}
 	var stem [StemSize]byte
@@ -691,7 +717,7 @@ func (p *VerkleProof) Verify(root types.Hash) bool {
 		// proof: a tree with no nodes has a zero root, and any key is
 		// trivially absent. Any other proof shape with a zero root is
 		// either a caller bug (default zero root) or a forgery attempt.
-		if !(p.IsExclusion && len(p.Path) == 0 && len(p.Siblings) == 0) {
+		if !p.IsExclusion || len(p.Path) != 0 || len(p.Siblings) != 0 {
 			return false
 		}
 	}
@@ -768,7 +794,7 @@ func (p *VerkleProof) validateStructure() bool {
 	if len(p.Path) != len(p.Siblings)+1 {
 		// Allow the empty-tree exclusion proof: Path == nil &&
 		// Siblings == nil && IsExclusion. Any other mismatch is malformed.
-		if !(len(p.Path) == 0 && len(p.Siblings) == 0 && p.IsExclusion) {
+		if len(p.Path) != 0 || len(p.Siblings) != 0 || !p.IsExclusion {
 			return false
 		}
 	}
@@ -1686,10 +1712,9 @@ func (t *VerkleTree) insert(node TreeNode, stem [StemSize]byte, key, value []byt
 		// the wrong byte positions → Get returns ErrKeyNotFound for all
 		// keys under the extension. With relative stems, no stripping is
 		// needed — the ExtensionNode is stored as-is at Children[idx].
-		newChildHash := types.Hash{}
-		if newChild != nil {
-			newChildHash = newChild.Hash()
-		}
+		// insert() never returns nil (staticcheck SA4023): every branch
+		// returns a node, so the former nil guard was dead code.
+		newChildHash := newChild.Hash()
 		if newChildHash != childHash {
 			n.Children[idx] = t.storeAndGetHash(newChild)
 			n.recomputeHash()
@@ -1768,7 +1793,8 @@ func (t *VerkleTree) insert(node TreeNode, stem [StemSize]byte, key, value []byt
 					oldChildHash = child.Hash()
 				}
 				newChild := t.insert(child, stem, key, value, depth+n.StemLen)
-				if newChild != nil && newChild.Hash() != oldChildHash {
+				// insert() never returns nil (staticcheck SA4023).
+				if newChild.Hash() != oldChildHash {
 					n.Child = newChild
 					n.childHash = newChild.Hash()
 					n.recomputeHash()
@@ -1827,7 +1853,8 @@ func (t *VerkleTree) insert(node TreeNode, stem [StemSize]byte, key, value []byt
 			oldChildHash = child.Hash()
 		}
 		newChild := t.insert(child, stem, key, value, depth+n.StemLen)
-		if newChild != nil && newChild.Hash() != oldChildHash {
+		// insert() never returns nil (staticcheck SA4023).
+		if newChild.Hash() != oldChildHash {
 			n.Child = newChild
 			n.childHash = newChild.Hash()
 			n.recomputeHash()
@@ -2821,6 +2848,47 @@ func (t *VerkleTree) Copy() *VerkleTree {
 	return newTree
 }
 
+// PersistentDB returns the database this tree flushes node writes into.
+// R7-01 (2026-10-21 seventh-round audit): StateDB needs it to hand the same
+// target to a build copy's capture overlay and to restore it on promotion.
+func (t *VerkleTree) PersistentDB() db.Database {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.persistentDB
+}
+
+// SetPersistentDB retargets where this tree's node writes land.
+//
+// R7-01: Copy() deliberately shares persistentDB between the original and the
+// copy (R39-P1-05 serialized the resulting Flush races with a shared mutex),
+// which is what made a block-building copy durable-writable against the live
+// database. A build copy is retargeted onto its own write buffer with this
+// method and returned to the shared database by StateDB.Promote.
+//
+// The pending batch must already be flushed: its queued ops belong to the
+// outgoing database, and silently re-homing them would either lose node writes
+// or apply them to the wrong target. Callers must Flush() first.
+func (t *VerkleTree) SetPersistentDB(next db.Database) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pendingBatchMu.Lock()
+	defer t.pendingBatchMu.Unlock()
+
+	if t.pendingBatch != nil && t.pendingBatch.ValueSize() > 0 {
+		return fmt.Errorf("verkle SetPersistentDB: %d bytes of node writes are still unflushed — call Flush() before retargeting the persistent database",
+			t.pendingBatch.ValueSize())
+	}
+
+	t.persistentDB = next
+	t.pendingBatchErr = nil
+	if next == nil {
+		t.pendingBatch = nil
+		return nil
+	}
+	t.pendingBatch = next.NewBatch()
+	return nil
+}
+
 // copyNode recursively copies a node.
 // FIX: ExtensionNode may have Child==nil but childHash!=empty (e.g. after
 // DecodeExtensionNode deserialization). In that case we must resolve the child
@@ -3107,14 +3175,4 @@ func (t *VerkleTree) GetDB() map[string][]byte {
 		result[k] = copied
 	}
 	return result
-}
-
-// SetHasher sets the node hasher (for future Pedersen commitment migration)
-func SetHasher(hasher NodeHasher) {
-	defaultHasher = hasher
-}
-
-// GetHasher returns the current node hasher
-func GetHasher() NodeHasher {
-	return defaultHasher
 }

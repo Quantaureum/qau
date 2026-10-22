@@ -173,7 +173,9 @@ func (bs *BlockStore) PutVRFAccumulatorsBatch(accs map[uint64]types.Hash) error 
 		}
 		var epochKey [8]byte
 		binary.BigEndian.PutUint64(epochKey[:], epoch)
-		batch.Put(append(vrfAccPrefix, epochKey[:]...), acc[:])
+		if err := batch.Put(append(vrfAccPrefix, epochKey[:]...), acc[:]); err != nil {
+			return err
+		}
 	}
 	return batch.Write()
 }
@@ -1515,7 +1517,9 @@ func (bs *BlockStore) MarkBlocksUnvalidatedBatch(markers []UnvalidatedMarker) er
 		heightBuf := make([]byte, 8)
 		binary.BigEndian.PutUint64(heightBuf, m.Height)
 		key := append(unvalidatedPrefix, m.Hash[:]...)
-		batch.Put(key, heightBuf)
+		if err := batch.Put(key, heightBuf); err != nil {
+			return err
+		}
 	}
 	return batch.Write()
 }

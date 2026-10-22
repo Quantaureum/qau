@@ -8,9 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/quantaureum/qau/crypto"
@@ -34,12 +32,8 @@ type EconomicsAPI struct {
 	blockReader          BlockReader
 	chainID              uint64
 
-	nonceMu    sync.Mutex
-	usedNonces map[types.Address]map[string]time.Time
+	replay *authReplayGuard
 }
-
-const maxEconomicsNoncesPerAddress = 10000
-const maxEconomicsTrackedAddresses = 100000
 
 // NewEconomicsAPI creates a new Economics API.
 func NewEconomicsAPI(
@@ -63,12 +57,20 @@ func NewEconomicsAPI(
 		liquidStakingManager: liquidStakingManager,
 		stakingManager:       stakingManager,
 		blockReader:          br,
-		usedNonces:           make(map[types.Address]map[string]time.Time),
+		replay:               newAuthReplayGuard("economics"),
 	}
 }
 
 func (api *EconomicsAPI) SetChainID(id uint64) {
 	api.chainID = id
+}
+
+// SetAuthReplayStore wires the persistent replay cache shared by all RPC APIs.
+func (api *EconomicsAPI) SetAuthReplayStore(store *AuthReplayStore) {
+	if api.replay == nil {
+		api.replay = newAuthReplayGuard("economics")
+	}
+	api.replay.setStore(store)
 }
 
 //	This method uses a non-standard name. The convention across
@@ -125,116 +127,57 @@ func (api *EconomicsAPI) stakedSupply() *big.Int {
 // verifyEconomicsSignature verifies a Dilithium3 signature for an economics operation.
 // CRITICAL C-1 FIX: all state-mutating economics RPC calls require Dilithium3 signature
 // verification proving ownership of the address being operated on, with nonce-based
-// replay protection. The signature covers: method || userAddress || nonce || params.
+// replay protection.
+// R2-04 FIX: the message binds ChainID and uses the same QAU-{method} domain
+// prefix as the DeFi/governance domains, so a signature produced for one chain
+// cannot be replayed against another.
 func (api *EconomicsAPI) verifyEconomicsSignature(method string, userAddr types.Address, nonce, params string, signature, pubKeyHex string) error {
 	if signature == "" || pubKeyHex == "" {
 		return fmt.Errorf("signature and publicKey are required for state-mutating operations")
 	}
-	if nonce == "" {
-		return fmt.Errorf("nonce is required for replay protection")
+	// The signed nonce carries the request deadline; see
+	// ParseAuthNonceDeadline. Reservations survive restarts when the node
+	// configures a replay store.
+	deadline, err := ParseAuthNonceDeadline(nonce, time.Now())
+	if err != nil {
+		return err
 	}
-
-	api.nonceMu.Lock()
-	if len(api.usedNonces) > maxEconomicsTrackedAddresses {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("too many tracked addresses (memory limit)")
-	}
-	if api.usedNonces[userAddr] == nil {
-		api.usedNonces[userAddr] = make(map[string]time.Time)
-	}
-	const economicsNonceTTL = 10 * time.Minute
-	now := time.Now()
-	for k, ts := range api.usedNonces[userAddr] {
-		// FIX: Skip pending (zero-time) nonces in TTL cleanup.
-		// Pending nonces await signature verification and must NOT be evicted
-		// by a concurrent request's cleanup, which would reopen a TOCTOU
-		// window allowing the same nonce to be reused.
-		if isNonceConfirmed(ts) && now.Sub(ts) > economicsNonceTTL {
-			delete(api.usedNonces[userAddr], k)
-		}
-	}
-	if _, used := api.usedNonces[userAddr][nonce]; used {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("nonce already used (replay detected)")
-	}
-	api.usedNonces[userAddr][nonce] = time.Time{}
-	api.nonceMu.Unlock()
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
 	if err != nil {
-		api.rollbackPendingEconomicsNonce(userAddr, nonce)
 		return fmt.Errorf("invalid signature hex: %w", err)
 	}
 
 	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
 	if err != nil {
-		api.rollbackPendingEconomicsNonce(userAddr, nonce)
 		return fmt.Errorf("invalid publicKey hex: %w", err)
 	}
 
 	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
 	if err != nil {
-		api.rollbackPendingEconomicsNonce(userAddr, nonce)
 		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
 	}
 
 	derivedAddr := pubKey.Address()
 	if derivedAddr != userAddr {
-		api.rollbackPendingEconomicsNonce(userAddr, nonce)
 		return fmt.Errorf("public key does not match claimed address")
 	}
 
-	message := []byte(method + "|" + userAddr.ToHexAddress() + "|" + nonce + "|" + params)
+	message := []byte(fmt.Sprintf("QAU-%s|%d|%s|%s|%s", method, api.chainID, userAddr.ToHexAddress(), nonce, params))
 
 	if !crypto.Verify(pubKey, message, sigBytes) {
-		api.rollbackPendingEconomicsNonce(userAddr, nonce)
 		return fmt.Errorf("signature verification failed")
 	}
 
-	api.nonceMu.Lock()
-	// FIX: Re-verify the nonce is still in pending state before
-	// confirming. This closes the TOCTOU window between the initial pending
-	// reservation (first lock) and this confirmation (second lock).
-	if ts, exists := api.usedNonces[userAddr][nonce]; !exists || isNonceConfirmed(ts) {
-		api.nonceMu.Unlock()
-		return fmt.Errorf("nonce reservation invalid or lost (possible replay)")
+	// R2-03 FIX: reserve only after the signature checks out, so
+	// unauthenticated traffic cannot drive persistent write transactions. A
+	// concurrent duplicate still loses the race here, so a nonce is consumed
+	// at most once.
+	if err := api.replay.reserve(userAddr, nonce, deadline); err != nil {
+		return err
 	}
-	if len(api.usedNonces[userAddr]) >= maxEconomicsNoncesPerAddress {
-		type nonceEntry struct {
-			nonce string
-			ts    time.Time
-		}
-		entries := make([]nonceEntry, 0, len(api.usedNonces[userAddr]))
-		for k, ts := range api.usedNonces[userAddr] {
-			// R22-NEW-004 FIX: Skip pending (zero-time) nonces in eviction.
-			// Pending nonces sort first (year 1) and would be deleted first,
-			// reopening a TOCTOU window allowing nonce replay.
-			if isNonceConfirmed(ts) {
-				entries = append(entries, nonceEntry{k, ts})
-			}
-		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].ts.Before(entries[j].ts)
-		})
-		for i := 0; i < len(entries)/2; i++ {
-			delete(api.usedNonces[userAddr], entries[i].nonce)
-		}
-	}
-	api.usedNonces[userAddr][nonce] = time.Now()
-	api.nonceMu.Unlock()
 
 	return nil
-}
-
-// rollbackPendingEconomicsNonce removes a pending nonce reservation when verification fails.
-func (api *EconomicsAPI) rollbackPendingEconomicsNonce(userAddr types.Address, nonce string) {
-	api.nonceMu.Lock()
-	defer api.nonceMu.Unlock()
-	if nonces, ok := api.usedNonces[userAddr]; ok {
-		if ts, exists := nonces[nonce]; exists && ts.IsZero() {
-			delete(nonces, nonce)
-		}
-	}
 }
 
 // GetInflationInfo returns inflation rate, block reward, total supply, and circulating supply.

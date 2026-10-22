@@ -166,7 +166,7 @@ func validateConfig(config *MultiSigConfig) error {
 		// registration. A zero key (t1=0) degenerates Dilithium verification
 		// so ANYONE can forge that signer's approval without a private key,
 		// letting an attacker satisfy the threshold and drain the wallet.
-		if crypto.IsZeroPublicKeyBytes(pk) {
+		if crypto.IsDegeneratePublicKeyBytes(pk) {
 			return fmt.Errorf("%w: public key %d is all-zero (keyless forgery vector)",
 				ErrInvalidPublicKey, i)
 		}

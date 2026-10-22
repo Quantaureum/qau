@@ -5,8 +5,8 @@
   "network": "testnet",
   "listenAddr": ":9000",
   "bootstrapPeers": [
-    "/dns4/testnet-boot1.quantaureum.io/tcp/9000/p2p/QmTestBootstrap1",
-    "/dns4/testnet-boot2.quantaureum.io/tcp/9000/p2p/QmTestBootstrap2"
+    "/dns4/testnet-boot1.quantaureum.com/tcp/9000/p2p/QmTestBootstrap1",
+    "/dns4/testnet-boot2.quantaureum.com/tcp/9000/p2p/QmTestBootstrap2"
   ],
   "_comment_bootstrapPeers": "PLACEHOLDER: Replace QmTestBootstrap1/2 with real PeerIDs after deploying validator nodes. Run 'qaud node-info' on each bootnode to get its PeerID.",
   "maxPeers": 50,
@@ -59,7 +59,7 @@
     "enabled": true,
     "certDir": "/var/lib/quantaureum/certs",
     "organization": "Quantaureum Testnet",
-    "commonName": "testnet.quantaureum.io",
+    "commonName": "testnet.quantaureum.com",
     "validityDuration": 90,
     "renewalThreshold": 14,
     "backupEnabled": true,

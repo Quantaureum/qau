@@ -88,7 +88,7 @@ type ExternalChainAdapter struct {
 	// P3-1 (2026-07-14): Prometheus metrics (nil-safe).
 	metrics *BridgeMetrics
 	// P1-5 (2026-07-14): SPV header verifier for reorg detection (nil-safe).
-	// When configured, VerifyMessage calls VerifyEthereumHeaderByNumber to
+	// When configured, VerifyMessage calls VerifyExternalChainHeaderByNumber to
 	// verify the block header at msg.BlockNumber via sync committee signatures
 	// and confirm the block hash matches msg.BlockHash.
 	headerVerifier *BridgeHeaderVerifier
@@ -600,7 +600,7 @@ func (e *ExternalChainAdapter) VerifyMessage(ctx context.Context, msg *BridgeMes
 			}
 		}
 		if msg.BlockNumber > 0 && msg.BlockHash != "" {
-			if err := verifier.VerifyEthereumHeaderByNumber(ctx, e, msg.BlockNumber, msg.BlockHash); err != nil {
+			if err := verifier.VerifyExternalChainHeaderByNumber(ctx, e, msg.BlockNumber, msg.BlockHash); err != nil {
 				return false, fmt.Errorf("SPV header verification failed for message %s: %w", msg.ID, err)
 			}
 		}

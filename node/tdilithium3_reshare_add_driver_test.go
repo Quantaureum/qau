@@ -160,6 +160,7 @@ func TestReshareAddRunnerDrivesAllMembers(t *testing.T) {
 func mustReshareNodeKeyID() protocol.ThresholdKeyID {
 	publicKey := make([]byte, 1952)
 	publicKey[0] = 0xAA
+	publicKey[32] = 0x01 // t1 must not be all-zero (F-06 degenerate-key rejection)
 	return protocol.ThresholdKeyID{
 		Algorithm:  qcrypto.SignatureAlgorithmDilithium3Legacy,
 		Generation: 20,

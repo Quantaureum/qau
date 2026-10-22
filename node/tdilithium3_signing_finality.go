@@ -38,7 +38,7 @@ type tdilithium3SigningFinalitySigner struct {
 // canonical non-degenerate Dilithium3 key before it becomes the verification
 // key of an epoch.
 func newTDilithium3SigningFinalitySigner(groupPublicKey []byte, threshold int) (*tdilithium3SigningFinalitySigner, error) {
-	if len(groupPublicKey) != qcrypto.Dilithium3PublicKeySize || qcrypto.IsZeroPublicKeyBytes(groupPublicKey) {
+	if len(groupPublicKey) != qcrypto.Dilithium3PublicKeySize || qcrypto.IsDegeneratePublicKeyBytes(groupPublicKey) {
 		return nil, fmt.Errorf(
 			"Dilithium3 v1 finality signer requires a non-zero %d-byte group public key",
 			qcrypto.Dilithium3PublicKeySize,

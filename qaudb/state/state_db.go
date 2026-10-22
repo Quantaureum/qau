@@ -102,6 +102,152 @@ var (
 	lastCommittedHeightKey = []byte("_last_committed_height_")
 )
 
+// R8-01 (2026-10-21 eighth-round audit): durable commit anchor and writer gate.
+
+// ErrStaleBuildState reports that a build copy may no longer be promoted
+// because the shared database moved on since the copy was taken (another writer
+// committed a block, or a fork rollback rewrote the anchor). The copy is simply
+// discarded — its block was built on a parent that is no longer durable.
+var ErrStaleBuildState = errors.New("state_db: R8-01: build state is stale, the shared database moved on since this copy was taken")
+
+// durableAnchor is a database's own record of what it holds durably: the
+// last-committed height and root written by Commit's post-commit batch
+// (R32-P2-05 / R87-M4-RESTART).
+type durableAnchor struct {
+	height  uint64
+	root    types.Hash
+	hasRoot bool
+}
+
+// readDurableAnchor reads the anchor straight from d. Callers pass the BASE
+// database (never a build copy's buffer), because the point of the anchor is
+// what is durable for everybody, not what one instance has staged.
+func readDurableAnchor(d db.Database) durableAnchor {
+	var a durableAnchor
+	if d == nil {
+		return a
+	}
+	if b, err := d.Get(lastCommittedHeightKey); err == nil && len(b) == 8 {
+		a.height = binary.BigEndian.Uint64(b)
+	}
+	if b, err := d.Get(lastCommittedRootKey); err == nil && len(b) == types.HashLength {
+		copy(a.root[:], b)
+		a.hasRoot = true
+	}
+	return a
+}
+
+// matches reports whether two anchor reads describe the same durable point.
+func (a durableAnchor) matches(b durableAnchor) bool {
+	return a.height == b.height && a.hasRoot == b.hasRoot && a.root == b.root
+}
+
+// drift describes how a and b differ, for the staleness error. Which component
+// moved matters: a height change is the sync path adopting a block (or a fork
+// rollback), a root-only change is a writer that rewrote state at the same
+// height. Both invalidate a pending build, but they are debugged differently.
+func (a durableAnchor) drift(b durableAnchor) string {
+	switch {
+	case a.height != b.height:
+		return fmt.Sprintf("durable height moved from %d to %d", a.height, b.height)
+	case a.hasRoot != b.hasRoot || a.root != b.root:
+		return fmt.Sprintf("durable root changed from %x to %x", a.root, b.root)
+	}
+	return "the durable anchor changed"
+}
+
+// isDurabilityControlKey reports whether key is one of the metadata keys that
+// tell the next startup what is durable (R8-02). They are prefixed with '_' so
+// they sort BEFORE the data prefixes "a", "c" and "s", which is exactly the
+// wrong order for a replay that can span several transactions: the anchor would
+// be published before the accounts behind it exist. Capture.ApplyToBase uses
+// this to apply them last, in one batch.
+func isDurabilityControlKey(key string) bool {
+	switch key {
+	case string(commitPendingKey), string(lastCommittedHeightKey), string(lastCommittedRootKey):
+		return true
+	}
+	return false
+}
+
+// durableDisk is the control block ONE base database shares with every StateDB
+// instance that writes it (R9-01, extending the R8-01 writer gate).
+//
+// Two things have to be shared here for exactly the same reason — Copy()
+// isolates in-memory state but deliberately keeps the durable handle, and
+// Promote() hands that same handle to the adopted instance, so a live instance,
+// its build copies and the instance it replaced are all users of ONE handle:
+//
+//   - gate serializes the composite durable writes (Commit / Promote /
+//     RollbackToHeight / PruneState / the snap-import writers) across the graph.
+//   - the close bookkeeping releases that handle. Before R9-01 Close() closed
+//     s.db on whichever instance was asked, taking only that instance's s.mu:
+//     it was not serialized with the other instances' durable writers, so a
+//     close landing in the middle of a promote replay left the base half-applied
+//     AND made the commit-pending marker un-readable — RecoverConsistency could
+//     not even run the fail-closed check, because the handle it needs is gone.
+//     It also double-closed the handle when two instances of the graph were shut
+//     down in turn.
+//
+// The pointer is inherited through Copy()/CopyForBuild(), the same convention
+// the Verkle tree uses for persistentFlushMu (R39-P1-05). Instances built as
+// struct literals outside allocStateDB/Copy() get nil, which the helpers below
+// treat as "no siblings".
+//
+// Lock order: StateDB.mu -> durableDisk.gate -> trie persistentFlushMu ->
+// pendingBatchMu. Nothing acquires StateDB.mu while holding the gate.
+type durableDisk struct {
+	gate sync.Mutex
+
+	// handle is the base database, captured once at construction. Close() must
+	// release THIS, not s.db: a provisional build copy has s.db == its own write
+	// buffer, and closing the buffer would leave the real disk open forever.
+	handle db.Database
+
+	closed   bool
+	closeErr error
+}
+
+// closeDatabase releases the shared handle, at most once, with no durable writer
+// able to interleave. Safe to call repeatedly and from any instance of the graph.
+func (d *durableDisk) closeDatabase() error {
+	if d == nil {
+		return nil
+	}
+	// The gate is what makes this safe: every durable writer in the instance
+	// graph holds it while touching the handle, so the close cannot land in the
+	// middle of a commit or a promote replay.
+	d.gate.Lock()
+	defer d.gate.Unlock()
+
+	if d.closed {
+		return d.closeErr
+	}
+	if d.handle != nil {
+		if err := d.handle.Close(); err != nil {
+			// Stay open-ended: a failed close must be retryable, otherwise the
+			// handle and its file lock would leak exactly like an absent close.
+			return err
+		}
+	}
+	d.closed = true
+	return nil
+}
+
+// lockDurableGate takes this instance's durable-writer gate, if it has one.
+// Always used as `defer s.lockDurableGate()()` and only while s.mu is held, so
+// the lock order stays StateDB.mu -> durableDisk.gate. The method keeps its old
+// name after R9-01 widened the field from a bare mutex to the whole durableDisk
+// control block; the 8 durable-writer sites are unchanged.
+func (s *StateDB) lockDurableGate() func() {
+	d := s.durableDisk
+	if d == nil {
+		return func() {}
+	}
+	d.gate.Lock()
+	return d.gate.Unlock
+}
+
 // Account represents the state of an account
 // storageCacheKey is the composite key for the storage cache.
 type storageCacheKey struct {
@@ -497,6 +643,56 @@ type stateSnapshot struct {
 // StateDB provides access to account states
 type StateDB struct {
 	db db.Database
+
+	// R7-01 (2026-10-21 seventh-round audit): a block-building copy.
+	//
+	// Copy() isolates every in-memory layer but intentionally shares the
+	// durable database, so the block producer's CommitWithBlock on its copy
+	// wrote the block-under-construction straight onto the live disk. When the
+	// chain tip moved while the block was being built the copy was discarded
+	// and those writes stayed: the live StateDB reads through to the same disk
+	// on every cache miss, RecoverConsistency rebuilds the state trie from that
+	// disk at startup, and the undo records that could have reverted them died
+	// with the copy.
+	//
+	// CopyForBuild() sets provisional + capture: every durable read still sees
+	// the shared database plus this copy's own buffered writes, every durable
+	// write goes into the buffer, and Promote replays the buffer when — and only
+	// when — the block is adopted.
+	provisional bool
+	capture     *db.Capture
+
+	// R8-01 (2026-10-21 eighth-round audit): one durable-writer gate per base
+	// database.
+	//
+	// Copy() isolates in-memory state but deliberately shares the durable
+	// database, so a StateDB graph (live instance + its build copies) is several
+	// instances writing ONE database. The per-instance s.mu and the per-instance
+	// execution frame (R4-07) cannot serialize across that graph, and a durable
+	// commit is a COMPOSITE write (account batch, then Verkle flush, then the
+	// height/root anchor batch). Without a shared gate, the block producer's
+	// Promote could interleave with the import path's Commit — the import runs
+	// outside node.mu (node.handleIncomingBlock calls ProcessBlock unlocked) —
+	// leaving durable state that belongs to neither block.
+	//
+	// The pointer is inherited through Copy()/CopyForBuild(), the same
+	// convention the Verkle tree uses for persistentFlushMu (R39-P1-05).
+	// Instances built as struct literals outside allocStateDB/Copy() get nil,
+	// which the helpers below treat as "no gate" (they have no sibling).
+	//
+	// R9-01: this field used to be the bare gate mutex. It is now the whole
+	// control block, because the handle's release has to be shared and serialized
+	// for exactly the same reason the writes are — see durableDisk.
+	//
+	// Lock order: StateDB.mu -> durableDisk.gate -> trie persistentFlushMu ->
+	// pendingBatchMu. Nothing acquires StateDB.mu while holding the gate.
+	durableDisk *durableDisk
+
+	// R8-01: the base database's durability anchor at the moment this build
+	// copy was taken. Promote refuses to replay unless the base still reports
+	// exactly that anchor.
+	buildAnchor durableAnchor
+
 	mu sync.RWMutex
 
 	// R39-P3-01 (2026-08-02) FIX: monotonically-increasing counter of
@@ -643,6 +839,22 @@ type StateDB struct {
 	snapshots      []stateSnapshot
 	nextSnapshotID int
 
+	// R4-07 (2026-10-21 audit) FIX: the stack above is positional and global to
+	// this instance, and RevertToSnapshot restores the ENTIRE dirty journal
+	// captured at that index. Two execution frames therefore must never be live
+	// on one StateDB at the same time: whichever reverts first silently drops
+	// the other frame's writes, and once the stack is exhausted the unknown-id
+	// fallback used to wipe every dirty change accumulated so far (including
+	// earlier transactions of the block being applied). execMu is the
+	// instance-wide execution lock that serializes top-level frames:
+	// BeginExecution is the blocking variant for consensus-critical application
+	// and TryBeginExecution the fail-fast variant for speculative callers
+	// (eth_call / eth_estimateGas / AA simulation).
+	//
+	// Lock ordering: execMu is ALWAYS acquired before s.mu (never while holding
+	// it), so the two locks cannot invert.
+	execMu sync.Mutex
+
 	// R33 P3-07 FIX (2026-07-28): lastError tracks the first silent error
 	// encountered by SetNonce/SetBalance/SetCode when the underlying account
 	// cannot be loaded (other than ErrAccountNotFound, which is a legitimate
@@ -676,6 +888,7 @@ func allocStateDB(database ...db.Database) *StateDB {
 	}
 	return &StateDB{
 		db:            dbInstance,
+		durableDisk:   &durableDisk{handle: dbInstance},
 		dirtyAccounts: make(map[types.Address]*Account),
 		dirtyStorage:  make(map[types.Address]map[types.Hash]types.Hash),
 		// R33 STATE-02 FIX: initialize pending code writes buffer
@@ -732,6 +945,10 @@ func NewStateDB(database ...db.Database) *StateDB {
 	s := allocStateDB(database...)
 	if err := s.RecoverConsistency(); err != nil {
 		log.Printf("[FATAL] state_db: R38-P1-04: RecoverConsistency failed: %v — halting to prevent corrupt state", err)
+		log.Printf("[FATAL] state_db recovery: (1) stop the node; (2) copy the data directory aside as a backup; " +
+			"(3) restore the newest known-good snapshot or data backup; (4) if no backup exists, move the corrupt " +
+			"data directory aside and re-sync from peers; (5) keep the backup until the node has re-synced and " +
+			"produced a block. Include the error above in any incident report.")
 		panic(fmt.Sprintf("state_db: RecoverConsistency failed (R38-P1-04): %v", err))
 	}
 	return s
@@ -781,6 +998,22 @@ func (s *StateDB) CommitPendingMarkerCloggedCount() uint64 {
 // state root matches the authoritative account data.
 //
 // This method is safe to call at startup and is idempotent.
+//
+// O-8-2 disposition (2026-10-21 tenth-round audit): unlike Commit and Promote,
+// recovery does NOT take the durableDisk writer gate, and that is deliberate. The
+// two durable writes here (the stateTrie swap and the commit-pending marker
+// delete) are safe without it because of a precondition, not because they are
+// concurrency-proof: every caller runs recovery from a constructor
+// (NewStateDB/OpenStateDB) immediately after allocStateDB, on a freshly allocated
+// durableDisk that is exclusively owned by this instance — no Copy sibling has
+// inherited the pointer yet and the instance has not been handed to any goroutine,
+// so there is no other durable writer to interleave with. Base-database writes are
+// additionally serialized by bbolt itself. Recovery must therefore never be invoked
+// on a live instance that may already have siblings sharing the gate; the
+// call-site guard test pins that the only callers stay the two constructors. If
+// recovery is ever wired to run post-construction, THIS precondition no longer
+// holds and the writes must take s.lockDurableGate() like the 8 durable-writer
+// sites do.
 //
 // AUDIT (2026) R4-DATA-03
 func (s *StateDB) RecoverConsistency() error {
@@ -894,6 +1127,11 @@ func (s *StateDB) RecoverConsistency() error {
 	}
 
 	// Clear the commit-pending marker now that the tree is rebuilt.
+	//
+	// No durable-writer gate here on purpose (O-8-2): recovery runs only from the
+	// constructors, before this instance's durableDisk is shared, so no sibling
+	// writer can race the delete. See the method doc for the precondition that must
+	// keep holding.
 	if err := s.db.Delete(commitPendingKey); err != nil {
 		// R39-P3-01 (2026-08-02) FIX: elevate to ERROR + counter. This
 		// path is the post-RecoverConsistency cleanup; if it fails, the
@@ -1048,10 +1286,25 @@ func (s *StateDB) ProveStorage(addr types.Address, key types.Hash) (*trie.Verkle
 	if s.stateTrie == nil {
 		return nil, errProofNotSupported
 	}
-	storageKey := append(storagePrefix, addr[:]...)
+	return s.stateTrie.Prove(StorageProofKey(addr, key))
+}
+
+// StorageProofKey returns the state-trie key under which the storage slot
+// (addr, key) is committed: storagePrefix ++ addr ++ 0xFF ++ key.
+//
+// R6-02 (2026-10-21 sixth-round audit): exposed so that proof CONSUMERS (the
+// light-client SPV layer) can check that a storage proof they were handed is
+// bound to the (address, slot) pair they asked about, rather than to some
+// other slot that also happens to be a valid path in the trie. Note that
+// ProveStorage walks the FLAT state trie, so the resulting proof is bound to
+// the state root -- not to the account's StorageRoot field.
+func StorageProofKey(addr types.Address, key types.Hash) []byte {
+	storageKey := make([]byte, 0, len(storagePrefix)+len(addr)+1+len(key))
+	storageKey = append(storageKey, storagePrefix...)
+	storageKey = append(storageKey, addr[:]...)
 	storageKey = append(storageKey, 0xFF)
 	storageKey = append(storageKey, key[:]...)
-	return s.stateTrie.Prove(storageKey)
+	return storageKey
 }
 
 // errProofNotSupported is returned by ProveAccount/ProveStorage when the
@@ -1697,6 +1950,13 @@ func (s *StateDB) computeStorageRoot(addr types.Address, dirtyStorage map[types.
 func (s *StateDB) Commit(blockHeight ...uint64) (types.Hash, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-01 (2026-10-21 eighth-round audit): a durable commit is a composite
+	// write (account batch, Verkle flush, then the height/root anchor batch).
+	// Other StateDB instances share this database — the block producer builds on
+	// a copy and promotes it while the import path commits here — so the whole
+	// composite is taken under the base's writer gate, not just under this
+	// instance's mutex.
+	defer s.lockDurableGate()()
 
 	// R33 P3-07 FIX: Surface any silent error recorded by SetNonce/SetBalance/
 	// SetCode during this transaction. Previously these methods only logged
@@ -2078,7 +2338,14 @@ func (s *StateDB) Commit(blockHeight ...uint64) (types.Hash, error) {
 	// Commit returns, the per-tx log slice is gone.
 	s.clearTxStateLocked()
 
-	// Return root hash from Verkle tree
+	// R4-07 (2026-10-21 audit): the snapshot stack journals DIRTY state, so a
+	// commit invalidates every entry still on it — restoring one would rewind
+	// changes that are now durable. Clearing here also stops unbalanced frames
+	// from creeping towards maxSnapshotDepth, where Snapshot() starts returning
+	// the depth-exhaustion sentinel (mirrors go-ethereum, which resets its
+	// snapshot journal on Commit).
+	s.snapshots = nil
+	s.nextSnapshotID = 0
 	return s.rootLocked(), nil
 }
 
@@ -2243,24 +2510,41 @@ func serializeAccount(acc *Account) ([]byte, error) {
 
 // Copy creates a copy of the state database
 // SECURITY FIX: Now copies stateTrie using VerkleTree.Copy()
+//
+// R7-01 (2026-10-21 seventh-round audit): the copy shares s.db and the tree's
+// persistent database with the original, so it can commit DURABLE writes into
+// live state. That is fine for a read-only fork and for the adopted block (the
+// copy becomes the live instance), but it is NOT isolation for a block that may
+// still be thrown away: use CopyForBuild for that.
 func (s *StateDB) Copy() *StateDB {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	newState := &StateDB{
-		db:                     s.db,
-		dirtyAccounts:          make(map[types.Address]*Account),
-		dirtyStorage:           make(map[types.Address]map[types.Hash]types.Hash),
-		accountCache:           make(map[types.Address]*Account),
-		stateTrie:              s.stateTrie.Copy(),
-		modificationLog:        make(map[uint64][]types.Address),
-		addressRefs:            make(map[types.Address]uint64),
-		addressLastModified:    make(map[types.Address]uint64),
-		pruneBatchSize:         s.pruneBatchSize,
-		pruningEnabled:         s.pruningEnabled,
-		pruneKeepBlocks:        s.pruneKeepBlocks,
-		snapshotInterval:       s.snapshotInterval,
-		stateSnapshots:         s.stateSnapshots,
+		db:                  s.db,
+		durableDisk:         s.durableDisk,
+		dirtyAccounts:       make(map[types.Address]*Account),
+		dirtyStorage:        make(map[types.Address]map[types.Hash]types.Hash),
+		accountCache:        make(map[types.Address]*Account),
+		stateTrie:           s.stateTrie.Copy(),
+		modificationLog:     make(map[uint64][]types.Address),
+		addressRefs:         make(map[types.Address]uint64),
+		addressLastModified: make(map[types.Address]uint64),
+		pruneBatchSize:      s.pruneBatchSize,
+		pruningEnabled:      s.pruningEnabled,
+		pruneKeepBlocks:     s.pruneKeepBlocks,
+		snapshotInterval:    s.snapshotInterval,
+		// R6-06 (2026-10-21 sixth-round audit): deep-copy the height -> root map.
+		// It used to be carried over by reference, so the original and every copy
+		// shared one Go map while each instance guards it with its OWN s.mu.
+		// The block producer builds on StateDB.Copy() and commits that copy
+		// (block_producer.go), whose CommitWithBlock reaches CreateSnapshot and
+		// PruneState — both of which write this map — at the same time the import
+		// path commits the main StateDB. Two mutexes, one map: concurrent map
+		// writes are a fatal runtime error the node cannot recover from, and even
+		// without the collision a discarded block-building copy was deleting
+		// entries out of the live instance's bookkeeping.
+		stateSnapshots:         deepCopyStateSnapshots(s.stateSnapshots),
 		lastPrunedBlock:        s.lastPrunedBlock,
 		lastSnapshotBlock:      s.lastSnapshotBlock,
 		prunedAccounts:         s.prunedAccounts,
@@ -2347,6 +2631,193 @@ func (s *StateDB) Copy() *StateDB {
 	return newState
 }
 
+// deepCopyStateSnapshots copies the pruning bookkeeping map for StateDB.Copy().
+// Callers must already hold the source's lock (R6-06).
+func deepCopyStateSnapshots(src map[uint64]types.Hash) map[uint64]types.Hash {
+	dst := make(map[uint64]types.Hash, len(src))
+	for height, root := range src {
+		dst[height] = root
+	}
+	return dst
+}
+
+// CopyForBuild returns a copy for building a block that has not been adopted
+// yet (R7-01). It is StateDB.Copy() plus a buffered durable layer: the copy may
+// Commit exactly as an adopted state would, but nothing it writes reaches the
+// shared database until Promote is called.
+//
+// Returns nil only when the copy cannot be isolated — the caller must then skip
+// the block rather than build on a copy that is still wired to live disk state.
+func (s *StateDB) CopyForBuild() *StateDB {
+	s.mu.RLock()
+	base, parentBuffer, alreadyProvisional := s.db, s.capture, s.provisional
+	s.mu.RUnlock()
+
+	c := s.Copy()
+	if c == nil {
+		return nil
+	}
+
+	// A build copy taken from a build copy keeps buffering into the same write
+	// set — Copy() already carried the parent's buffer over as s.db, so only the
+	// bookkeeping has to be re-attached. Silently starting a fresh buffer here
+	// would strand the parent copy's staged block.
+	if alreadyProvisional {
+		c.provisional = true
+		c.capture = parentBuffer
+		// R8-01: the fence has to be the one the OUTER copy captured against the
+		// real base: this copy's writes land in the shared buffer, and promoting it
+		// replays that buffer onto the base, so its staleness is the outer copy's
+		// staleness.
+		c.buildAnchor = s.buildAnchor
+		return c
+	}
+
+	// R8-01: remember what the base reports as durable RIGHT NOW. Promote
+	// refuses to replay unless it still reports the same thing — otherwise this
+	// copy's data would be written on top of a state that has moved on (a block
+	// imported by the sync path, or a fork rollback).
+	c.buildAnchor = readDurableAnchor(base)
+
+	buffer := db.NewCapture(base)
+	c.db = buffer
+	c.capture = buffer
+	c.provisional = true
+	if c.stateTrie != nil {
+		// The tree's node writes (and the orphan sweep / node resolution reads
+		// that fall through to it) belong to the same buffered set as the
+		// account writes. Copy() leaves the pending batch empty, so this cannot
+		// fail; if it ever does, refuse to hand out a half-isolated copy.
+		if err := c.stateTrie.SetPersistentDB(buffer); err != nil {
+			log.Printf("[ERROR] state_db: R7-01: cannot isolate the Verkle tree of a build copy: %v — refusing to hand out a copy that would still write to live state", err)
+			return nil
+		}
+	}
+	return c
+}
+
+// Promote flushes a build copy's buffered durable writes into the shared
+// database and turns the copy into an ordinary StateDB. Call it at the moment
+// the built block is accepted; a copy that is never promoted leaves nothing
+// behind on disk.
+//
+// Returns ErrStaleBuildState if another writer moved the shared database while
+// this copy was being built (R8-01). Nothing has been written in that case.
+//
+// On any other error the instance stays provisional AND the base may hold part
+// of the replay: applied data cannot be un-written. The commit-pending marker
+// is published before the replay for exactly that reason — the next startup
+// then rebuilds the Verkle tree from the accounts that did land and refuses to
+// serve a state it cannot verify. Callers must fail closed (discard the block
+// and stop trusting local state), not just carry on.
+func (s *StateDB) Promote() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.provisional {
+		return nil
+	}
+	buffer := s.capture
+	if buffer == nil {
+		return errors.New("state_db: R7-01: provisional copy has no write buffer to promote")
+	}
+
+	base := buffer.Base()
+
+	// R8-01: from here to the end of the replay this instance is the only
+	// writer of the shared database. The gate is what makes the staleness check
+	// below and the replay it protects atomic against a concurrent Commit.
+	defer s.lockDurableGate()()
+
+	if current := readDurableAnchor(base); !current.matches(s.buildAnchor) {
+		return fmt.Errorf("%w: %s", ErrStaleBuildState, s.buildAnchor.drift(current))
+	}
+
+	// Node writes queued by the most recent Commit are part of the buffered set
+	// and must be inside it before the buffer is replayed.
+	if s.stateTrie != nil {
+		if err := s.stateTrie.Flush(); err != nil {
+			return fmt.Errorf("state_db: R7-01: Promote refused, pending Verkle flush failed: %w", err)
+		}
+	}
+
+	// R8-02: publish the recovery marker BEFORE any of the replay is applied.
+	// The buffered set itself clears it (Commit stages the clear together with
+	// the anchor), and ApplyToBase applies those metadata keys last — so if this
+	// process dies or the replay fails halfway, the marker is on disk and
+	// RecoverConsistency rebuilds the Verkle tree from whatever accounts landed
+	// instead of trusting an anchor that was never fully applied.
+	if buffer.BufferedKeys() > 0 {
+		if err := base.Put(commitPendingKey, []byte{1}); err != nil {
+			return fmt.Errorf("state_db: R8-02: Promote refused, cannot stage the commit-pending marker: %w", err)
+		}
+	}
+
+	if err := buffer.ApplyToBase(isDurabilityControlKey); err != nil {
+		return fmt.Errorf("state_db: R7-01: Promote failed replaying buffered writes to disk: %w", err)
+	}
+
+	if s.stateTrie != nil {
+		if err := s.stateTrie.SetPersistentDB(base); err != nil {
+			return fmt.Errorf("state_db: R7-01: Promote failed retargeting the Verkle tree: %w", err)
+		}
+	}
+	s.db = base
+	s.capture = nil
+	s.provisional = false
+	return nil
+}
+
+// ProvisionalForTesting reports whether durable writes are buffered rather than
+// written through (R7-01). Test-only accessor, mirroring ClearCacheForTesting.
+func (s *StateDB) ProvisionalForTesting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.provisional
+}
+
+// BufferedDurableWritesForTesting returns the number of distinct keys and the
+// total value bytes a provisional copy is holding back from the shared database
+// (R7-01). Test-only.
+func (s *StateDB) BufferedDurableWritesForTesting() (keys int, valueBytes int) {
+	s.mu.RLock()
+	buffer := s.capture
+	s.mu.RUnlock()
+	if buffer == nil {
+		return 0, 0
+	}
+	return buffer.BufferedKeys(), buffer.BufferedBytes()
+}
+
+// DurableDatabaseForTesting returns the shared database this instance's durable
+// reads and writes ultimately land on: the capture's base for a provisional
+// build copy, the plain database otherwise (R7-01). A test can build a second
+// StateDB on top of it to get a restart-equivalent view of what the instance has
+// actually made durable. Test-only.
+func (s *StateDB) DurableDatabaseForTesting() db.Database {
+	s.mu.RLock()
+	buffer, current := s.capture, s.db
+	s.mu.RUnlock()
+	if buffer != nil {
+		return buffer.Base()
+	}
+	return current
+}
+
+// DurableWriterGateForTesting returns the mutex that serializes durable composite
+// writes across every StateDB instance sharing this base database (R8-01).
+// Identity comparison against the parent instance is the invariant a test can
+// check without racing; holding it is how a test proves Promote goes through
+// the gate. Test-only.
+func (s *StateDB) DurableWriterGateForTesting() *sync.Mutex {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.durableDisk == nil {
+		return nil
+	}
+	return &s.durableDisk.gate
+}
+
 // Root returns the current state root hash
 // audit-fix: integrated Verkle tree for proper state root calculation
 func (s *StateDB) Root() types.Hash {
@@ -2400,13 +2871,17 @@ func (s *StateDB) Snapshot() int {
 	// could kill block production and consensus. Convert to a typed error
 	// return by returning a sentinel snapshot id (ErrSnapshotDepthExceeded)
 	// so the caller (qvm executor) can REVERT the transaction instead of
-	// crashing the process. Callers already handle invalid snapshot ids
-	// (id < 0 falls through to the wipe-all fallback in RevertToSnapshot).
+	// crashing the process.
+	//
+	// R4-07 (2026-10-21 audit): RevertToSnapshot(-1) no longer wipes dirty
+	// state. It abandons the in-flight frame chain by restoring the outermost
+	// journaled snapshot (or, if the stack is empty, by leaving the state
+	// untouched and failing the next Commit closed). Reaching this branch at all
+	// means the frames are unbalanced — see ReleaseSnapshot; the depth guard
+	// stays because every journaled snapshot deep-copies the dirty state.
 	if len(s.snapshots) >= maxSnapshotDepth {
 		// Return -1 sentinel; RevertToSnapshot(-1) treats it as invalid and
-		// wipes dirty state, effectively reverting the entire transaction.
-		// This is the safest fallback: a transaction that exceeds snapshot
-		// depth is almost certainly malicious or buggy.
+		// rolls the in-flight frame chain back to the outermost snapshot.
 		log.Printf("[WARN] state_db: snapshot depth %d exceeds maximum %d (possible DoS via excessive call depth) — returning invalid id to trigger revert", len(s.snapshots), maxSnapshotDepth)
 		return -1
 	}
@@ -2460,20 +2935,35 @@ func (s *StateDB) RevertToSnapshot(id int) {
 	defer s.mu.Unlock()
 
 	if id < 0 || id >= len(s.snapshots) {
-		// Invalid snapshot — fall back to clearing everything (legacy behavior)
-		s.dirtyAccounts = make(map[types.Address]*Account)
-		s.dirtyStorage = make(map[types.Address]map[types.Hash]types.Hash)
-		// R33 STATE-02 FIX: Clear pending code writes on invalid snapshot revert.
-		s.pendingCodeWrites = make(map[types.Hash][]byte)
-		// STATE- (2026-07-20): Also clear storageCache on invalid
-		// snapshot — can't trust any cache state if we don't know which
-		// snapshot to revert to.
-		s.storageCache = make(map[storageCacheKey]types.Hash)
-		// STATE- (2026-07-20): Also clear per-tx EIP state — same
-		// reasoning as storageCache.
-		s.clearTxStateLocked()
-		s.snapshots = nil
-		return
+		// R4-07 (2026-10-21 audit) FIX: this branch used to wipe the whole dirty
+		// journal (dirtyAccounts / dirtyStorage / pendingCodeWrites / caches +
+		// the entire snapshot stack). Anything that could put a caller out of
+		// sync with the stack — a concurrent frame truncating it, an id reused
+		// after Commit/Revert reset it, a depth-exhausted Snapshot() — therefore
+		// destroyed state that belonged to OTHER frames, including the
+		// transactions already applied in the block in progress. The node then
+		// committed a state root that silently dropped those writes, which is
+		// remotely reachable (see the round-4 report) and unrecoverable.
+		//
+		// Now the fallback never destroys state:
+		//   - id >= len(snapshots): the caller's snapshot has already been
+		//     discarded by someone else, so there is no sound restore point.
+		//     Touch nothing and make the authoritative Commit fail closed.
+		//   - id < 0: the documented Snapshot() depth-exhaustion sentinel. The
+		//     caller could not journal its frame and wants the whole in-flight
+		//     frame chain abandoned, so restore to the outermost snapshot still
+		//     on the stack (with a balanced per-transaction stack that is the
+		//     current transaction's own snapshot). With nothing on the stack the
+		//     frame is likewise unrevertible -> fail closed.
+		if id >= 0 || len(s.snapshots) == 0 {
+			if s.lastError == nil {
+				s.lastError = fmt.Errorf("state_db: RevertToSnapshot(%d) referenced an unknown snapshot (stack depth %d)", id, len(s.snapshots))
+			}
+			log.Printf("[ERROR] state_db: R4-07 RevertToSnapshot(%d) with stack depth %d — refusing to wipe dirty state; the next Commit will fail closed", id, len(s.snapshots))
+			return
+		}
+		log.Printf("[ERROR] state_db: R4-07 snapshot depth exhausted; reverting the in-flight frame chain to the outermost snapshot (depth %d)", len(s.snapshots))
+		id = 0
 	}
 
 	snap := s.snapshots[id]
@@ -2513,10 +3003,91 @@ func (s *StateDB) RevertToSnapshot(id int) {
 	s.snapshots = s.snapshots[:id]
 }
 
+// ReleaseSnapshot discards the snapshot with the given id and every snapshot
+// above it, WITHOUT touching the dirty state. A top-level execution frame uses
+// it when it finishes successfully: the journal entries below it belong to
+// other (outer) frames and stay intact, while its own entry is no longer
+// needed — keeping it would leak one stack slot per call.
+//
+// R4-07 (2026-10-21 audit): without such a primitive every successful
+// transaction and every successful read-only simulation left entries on the
+// shared stack, so the stack drifted to maxSnapshotDepth and every later
+// Snapshot() returned the depth-exhaustion sentinel. Frames must still hold the
+// execution lock (BeginExecution / TryBeginExecution) while they run, because
+// truncating the stack discards any other live frame's journal entries.
+func (s *StateDB) ReleaseSnapshot(id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if id < 0 || id >= len(s.snapshots) {
+		return
+	}
+	s.snapshots = s.snapshots[:id]
+}
+
+// BeginExecution acquires the instance-wide top-level execution lock and
+// returns the release function. Consensus-critical callers (block application)
+// use this variant: they must not skip a state transition, so they wait for the
+// lock instead of failing fast.
+//
+// R4-07 (2026-10-21 audit): the dirty journal and the positional snapshot stack
+// are per-instance, so only ONE execution frame may be live on a StateDB at a
+// time. Concurrent frames used to truncate or restore each other's journals,
+// which silently dropped already-applied transactions of the block in progress
+// and produced a wrong state root.
+func (s *StateDB) BeginExecution() func() {
+	s.execMu.Lock()
+	return func() { s.execMu.Unlock() }
+}
+
+// TryBeginExecution is the non-blocking variant for speculative callers
+// (eth_call, eth_estimateGas, AA signature validation simulation). When the
+// live state is busy applying a block, or another simulation holds the frame,
+// the caller is told to back off instead of waiting: speculative execution must
+// never delay consensus.
+func (s *StateDB) TryBeginExecution() (func(), bool) {
+	if !s.execMu.TryLock() {
+		return nil, false
+	}
+	return func() { s.execMu.Unlock() }, true
+}
+
+// WithExecutionFrame runs fn while holding this instance's execution frame and
+// returns whatever fn returned.
+//
+// R6-03 (2026-10-21 sixth-round audit): state lifecycle operations that rewrite
+// committed accounts (RollbackToHeight) or flush the shared journal and snapshot
+// stack (Commit outside a block transition) mutate the same per-instance
+// structures a block transition or simulation is using, so they must be
+// serialized by the R4-07 contract C1 frame. Wrapping the call instead of
+// hand-rolling BeginExecution + defer release at each site keeps the release on
+// every return path, including a panic inside fn.
+//
+// execMu is NOT reentrant: a caller that already holds the frame must call the
+// unwrapped method directly, otherwise this blocks forever.
+func (s *StateDB) WithExecutionFrame(fn func() error) error {
+	release := s.BeginExecution()
+	defer release()
+	return fn()
+}
+
+// SnapshotDepth reports how many snapshots are currently journaled. Used by
+// tests and by operators watching for snapshot-stack drift (R4-07).
+func (s *StateDB) SnapshotDepth() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.snapshots)
+}
+
 // RollbackToHeight rolls back the committed state to the given block height.
 // SECURITY: This is called during fork rollback to ensure state consistency.
 // Without this, DeleteBlocksFromHeight only removes block records but leaves
 // committed state (balances, contract storage) unchanged.
+//
+// R6-03 (2026-10-21 sixth-round audit): callers MUST hold the execution frame
+// for the duration (see WithExecutionFrame). A rollback restores before-images
+// into the live account set while some other frame may still be journaling a
+// block transition on top of it.
 //
 // It applies before-images in reverse block order (newest first) to undo
 // all state changes made at or after the fork point. After rollback, the
@@ -2524,6 +3095,11 @@ func (s *StateDB) RevertToSnapshot(id int) {
 func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-01: a rollback rewrites accounts AND the durable height anchor, so it
+	// takes the writer gate too. This is also what makes a concurrent promote
+	// fail its staleness fence instead of silently replaying onto rolled-back
+	// state.
+	defer s.lockDurableGate()()
 
 	// Collect heights that need to be rolled back (>= forkHeight), sorted descending
 	var heights []uint64
@@ -3291,6 +3867,9 @@ func (s *StateDB) CreateSnapshot(blockHeight uint64) error {
 func (s *StateDB) PruneState(currentBlock uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-01: pruning deletes durable keys; it must not interleave with another
+	// instance's promote replay, which can re-create exactly those accounts.
+	defer s.lockDurableGate()()
 
 	if !s.pruningEnabled {
 		return nil
@@ -4009,9 +4588,16 @@ func (s *StateDB) ExportStorage(addr types.Address, batchSize int) (<-chan SnapS
 }
 
 // ImportAccount imports a single account into the state database.
+//
+// R8-03 (2026-10-21 eighth-round audit): snap import is a durable writer of this
+// database, so it takes the writer gate. It cannot be caught by Promote's
+// staleness fence instead: importing accounts leaves lastCommittedHeight and
+// lastCommittedRoot untouched, so a build copy mid-replay would not see that the
+// base moved underneath it and would publish a root the disk does not hold.
 func (s *StateDB) ImportAccount(addr types.Address, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.lockDurableGate()()
 
 	accountKey := append(accountPrefix, addr[:]...)
 	// R58-SNAP-FALLBACK: record the key so a failed snap sync can surgically
@@ -4024,6 +4610,8 @@ func (s *StateDB) ImportAccount(addr types.Address, data []byte) error {
 func (s *StateDB) ImportStorage(addr types.Address, key, value types.Hash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-03: durable writer — see ImportAccount.
+	defer s.lockDurableGate()()
 
 	storageKey := append(storagePrefix, addr[:]...)
 	storageKey = append(storageKey, 0xFF)
@@ -4038,6 +4626,8 @@ func (s *StateDB) ImportStorage(addr types.Address, key, value types.Hash) error
 func (s *StateDB) ImportCode(codeHash types.Hash, code []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-03: durable writer — see ImportAccount.
+	defer s.lockDurableGate()()
 
 	// R58-SNAP-FALLBACK: record the key so a failed snap sync can surgically
 	// delete exactly what this session imported.
@@ -4066,6 +4656,12 @@ func (s *StateDB) BeginSnapImport() {
 func (s *StateDB) ClearSnapImport() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// R8-03: this deletes durable keys, so it holds the gate for the whole
+	// discard — releasing it between chunks would let a promote replay land in
+	// the middle and re-create exactly the accounts this call is throwing away.
+	// The discard path is rare (snap root verification failed) and already holds
+	// s.mu for the same span, so no new waiting relationship is introduced.
+	defer s.lockDurableGate()()
 
 	if len(s.snapImportedKeys) == 0 {
 		return nil
@@ -4095,13 +4691,30 @@ func (s *StateDB) ClearSnapImport() error {
 	return nil
 }
 
-// Close releases the underlying database resources.
-// This must be called when the StateDB is no longer needed to release
-// file locks held by BoltDB on Windows.
+// Close releases the durable database handle this instance writes through,
+// which is what lets BoltDB drop its file descriptor and — on Windows — the
+// exclusive file lock.
+//
+// R9-01 (2026-10-21 ninth-round audit): the handle is SHARED by construction
+// (every Copy(), every build copy, and — after Promote — the instance that was
+// replaced all point at the same one), so Close is routed through the shared
+// per-database control block: it waits on the durable-writer gate so a close can
+// never land inside another instance's commit or promote replay, and it closes
+// the handle at most once so shutting two instances of the graph down in turn is
+// not a double close.
+//
+// It releases the BASE database even when this instance is still provisional and
+// therefore writes to its own buffer — closing the buffer would leave the real
+// disk open.
 func (s *StateDB) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.durableDisk != nil {
+		return s.durableDisk.closeDatabase()
+	}
+	// Struct-literal instance with no siblings: it is the only user of its own
+	// handle, so closing it directly is safe (same escape hatch as the gate).
 	if s.db != nil {
 		return s.db.Close()
 	}

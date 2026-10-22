@@ -109,6 +109,21 @@ type StateDB interface {
 	IncrementNonce(addr types.Address)
 }
 
+// SnapshotReleaser is an optional capability of a StateDB backend: drop the
+// journal entry with the given id (and everything nested inside it) WITHOUT
+// rewinding any state change.
+//
+// R4-07 (2026-10-21 audit): the transaction-level snapshot taken in Execute is
+// only reverted when the transaction fails. On the success path the entry used
+// to stay on the stack forever, so a long-lived StateDB drifted towards
+// maxSnapshotDepth, after which Snapshot() returns the depth-exhaustion
+// sentinel and reverts stop working correctly. Backends that keep a global
+// positional snapshot stack implement this so a finished transaction can release
+// its frame cleanly.
+type SnapshotReleaser interface {
+	ReleaseSnapshot(id int)
+}
+
 // PrivacyTxVerifier verifies the cryptographic proofs carried in an encoded
 // transaction's privacy fields. When configured, the executor calls Verify
 // before applying any state transition in executePrivacyTransfer.
@@ -578,6 +593,14 @@ func (e *TxExecutor) Execute(tx *encoding.Transaction, state StateDB, blockCtx *
 			coinbaseBalance := state.GetBalance(blockCtx.Coinbase)
 			state.SetBalance(blockCtx.Coinbase, new(big.Int).Add(coinbaseBalance, priorityFee))
 		}
+	}
+
+	// R4-07 (2026-10-21 audit): the transaction is finished (its writes, refund
+	// and coinbase payment are all staged), so its snapshot frame — and anything
+	// the EVM journalled inside it — can be released without rewinding state.
+	// This keeps the shared snapshot stack balanced across transactions.
+	if rel, ok := state.(SnapshotReleaser); ok {
+		rel.ReleaseSnapshot(snapshot)
 	}
 
 	return receipt

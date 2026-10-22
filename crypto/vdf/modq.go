@@ -43,7 +43,7 @@ func InvMod(a, q uint64) uint64 {
 	}
 	// Extended Euclid on (a, q): track Bézout coefficient for a.
 	var t, newT uint64 = 0, 1
-	var r, newR uint64 = q, a % q
+	r, newR := q, a%q
 	for newR != 0 {
 		quot := r / newR
 		t, newT = newT, SubMod(t, MulMod(quot, newT, q), q)

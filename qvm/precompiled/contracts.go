@@ -3,10 +3,10 @@ package precompiled
 
 import (
 	"container/list"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math/big"
 	"math/bits"
 	"sync"
@@ -16,7 +16,7 @@ import (
 	"github.com/quantaureum/qau/crypto"
 	k1 "github.com/quantaureum/qau/qvm/secp256k1"
 	"github.com/quantaureum/qau/types"
-	"golang.org/x/crypto/ripemd160" // #nosec G507 -- EVM-compatible precompile 0x03 requires RIPEMD160 (see ripemd160Precompiled.Run)
+	"golang.org/x/crypto/ripemd160" //nolint:staticcheck,gosec // #nosec G507 -- EVM precompile 0x03 requires RIPEMD160
 	"golang.org/x/crypto/sha3"
 )
 
@@ -94,9 +94,9 @@ func recoverECDSAPubKey(hash []byte, v, r, s *big.Int) ([]byte, error) {
 	// CRITICAL FIX: Wrap curve operations in panic recovery to handle malicious inputs
 	// that could cause curve.ScalarBaseMult/ScalarMult to panic
 	defer func() {
-		if recoverPanic := recover(); recoverPanic != nil {
-			// Return nil to indicate invalid signature - don't propagate the panic
-		}
+		// A panic on malicious point inputs yields the zero-value return
+		// (nil, nil), which callers treat as an invalid signature.
+		_ = recover()
 	}()
 
 	secp256k1N := new(big.Int).SetBytes([]byte{
@@ -215,7 +215,7 @@ var secp256k1P = new(big.Int).SetBytes([]byte{
 // above — the precompile returned the zero address for ALL inputs.
 // Delegate to the self-contained Jacobian-coordinate implementation in
 // qvm/secp256k1 (shared package; precompiled cannot import qvm).
-func secp256k1() elliptic.Curve {
+func secp256k1() *k1.Curve {
 	return k1.Shared()
 }
 
@@ -1016,21 +1016,17 @@ func dilithiumVerifyCached(pubKeyBytes, sigBytes, hashBytes []byte) bool {
 	// Dilithium3 precompile from contract code can pass arbitrary
 	// pubkey/sig/message), so it MUST reject degenerate inputs at the
 	// entry — must NOT rely on mode3.Verify to handle a zero key safely.
-	// Use crypto.IsZeroPublicKeyBytes for constant-time comparison.
+	// Use crypto.IsDegeneratePublicKeyBytes for constant-time comparison.
 	if len(pubKeyBytes) != crypto.Dilithium3PublicKeySize {
 		return false
 	}
-	if crypto.IsZeroPublicKeyBytes(pubKeyBytes[:crypto.Dilithium3PublicKeySize]) {
+	if crypto.IsDegeneratePublicKeyBytes(pubKeyBytes[:crypto.Dilithium3PublicKeySize]) {
 		return false
 	}
-	var pubKey mode3.PublicKey
-	// R47-QV-06 FIX: Replace unsafe.Pointer cast with safe array copy.
-	// The unsafe.Pointer cast was technically safe (length checked above),
-	// but copy() is idiomatic and avoids potential aliasing issues.
-	var pkBytes [1952]byte
-	copy(pkBytes[:], pubKeyBytes[:1952])
-	pubKey.Unpack(&pkBytes)
-	valid := mode3.Verify(&pubKey, hashBytes, sigBytes)
+	// R5-01 (2026-10-21 fifth-round audit): unpack + verify run inside a
+	// panic guard. See dilithiumVerifyGuarded for why this cannot be left to
+	// the frame-level recover.
+	valid := dilithiumVerifyGuarded(pubKeyBytes, sigBytes, hashBytes)
 
 	// Write to the cache only on successful verification, to avoid poisoning (see SECURITY note above).
 	if valid {
@@ -1051,6 +1047,52 @@ func dilithiumVerifyCached(pubKeyBytes, sigBytes, hashBytes []byte) bool {
 	}
 
 	return valid
+}
+
+// dilithiumVerifyGuarded unpacks a Dilithium3 public key and verifies a
+// signature over hashBytes, converting any panic into "verification failed".
+//
+// R5-01 (2026-10-21 fifth-round audit): until this fix the precompile was the
+// only remote-reachable Dilithium3 verification entry point without a panic
+// guard, while crypto.Verify and types.QuantumTransaction.Verify already run
+// under recover. Measured against circl v1.6.3 (TestR5_01_CirclPanicProbe):
+// right-length but structurally malformed keys and signatures do NOT panic —
+// Unpack panicked 0 out of 3 probes, Verify 0 out of 9 — the input that does
+// panic is a nil *mode3.PublicKey, which this call site cannot produce because
+// it passes the address of a local value. The guard is therefore defense in
+// depth, not a fix for a demonstrated remote crash. It still matters for a
+// second reason: without it any future panic here would be swallowed by the
+// frame-level recover in the interpreter (qvm/environment.go, Interpreter.run)
+// or in the JIT path (qvm/executor.go, executeWithJIT). Those two handlers do
+// not agree:
+// the frame recover rolls the transaction back and consumes all remaining gas,
+// whereas the intended precompile semantics are "return 0, keep running". With
+// QVM-R15-CRIT-001 gating JIT behind QAU_ENABLE_JIT=1, a JIT-enabled validator
+// and an interpreter-only validator could therefore disagree on the outcome of
+// the same transaction — a state-root divergence. Normalizing the panic here
+// makes both paths deterministic regardless of the JIT flag.
+//
+// The guard logs a single line without echoing any key/signature material (a
+// panic here is a rejection, and dumping attacker-supplied bytes into logs is
+// itself a leak vector — see the [TSS-DEBUG] removal note in
+// wallet/tss/signing.go).
+func dilithiumVerifyGuarded(pubKeyBytes, sigBytes, hashBytes []byte) (valid bool) {
+	if len(sigBytes) != mode3.SignatureSize {
+		return false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERROR: dilithiumVerify precompile rejected malformed key/signature (panic guard, R5-01): %v", r)
+			valid = false
+		}
+	}()
+	var pubKey mode3.PublicKey
+	// R47-QV-06 FIX: safe array copy instead of an unsafe.Pointer cast (the
+	// length is validated by the caller).
+	var pkBytes [mode3.PublicKeySize]byte
+	copy(pkBytes[:], pubKeyBytes)
+	pubKey.Unpack(&pkBytes)
+	return mode3.Verify(&pubKey, hashBytes, sigBytes)
 }
 
 // Exported constructors for use by external packages (e.g., evmcompat).

@@ -45,6 +45,19 @@ var (
 	ErrBatchExceedsLimit  = errors.New("batch size exceeds validation limit")
 	ErrPoolStopped        = errors.New("transaction pool has been stopped")
 	ErrUnderpriced        = errors.New("transaction gas price below minimum")
+	// ErrUserOpsNotLive is returned by TxPool.AddUserOperation. R5-05
+	// (2026-10-21 fifth-round audit): account abstraction is not live on the
+	// network. No component consumes Bundler.BundleChannel(), so operations
+	// admitted through the public RPC were silently accepted, held in an
+	// in-memory mempool and then dropped on the floor -- the caller got a
+	// hash back that could never resolve to a receipt. Accepting them was
+	// worse than refusing them, so the pool boundary now refuses outright.
+	// The Bundler itself is kept intact (and tested) for when a producer is
+	// wired up; only this admission path is gated. The rpc layer refuses with
+	// its own copy of this message (rpc.ErrUserOpsNotLiveRPC) rather than
+	// translating this sentinel, because it must refuse even when the pool it
+	// talks to is a stub.
+	ErrUserOpsNotLive = errors.New("account abstraction is not live: user operations are not bundled on chain yet")
 )
 
 // Pool configuration
@@ -1674,16 +1687,18 @@ func (p *TxPool) Bundler() *Bundler {
 	return p.bundler
 }
 
-func (p *TxPool) AddUserOperation(uo *encoding.UserOperation) error {
-	p.mu.RLock()
-	bundler := p.bundler
-	p.mu.RUnlock()
-
-	if bundler == nil {
-		return errors.New("bundler not configured")
-	}
-
-	return bundler.AddUserOperation(uo)
+// AddUserOperation always refuses while account abstraction is dark.
+func (p *TxPool) AddUserOperation(_ *encoding.UserOperation) error {
+	// R5-05 (2026-10-21 fifth-round audit): account abstraction has no
+	// on-chain producer — nothing reads BundleChannel() — so admitting an
+	// operation here only fills a capped in-memory set (DefaultMaxUserOpsInMempool
+	// slots) that no block producer ever reads, and hands the caller a hash that
+	// can never become a receipt. Refuse at the pool boundary, before the bundler
+	// is consulted, so no caller of the real pool can reach the admission path by
+	// accident. The rpc layer refuses independently for the same reason; this is
+	// the second of the two gates. Revisit both together once something consumes
+	// bundles.
+	return ErrUserOpsNotLive
 }
 
 func (p *TxPool) GetUserOperation(hash types.Hash) *encoding.UserOperation {

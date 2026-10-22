@@ -602,6 +602,34 @@ type PruningOptConfig struct {
 	BatchSize       int  `json:"batchSize"`
 }
 
+// PruningImplemented reports whether this build actually prunes state. It does
+// not: qaudb/state.StatePruner is a design plus its own tests and has no
+// construction point anywhere in the node or cmd trees (R10-03, 2026-10-21
+// tenth-round audit). The constant exists so the banner and the startup log can
+// describe what the binary does rather than what the configuration asked for, and
+// so that wiring a pruner later flips exactly one line.
+const PruningImplemented = false
+
+// PruningStatusLine is the single source of truth for what a node says about state
+// pruning when it starts. Before R10-03 the banner announced pruning as switched
+// on with a retention window, on every node, because both DefaultConfig and the
+// --prune flag default to enabled — while nothing pruned anything, and the
+// operator went away believing disk growth was bounded. The line is never allowed
+// to claim the work is on unless it actually is.
+func PruningStatusLine(cfg PruningOptConfig) string {
+	if !cfg.Enabled {
+		return "State Pruning: disabled"
+	}
+	if !PruningImplemented {
+		return fmt.Sprintf("State Pruning: configured (retention=%d blocks, batch=%d) but NOT IMPLEMENTED IN THIS BUILD - state grows with the chain",
+			cfg.RetentionBlocks, cfg.BatchSize)
+	}
+	// Reachable only once qaudb/state.StatePruner is wired — see the durable-writer
+	// gate notes in that file. Wiring the code is what earns this wording; the
+	// phrase "enabled" must never appear before the work exists.
+	return fmt.Sprintf("State Pruning: %d-block retention enforced", cfg.RetentionBlocks)
+}
+
 // Network IDs
 const (
 	MainnetNetworkID = 1668 // Quantaureum Mainnet

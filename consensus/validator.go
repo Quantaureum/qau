@@ -38,7 +38,11 @@ func (q *QPOS) ProcessAttestation(att *Attestation) error {
 	// happens outside the lock, reducing contention on the hot path.
 	defer func() {
 		if vm != nil && voteData != nil {
-			go vm.recordAttestationVote(voteData, voteStake)
+			go func() {
+				// Statistics/double-sign bookkeeping is best-effort; a failure
+				// must not affect attestation processing.
+				_ = vm.recordAttestationVote(voteData, voteStake)
+			}()
 		}
 	}()
 

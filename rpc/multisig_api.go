@@ -1482,7 +1482,7 @@ func computeProposalHash(fromAddr, toAddr types.Address, value *big.Int, nonce i
 	h.Write(fromAddr[:])
 	h.Write(toAddr[:])
 	h.Write(value.Bytes())
-	h.Write([]byte(fmt.Sprintf("%d", nonce)))
+	_, _ = fmt.Fprintf(h, "%d", nonce)
 	// audit-fix H-6 [HIGH]: Include GasLimit, GasPrice, Data, ChainID in the
 	// proposal hash. Without these fields, an attacker could modify them after
 	// proposal creation without invalidating the hash, enabling transaction

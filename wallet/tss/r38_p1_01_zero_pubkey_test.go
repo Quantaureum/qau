@@ -33,7 +33,7 @@ func makeTestTSSManager(tb testing.TB) *TSSManager {
 // transactions, but the QTD / TSS sibling path used its own verifier
 // (VerifySignatureWithPublicKey) that routed directly to mode3.Verify,
 // bypassing the R37 gate. R38-P1-01 added a zero-pubkey gate (using
-// crypto.IsZeroPublicKeyBytes for constant-time comparison) inside
+// crypto.IsDegeneratePublicKeyBytes for constant-time t1 comparison) inside
 // VerifySignatureWithPublicKey so a "DKG not initialized" all-zero group
 // key cannot be used to forge QTD seals in cross-node verification.
 //
@@ -43,8 +43,8 @@ func makeTestTSSManager(tb testing.TB) *TSSManager {
 func TestR38P101_VerifySignatureWithPublicKey_RejectsAllZeroPubKey(t *testing.T) {
 	mgr := makeTestTSSManager(t)
 	zeroPubKey := make([]byte, crypto.Dilithium3PublicKeySize)
-	if !crypto.IsZeroPublicKeyBytes(zeroPubKey) {
-		t.Fatalf("fixture itself is not recognized as all-zero by crypto.IsZeroPublicKeyBytes — fixture wrong")
+	if !crypto.IsDegeneratePublicKeyBytes(zeroPubKey) {
+		t.Fatalf("fixture itself is not recognized as degenerate by crypto.IsDegeneratePublicKeyBytes — fixture wrong")
 	}
 	sig := make([]byte, crypto.Dilithium3SignatureSize)
 	message := []byte("QTD cross-node seal message")
@@ -112,8 +112,8 @@ func TestR38P101_VerifySignatureWithPublicKey_AcceptsCanonicalPubKeyLength(t *te
 	if len(pubKeyBytes) != crypto.Dilithium3PublicKeySize {
 		t.Fatalf("real Dilithium3 pubkey len = %d, want %d", len(pubKeyBytes), crypto.Dilithium3PublicKeySize)
 	}
-	if crypto.IsZeroPublicKeyBytes(pubKeyBytes) {
-		t.Fatalf("real Dilithium3 pubkey is all-zero — GenerateKeyPair broken")
+	if crypto.IsDegeneratePublicKeyBytes(pubKeyBytes) {
+		t.Fatalf("real Dilithium3 pubkey is degenerate — GenerateKeyPair broken")
 	}
 	sig := make([]byte, crypto.Dilithium3SignatureSize)
 	message := []byte("any payload")
@@ -146,8 +146,8 @@ func TestR38P101_VerifyCombinedSignature_RejectsAllZeroGroupPublicKey(t *testing
 	mgr := makeTestTSSManager(t)
 	// Directly assign the degenerate key (same-package test access):
 	zeroPubKey := make([]byte, crypto.Dilithium3PublicKeySize)
-	if !crypto.IsZeroPublicKeyBytes(zeroPubKey) {
-		t.Fatalf("fixture itself is not recognized as all-zero by crypto.IsZeroPublicKeyBytes — fixture wrong")
+	if !crypto.IsDegeneratePublicKeyBytes(zeroPubKey) {
+		t.Fatalf("fixture itself is not recognized as degenerate by crypto.IsDegeneratePublicKeyBytes — fixture wrong")
 	}
 	mgr.mu.Lock()
 	mgr.qtdPubKey = &qtd.QTDPublicKey{

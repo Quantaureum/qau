@@ -6,6 +6,19 @@ Quantaureum is a quantum-resistant, EVM-compatible Proof-of-Stake (PoS) Layer 1 
 - **EVM**: full integration (current `go-ethereum` slice)
 - **Post-quantum**: validator identities, consensus signatures, and staking use post-quantum primitives (Dilithium3 / Falcon-512).
 
+## Experimental — not live
+
+Some surfaces exist in the code but are not usable on the network yet. They are
+listed here so integrators do not read a registered method as a supported one.
+
+- **Account abstraction (ERC-4337)**: the `eth_*` and `qau_*` user-operation
+  methods are registered, and the `Bundler` is implemented and tested, but no
+  component consumes built bundles, so nothing can include a user operation in a
+  block. `eth_sendUserOperation` / `qau_sendUserOperation` refuse submissions with
+  `account abstraction is not live: user operations are not bundled on chain yet`
+  rather than returning a hash for work that cannot happen. Do not integrate
+  against these methods until this note is removed.
+
 ## Requirements
 
 - Go 1.22+ (from `go.mod`)
