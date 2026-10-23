@@ -98,10 +98,12 @@ jobs:
       - name: Test (p2p)
         run: go test ./p2p/... -timeout 30m -race
       - name: Test (node)
-        # F-04: DKG/seam-heavy suite; measured ~18m in -short mode, so it gets
-        # the same generous budget as the other heavy packages instead of
-        # sharing the 10m fast-package alarm.
-        run: go test ./node/... -timeout 30m -race
+        # F-04: DKG/seam-heavy suite; measured ~18m in -short mode locally, but
+        # the 2-vCPU shared runner is 2-3x slower (TestTDilithium3DKGCrash-
+        # RecoveryAtEveryBoundary alone can run 5m+ per phase there), so the
+        # original 30m budget timed out mid-suite on CI. 60m covers the
+        # slowest observed runner while staying an effective hang alarm.
+        run: go test ./node/... -timeout 60m -race
       - name: Lint
         # R42-CI-RACE-10 (2026-08-20): golangci-lint v1.x (built with go1.23)
         # cannot handle a Go 1.26 target ("the Go language version used to
