@@ -372,7 +372,7 @@ Contributions are welcome! Please read our contributing guidelines before submit
 
 ## Links
 
-- [Documentation](https://docs.quantaureum.io/sdk/python)
+- [Documentation](https://docs.quantaureum.com/sdk/python)
 - [GitHub Repository](https://github.com/quantaureum/qau/tree/main/sdks/python-sdk)
 - [Issue Tracker](https://github.com/quantaureum/qau/issues)
-- [Quantaureum Website](https://quantaureum.io)
+- [Quantaureum Website](https://quantaureum.com)

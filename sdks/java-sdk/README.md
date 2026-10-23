@@ -201,6 +201,6 @@ Apache License 2.0. See the repository [LICENSE](../../LICENSE).
 
 ## Links
 
-- [Quantaureum Website](https://quantaureum.io)
-- [API Documentation](https://docs.quantaureum.io)
+- [Quantaureum Website](https://quantaureum.com)
+- [API Documentation](https://docs.quantaureum.com)
 - [GitHub Repository](https://github.com/quantaureum/qau/tree/main/sdks/java-sdk)

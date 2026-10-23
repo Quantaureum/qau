@@ -49,7 +49,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/quantaureum/qau"
-Documentation = "https://docs.quantaureum.io/sdk/python"
+Documentation = "https://docs.quantaureum.com/sdk/python"
 Repository = "https://github.com/quantaureum/qau/tree/main/sdks/python-sdk"
 
 [tool.setuptools.packages.find]

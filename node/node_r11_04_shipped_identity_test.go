@@ -345,6 +345,15 @@ func TestR12_02_ShippedFilesCarryNoKeyMaterialOrRoutableSSHTargets(t *testing.T)
 				}
 				keyHits = append(keyHits, fmt.Sprintf("%s:%d: %s", path, i+1, shown))
 			}
+			// R12-02-ENODE-EXEMPT: an enode:// record is the public bootnode
+			// identity URI (id@host:port) that the network specification REQUIRES
+			// to be public. The hex tail of the node ID satisfies the username
+			// character class, so without this guard every built-in bootnode
+			// record would read as an SSH target. Only true user@host shapes
+			// outside an enode URL are topology leaks.
+			if strings.Contains(line, "enode://") {
+				continue
+			}
 			for _, m := range r1202UserAtIP.FindAllStringSubmatch(line, -1) {
 				if r1202IPv4IsRoutable(m[1]) {
 					ipHits = append(ipHits, fmt.Sprintf("%s:%d: user@%s: %s",

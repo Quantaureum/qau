@@ -39,6 +39,13 @@ import (
 // otherwise-English line is the most common residue of both failure modes.
 var r1005ForeignScript = regexp.MustCompile(`[\x{3000}-\x{9FFF}\x{AC00}-\x{D7AF}\x{F900}-\x{FAFF}\x{FF00}-\x{FFEF}]`)
 
+// r1005ShippedMultilingual matches the localized READMEs the release line
+// deliberately publishes (R10-06-EXEMPT). The guard exists to keep untranslated
+// working notes and codepage damage out of the tree — a README.<lang>.md that
+// carries that language's script is the product, not a leak. The release-line
+// review owns these files; additions to this set need a release-line decision.
+var r1005ShippedMultilingual = regexp.MustCompile(`^README\.(es|ja-JP|ko-KR|ru-RU|zh-CN)\.md$`)
+
 // r1005QuestionRun matches two adjacent question marks. Go has no syntax that
 // needs them outside string and comment text, and this repository uses neither for
 // real: every occurrence found was damage from a lossy write. Two in a row is the
@@ -153,6 +160,9 @@ func r1005Walk(t *testing.T) (bad []string, foreign []string, scanned int, cover
 		}
 		if !utf8.Valid(src) {
 			bad = append(bad, filepath.ToSlash(path)+": invalid UTF-8 byte sequence")
+		}
+		if r1005ShippedMultilingual.MatchString(info.Name()) {
+			return nil
 		}
 		if loc := r1005ForeignScript.FindIndex(src); loc != nil {
 			line := 1 + strings.Count(string(src[:loc[0]]), "\n")

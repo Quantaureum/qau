@@ -109,12 +109,12 @@ configured, `qaud` uses these records automatically:
 {
   "network": "mainnet",
   "bootstrapPeers": [
-    "enode://65b6dcc0aeb5e0458996d3c6934a36c5213caf8074e4153c3f9e0f5f225789f7@163.192.142.82:9000",
-    "enode://3ef6a7c05e64d2218ce250ae345c05bee2836b3dd24843f6840b1c26773875a1@217.142.189.163:9000",
-    "enode://d552745f67d0dfebe9b407a2fad4ff5340ce6273e4d7920ff7080115be9186f1@149.118.59.251:9000",
-    "enode://57879ea427537fd3690ed35353a32d1e87035f696995cd4da5126cb2fee05d3d@149.118.61.186:9000",
-    "enode://ebf49fb21426f10430e48bf513f07750dc88dfa15c1d65d322b9f922ff1d61da@149.118.62.16:9000",
-    "enode://949dcd8f80c032022d2bb7836afc1de9628c49d2f3325131d45d73d5908451e5@149.118.55.2:9000"
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.10:9000",
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.11:9000",
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.12:9000",
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.13:9000",
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.14:9000",
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.15:9000"
   ]
 }
 ```
@@ -127,7 +127,7 @@ configured, `qaud` uses this record automatically:
 {
   "network": "testnet",
   "bootstrapPeers": [
-    "enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000"
+    "enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.16:9000"
   ]
 }
 ```
@@ -141,7 +141,7 @@ channel, and do not add unverified endpoints to the client source.
 The preferred bootstrap record is an Ethereum-style enode URL:
 
 ```text
-enode://65b6dcc0aeb5e0458996d3c6934a36c5213caf8074e4153c3f9e0f5f225789f7@163.192.142.82:9000
+enode://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789@203.0.113.10:9000
 ```
 
 `<node-id>` is the public, authenticated node identity. When `qaud` dials an
