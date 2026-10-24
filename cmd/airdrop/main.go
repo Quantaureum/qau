@@ -58,6 +58,7 @@ type config struct {
 	adminKey       string
 	limit          int
 	dryRun         bool
+	batchFile      string
 	confirmTimeout time.Duration
 }
 
@@ -78,6 +79,7 @@ func loadConfig() config {
 	flag.StringVar(&c.adminKey, "adminkey", "", "deprecated and rejected; set AIRDROP_ADMIN_KEY env var")
 	flag.IntVar(&c.limit, "limit", 200, "max registrations to process in one run")
 	flag.BoolVar(&c.dryRun, "dry-run", false, "print the pending list only, do not send")
+	flag.StringVar(&c.batchFile, "batch", envOr("AIRDROP_BATCH_FILE", ""), "pay a CSV file (address,amountQau[,memo]) instead of the website pending list")
 	flag.DurationVar(&c.confirmTimeout, "confirm-timeout", 30*time.Second, "timeout waiting for a receipt")
 
 	flag.Parse()
@@ -105,7 +107,8 @@ func loadConfig() config {
 		fatal("-adminkey is rejected: argv is visible in process listings; set AIRDROP_ADMIN_KEY env var")
 	}
 	c.adminKey = os.Getenv("AIRDROP_ADMIN_KEY")
-	if c.adminKey == "" && !c.dryRun {
+	// Batch mode never talks to the website, so it needs no admin key.
+	if c.adminKey == "" && !c.dryRun && c.batchFile == "" {
 		fatal("admin key required: set AIRDROP_ADMIN_KEY env var (not needed for dry-run)")
 	}
 	return c
@@ -489,32 +492,113 @@ func rpcJSON(url, method string, params []any, out any) error {
 // Main flow
 // ---------------------------------------------------------------------------
 
+// payoutItem is the normalized per-payment record the payout loop consumes.
+// Website mode fills Label with the registration ID; batch mode fills it with
+// the CSV memo (or address#amount when no memo is given).
+type payoutItem struct {
+	Label   string
+	Address string
+	Amount  int
+	SiteID  int // >0 only in website mode: enables the txHash write-back
+}
+
+// readBatchCSV parses a payout CSV: one payment per line,
+// "address,amountQau[,memo]". Blank lines and #-comments are skipped. Any
+// malformed row stops the run — a typo'd payout file must never pay partially.
+func readBatchCSV(path string) ([]payoutItem, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var items []payoutItem
+	for ln, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("batch line %d: want address,amount[,memo], got %q", ln+1, line)
+		}
+		addr := strings.TrimSpace(fields[0])
+		if !strings.HasPrefix(addr, "0x") {
+			return nil, fmt.Errorf("batch line %d: address %q must be 0x-prefixed", ln+1, addr)
+		}
+		amount, err := strconv.Atoi(strings.TrimSpace(fields[1]))
+		if err != nil || amount <= 0 {
+			return nil, fmt.Errorf("batch line %d: amount %q must be a positive integer", ln+1, fields[1])
+		}
+		label := fmt.Sprintf("%s#%d", addr, amount)
+		if len(fields) >= 3 && strings.TrimSpace(fields[2]) != "" {
+			label = strings.TrimSpace(fields[2])
+		}
+		items = append(items, payoutItem{Label: label, Address: addr, Amount: amount})
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("batch file %s contains no payable rows", path)
+	}
+	// Reject duplicate addresses: tier-B tranches are one row per address per
+	// run by construction, and a duplicated paste must never double-pay.
+	seen := make(map[string]bool)
+	for _, it := range items {
+		a := strings.ToLower(it.Address)
+		if seen[a] {
+			return nil, fmt.Errorf("batch file lists %s more than once", it.Address)
+		}
+		seen[a] = true
+	}
+	return items, nil
+}
+
 func main() {
 	cfg := loadConfig()
 
-	// 1. Pull the pending list.
+	var items []payoutItem
+
+	if cfg.batchFile != "" {
+		// Batch mode (tier-B tranches and any offline-approved payouts):
+		// same signer, same commit-reveal send path; no website interaction.
+		batch, err := readBatchCSV(cfg.batchFile)
+		if err != nil {
+			fatal("bad batch file: %v", err)
+		}
+		items = batch
+		fmt.Printf("batch: %d payment(s) from %s\n", len(items), cfg.batchFile)
+	}
+
+	// 1. Pull the pending list (website mode only; batch mode filled items above).
 	var pending struct {
 		Success       bool          `json:"success"`
 		Count         int           `json:"count"`
 		Registrations []pendingItem `json:"registrations"`
 	}
-	if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/pending?limit="+
-		fmt.Sprint(cfg.limit), cfg.adminKey, "GET", nil, &pending); err != nil {
-		fatal("failed to fetch pending registrations: %v", err)
-	}
-	if !pending.Success {
-		fatal("website returned a failure status")
-	}
-	if len(pending.Registrations) == 0 {
-		fmt.Println("no pending registrations.")
-		return
+	if cfg.batchFile == "" {
+		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/pending?limit="+
+			fmt.Sprint(cfg.limit), cfg.adminKey, "GET", nil, &pending); err != nil {
+			fatal("failed to fetch pending registrations: %v", err)
+		}
+		if !pending.Success {
+			fatal("website returned a failure status")
+		}
+		if len(pending.Registrations) == 0 {
+			fmt.Println("no pending registrations.")
+			return
+		}
+		for _, r := range pending.Registrations {
+			items = append(items, payoutItem{
+				Label:   fmt.Sprintf("#%d", r.ID),
+				Address: r.WalletAddress,
+				Amount:  r.Amount,
+				SiteID:  r.ID,
+			})
+		}
+		fmt.Printf("pending: %d registration(s)\n", len(items))
 	}
 
-	fmt.Printf("pending: %d registration(s)\n", len(pending.Registrations))
 	total := new(big.Int)
-	for _, r := range pending.Registrations {
-		fmt.Printf("  #%d  %s  %d QAU\n", r.ID, r.WalletAddress, r.Amount)
-		total.Add(total, big.NewInt(int64(r.Amount)))
+	for _, it := range items {
+		fmt.Printf("  %s  %s  %d QAU\n", it.Label, it.Address, it.Amount)
+		total.Add(total, big.NewInt(int64(it.Amount)))
 	}
 	fmt.Printf("total: %s QAU\n", total.String())
 
@@ -542,60 +626,60 @@ func main() {
 			need.String(), bal.String())
 	}
 
-	// 3. Pay out one registration at a time.
+	// 3. Pay out one item at a time.
 	var sentOK, sentFail int
 	var failures []map[string]any
-	for _, r := range pending.Registrations {
-		to, err := types.ParseAddressWithFallback(r.WalletAddress)
+	for _, it := range items {
+		to, err := types.ParseAddressWithFallback(it.Address)
 		if err != nil {
-			fmt.Printf("  ✗ #%d invalid address %s: %v\n", r.ID, r.WalletAddress, err)
-			failures = append(failures, map[string]any{"id": r.ID, "note": "invalid address: " + err.Error()})
+			fmt.Printf("  x %s invalid address %s: %v\n", it.Label, it.Address, err)
+			failures = append(failures, map[string]any{"id": it.SiteID, "note": "invalid address: " + err.Error()})
 			sentFail++
 			continue
 		}
 
-		txHash, err := s.sendTransfer(to, big.NewInt(int64(r.Amount)))
+		txHash, err := s.sendTransfer(to, big.NewInt(int64(it.Amount)))
 		if err != nil {
-			fmt.Printf("  ✗ #%d send failed: %v\n", r.ID, err)
-			failures = append(failures, map[string]any{"id": r.ID, "note": "send failed: " + err.Error()})
+			fmt.Printf("  x %s send failed: %v\n", it.Label, err)
+			failures = append(failures, map[string]any{"id": it.SiteID, "note": "send failed: " + err.Error()})
 			sentFail++
 			continue
 		}
-		fmt.Printf("  → #%d submitted %s, waiting for confirmation...\n", r.ID, txHash)
+		fmt.Printf("  -> %s submitted %s, waiting for confirmation...\n", it.Label, txHash)
 
 		ok, _ := s.waitForReceipt(txHash, cfg.confirmTimeout)
 		if !ok {
-			fmt.Printf("  ✗ #%d receipt timeout (tx %s state unknown — resolve manually)\n", r.ID, txHash)
-			failures = append(failures, map[string]any{"id": r.ID, "note": "receipt timeout, tx " + txHash})
+			fmt.Printf("  x %s receipt timeout (tx %s state unknown - resolve manually)\n", it.Label, txHash)
+			failures = append(failures, map[string]any{"id": it.SiteID, "note": "receipt timeout, tx " + txHash})
 			sentFail++
 			continue
 		}
 
-		// 4. Write the txHash back to the website. The site validates the
-		// EVM-style 0x-prefixed form (InputValidator.isValidTxHash), while
-		// tx.Hash().String() returns bare 64-hex — normalize at the boundary.
-		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
-			cfg.adminKey, "POST", map[string]any{"id": r.ID, "txHash": "0x" + txHash}, nil); err != nil {
-			fmt.Printf("  ⚠ #%d on chain but write-back failed (tx %s): %v — record manually\n", r.ID, txHash, err)
-			// An on-chain transfer is never rolled back when the write-back
-			// fails; resolve manually, and mark the record as sent before
-			// re-running so it is not paid twice.
-			sentFail++
-			continue
+		// 4. Website mode: write the txHash back. Batch mode has no website
+		// record — the reconciler archives (label, address, amount, txHash)
+		// from this run's output instead. The site validates the EVM-style
+		// 0x-prefixed form, while tx.Hash().String() returns bare 64-hex.
+		if it.SiteID > 0 {
+			if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
+				cfg.adminKey, "POST", map[string]any{"id": it.SiteID, "txHash": "0x" + txHash}, nil); err != nil {
+				fmt.Printf("  ! %s on chain but write-back failed (tx %s): %v - record manually\n", it.Label, txHash, err)
+				sentFail++
+				continue
+			}
 		}
-		fmt.Printf("  ✓ #%d done: %d QAU → %s (tx %s)\n", r.ID, r.Amount, r.WalletAddress, txHash)
+		fmt.Printf("  v %s done: %d QAU -> %s (tx %s)\n", it.Label, it.Amount, it.Address, txHash)
 		sentOK++
 	}
 
-	// 5. Batch write-back of failure reasons.
-	if len(failures) > 0 {
+	// 5. Batch write-back of failure reasons (website mode only).
+	if len(failures) > 0 && cfg.batchFile == "" {
 		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
 			cfg.adminKey, "POST", map[string]any{"failures": failures}, nil); err != nil {
-			fmt.Printf("⚠ failed to write back failure reasons: %v\n", err)
+			fmt.Printf("! failed to write back failure reasons: %v\n", err)
 		}
 	}
 
-	fmt.Printf("\ndone: %d sent / %d failed / %d total\n", sentOK, sentFail, len(pending.Registrations))
+	fmt.Printf("\ndone: %d sent / %d failed / %d total\n", sentOK, sentFail, len(items))
 	if sentFail > 0 {
 		os.Exit(1)
 	}
