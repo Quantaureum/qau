@@ -4571,6 +4571,18 @@ func (s *Syncer) rebuildState(fromHeight, toHeight uint64) {
 				if err != nil {
 					syncLog.Error("rebuildState: failed to rollback stateDB to baseline %d: %v (continuing anyway, rebuild may fail)", baseline, err)
 				}
+				// R123-ROLLBACK-EATS-BASELINE (2026-10-24): RollbackToHeight
+				// is >=-INCLUSIVE — it restores the post-(baseline-1) state
+				// and rewinds lch to baseline-1 (see its doc comment in
+				// state_db.go). The re-apply range must therefore include the
+				// baseline block ITSELF, or its state effects are undone and
+				// never re-created. Empty baselines hide the loss; an epoch
+				// boundary baseline loses its census rewards permanently — a
+				// production RPC node hit this shape (first frozen state-root
+				// mismatch four log lines after this rollback; wrong balances
+				// until a state transplant).
+				// Regression: TestRebuildState_RollbackMustNotEatBaselineEffects.
+				from = baseline
 			}
 		}
 
