@@ -6,9 +6,22 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
+	"sync/atomic"
 
 	"github.com/quantaureum/qau/types"
 )
+
+// finalityDiagEnabled gates the FINALITY-9289 diagnostic counters/summary.
+// Read once into an atomic for the hot path (called every 8 attestations).
+var finalityDiagFlag = func() int32 {
+	if os.Getenv("QAU_FINALITY_DIAG") == "1" {
+		return 1
+	}
+	return 0
+}()
+
+func finalityDiagEnabled() bool { return atomic.LoadInt32(&finalityDiagFlag) == 1 }
 
 // tryUpdateFinality attempts to justify the previous epoch and finalize the one before it.
 //
@@ -86,6 +99,13 @@ func (q *QPOS) tryUpdateFinality() {
 	}
 
 	attestedValidators := make(map[int]bool)
+	// FINALITY-9289 diagnostics (2026-10-25): count why attestations are
+	// skipped so a justification stall is observable in node logs. The
+	// counters are per-tryUpdateFinality call; the summary below logs them
+	// once per epoch. Env-gated (QAU_FINALITY_DIAG=1) — default silent, so
+	// prod noise and hot-path cost stay zero without the flag.
+	fdiag := finalityDiagEnabled()
+	var dskipped [8]int
 	// AUDIT (2026) CORE-03: Track the canonical epoch root so we can
 	// reject attestations that target a conflicting root. Without this, two
 	// conflicting forks could both accumulate enough attestations to reach
@@ -107,6 +127,9 @@ func (q *QPOS) tryUpdateFinality() {
 			// Target.Epoch (e.g. from a prior epoch); without this check an
 			// attacker could reuse old attestations to inflate finality weight.
 			if att.Target.Epoch != prevEpoch {
+				if fdiag {
+					dskipped[0]++
+				}
 				continue
 			}
 			// AUDIT (2026) CORE B-3 FIX: Validate Source→Target chain.
@@ -116,12 +139,18 @@ func (q *QPOS) tryUpdateFinality() {
 			// inflate finality weight on a conflicting fork.
 			if att.Source.Epoch >= att.Target.Epoch {
 				// Source must precede Target (strict ancestor).
+				if fdiag {
+					dskipped[1]++
+				}
 				continue
 			}
 			if att.Source.Epoch > q.justifiedEpoch {
 				// Source must be an already-justified checkpoint. If the
 				// attester claims a Source epoch we haven't justified yet,
 				// the attestation is invalid.
+				if fdiag {
+					dskipped[2]++
+				}
 				continue
 			}
 			// CONS-003 (R8 2026-07-19 FIX): Bind att.Source.Root to the
@@ -149,6 +178,9 @@ func (q *QPOS) tryUpdateFinality() {
 					// never called for this epoch. Fail-closed: skip the
 					// attestation rather than risk counting weight toward an
 					// unverified Source.Root.
+					if fdiag {
+						dskipped[3]++
+					}
 					continue
 				}
 				if att.Source.Root != canonicalSourceRoot {
@@ -156,6 +188,9 @@ func (q *QPOS) tryUpdateFinality() {
 					// Source.Epoch. This is either an attacker trying to
 					// inflate finality on a conflicting fork, or a stale /
 					// misconfigured attestation. Either way, skip it.
+					if fdiag {
+						dskipped[4]++
+					}
 					continue
 				}
 			}
@@ -178,16 +213,28 @@ func (q *QPOS) tryUpdateFinality() {
 			if canonicalEpochRoot == (types.Hash{}) {
 				// No canonical boundary root recorded for this epoch —
 				// cannot verify the vote, so skip the attestation.
+				if fdiag {
+					dskipped[5]++
+				}
 				continue
 			}
 			if att.Target.Root != canonicalEpochRoot {
+				if fdiag {
+					dskipped[6]++
+				}
 				continue
 			}
 			if slotRootKnown {
 				if canonicalSlotRoot == (types.Hash{}) {
+					if fdiag {
+						dskipped[7]++
+					}
 					continue // bootstrap placeholder — skip
 				}
 				if att.BeaconBlockRoot != canonicalSlotRoot {
+					if fdiag {
+						dskipped[7]++
+					}
 					continue
 				}
 			}
@@ -242,6 +289,21 @@ func (q *QPOS) tryUpdateFinality() {
 	if activeValidatorCount == 0 {
 		return
 	}
+
+	// FINALITY-9289 diagnostics: once per evaluated epoch, dump why the
+	// previous epoch did (or did not) justify. The caller already holds the
+	// q.mu write lock (LOCK CONTRACT above), so field access is direct and
+	// re-acquiring the lock here would deadlock.
+	if fdiag && currentEpoch > q.lastFinalityDiagEpoch {
+		q.lastFinalityDiagEpoch = currentEpoch
+		log.Printf("[finality-diag] epoch=%d prev=%d just=%d fin=%d attesters=%d/%d weight=%s/%s skips[tgtEpoch,srcGeTgt,srcGtJust,srcRootMissing,srcRootDiff,bndMissing,tgtRootDiff,slotRoot]=[%d,%d,%d,%d,%d,%d,%d,%d]",
+			currentEpoch, prevEpoch, q.justifiedEpoch, q.finalizedEpoch,
+			len(attestedValidators), activeValidatorCount,
+			attestedWeight.String(), totalWeight.String(),
+			dskipped[0], dskipped[1], dskipped[2], dskipped[3],
+			dskipped[4], dskipped[5], dskipped[6], dskipped[7])
+	}
+
 	if len(attestedValidators) < ComputeMinAttestations(activeValidatorCount) {
 		return
 	}

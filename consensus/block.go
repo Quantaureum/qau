@@ -404,6 +404,10 @@ type QPOS struct {
 	justifiedRoot      types.Hash
 	attestationSources map[uint64]AttestationCheckpoint
 
+	// FINALITY-9289 diagnostics (2026-10-25): last epoch whose
+	// tryUpdateFinality summary was logged (QAU_FINALITY_DIAG=1 only).
+	lastFinalityDiagEpoch uint64
+
 	// R107-FINALITY-PERSIST: optional durable checkpoint callback. The
 	// consensus package stays storage-agnostic; node wiring persists the
 	// current checkpoint and restores it before live attestation processing.
