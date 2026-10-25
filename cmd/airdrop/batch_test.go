@@ -17,7 +17,7 @@ func writeTB(t *testing.T, content string) string {
 }
 
 func TestReadBatchCSV_HappyPath(t *testing.T) {
-	p := writeTB(t, "# comment\n\n0x619ed75fb3262f491688b6d6dd7591ee72fbf6da,100,B1-tranche\n0x607c2d725c87d033698b35c627dbfb9266d5d8b3,200\n")
+	p := writeTB(t, "# comment\n\n0x1111111111111111111111111111111111111111,100,B1-tranche\n0x2222222222222222222222222222222222222222,200\n")
 	items, err := readBatchCSV(p)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -28,7 +28,7 @@ func TestReadBatchCSV_HappyPath(t *testing.T) {
 	if items[0].Amount != 100 || items[0].Label != "B1-tranche" {
 		t.Fatalf("row0 wrong: %+v", items[0])
 	}
-	if items[1].Label != "0x607c2d725c87d033698b35c627dbfb9266d5d8b3#200" {
+	if items[1].Label != "0x2222222222222222222222222222222222222222#200" {
 		t.Fatalf("default label wrong: %s", items[1].Label)
 	}
 }
@@ -36,10 +36,10 @@ func TestReadBatchCSV_HappyPath(t *testing.T) {
 func TestReadBatchCSV_RejectsBad(t *testing.T) {
 	cases := map[string]string{
 		"no 0x":     "619ed75fb3262f491688b6d6dd7591ee72fbf6da,100\n",
-		"zero amt":  "0x619ed75fb3262f491688b6d6dd7591ee72fbf6da,0\n",
-		"neg amt":   "0x619ed75fb3262f491688b6d6dd7591ee72fbf6da,-5\n",
-		"non-int":   "0x619ed75fb3262f491688b6d6dd7591ee72fbf6da,abc\n",
-		"one field": "0x619ed75fb3262f491688b6d6dd7591ee72fbf6da\n",
+		"zero amt":  "0x1111111111111111111111111111111111111111,0\n",
+		"neg amt":   "0x1111111111111111111111111111111111111111,-5\n",
+		"non-int":   "0x1111111111111111111111111111111111111111,abc\n",
+		"one field": "0x1111111111111111111111111111111111111111\n",
 		"empty":     "# only comments\n",
 	}
 	for name, content := range cases {
@@ -51,7 +51,7 @@ func TestReadBatchCSV_RejectsBad(t *testing.T) {
 }
 
 func TestReadBatchCSV_RejectsDuplicateAddress(t *testing.T) {
-	p := writeTB(t, "0x619ed75fb3262f491688b6d6dd7591ee72fbf6da,100\n0X619ED75FB3262F491688B6D6DD7591EE72FBF6DA,100\n")
+	p := writeTB(t, "0x1111111111111111111111111111111111111111,100\n0X1111111111111111111111111111111111111111,100\n")
 	if _, err := readBatchCSV(p); err == nil {
 		t.Fatal("duplicate (case-insensitive) must be rejected")
 	}
