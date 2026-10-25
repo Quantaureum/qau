@@ -104,6 +104,10 @@ func r704DocHeaderCount(t *testing.T, prefix string) int {
 		t.Fatalf("read docs/api/JSON_RPC_API.md: %v", err)
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
+		// Checkout-portable: tolerate CRLF working copies (core.autocrlf on
+		// Windows rewrites files that lack .gitattributes attrs) before the
+		// prefix/number parsing below.
+		line = strings.TrimRight(line, "\r")
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
