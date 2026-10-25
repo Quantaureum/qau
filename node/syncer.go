@@ -453,6 +453,26 @@ func (s *Syncer) SetCommitRevealManager(crm *txpool.CommitRevealManager) {
 	s.commitRevealManager = crm
 }
 
+// updateCommitRevealState advances the commit-reveal manager's block height
+// and indexes commitments carried by TxTypeCommit txs in `blk`. CRV2-SYNC-FLAP
+// FIX (2026-10-25): called from the ProcessBlock sync-skip branch so follower
+// nodes that never execute applyBlockInternal still track reveal timing.
+// SetBlockHeight is monotonic and RegisterCommitment is idempotent, so calling
+// this alongside applyBlockInternal's own invocation is safe on every path.
+func (s *Syncer) updateCommitRevealState(blk *encoding.Block) {
+	if s.commitRevealManager == nil {
+		return
+	}
+	s.commitRevealManager.SetBlockHeight(blk.Header.Height)
+	for _, tx := range blk.Transactions {
+		if tx.Type == encoding.TxTypeCommit {
+			var ch types.Hash
+			copy(ch[:], tx.Data)
+			_ = s.commitRevealManager.RegisterCommitment(ch, tx.From)
+		}
+	}
+}
+
 func (s *Syncer) SetOnGenesisReplace(fn func(newGenesis *encoding.Block)) {
 	s.onGenesisReplace = fn
 }
@@ -1308,6 +1328,19 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 		if blk.Header.Height%500 == 0 {
 			syncLog.Info("ProcessBlock: skipping applyBlock during sync for block %d", blk.Header.Height)
 		}
+		// CRV2-SYNC-FLAP FIX (2026-10-25): a follower node that perpetually
+		// sits 1 block behind the proposer (P3-SYNC-GATE: any gap >= 1 keeps
+		// sync mode on) never reaches applyBlockInternal here, so its
+		// commit-reveal manager keeps a stale height AND never learns about
+		// commitments mined by other nodes. Pool-admitted commits were then
+		// stamped BlockHeight = staleHeight+1 (1 on a fresh RPC node) and
+		// every reveal died with "commit has expired" seconds after the
+		// commit was mined. Mirror the two manager updates from
+		// applyBlockInternal here so they run on every accepted block
+		// regardless of the apply path. Both are idempotent/monotonic:
+		// SetBlockHeight takes a max(), and RegisterCommitment is a no-op
+		// for a hash it already has.
+		s.updateCommitRevealState(blk)
 	} else if err := s.applyBlock(blk); err != nil {
 		// CRITICAL FIX (r68h): Do NOT delete the block when applyBlock fails.
 		// The block has already passed ValidateBlock and PutBlockWithIndex — it is

@@ -463,7 +463,20 @@ func (m *CommitRevealManager) GetStats() *CommitRevealStats {
 func (m *CommitRevealManager) SetBlockHeight(height uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.currentBlockHeight = height
+	// Monotonic: never move the height backwards. Multiple call sites now
+	// feed the manager (block producer, applyBlockInternal, and the sync-flap
+	// path in ProcessBlock); a late-arriving lower height must not regress
+	// expiry windows. (CRV2-SYNC-FLAP FIX 2026-10-25.)
+	if height > m.currentBlockHeight {
+		m.currentBlockHeight = height
+	}
+}
+
+// CurrentBlockHeight returns the manager's view of the canonical block height.
+func (m *CommitRevealManager) CurrentBlockHeight() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.currentBlockHeight
 }
 
 // UpdateBlockHeight is retained for backward compatibility; see SetBlockHeight.
