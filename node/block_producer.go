@@ -865,6 +865,24 @@ func (bp *BlockProducer) initValidatorSet() {
 			bpLog.Info("R106: seeded QPOS finality from stored head: height=%d justified=%d finalized=%d",
 				stored.Header.Height, stored.Header.JustifiedEpoch, stored.Header.FinalizedEpoch)
 		}
+		// FINALITY-9289 REANCHOR (2026-10-25): operator-triggered recovery for
+		// a cluster whose justified-checkpoint root has diverged across nodes
+		// (legacy of the 2026-10-19/20 three-way state-root fork). QPOS restarts
+		// with QAU_FINALITY_REANCHOR=1 reset both checkpoints to the genesis
+		// epoch — the one root every node agrees on — so FFG votes share a
+		// Source again and justification resumes within two epochs. Must be
+		// applied to every validator in the same maintenance window; see
+		// ReanchorFinalityToGenesis for the full rationale. Runs AFTER the
+		// R106 seed so the seed cannot resurrect the poisoned checkpoint.
+		if os.Getenv("QAU_FINALITY_REANCHOR") == "1" {
+			if qpos.ReanchorFinalityToGenesis() {
+				bpLog.Info("FINALITY-REANCHOR: reset justified/finalized checkpoints to genesis (0, %x); "+
+					"FFG will re-justify from the shared genesis anchor", genesisRoot[:8])
+			} else {
+				bpLog.Warn("FINALITY-REANCHOR requested (QAU_FINALITY_REANCHOR=1) but genesis root is not " +
+					"registered — refusing to re-anchor (fail-closed)")
+			}
+		}
 	}
 	qposAdv, err := consensus.NewQPOSAdvancedWithQPOS(qpos, genesisRoot)
 	if err != nil {

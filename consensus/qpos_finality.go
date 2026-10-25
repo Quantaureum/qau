@@ -488,6 +488,56 @@ func (q *QPOS) CheckFinality() (justifiedEpoch, finalizedEpoch uint64, changed b
 // epoch roots satisfy the Source.Root binding, so tryUpdateFinality resumes
 // from the adopted value on the next epoch boundary.
 //
+// ReanchorFinalityToGenesis resets the justified and finalized checkpoints to
+// the genesis epoch (epoch 0, genesis root) and drops all cached FFG state.
+//
+// FINALITY-9289 (2026-10-25): the cluster's canonical root for the justified
+// checkpoint (epoch 9289) diverged across nodes as a legacy of the 2026-10-19/20
+// three-way state-root fork incident. Since then every cross-node FFG vote
+// failed the CONS-003 Source.Root binding against whichever 9289 root the
+// receiving node had recorded, so justification has been frozen cluster-wide
+// while block production continued (75+ rejections/minute observed per node).
+//
+// Genesis is the one checkpoint every node agrees on by construction (it is
+// fixed by genesis.json and registered via SetGenesisRoot; the CONS-003 binding
+// deliberately exempts Source.Epoch == 0 for exactly this reason). Re-anchoring
+// both checkpoints to (0, genesisRoot) gives every validator a common Source
+// pair again; after two epochs of normal attestation the 2/3 supermajority
+// re-justifies and the finalize ratchet (which only moves forward) resumes.
+//
+// Down-grading justified/finalized is ONLY safe as a deliberate operator
+// action: it widens the no-slash window analysis for the affected epochs and
+// must be applied to every validator within the same window (a mixed fleet
+// would have nodes voting with different Sources). For that reason this method
+// exists ONLY for the QAU_FINALITY_REANCHOR=1 startup path in block_producer.go
+// and is never called elsewhere. It is idempotent and a no-op when the
+// genesis root has not been registered (fail-closed: re-anchoring to an
+// unregistered root would recreate the same class of divergence).
+//
+// LOCK CONTRACT: takes q.mu internally.
+func (q *QPOS) ReanchorFinalityToGenesis() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	genesisRoot := q.epochBlockRoots[0]
+	if genesisRoot == (types.Hash{}) {
+		return false
+	}
+
+	q.justifiedEpoch = 0
+	q.justifiedRoot = genesisRoot
+	q.finalizedEpoch = 0
+	q.finalizedRoot = genesisRoot
+	q.attestationSources = make(map[uint64]AttestationCheckpoint)
+	// Drop live attestations: every stored one carries the poisoned 9289
+	// Source and would be skipped anyway; clearing bounds memory and keeps
+	// the counting slate consistent with the new anchor.
+	q.attestations = make(map[uint64][]*Attestation)
+	q.finalityPersistPending = true
+	q.persistFinalityLocked()
+	return true
+}
+
 // LOCK CONTRACT: takes q.mu internally; safe to call from any import path.
 func (q *QPOS) AdoptHeaderFinality(justifiedEpoch, finalizedEpoch uint64, headerHash types.Hash) {
 	q.mu.Lock()
