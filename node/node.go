@@ -8994,12 +8994,18 @@ func (n *Node) attestationProcessingLoop() {
 // handleIncomingAttestation handles an incoming attestation from a peer
 func (n *Node) handleIncomingAttestation(data []byte) {
 	if len(data) < 60 { // Minimum attestation size
+		if consensus.FinalityDiagEnabled() {
+			nodeLog.Warn("[finality-diag] inbound attestation too short: %d bytes", len(data))
+		}
 		return
 	}
 
 	// Parse attestation
 	att, err := n.parseAttestation(data)
 	if err != nil {
+		if consensus.FinalityDiagEnabled() {
+			nodeLog.Warn("[finality-diag] parseAttestation failed: %v (len=%d)", err, len(data))
+		}
 		return
 	}
 
@@ -9007,6 +9013,19 @@ func (n *Node) handleIncomingAttestation(data []byte) {
 	if n.blockProducer != nil && n.blockProducer.QPOS() != nil {
 		if err := n.blockProducer.QPOS().ProcessAttestation(att); err != nil {
 			// Ignore duplicate or invalid attestations
+			if consensus.FinalityDiagEnabled() {
+				// Rate-limit: remote duplicates are the common case; only
+				// surface NON-duplicate rejections (a duplicate means the
+				// remote attestation WAS received — exactly what the
+				// finality-9289 diagnosis needs to distinguish).
+				if !errors.Is(err, consensus.ErrDuplicateAttestation) {
+					nodeLog.Warn("[finality-diag] ProcessAttestation rejected slot=%d validator=%d: %v",
+						att.Slot, att.ValidatorIndex, err)
+				} else {
+					nodeLog.Debug("[finality-diag] duplicate attestation slot=%d validator=%d (received OK)",
+						att.Slot, att.ValidatorIndex)
+				}
+			}
 			return
 		}
 		// P1-2: Forward to ReviewChamber for block approval tracking.

@@ -23,6 +23,10 @@ var finalityDiagFlag = func() int32 {
 
 func finalityDiagEnabled() bool { return atomic.LoadInt32(&finalityDiagFlag) == 1 }
 
+// FinalityDiagEnabled exposes the QAU_FINALITY_DIAG flag so the node layer can
+// gate its inbound-attestation diagnostics with the same switch.
+func FinalityDiagEnabled() bool { return finalityDiagEnabled() }
+
 // tryUpdateFinality attempts to justify the previous epoch and finalize the one before it.
 //
 // LOCK CONTRACT: Caller MUST hold q.mu write lock. This function reads/writes
