@@ -496,7 +496,7 @@ func (q *QPOS) CheckFinality() (justifiedEpoch, finalizedEpoch uint64, changed b
 // three-way state-root fork incident. Since then every cross-node FFG vote
 // failed the CONS-003 Source.Root binding against whichever 9289 root the
 // receiving node had recorded, so justification has been frozen cluster-wide
-// while block production continued (75+ rejections/minute observed per node).
+// while block production continued (rejections observed per node).
 //
 // Genesis is the one checkpoint every node agrees on by construction (it is
 // fixed by genesis.json and registered via SetGenesisRoot; the CONS-003 binding

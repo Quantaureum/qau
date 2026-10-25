@@ -867,7 +867,7 @@ func (bp *BlockProducer) initValidatorSet() {
 		}
 		// FINALITY-9289 REANCHOR (2026-10-25): operator-triggered recovery for
 		// a cluster whose justified-checkpoint root has diverged across nodes
-		// (legacy of the 2026-10-19/20 three-way state-root fork). QPOS restarts
+		// (legacy of a historical three-way state-root fork). QPOS restarts
 		// with QAU_FINALITY_REANCHOR=1 reset both checkpoints to the genesis
 		// epoch — the one root every node agrees on — so FFG votes share a
 		// Source again and justification resumes within two epochs. Must be
