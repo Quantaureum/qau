@@ -492,7 +492,7 @@ func (q *QPOS) CheckFinality() (justifiedEpoch, finalizedEpoch uint64, changed b
 // the genesis epoch (epoch 0, genesis root) and drops all cached FFG state.
 //
 // FINALITY-9289 (2026-10-25): the cluster's canonical root for the justified
-// checkpoint (epoch 9289) diverged across nodes as a legacy of the 2026-10-19/20
+// checkpoint (epoch 9289) diverged across nodes as a legacy of a historical
 // three-way state-root fork incident. Since then every cross-node FFG vote
 // failed the CONS-003 Source.Root binding against whichever 9289 root the
 // receiving node had recorded, so justification has been frozen cluster-wide

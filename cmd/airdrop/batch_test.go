@@ -35,7 +35,7 @@ func TestReadBatchCSV_HappyPath(t *testing.T) {
 
 func TestReadBatchCSV_RejectsBad(t *testing.T) {
 	cases := map[string]string{
-		"no 0x":     "619ed75fb3262f491688b6d6dd7591ee72fbf6da,100\n",
+		"no 0x":     "1111111111111111111111111111111111111111,100\n",
 		"zero amt":  "0x1111111111111111111111111111111111111111,0\n",
 		"neg amt":   "0x1111111111111111111111111111111111111111,-5\n",
 		"non-int":   "0x1111111111111111111111111111111111111111,abc\n",
