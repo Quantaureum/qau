@@ -613,10 +613,12 @@ type Peer struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 
-	// P2P-R28-H02 FIX (2026-07-25): closeSendCh guards sendCh closure to
-	// prevent double-close panics. readLoop and disconnectPeer may both
-	// run cleanup concurrently — without sync.Once, a double close on
-	// sendCh would panic and crash the node.
+	// P2P-R28-H02 / P2P-R31-PANIC: closeOnce serializes the send-channel
+	// retirement across readLoop and disconnectPeer. R31 changed the
+	// retirement to NOT close the channel (closing raced with concurrent
+	// broadcast senders and crashed a mainnet validator); the Once now
+	// guards idempotence of the no-op retirement for any future teardown
+	// bookkeeping added here.
 	closeOnce sync.Once
 	// P2P-H01 FIX (R29, audit 2026-07-25): disconnectCleanupOnce ensures
 	// sybilResistance.OnDisconnect and peerScorer.OnDisconnect run exactly
@@ -656,13 +658,32 @@ func (p *Peer) disconnectCleanup(h *Host) {
 	})
 }
 
-// closeSendCh closes the peer's send channel exactly once.
-// P2P-R28-H02: This is safe to call from multiple goroutines (readLoop,
-// disconnectPeer, disconnectAllPeersForCertRotation) without risking a
-// "close of closed channel" panic.
+// closeSendCh retires the peer's send channel without closing it.
+//
+// P2P-R31-PANIC (2026-10-27): the previous implementation did
+// close(p.sendCh) under sync.Once, which raced with every send site: the
+// writeLoop's defer closes the channel BEFORE removing the peer from
+// h.peers (map removal needs peersMu), and disconnectPeer closes it AFTER
+// dropping the lock. Either order leaves a window where a concurrent
+// broadcast() — holding only peersMu.RLock — finds the peer in the map
+// and sends on the already-closed channel. This is not theoretical: it
+// killed a mainnet validator process via "panic: send on closed channel"
+// (broadcast -> BroadcastTSS -> tdilithium3 signing slot driver, observed
+// in the field with a full goroutine dump).
+//
+// Closing the channel was only ever a wakeup optimization for senders
+// blocked on a full channel — but every send site is a non-blocking
+// select with a default (verified across all 11 call sites), so no sender
+// ever blocks on sendCh in the first place. writeLoop exits via
+// peer.ctx.Done(), not via channel closure. Leaving the channel open is
+// therefore strictly safer: a stale peer's channel fills to its buffer
+// and further sends fall to default (skipped), the channel and any
+// buffered messages are garbage-collected together with the Peer once the
+// map and loops drop their references, and no send/close interleaving can
+// panic.
 func (p *Peer) closeSendCh() {
 	p.closeOnce.Do(func() {
-		close(p.sendCh)
+		// Deliberately no close(p.sendCh). See the comment above.
 	})
 }
 
@@ -3576,9 +3597,9 @@ func (h *Host) readLoop(peer *Peer) {
 		// observe ctx.Done() and exit cleanly rather than blocking on
 		// sendCh.
 		peer.cancel()
-		// P2P-R28-H02: Close sendCh to unblock any goroutine doing a
-		// blocking send to this peer. Use sync.Once to avoid double-close
-		// panic if disconnectPeer or another cleanup path also closes it.
+		// P2P-R31-PANIC: retire the send channel (no close — see
+		// closeSendCh). Senders never block on it (all sends are
+		// select/default), so this is teardown bookkeeping only.
 		peer.closeSendCh()
 		// P2P-H01 FIX (R29): Run sybilResistance + peerScorer OnDisconnect
 		// exactly once via disconnectCleanupOnce. writeLoop's defer also
@@ -3896,7 +3917,8 @@ func (h *Host) writeLoop(peer *Peer) {
 	defer func() {
 		// Signal readLoop to exit (it may be blocked on readFull).
 		peer.cancel()
-		// Close sendCh to unblock any goroutine doing a blocking send.
+		// P2P-R31-PANIC: retire the send channel (no close — see
+		// closeSendCh).
 		peer.closeSendCh()
 		// Close the connection to unblock any pending read/write.
 		if peer.Conn != nil {
@@ -3927,10 +3949,10 @@ func (h *Host) writeLoop(peer *Peer) {
 			})
 			return
 		case data, ok := <-peer.sendCh:
-			// P2P-R28-H02: sendCh may be closed by readLoop's cleanup or
-			// disconnectPeer. ok=false means channel is closed and drained —
-			// exit cleanly rather than writing to a closed channel (which
-			// would panic).
+			// P2P-R31-PANIC (2026-10-27): sendCh is intentionally never
+			// closed any more (see closeSendCh) — this branch is retained
+			// as defense-in-depth: a future change that reintroduces
+			// closure still exits cleanly instead of writing to the peer.
 			if !ok {
 				return
 			}
