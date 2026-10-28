@@ -435,6 +435,23 @@ func NewMessageValidator() *MessageValidator {
 	// NOT a threshold envelope, so it uses a plain size-bounded validator.
 	v.RegisterValidator(MsgTypeTDilithium3DKGActivationCertificate, &BatchMessageValidator{})
 
+	// R19-F4 (2026-10-28): register validators for the shard protocol message
+	// types (80-85). Without these, ValidateMessage rejects every inbound shard
+	// frame with "invalid message type" in readLoop BEFORE it reaches
+	// handleShardProtocol — the shard subsystem could not receive any network
+	// input (blocks, attestations, cross-shard messages), and honest peers
+	// broadcasting shard frames were penalized as protocol violations.
+	// The size bounds mirror the shard rules documented in message.go
+	// (ValidateMessage's shard cases): block/resp ≤ 2MB, req exactly
+	// shardID(8)+height(8)=16, attestation ≤ 4KB, cross-shard msg ≤ 64KB,
+	// receipt ≤ 4KB.
+	v.RegisterValidator(MsgTypeShardBlock, &sizeRangeValidator{minSize: 32, maxSize: 2 * 1024 * 1024})
+	v.RegisterValidator(MsgTypeShardBlockReq, &sizeRangeValidator{minSize: 16, maxSize: 16})
+	v.RegisterValidator(MsgTypeShardBlockResp, &sizeRangeValidator{minSize: 32, maxSize: 2 * 1024 * 1024})
+	v.RegisterValidator(MsgTypeShardAttestation, &sizeRangeValidator{minSize: 32, maxSize: 4 * 1024})
+	v.RegisterValidator(MsgTypeCrossShardMsg, &sizeRangeValidator{minSize: 32, maxSize: 64 * 1024})
+	v.RegisterValidator(MsgTypeCrossShardReceipt, &sizeRangeValidator{minSize: 32, maxSize: 4 * 1024})
+
 	// L16-009 FIX: Start cleanup goroutine by default to prevent unbounded
 	// growth of seenMessages map. Uses context.Background() so the goroutine
 	// persists for the lifetime of the validator. The P2P Host's subsequent
@@ -442,6 +459,30 @@ func NewMessageValidator() *MessageValidator {
 	v.StartCleanup(context.Background())
 
 	return v
+}
+
+// sizeRangeValidator accepts payloads whose length lies in [minSize, maxSize].
+// R19-F4: generic bounds-only validator for frame types whose deeper format
+// checks live in the protocol handler (the handler decodes and fails closed
+// on malformed payloads; this layer only bounds memory).
+type sizeRangeValidator struct {
+	minSize uint64
+	maxSize uint64
+}
+
+func (v *sizeRangeValidator) MaxSize() uint64 { return v.maxSize }
+func (v *sizeRangeValidator) MinSize() uint64 { return v.minSize }
+
+func (v *sizeRangeValidator) Validate(payload []byte) error {
+	if uint64(len(payload)) < v.minSize {
+		return fmt.Errorf("%w: payload too short: got %d, need at least %d",
+			ErrInvalidMessageFormat, len(payload), v.minSize)
+	}
+	if uint64(len(payload)) > v.maxSize {
+		return fmt.Errorf("%w: payload exceeds max size %d, got %d",
+			ErrInvalidMessageFormat, v.maxSize, len(payload))
+	}
+	return nil
 }
 
 // RegisterValidator registers a validator for a specific message type

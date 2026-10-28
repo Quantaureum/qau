@@ -221,6 +221,106 @@ func (s *ShardStateStore) IsReceiptSpent(shardID uint64, msgID types.Hash) (bool
 	return len(data) > 0 && data[0] == 0x01, nil
 }
 
+// --- R19-F2 restore iteration (2026-10-28) ---
+//
+// The write side of this store has existed since P0-3, but until R19-F2 no
+// production code ever read it back, so the HIGH-17 replay-protection state
+// (spent markers, sender nonces), the receipt table and the block/commitment
+// history were silently lost on every restart. These iterators are the read
+// side ShardChain.RestoreFromStore is built on.
+
+// shardIterKeys returns the suffix of a persisted key after
+// "prefix:{shardID(8 LE)}", or nil when the entry belongs to another shard.
+func shardIterSuffix(prefix []byte, key []byte, shardID uint64) []byte {
+	if len(key) < len(prefix)+8 {
+		return nil
+	}
+	var gotID uint64
+	for i := 0; i < 8; i++ {
+		gotID |= uint64(key[len(prefix)+i]) << (8 * i)
+	}
+	if gotID != shardID {
+		return nil
+	}
+	return key[len(prefix)+8:]
+}
+
+// IterateReceipts visits every persisted receipt for the given shard.
+func (s *ShardStateStore) IterateReceipts(shardID uint64, fn func(msgID types.Hash, receipt *CrossShardReceipt) error) error {
+	if s == nil || s.database == nil {
+		return ErrStateStoreNotConfigured
+	}
+	s.mu.RLock()
+	it := s.database.NewIterator(shardReceiptPrefix, nil)
+	s.mu.RUnlock()
+	defer it.Release()
+	for it.Next() {
+		suffix := shardIterSuffix(shardReceiptPrefix, it.Key(), shardID)
+		if suffix == nil || len(suffix) != 32 {
+			continue
+		}
+		var msgID types.Hash
+		copy(msgID[:], suffix)
+		var receipt CrossShardReceipt
+		if err := json.Unmarshal(it.Value(), &receipt); err != nil {
+			return fmt.Errorf("failed to unmarshal receipt: %w", err)
+		}
+		if err := fn(msgID, &receipt); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
+// IterateSpentReceipts visits every persisted spent marker for the given shard.
+func (s *ShardStateStore) IterateSpentReceipts(shardID uint64, fn func(msgID types.Hash) error) error {
+	if s == nil || s.database == nil {
+		return ErrStateStoreNotConfigured
+	}
+	s.mu.RLock()
+	it := s.database.NewIterator(shardSpentPrefix, nil)
+	s.mu.RUnlock()
+	defer it.Release()
+	for it.Next() {
+		suffix := shardIterSuffix(shardSpentPrefix, it.Key(), shardID)
+		if suffix == nil || len(suffix) != 32 {
+			continue
+		}
+		var msgID types.Hash
+		copy(msgID[:], suffix)
+		if err := fn(msgID); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
+// IterateSenderNonces visits every persisted sender nonce for the given shard.
+func (s *ShardStateStore) IterateSenderNonces(shardID uint64, fn func(sender types.Address, nonce uint64) error) error {
+	if s == nil || s.database == nil {
+		return ErrStateStoreNotConfigured
+	}
+	s.mu.RLock()
+	it := s.database.NewIterator(shardNoncePrefix, nil)
+	s.mu.RUnlock()
+	defer it.Release()
+	for it.Next() {
+		suffix := shardIterSuffix(shardNoncePrefix, it.Key(), shardID)
+		if suffix == nil || len(suffix) != 20 {
+			continue
+		}
+		var addr types.Address
+		copy(addr[:], suffix)
+		if len(it.Value()) != 8 {
+			continue
+		}
+		if err := fn(addr, binary.LittleEndian.Uint64(it.Value())); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
 // --- Nonce persistence ---
 
 // PutSenderNonce persists the latest nonce for a sender on a shard.

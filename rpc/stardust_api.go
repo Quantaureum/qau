@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/quantaureum/qau/consensus"
 	"github.com/quantaureum/qau/crypto"
@@ -200,6 +201,22 @@ func (api *StardustAPI) VerifyFinality(ctx context.Context, params json.RawMessa
 	}
 	if err := parseParams(params, &req); err != nil {
 		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid params", err.Error())
+	}
+
+	// R19-F03 (2026-10-28): reject the empty-verification path. FinalityType
+	// defaults to 0 when the caller omits the field, and
+	// consensus.VerifyStardustFinality returns true immediately for type 0 —
+	// so this public endpoint used to answer {"valid": true} for ANY
+	// (slot, blockHash) with no signature at all. Require the caller to
+	// assert a concrete finality type and to present a signature; type 0 is
+	// not a queryable finality level.
+	if req.FinalityType == 0 {
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid finalityType",
+			"finalityType must be set (0 is not a verifiable finality level)")
+	}
+	if req.QTDSignature == "" {
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "missing qtdSignature",
+			"a QTD seal signature is required for finality verification")
 	}
 
 	header := &encoding.BlockHeader{
@@ -443,7 +460,7 @@ func (api *StardustAPI) GetSealStatus(ctx context.Context, params json.RawMessag
 
 	finalized := qfs.IsSlotFinalized(slot)
 	result := map[string]any{
-		"slot":      fmt.Sprintf("0x%x", slot),
+		"slot":      slot,
 		"finalized": finalized,
 	}
 	if finalized {
@@ -545,12 +562,34 @@ func (api *StardustAPI) RequestSeal(ctx context.Context, params json.RawMessage)
 	copy(blockHash[:], hashBytes)
 
 	if err := qfs.RequestSeal(req.Slot, blockHash); err != nil {
-		return nil, NewErrorWithData(ErrCodeInternal, "request seal failed", err.Error())
+		msg := err.Error()
+		// R19-F07 (2026-10-28): an identical repeat request is an idempotent
+		// retry, not a server fault — report success with existing=true when
+		// the pending seal carries the same blockHash, and a conflict error
+		// when the caller is trying to seal a different hash for the slot.
+		if strings.Contains(msg, "seal already requested") {
+			if pending := qfs.GetPendingSeal(req.Slot); pending != nil && pending.BlockHash == blockHash {
+				return map[string]any{
+					"success":       true,
+					"existing":      true,
+					"slot":          req.Slot,
+					"blockHash":     "0x" + hex.EncodeToString(blockHash[:]),
+					"requiredCount": api.getRequiredSealCount(),
+				}, nil
+			}
+			return nil, NewErrorWithData(ErrCodeInvalidParams, "seal request conflict", msg)
+		}
+		// R19-F07: the remaining rejections are domain preconditions (slot
+		// finalized, chambers not ready, block not approved, non-canonical
+		// hash) — operator errors, not node faults. Mapping them to
+		// ErrCodeInvalidParams (instead of ErrCodeInternal) lets monitoring
+		// distinguish misuse from internal failures.
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "request seal rejected", msg)
 	}
 
 	return map[string]any{
 		"success":       true,
-		"slot":          fmt.Sprintf("0x%x", req.Slot),
+		"slot":          req.Slot,
 		"blockHash":     "0x" + hex.EncodeToString(blockHash[:]),
 		"requiredCount": api.getRequiredSealCount(),
 	}, nil
@@ -605,23 +644,42 @@ func (api *StardustAPI) SubmitPartialSeal(ctx context.Context, params json.RawMe
 		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid signature hex", err.Error())
 	}
 
-	// RPC-FIX: Validate Dilithium3 signature length at the RPC boundary
-	// for defense-in-depth (DoS hardening), consistent with rollup_api.go:456.
-	if len(sigBytes) != crypto.Dilithium3SignatureSize {
+	// R19-F04 (2026-10-28): accept BOTH signature shapes the consensus layer
+	// defines, instead of only full Dilithium3 signatures. The previous
+	// 3293-byte-only gate made the documented "executive members can invoke
+	// joint signing" unusable — a threshold-share holder only holds a share
+	// and cannot produce a full 3293-byte independent signature, while
+	// SubmitPartialSeal explicitly supports TSS partials (>= 16 bytes, with
+	// fail-closed aggregation downstream per R14-MED). Full Dilithium3
+	// signatures remain cryptographically verified inside SubmitPartialSeal
+	// (over the pending seal's blockHash); TSS partials are length-checked
+	// here and at the consensus layer, and can never influence the final
+	// aggregated signature (local mode rejects them at aggregation,
+	// distributed mode re-signs from scratch).
+	const minTSSPartialSigLen = 16
+	if len(sigBytes) != crypto.Dilithium3SignatureSize && len(sigBytes) < minTSSPartialSigLen {
 		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid signature length",
-			fmt.Sprintf("expected %d bytes (Dilithium3), got %d",
+			fmt.Sprintf("expected %d bytes (full Dilithium3) or >= %d bytes (TSS partial), got %d",
+				crypto.Dilithium3SignatureSize, minTSSPartialSigLen, len(sigBytes)))
+	}
+	if len(sigBytes) > crypto.Dilithium3SignatureSize {
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid signature length",
+			fmt.Sprintf("signature exceeds the maximum (%d bytes), got %d",
 				crypto.Dilithium3SignatureSize, len(sigBytes)))
 	}
 
 	if err := qfs.SubmitPartialSeal(req.ValidatorIndex, req.Slot, sigBytes); err != nil {
-		return nil, NewErrorWithData(ErrCodeInternal, "submit partial seal failed", err.Error())
+		// R19-F07: domain rejections (no pending seal, duplicate, wrong
+		// length, not a sealer) are caller errors — map to invalid-params
+		// instead of internal so monitoring can tell misuse from faults.
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "submit partial seal rejected", err.Error())
 	}
 
 	// Report post-submission status.
 	finalized := qfs.IsSlotFinalized(req.Slot)
 	result := map[string]any{
 		"success":        true,
-		"slot":           fmt.Sprintf("0x%x", req.Slot),
+		"slot":           req.Slot,
 		"validatorIndex": req.ValidatorIndex,
 		"finalized":      finalized,
 		"signatureSize":  len(sigBytes),
@@ -693,6 +751,12 @@ func parseUint64Hex(s string) (uint64, error) {
 			d = uint64(ch-'A') + 10
 		default:
 			return 0, fmt.Errorf("invalid hex char %q", ch)
+		}
+		// R19-F11: detect overflow instead of silently wrapping — a >16-hex-digit
+		// value used to wrap modulo 2^64 and address a different slot than
+		// the caller typed.
+		if v > (^(uint64(0))-d)/16 {
+			return 0, fmt.Errorf("hex value overflows uint64")
 		}
 		v = v*16 + d
 	}

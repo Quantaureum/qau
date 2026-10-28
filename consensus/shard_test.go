@@ -119,36 +119,20 @@ func signCrossShardMessage(sender types.Address, msg *CrossShardMessage) []byte 
 
 // proposeShardBlock is a test helper that creates a properly signed shard block.
 func proposeShardBlock(chain *ShardChain, proposer types.Address, txs [][]byte, crossMsgs []*CrossShardMessage) (*ShardBlock, error) {
-	// Build a temporary header to compute the signing hash.
-	height := chain.latest + 1
-	var parentHash types.Hash
-	if parent, exists := chain.blocks[chain.latest]; exists {
-		parentHash = computeShardBlockHash(parent.Header)
+	// R19-F1 (2026-10-28): use the production prepare→sign→propose flow.
+	// PrepareBlockSigningHash returns the COMPLETE header (including the
+	// timestamp) and the hash covering it; the same header instance is passed
+	// to ProposeBlock so the signature commits to the block that is stored.
+	header, signingHash, err := chain.PrepareBlockSigningHash(proposer, txs, crossMsgs, nil, types.Hash{})
+	if err != nil {
+		return nil, err
 	}
-	txRoot := computeTxRoot(txs)
-	crossMsgRoot := computeCrossMsgRoot(crossMsgs)
-	// P0-1 (2026-07-13): Compute the same stateRoot that ProposeBlock will
-	// compute, so the signature covers the correct stateRoot. Previously this
-	// was always a zero hash, which ProposeBlock would also use. Now both
-	// sides call ComputeStateRoot to ensure consistency.
-	stateRoot := chain.ComputeStateRoot(height, parentHash, txRoot, crossMsgRoot)
-	tmpHeader := &ShardBlockHeader{
-		ShardID:      chain.shardID,
-		Height:       height,
-		ParentHash:   parentHash,
-		StateRoot:    stateRoot,
-		TxRoot:       txRoot,
-		CrossMsgRoot: crossMsgRoot,
-		Timestamp:    uint64(0), // will be set by ProposeBlock
-		Proposer:     proposer,
+	kp := getShardTestKey(proposer)
+	sig, err := qaucrypto.Sign(kp.priv, signingHash)
+	if err != nil {
+		return nil, err
 	}
-	// audit-fix M-6: VRF proof/output are nil/zero in tests because the test
-	// chains do not set a VRF seed, so VRF verification is skipped.
-	// Use a fixed timestamp for deterministic signing in tests.
-	// ProposeBlock will set its own timestamp, but the signing hash must match.
-	// We sign over a header with the same fields ProposeBlock will use.
-	sig := signShardBlock(proposer, tmpHeader)
-	return chain.ProposeBlock(proposer, txs, crossMsgs, sig, nil, types.Hash{})
+	return chain.ProposeBlock(header, txs, crossMsgs, sig)
 }
 
 // finalizeShardBlock is a test helper that finalizes a block with attestations

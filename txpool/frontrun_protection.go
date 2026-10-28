@@ -250,8 +250,18 @@ func (m *CommitRevealManager) CheckReveal(tx *encoding.Transaction) error {
 
 	commitHash := ComputeCommitHash(*tx.To, tx.Value, tx.Data)
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	// R14-01 FIX (2026-10-27): this path evicts an expired commitment below,
+	// so it must hold the WRITE lock. It previously held m.mu.RLock() and
+	// called delete(m.commits, ...) — a concurrent map write under a read
+	// lock, which Go detects and aborts the process with
+	// "fatal error: concurrent map writes" (not recoverable, kills the node).
+	// Trigger is routine: a user re-submits a reveal after their commitment
+	// aged past CommitTimeoutBlocks but before the 3.5-minute CleanupExpired
+	// tick, while any other goroutine (admission, selection, stats) reads the
+	// map. Contention is acceptable: CheckReveal only runs for ≥threshold
+	// commit-reveal reveals, not for ordinary traffic.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	commit, exists := m.commits[commitHash]
 	if !exists {

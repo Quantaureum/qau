@@ -333,8 +333,17 @@ func (sp *StatePruner) pruneDatabaseDirect(cutoffEpoch uint64) (uint64, uint64, 
 	// Iterate over account prefix and count entries
 	// Note: Without modification logs, we cannot safely delete individual
 	// accounts. This fallback only prunes snapshot entries.
-	// Snapshot keys are prefixed with "snap_" + block height
-	snapPrefix := []byte("snap_")
+	// Snapshot keys are prefixed with "xsnap:" + block height.
+	// R20-O FIX (2026-10-29): was "snap_" — which collided on the first byte
+	// with statePrefix "s" (same shared keyspace): a storage key is
+	// "s" + address(20) + slot(32), and address bytes are attacker-facing
+	// key material, so an address beginning with "nap_" yields storage keys
+	// that this deletion iterator would sweep and (bytes[5:13] parsing as a
+	// low block height) prune. The path is already gated behind
+	// allowUnsafeFallback and no current code writes "snap_" keys, but the
+	// overlap is now structurally removed ("x" is unused as a first byte by
+	// every prefix family in this keyspace).
+	snapPrefix := []byte("xsnap:")
 	iter := sp.database.NewIterator(snapPrefix, nil)
 	batch := sp.database.NewBatch()
 	batchCount := 0

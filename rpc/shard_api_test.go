@@ -87,6 +87,9 @@ func setupShardAPIWithChain(t *testing.T) (*ShardAPI, *consensus.ShardChain, []t
 // so the rpc test package can sign messages without accessing unexported helpers.
 func computeCrossShardSigningHashForRPC(msg *consensus.CrossShardMessage) []byte {
 	h := sha3.New256()
+	// R19-F11: mirrors the domain prefix added to
+	// consensus.computeCrossShardMessageSigningHash.
+	h.Write([]byte("QUANTAUREUM_CROSS_MSG_SIGN_V1"))
 	h.Write(msg.ID[:])
 	var srcBytes, dstBytes, nonceBytes, tsBytes [8]byte
 	for i := 0; i < 8; i++ {
@@ -292,17 +295,45 @@ func TestShardAPI_SubmitCrossShardMessage_InvalidAddress(t *testing.T) {
 
 func TestShardAPI_SubmitCrossShardMessage_Success(t *testing.T) {
 	api, chain, validators := setupShardAPIWithChain(t)
+	// R19-F6/F8: the destination shard must exist and differ from the source.
+	// Create and activate a second shard as the relay target (activation
+	// requires every dest validator to have a registered public key).
+	destValidators := make([]types.Address, 3)
+	for i := range destValidators {
+		kp, err := qaucrypto.GenerateKeyPair()
+		if err != nil {
+			t.Fatalf("GenerateKeyPair (dest) failed: %v", err)
+		}
+		copy(destValidators[i][:], kp.Public.Bytes()[:20])
+	}
+	destChain, err := api.manager.CreateShard(destValidators)
+	if err != nil {
+		t.Fatalf("CreateShard (dest) failed: %v", err)
+	}
+	for _, v := range destValidators {
+		kp := getRPCTestKey(v)
+		if err := destChain.SetValidatorPubKey(v, kp.Public.Bytes()); err != nil {
+			t.Fatalf("SetValidatorPubKey (dest) failed: %v", err)
+		}
+	}
+	destChain.SetElectionVerifier(&mockElectionVerifierForRPC{})
+	if err := api.manager.ActivateShard(destChain.ShardID()); err != nil {
+		t.Fatalf("ActivateShard (dest) failed: %v", err)
+	}
 	// RPC-FIX: timestamp must be within ±5 minutes of current time.
 	// Previously used a fixed 2009 timestamp which is now rejected by the
 	// freshness check added in RPC-.
 	msg := &consensus.CrossShardMessage{
 		SourceShard: chain.ShardID(),
-		DestShard:   chain.ShardID(),
-		Sender:      validators[0],
-		Recipient:   validators[1],
-		Payload:     []byte{0xde, 0xad, 0xbe, 0xef},
-		Nonce:       1,
-		Timestamp:   uint64(time.Now().Unix()),
+		// R19-F8: source == dest is rejected at the RPC and chain layers;
+		// use a distinct (nonexistent) destination and expect the explicit
+		// destination-shard error path in the dedicated negative test.
+		DestShard: chain.ShardID() + 1,
+		Sender:    validators[0],
+		Recipient: validators[1],
+		Payload:   []byte{0xde, 0xad, 0xbe, 0xef},
+		Nonce:     1,
+		Timestamp: uint64(time.Now().Unix()),
 	}
 	msg.ID = consensus.GenerateCrossShardMessageID(msg.SourceShard, msg.DestShard, msg.Sender, msg.Nonce)
 	msg.Signature = signCrossShardMsgForRPC(validators[0], msg)

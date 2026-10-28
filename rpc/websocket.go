@@ -1483,6 +1483,19 @@ func (ws *WebSocketServer) handleMessage(conn *WSConn, msg []byte) {
 		// in the HMAC input makes batch signatures incompatible with single-
 		// request signatures, preventing cross-format replay.
 		batchAuthCtx := ws.rpcServer.authManager
+		// R15-01 FIX (2026-10-27): track whether batch-level validation actually
+		// RAN, not merely whether an auth manager exists. The flag previously
+		// passed to handleRequestInternal was `batchAuthCtx != nil`, so a batch
+		// containing ONLY public methods (ValidateBatchRequest short-circuits on
+		// empty method list) marked every request as "auth already verified" and
+		// skipped ValidateRequest entirely — including the GlobalIPWhitelist
+		// check. That is the WebSocket-batch sibling of R14-03: an operator who
+		// configured GlobalIPWhitelist still served public methods over a WS
+		// batch to the whole internet, while the identical single-request path
+		// (skipAuth=false → ValidateRequest) correctly rejected them. With this
+		// flag, an all-public batch falls back to per-request ValidateRequest,
+		// which enforces the whitelist (R14-03) without requiring an API key.
+		batchAuthValidated := false
 		if batchAuthCtx != nil {
 			// Collect all non-public method names. HMAC will cover every name.
 			nonPublicMethods := make([]string, 0, len(batch))
@@ -1518,6 +1531,10 @@ func (ws *WebSocketServer) handleMessage(conn *WSConn, msg []byte) {
 						}
 					}
 				}
+				// R15-01 FIX: batch-level validation ran and passed — non-public
+				// requests below may skip re-validation. Reaching this line means
+				// the lockout/API-key/HMAC/whitelist gate actually executed.
+				batchAuthValidated = true
 			}
 		}
 
@@ -1566,8 +1583,11 @@ func (ws *WebSocketServer) handleMessage(conn *WSConn, msg []byte) {
 						}
 					}
 				}()
-				//  skipAuth=true — auth already verified at batch level above.
-				resp = ws.handleRequestInternal(conn, &req, batchAuthCtx != nil)
+				// R15-01 FIX: pass batchAuthValidated (not batchAuthCtx != nil).
+				// skipAuth=true is only legitimate when batch-level validation
+				// actually ran; an all-public batch must fall through to
+				// per-request ValidateRequest so the GlobalIPWhitelist applies.
+				resp = ws.handleRequestInternal(conn, &req, batchAuthValidated)
 			}()
 			if req.ID != nil {
 				responses = append(responses, resp)

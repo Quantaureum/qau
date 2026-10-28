@@ -1028,6 +1028,24 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		// OBS-15-1 FIX (2026-10-28): the operator's GlobalIPWhitelist must gate
+		// EVERY request, including a batch whose elements are all public
+		// methods. The auth block below sits behind `len(nonPublicMethods) > 0`,
+		// so an all-public batch skipped it entirely — and with it every
+		// GlobalIPWhitelist enforcement point — while each element was still
+		// dispatched to method handlers (handleRequest authorizes only ADMIN
+		// methods). An operator who restricted the RPC to their own network
+		// therefore still served the whole public surface over HTTP batch.
+		//
+		// The allowlist decision depends only on the client IP, so it is made
+		// once for the batch here, before dispatch. This is the HTTP sibling of
+		// the WebSocket batch gap fixed by R15-01.
+		if s.authManager != nil {
+			if err := s.authManager.CheckGlobalIPWhitelist(r); err != nil {
+				s.writeError(w, nil, NewError(ErrCodeUnauthorized, err.Error()))
+				return
+			}
+		}
 		// audit-fix R5-H1: auth+ratelimit for batch requests
 		if s.rateLimiter != nil {
 			// audit-fix HIGH-RATELIMIT: Consume tokens for each request in the batch.

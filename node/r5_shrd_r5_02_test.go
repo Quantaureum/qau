@@ -167,19 +167,33 @@ func TestSHRD_R5_02_RegisteredValidatorAcceptedNoBlock(t *testing.T) {
 	// height=1 is within window (latest=0, window=64). Block at height 1
 	// does not exist yet, so validateAttestation should accept (signature
 	// will be verified later by FinalizeBlock).
-	sig := []byte{0xaa, 0xbb, 0xcc}
+	// R19-F3: the signature must be Dilithium3-sized to pass the admission
+	// format gate; content is still unverifiable until the block arrives.
+	sig := make([]byte, qaucrypto.Dilithium3SignatureSize)
+	sig[0], sig[1], sig[2] = 0xaa, 0xbb, 0xcc
 	if !sbp.validateAttestation(chain.ShardID(), 1, validator, sig) {
 		t.Fatal("attestation from registered validator (block not yet known) should be accepted")
 	}
+	// R19-F3: a wrong-length signature must be rejected outright — it can
+	// never verify later, so it must not occupy a pending slot.
+	if sbp.validateAttestation(chain.ShardID(), 1, validator, []byte{0xaa, 0xbb, 0xcc}) {
+		t.Fatal("attestation with non-Dilithium3 signature length should be rejected")
+	}
 }
 
-// TestSHRD_R5_02_PerHeightCapacityLimit verifies that addPendingAttestation
-// rejects attestations beyond the validator count for a single height.
+// TestSHRD_R5_02_PerHeightCapacityLimit verifies the R19-F3 semantics of
+// addPendingAttestation: entries are keyed by validator address (so the map
+// is inherently bounded by the validator set) and a re-attestation from the
+// SAME validator overwrites its slot instead of being dropped. The old
+// capacity DROP was the R19-F3 DoS enabler: garbage pre-filled every
+// validator's slot while the block was unknown, and every real attestation
+// then hit the cap and was discarded, permanently stalling finalization.
 func TestSHRD_R5_02_PerHeightCapacityLimit(t *testing.T) {
 	mc := &r5MockMainChain{latestSlot: 100}
 	sm := consensus.NewShardManager(mc)
 
-	// 3 validators → max 3 attestations per height.
+	// 3 validators → at most 3 pending entries per height (keys are
+	// constrained by validateAttestation's validator-registry check).
 	validators := []types.Address{{0x01}, {0x02}, {0x03}}
 	chain, err := sm.CreateShard(validators)
 	if err != nil {
@@ -194,31 +208,26 @@ func TestSHRD_R5_02_PerHeightCapacityLimit(t *testing.T) {
 
 	// Add 3 attestations (one per validator) — all should be accepted.
 	// We bypass validateAttestation and call addPendingAttestation directly
-	// to test the capacity limit in isolation.
+	// to test the map semantics in isolation.
 	sbp.addPendingAttestation(chain.ShardID(), 1, validators[0], []byte("sig0"))
 	sbp.addPendingAttestation(chain.ShardID(), 1, validators[1], []byte("sig1"))
 	sbp.addPendingAttestation(chain.ShardID(), 1, validators[2], []byte("sig2"))
 
-	// 4th attestation from a new validator address should be rejected
-	// (capacity = 3 reached).
-	extraValidator := types.Address{0x04}
-	sbp.addPendingAttestation(chain.ShardID(), 1, extraValidator, []byte("sig3"))
+	// R19-F3: a re-attestation from the SAME validator must OVERWRITE its
+	// slot (a real attestation displaces garbage squatting on its key) and
+	// must not grow the map.
+	sbp.addPendingAttestation(chain.ShardID(), 1, validators[0], []byte("sig0-real"))
 
-	// Verify only 3 attestations are stored.
 	sbp.pendingMu.Lock()
 	count := len(sbp.pendingAttestations[chain.ShardID()][1])
+	stored := string(sbp.pendingAttestations[chain.ShardID()][1][validators[0]])
 	sbp.pendingMu.Unlock()
 
 	if count != 3 {
-		t.Fatalf("expected 3 attestations after capacity overflow, got %d", count)
+		t.Fatalf("expected 3 attestations after same-key overwrite, got %d", count)
 	}
-
-	// Verify the extra validator was not stored.
-	sbp.pendingMu.Lock()
-	_, exists := sbp.pendingAttestations[chain.ShardID()][1][extraValidator]
-	sbp.pendingMu.Unlock()
-	if exists {
-		t.Fatal("extra validator attestation should have been rejected by capacity limit")
+	if stored != "sig0-real" {
+		t.Fatalf("expected validator[0]'s slot to be overwritten, got %q", stored)
 	}
 }
 

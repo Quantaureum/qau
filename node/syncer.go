@@ -4736,6 +4736,39 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	syncLog.Info("rebuildState: complete, applied=%d, failed=%d, skippedCommitted=%d, duration=%s",
 		applied, failed, skippedCommitted, time.Since(startTime).Round(time.Second))
 
+	// R14-02 FIX (2026-10-27): a rebuild that could not fetch/apply every block
+	// in the range has NOT reconstructed canonical state — the skipped blocks
+	// carry state transitions that are now missing. The loop above only counted
+	// those failures (failed++) and never acted on the count, so control fell
+	// through to the final state-root comparison. Both outcomes were wrong:
+	//   * root mismatch (the normal case, state is missing transitions) → the
+	//     R63-STATE-ROOT-TRUST branch below sets s.stateVerifiedHeight =
+	//     toHeight and returns true, permanently freezing a state that was
+	//     never rebuilt; every later rebuild then skips the whole range.
+	//   * root coincidence (the failed blocks happened to be no-ops) → the
+	//     match branch also sets stateVerifiedHeight = toHeight while the
+	//     in-range unvalidated markers survive, leaving "verified height" and
+	//     "still unvalidated" contradicting each other for later readers.
+	// Fail closed instead: never advance the verified height past an
+	// incomplete range, request the missing blocks, and let the caller retry.
+	// Regression: TestRebuildRange_PartialApplyMustNotMarkVerified.
+	if failed > 0 {
+		syncLog.Error("rebuildState: CRITICAL — %d block(s) in range %d-%d could not be fetched or applied; "+
+			"local state is INCOMPLETE and must not be treated as canonical. Refusing to mark the range "+
+			"verified (R14-02). Requesting the missing blocks; the caller will retry this range.",
+			failed, fromHeight, toHeight)
+		// A partial rebuild must also not sit under an already-raised verified
+		// height: later logic trusts stateVerifiedHeight as proof that every
+		// block up to it was applied. Clamp to just below this range's start.
+		s.mu.Lock()
+		if fromHeight > 0 && s.stateVerifiedHeight >= fromHeight {
+			s.stateVerifiedHeight = fromHeight - 1
+		}
+		s.mu.Unlock()
+		s.requestMissingBlocks()
+		return false
+	}
+
 	// R32-P1-02 FIX (2026-07-28): Final state root verification after rebuild.
 	// rebuildState uses skipStateRootValidation=true per block during the loop
 	// (trusting the chain's state roots block-by-block). However, after the

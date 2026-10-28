@@ -372,7 +372,12 @@ func (sbp *ShardBlockProducer) tryProduceShardBlock(chain *consensus.ShardChain)
 	var vrfProof []byte // nil — ShardQPOSAdapter ignores this
 	var vrfOutput types.Hash
 
-	signingHash, err := chain.PrepareBlockSigningHash(sbp.validatorAddr, nil, nil)
+	// R19-F1 (2026-10-28): PrepareBlockSigningHash now returns the COMPLETE
+	// prepared header (including the timestamp and VRF fields) alongside the
+	// signing hash, and ProposeBlock verifies the signature over that same
+	// header instance — the signature commits to the timestamp that enters
+	// the block hash.
+	preparedHeader, signingHash, err := chain.PrepareBlockSigningHash(sbp.validatorAddr, nil, nil, vrfProof, vrfOutput)
 	if err != nil {
 		shardProducerLog.Warn("shard %d: PrepareBlockSigningHash failed: %v", shardID, err)
 		return
@@ -385,13 +390,19 @@ func (sbp *ShardBlockProducer) tryProduceShardBlock(chain *consensus.ShardChain)
 	}
 
 	// Propose the block. ProposeBlock verifies the signature + election internally.
-	block, err := chain.ProposeBlock(sbp.validatorAddr, nil, nil, signature, vrfProof, vrfOutput)
+	block, err := chain.ProposeBlock(preparedHeader, nil, nil, signature)
 	if err != nil {
 		shardProducerLog.Warn("shard %d: ProposeBlock failed: %v", shardID, err)
 		return
 	}
 
 	shardProducerLog.Info("shard %d: produced block height %d (slot %d)", shardID, block.Header.Height, slot)
+
+	// R19-F3 (2026-10-28): the block is now known — drop any pending
+	// attestations that were admitted before it existed and whose signatures
+	// do not verify over the actual block hash, then re-attempt finalization
+	// from the surviving valid entries.
+	sbp.revalidatePendingAttestations(chain, block.Header.Height)
 
 	// P3-1 (2026-07-15): Record proposal time for finalization delay.
 	sbp.recordProposed(shardID, block.Header.Height)
@@ -468,6 +479,11 @@ func (sbp *ShardBlockProducer) handleIncomingShardBlock(data []byte) {
 			block.Header.ShardID, block.Header.Height, err)
 		return
 	}
+
+	// R19-F3 (2026-10-28): the block is now known — drop pending attestations
+	// that were admitted before it existed and do not verify over the actual
+	// block hash, then re-attempt finalization from the surviving entries.
+	sbp.revalidatePendingAttestations(chain, block.Header.Height)
 
 	// P3-1 (2026-07-15): Record proposal time for finalization delay.
 	sbp.recordProposed(block.Header.ShardID, block.Header.Height)
@@ -638,10 +654,23 @@ func (sbp *ShardBlockProducer) validateAttestation(shardID, height uint64, valid
 		return false
 	}
 
+	// R19-F3 (2026-10-28): cheap format gate before any "accept for now"
+	// path. A Dilithium3 attestation signature has a fixed size; anything
+	// else can never verify later, so accepting it would only occupy a
+	// per-validator slot that a real attestation then has to race to
+	// overwrite.
+	if len(sig) != crypto.Dilithium3SignatureSize {
+		shardProducerLog.Debug("attestation: signature length %d != Dilithium3 size for shard %d height %d",
+			len(sig), shardID, height)
+		return false
+	}
+
 	// Check 3: If the block is already known, verify the attestation signature
 	// over the block hash. This is the expensive check, so it's done last.
-	// If the block is not yet known, accept the attestation — it will be
-	// verified by FinalizeBlock when the block arrives.
+	// If the block is not yet known, accept the attestation provisionally —
+	// it will be verified by FinalizeBlock when the block arrives, and
+	// re-validated (and dropped if invalid) by the R19-F3 sweep when the
+	// block reaches this producer.
 	block, err := chain.GetBlock(height)
 	if err != nil {
 		// Block not yet known — accept for now. FinalizeBlock will verify.
@@ -665,6 +694,59 @@ func (sbp *ShardBlockProducer) validateAttestation(shardID, height uint64, valid
 	return true
 }
 
+// revalidatePendingAttestations re-checks every pending attestation for
+// (shard, height) now that the block is known, dropping entries whose
+// signature does not verify over the actual block hash, and re-running the
+// quorum check with the surviving count.
+//
+// R19-F3 (2026-10-28): attestations admitted while the block was still
+// unknown cannot be signature-checked at admission (there is no block hash
+// to verify against), so a flood of length-valid garbage under real
+// validator addresses used to be able to squat on slots. With the capacity
+// drop removed (same fix), real attestations overwrite their own slot —
+// this sweep closes the remaining gap by purging the garbage as soon as
+// the block arrives, so the next quorum decision is computed from verified
+// entries only (FinalizeBlock re-verifies everything internally either way).
+func (sbp *ShardBlockProducer) revalidatePendingAttestations(chain *consensus.ShardChain, height uint64) {
+	shardID := chain.ShardID()
+
+	sbp.pendingMu.Lock()
+	heightMap, ok := sbp.pendingAttestations[shardID][height]
+	if !ok || len(heightMap) == 0 {
+		sbp.pendingMu.Unlock()
+		return
+	}
+	block, err := chain.GetBlock(height)
+	if err != nil {
+		// Block vanished (reorg/receive failure) — leave pending as-is.
+		sbp.pendingMu.Unlock()
+		return
+	}
+	blockHash := consensus.ComputeShardBlockHashPublic(block.Header)
+	dropped := 0
+	for addr, sig := range heightMap {
+		pubKeyBytes, known := chain.ValidatorPubKey(addr)
+		if !known {
+			delete(heightMap, addr)
+			dropped++
+			continue
+		}
+		pubKey, perr := crypto.PublicKeyFromBytes(pubKeyBytes)
+		if perr != nil || pubKey == nil || !crypto.Verify(pubKey, blockHash[:], sig) {
+			delete(heightMap, addr)
+			dropped++
+		}
+	}
+	count := len(heightMap)
+	sbp.pendingMu.Unlock()
+
+	if dropped > 0 {
+		shardProducerLog.Debug("shard %d: revalidated pending attestations at height %d: dropped %d invalid of %d",
+			shardID, height, dropped, dropped+count)
+	}
+	sbp.checkQuorumAndFinalize(shardID, height, count)
+}
+
 // addPendingAttestation adds an attestation to the pending map and checks
 // if quorum is reached. If so, calls FinalizeBlock.
 //
@@ -681,23 +763,18 @@ func (sbp *ShardBlockProducer) addPendingAttestation(shardID, height uint64, val
 		sbp.pendingAttestations[shardID][height] = make(map[types.Address][]byte)
 	}
 
-	// SHRD- Enforce per-height capacity limit. Each validator can
-	// only attest once per height, so the maximum number of attestations
-	// per height is the validator count. Rejecting excess attestations
-	// prevents an attacker from flooding a single height with forged
-	// entries (each forged entry from a non-validator would have been
-	// rejected by validateAttestation, but duplicate entries from the
-	// same validator could still overwrite and consume map slots).
-	if chain, err := sbp.shardManager.GetShard(shardID); err == nil {
-		maxAttestations := len(chain.Validators())
-		if maxAttestations > 0 && len(sbp.pendingAttestations[shardID][height]) >= maxAttestations {
-			sbp.pendingMu.Unlock()
-			shardProducerLog.Debug("attestation: per-height capacity (%d) reached for shard %d height %d",
-				maxAttestations, shardID, height)
-			return
-		}
-	}
-
+	// R19-F3 FIX (2026-10-28): the per-height capacity DROP below was removed.
+	// It was actively harmful: validateAttestation only admits addresses
+	// registered for the shard, so this map is inherently bounded by the
+	// validator set (≤ N entries per height) — the cap could never be exceeded,
+	// but a pre-filled map (garbage signatures under real validator addresses,
+	// accepted while the block was still unknown) made every REAL attestation
+	// hit the cap and get dropped, permanently stalling finalization for that
+	// height (count reached quorum, FinalizeBlock's per-entry verification
+	// rejected the garbage, and no further entries were ever accepted).
+	// Plain map assignment overwrites the same validator's slot, so a real
+	// attestation always displaces the garbage squatting on its key and
+	// re-triggers the quorum check below.
 	sbp.pendingAttestations[shardID][height][validator] = sig
 	count := len(sbp.pendingAttestations[shardID][height])
 

@@ -478,15 +478,30 @@ func (ds *DistributedSigner) SubmitRound2Reveal(sessionID [32]byte, reveal *qtd.
 	}
 	session.round2Reveals[reveal.ParticipantID] = reveal
 
-	// Check if we have enough reveals (threshold)
-	if len(session.round2Reveals) >= session.Threshold {
+	// R19-F01 FIX (2026-10-28): round 2 is complete only when EVERY
+	// participant has revealed. The signing side computes the challenge c
+	// over the sum of ALL participants' Round-1 W shares (qtd_protocol
+	// Round2Reveal → AggregateW over s.participants), while the aggregation
+	// side computes c over only the REVEALED subset. With n > t (production
+	// default 5-of-3), a threshold-triggered aggregation used whatever
+	// subset happened to have revealed when the 50 ms poll fired —
+	// c_agg ≠ c_signer → the assembled signature fails verification,
+	// making every seal with one non-revealing participant flaky and the
+	// reveal set a timing-dependent attacker-influenceable choice. The
+	// protocol as implemented can only produce a valid signature when the
+	// reveal set equals the participant set, so requiring all reveals here
+	// makes that implicit precondition explicit and deterministic; it is
+	// NOT a liveness regression (a withholding participant already broke
+	// the seal, just nondeterministically).
+	if len(session.round2Reveals) >= len(session.ParticipantIDs) {
 		session.round2Done = true
 	}
 
 	return nil
 }
 
-// IsRound2Complete returns true if enough Round2 reveals have been received (>= threshold).
+// IsRound2Complete returns true when every participant has revealed and the
+// reveals are aggregation-ready (R19-F01: all-participant gate).
 func (ds *DistributedSigner) IsRound2Complete(sessionID [32]byte) bool {
 	ds.mu.RLock()
 	session, ok := ds.sessions[sessionID]

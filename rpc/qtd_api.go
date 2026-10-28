@@ -3,15 +3,14 @@ package rpc
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha3"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/quantaureum/qau/wallet/tss"
 )
@@ -43,12 +42,15 @@ func (api *TSSAPI) SetDevMode(enabled bool) {
 // hashShare returns the SHA3-256 hash of a key share as hex string.
 // SECURITY (audit P0-): Return hash instead of raw share bytes to prevent
 // private key extraction via RPC.
-// RPC-FIX: Mix a per-call salt (current Unix timestamp) into the hash
-// so that the same share queried at different times yields different hashes.
-// This prevents traffic-analysis correlation of repeat share queries and
-// prevents an attacker from verifying a leaked share's validity via this
-// endpoint. The salt is returned alongside the hash so legitimate callers
-// (audit logs) can re-derive if needed.
+// R19-F06 (2026-10-28): the salt is a per-call crypto/rand value that is
+// RETURNED to the caller alongside the hash. The previous salt was the
+// current Unix second — never returned, guessable to within a few
+// candidates, and shared by every query in the same second — which made
+// shareHash a low-entropy verification oracle for a leaked share rather
+// than a commitment, and broke the "audit logs can re-derive" promise
+// (the log path salted with a DIFFERENT timestamp than the response).
+// A high-entropy returned salt fixes both: re-derivation works, and a
+// verifier without the salt learns nothing.
 func hashShare(share []byte, salt []byte) string {
 	h := sha3.New256()
 	_, _ = h.Write(share)
@@ -56,11 +58,13 @@ func hashShare(share []byte, salt []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// shareHashSalt returns a per-call salt derived from the current Unix
-// timestamp (second-resolution is sufficient — the goal is to break
-// cross-query linkability, not to provide cryptographic freshness).
-func shareHashSalt() []byte {
-	return []byte(strconv.FormatInt(time.Now().Unix(), 10))
+// shareHashSalt returns a fresh 32-byte crypto/rand salt.
+func shareHashSalt() ([]byte, error) {
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	return salt, nil
 }
 
 func (api *TSSAPI) RegisterHandlers(server *Server) {
@@ -104,7 +108,12 @@ func (api *TSSAPI) GenerateKeyShares(ctx context.Context, params json.RawMessage
 		}
 	}
 
-	if req.Threshold > 0 && req.TotalShares > 0 {
+	// R19-F05 (2026-10-28): the caller-supplied threshold/totalShares used to
+	// be validated and then silently DROPPED — GenerateKeyShares() has no
+	// parameters and uses the manager's own configuration, so an operator
+	// asking for 3-of-5 got whatever the manager was configured with and no
+	// signal that the request was a no-op. Refuse explicitly instead.
+	if req.Threshold > 0 || req.TotalShares > 0 {
 		cfg := tss.TSSConfig{
 			Threshold:     req.Threshold,
 			TotalShares:   req.TotalShares,
@@ -113,6 +122,11 @@ func (api *TSSAPI) GenerateKeyShares(ctx context.Context, params json.RawMessage
 		if err := cfg.Validate(); err != nil {
 			return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid config", err.Error())
 		}
+		if req.Threshold != api.tssManager.Threshold() || req.TotalShares != api.tssManager.TotalShares() {
+			return nil, NewErrorWithData(ErrCodeInvalidParams, "config mismatch",
+				fmt.Sprintf("threshold/totalShares cannot be set via RPC; the TSS manager is already configured with %d-of-%d — reconfigure the node instead",
+					api.tssManager.Threshold(), api.tssManager.TotalShares()))
+		}
 	}
 
 	shares, err := api.tssManager.GenerateKeyShares()
@@ -120,13 +134,18 @@ func (api *TSSAPI) GenerateKeyShares(ctx context.Context, params json.RawMessage
 		return nil, NewErrorWithData(ErrCodeInternal, "DKG failed", err.Error())
 	}
 
-	salt := shareHashSalt()
+	salt, err := shareHashSalt()
+	if err != nil {
+		return nil, NewErrorWithData(ErrCodeInternal, "salt generation failed", err.Error())
+	}
+	saltHex := hex.EncodeToString(salt)
 	result := make([]map[string]any, len(shares))
 	for i, s := range shares {
 		result[i] = map[string]any{
 			"index":              s.Index,
 			"shareHash":          "0x" + hashShare(s.Share, salt),
 			"shareHashAlgorithm": "sha3-256",
+			"shareHashSalt":      "0x" + saltHex,
 			"verificationVector": encodeVerificationVector(s.VerificationVector),
 		}
 	}
@@ -134,11 +153,12 @@ func (api *TSSAPI) GenerateKeyShares(ctx context.Context, params json.RawMessage
 	pubKey := api.tssManager.GroupPublicKey()
 
 	return map[string]any{
-		"success":     true,
-		"publicKey":   "0x" + hex.EncodeToString(pubKey),
-		"threshold":   api.tssManager.Threshold(),
-		"totalShares": api.tssManager.TotalShares(),
-		"shares":      result,
+		"success":       true,
+		"publicKey":     "0x" + hex.EncodeToString(pubKey),
+		"threshold":     api.tssManager.Threshold(),
+		"totalShares":   api.tssManager.TotalShares(),
+		"shareHashSalt": "0x" + saltHex,
+		"shares":        result,
 	}, nil
 }
 
@@ -189,12 +209,20 @@ func (api *TSSAPI) GetShare(ctx context.Context, params json.RawMessage) (any, *
 	// TSS-FIX: Audit-log every successful share export — who (caller
 	// identity is enforced by AdminMethod gateway upstream), when, and which
 	// participant's share was queried. The share itself is never logged.
-	log.Printf("[SECURITY AUDIT] qau_tss_getShare participantId=%d shareIndex=%d hash=%s",
-		req.ParticipantID, share.Index, hashShare(share.Share, shareHashSalt()))
+	// R19-F06: one salt per call, returned with the response so the audit
+	// log and the caller can re-derive the SAME hash.
+	salt, err := shareHashSalt()
+	if err != nil {
+		return nil, NewErrorWithData(ErrCodeInternal, "salt generation failed", err.Error())
+	}
+	shareHash := hashShare(share.Share, salt)
+	log.Printf("[SECURITY AUDIT] qau_tss_getShare participantId=%d shareIndex=%d hash=%s salt=%s",
+		req.ParticipantID, share.Index, shareHash, hex.EncodeToString(salt))
 
 	return map[string]any{
 		"index":              share.Index,
-		"shareHash":          "0x" + hashShare(share.Share, shareHashSalt()),
+		"shareHash":          "0x" + shareHash,
+		"shareHashSalt":      "0x" + hex.EncodeToString(salt),
 		"shareHashAlgorithm": "sha3-256",
 		"verificationVector": encodeVerificationVector(share.VerificationVector),
 	}, nil

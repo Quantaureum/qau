@@ -53,6 +53,26 @@ const ipCleanupInterval = time.Hour
 // O(n) but only triggered at the cap, so normal operation stays O(1).
 const ipStatesMaxEntries = 200000
 
+// OBS-13-2 (round 13, 2026-10-22): the cap above used to be soft. When the
+// synchronous sweep at the cap reclaimed nothing (every entry still inside an
+// active ban, or freshly failing), getIPState / recordAuthFailure inserted
+// anyway and the map kept growing past ipStatesMaxEntries. The cap is now
+// fail-closed: a NEW source IP that cannot be admitted after the sweep is
+// rejected (HTTP 429) instead of being tracked. Existing entries keep working,
+// so an operator-visible ban list is never silently dropped.
+const ipSaturatedWarnInterval = time.Second
+
+// OBS-13-3 (round 13, 2026-10-22): xffWarnLast is a throttle table keyed by
+// peer RemoteAddr. It had no cap and no cleanup, so it grew for the lifetime
+// of the process (bounded only by how many distinct peer addresses ever
+// connected). Entries are useless after the one-second throttle window, so
+// the reaper drops anything older than xffWarnTTL and the insertion path
+// refuses to grow past xffWarnMaxEntries.
+const (
+	xffWarnMaxEntries = 8192
+	xffWarnTTL        = time.Minute
+)
+
 // ipRateState tracks per-IP rate-limit tokens and auth-failure counters.
 // BRDG- fields are protected by ipLimiterMu in BridgeAPI.
 type ipRateState struct {
@@ -74,6 +94,10 @@ type BridgeAPI struct {
 	// BRDG- per-IP rate limit + ban state.
 	ipLimiterMu sync.Mutex
 	ipStates    map[string]*ipRateState
+	// OBS-13-2: throttles the "tracking table saturated" warning so a
+	// sustained distinct-IP flood cannot turn rejections into log spam.
+	// Guarded by ipLimiterMu.
+	ipSaturatedLastWarn time.Time
 	// R43-BRIDGE-IP-01 FIX (2026-08-03): background TTL reaper goroutine.
 	// stopCleanup is closed to signal the reaper to exit; cleanupWG is
 	// waited on in Close() for clean shutdown. cleanupInterval is the
@@ -206,10 +230,34 @@ func (api *BridgeAPI) warnXFFIgnored(peer string) {
 		api.xffWarnMu.Unlock()
 		return
 	}
+	// OBS-13-3: never grow the throttle table past its cap. Reclaim
+	// entries that can no longer suppress anything (older than the TTL);
+	// if that frees nothing, drop the warning instead of the memory bound.
+	if len(api.xffWarnLast) >= xffWarnMaxEntries {
+		api.sweepXFFWarnLocked(now)
+		if len(api.xffWarnLast) >= xffWarnMaxEntries {
+			api.xffWarnMu.Unlock()
+			return
+		}
+	}
 	api.xffWarnLast[peer] = now
 	api.xffWarnMu.Unlock()
 	slog.Warn("bridge API: X-Forwarded-For seen but TrustProxy is false; ignoring header",
 		"peer", peer)
+}
+
+// sweepXFFWarnLocked drops throttle entries older than xffWarnTTL and
+// returns how many were removed. OBS-13-3 (round 13, 2026-10-22).
+// Caller must hold api.xffWarnMu.
+func (api *BridgeAPI) sweepXFFWarnLocked(now time.Time) int {
+	removed := 0
+	for peer, seen := range api.xffWarnLast {
+		if now.Sub(seen) > xffWarnTTL {
+			delete(api.xffWarnLast, peer)
+			removed++
+		}
+	}
+	return removed
 }
 
 // stripPort removes the trailing :port from a host:port RemoteAddr.
@@ -258,24 +306,45 @@ func (api *BridgeAPI) sweepExpiredIPStates() int {
 // the map has reached ipStatesMaxEntries, sweep expired/lapsed entries
 // synchronously (fail-closed-then-reclaimed). This caps memory under
 // sustained attack even between reaper ticks.
-func (api *BridgeAPI) getIPState(ip string) *ipRateState {
+//
+// OBS-13-2 (round 13, 2026-10-22): the boolean result is false when the
+// sweep could not free a slot. Callers MUST treat that as "deny" — the old
+// behavior inserted past the cap, which made ipStatesMaxEntries advisory.
+func (api *BridgeAPI) getIPState(ip string) (*ipRateState, bool) {
 	api.ipLimiterMu.Lock()
 	defer api.ipLimiterMu.Unlock()
-	st, ok := api.ipStates[ip]
-	if !ok {
-		if len(api.ipStates) >= ipStatesMaxEntries {
-			removed := api.sweepExpiredIPStates()
-			if removed > 0 {
-				slog.Info("bridge API: synchronous ipStates sweep at cap reclaimed entries",
-					"before", len(api.ipStates)+removed, "removed", removed, "cap", ipStatesMaxEntries)
-			}
-		}
-		st = &ipRateState{
-			limiter: newRateLimiter(int(apiRatePerSec), apiBurst),
-		}
-		api.ipStates[ip] = st
+	if st, ok := api.ipStates[ip]; ok {
+		return st, true
 	}
-	return st
+	if len(api.ipStates) >= ipStatesMaxEntries {
+		removed := api.sweepExpiredIPStates()
+		if removed > 0 {
+			slog.Info("bridge API: synchronous ipStates sweep at cap reclaimed entries",
+				"before", len(api.ipStates)+removed, "removed", removed, "cap", ipStatesMaxEntries)
+		}
+		if len(api.ipStates) >= ipStatesMaxEntries {
+			api.warnIPSaturatedLocked("getIPState")
+			return nil, false
+		}
+	}
+	st := &ipRateState{
+		limiter: newRateLimiter(int(apiRatePerSec), apiBurst),
+	}
+	api.ipStates[ip] = st
+	return st, true
+}
+
+// warnIPSaturatedLocked emits at most one "tracking table saturated"
+// warning per ipSaturatedWarnInterval. OBS-13-2. Caller must hold
+// api.ipLimiterMu.
+func (api *BridgeAPI) warnIPSaturatedLocked(caller string) {
+	now := time.Now()
+	if !api.ipSaturatedLastWarn.IsZero() && now.Sub(api.ipSaturatedLastWarn) < ipSaturatedWarnInterval {
+		return
+	}
+	api.ipSaturatedLastWarn = now
+	slog.Warn("bridge API: ipStates tracking table saturated; rejecting new source IPs",
+		"caller", caller, "cap", ipStatesMaxEntries)
 }
 
 // recordAuthFailure increments the per-IP failure counter and bans the IP
@@ -284,6 +353,10 @@ func (api *BridgeAPI) getIPState(ip string) *ipRateState {
 // R43-BRIDGE-IP-01 FIX (2026-08-03): same synchronous sweep-at-cap guard
 // as getIPState, so a flood of distinct-IP auth failures cannot grow the
 // map past ipStatesMaxEntries between reaper ticks.
+//
+// OBS-13-2 (round 13, 2026-10-22): when the sweep frees nothing the failure
+// is not recorded at all. Dropping the counter only weakens ban accounting
+// for an IP that was never tracked; growing the map would defeat the cap.
 func (api *BridgeAPI) recordAuthFailure(ip string) {
 	api.ipLimiterMu.Lock()
 	defer api.ipLimiterMu.Unlock()
@@ -294,6 +367,10 @@ func (api *BridgeAPI) recordAuthFailure(ip string) {
 			if removed > 0 {
 				slog.Info("bridge API: synchronous ipStates sweep at cap reclaimed entries (recordAuthFailure)",
 					"before", len(api.ipStates)+removed, "removed", removed, "cap", ipStatesMaxEntries)
+			}
+			if len(api.ipStates) >= ipStatesMaxEntries {
+				api.warnIPSaturatedLocked("recordAuthFailure")
+				return
 			}
 		}
 		st = &ipRateState{
@@ -362,6 +439,15 @@ func (api *BridgeAPI) startIPReaper() {
 						"removed", removed, "remaining", len(api.ipStates))
 				}
 				api.ipLimiterMu.Unlock()
+				// OBS-13-3: the XFF throttle table ages out on the same
+				// cadence so it cannot accumulate for the process lifetime.
+				api.xffWarnMu.Lock()
+				xffRemoved := api.sweepXFFWarnLocked(time.Now())
+				api.xffWarnMu.Unlock()
+				if xffRemoved > 0 {
+					slog.Debug("bridge API: periodic reaper pruned xffWarnLast entries",
+						"removed", xffRemoved)
+				}
 			}
 		}
 	}()
@@ -399,7 +485,13 @@ func (api *BridgeAPI) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusTooManyRequests, "rate limit: IP temporarily banned due to excessive auth failures")
 			return
 		}
-		st := api.getIPState(ip)
+		st, admitted := api.getIPState(ip)
+		if !admitted {
+			// OBS-13-2: tracking table is full of still-active entries;
+			// deny rather than grow past the cap.
+			writeError(w, http.StatusTooManyRequests, "rate limit: IP tracking table saturated")
+			return
+		}
 		if !st.limiter.allow() {
 			writeError(w, http.StatusTooManyRequests, "rate limit: too many requests")
 			return

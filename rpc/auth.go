@@ -782,6 +782,52 @@ func (am *AuthManager) AuthorizeMethod(r *http.Request, method string) error {
 	return am.validateRequest(r, method, false, false)
 }
 
+// checkGlobalIPWhitelistLocked enforces the operator's global IP allowlist
+// against one client IP. It returns nil when no allowlist is configured.
+//
+// OBS-15-1 (2026-10-28): extracted so every request path — single request,
+// HTTP batch, WebSocket batch — enforces the SAME global rule through one
+// implementation. The rule is per-request (it depends only on the client IP),
+// not per-method, so it must not be tied to whether the batch happens to
+// contain a non-public method.
+//
+// Caller must hold am.mu (read or write).
+func (am *AuthManager) checkGlobalIPWhitelistLocked(clientIP string) error {
+	if len(am.config.GlobalIPWhitelist) == 0 {
+		return nil
+	}
+	if !am.isIPAllowed(clientIP, am.config.GlobalIPWhitelist) {
+		return ErrIPNotAllowed
+	}
+	return nil
+}
+
+// CheckGlobalIPWhitelist enforces the operator's global IP allowlist for a
+// request, independently of the methods it carries.
+//
+// OBS-15-1 (2026-10-28): the HTTP batch path used to run its whole auth block
+// behind `if len(nonPublicMethods) > 0`, so a batch of only public methods
+// skipped every GlobalIPWhitelist enforcement point — the batch was dispatched
+// to method handlers while the identical single-request path was rejected.
+// This is the HTTP sibling of the WebSocket batch gap fixed by R15-01. The
+// batch path now calls this before dispatching, so an allowlist restricts the
+// whole endpoint rather than only the requests that happen to carry a
+// non-public method.
+func (am *AuthManager) CheckGlobalIPWhitelist(r *http.Request) error {
+	if am == nil {
+		return nil
+	}
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	if !am.config.Enabled {
+		return nil
+	}
+
+	clientIP := getClientIPWithTrust(r, am.config.TrustedProxies)
+	return am.checkGlobalIPWhitelistLocked(clientIP)
+}
+
 // validateRequest is the shared authorization core. verifyHMAC controls whether
 // the HMAC signature is checked (only once per batch). isFullValidation controls
 // rate limiting and usage-stat updates (only for the primary validation pass).
@@ -792,6 +838,23 @@ func (am *AuthManager) validateRequest(r *http.Request, method string, verifyHMA
 	// Check if authentication is enabled
 	if !am.config.Enabled {
 		return nil
+	}
+
+	clientIP := getClientIPWithTrust(r, am.config.TrustedProxies)
+
+	// R14-03 FIX (2026-10-27): GlobalIPWhitelist is GLOBAL — it must gate every
+	// request, public methods included. This check used to sit AFTER the
+	// public-method loop below, so every method listed in PublicMethods
+	// skipped the operator's allowlist entirely: an operator who set
+	// GlobalIPWhitelist to restrict RPC to their own network still served the
+	// whole public surface to the internet. Order matters here — allowlist
+	// first, then the public-method shortcut, then the brute-force lockout.
+	//
+	// OBS-15-1 (2026-10-28): the check moved into the shared helper
+	// checkGlobalIPWhitelistLocked so the batch paths can enforce the same
+	// rule without duplicating it. See CheckGlobalIPWhitelist.
+	if err := am.checkGlobalIPWhitelistLocked(clientIP); err != nil {
+		return err
 	}
 
 	// Check if method is public
@@ -806,16 +869,8 @@ func (am *AuthManager) validateRequest(r *http.Request, method string, verifyHMA
 	// is locked out for AuthLockoutDuration regardless of which API key it
 	// subsequently presents. Without this guard, an attacker could keep
 	// cycling API keys against the same endpoint to bypass per-key throttling.
-	clientIP := getClientIPWithTrust(r, am.config.TrustedProxies)
 	if err := am.checkAuthLockout(clientIP); err != nil {
 		return err
-	}
-
-	// Check global IP whitelist
-	if len(am.config.GlobalIPWhitelist) > 0 {
-		if !am.isIPAllowed(clientIP, am.config.GlobalIPWhitelist) {
-			return ErrIPNotAllowed
-		}
 	}
 
 	// Get API key from header only.

@@ -199,3 +199,45 @@ func TestSetQTDSignerReRootsCustody(t *testing.T) {
 		t.Fatal("unproven rotation accepted after re-root")
 	}
 }
+
+// TestR19_F02_FirstEstablishmentMustMatchLocalSigner pins the R19-F02
+// hardening: when the node holds its own group key (qtdSigner configured),
+// the FIRST anchor adopted into an empty history must match the local
+// signer's key — otherwise a malicious proposer could anchor a forged
+// QTDGroupKey (the header field is not covered by the proposer signature)
+// into an observer's trust store and forge seals for that epoch.
+func TestR19_F02_FirstEstablishmentMustMatchLocalSigner(t *testing.T) {
+	localKey := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	localKey[0] = 0x11
+	localKey[len(localKey)-1] = 0x22
+
+	attackerKey := make([]byte, qcrypto.Dilithium3PublicKeySize)
+	attackerKey[0] = 0x33
+	attackerKey[len(attackerKey)-1] = 0x44
+
+	qfs := &QTDFinalityState{}
+	qfs.SetQTDSigner(&keyAwareSigner{currentKey: localKey, expectedKey: localKey})
+	// SetQTDSigner records the signer's key in groupKeyHistory; clear it to
+	// exercise the first-establishment branch (same trick as
+	// cons_p0_01_03_test.go).
+	qfs.mu.Lock()
+	qfs.groupKeyHistory = make(map[uint64][]byte)
+	qfs.mu.Unlock()
+
+	// An attacker-anchored key that differs from the local signer's key must
+	// be refused on first establishment.
+	if qfs.ObserveAnchoredGroupKey(3, attackerKey, nil) {
+		t.Fatal("first establishment with a key differing from the local signer key must be refused (R19-F02)")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(3); got != nil && bytes.Equal(got, attackerKey) {
+		t.Fatal("attacker key must not have been adopted")
+	}
+
+	// The legitimate key (matching the local signer) is adopted.
+	if !qfs.ObserveAnchoredGroupKey(3, localKey, nil) {
+		t.Fatal("first establishment with the local signer's own key must be adopted")
+	}
+	if got := qfs.getGroupPublicKeyForEpoch(3); !bytes.Equal(got, localKey) {
+		t.Fatal("local signer key must be the adopted group key")
+	}
+}

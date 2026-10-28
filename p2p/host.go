@@ -630,6 +630,24 @@ type Peer struct {
 	disconnectCleanupOnce sync.Once
 }
 
+// stop signals the peer's goroutines to exit. It is the ONLY safe way to call
+// cancel on a Peer taken from h.peers.
+//
+// R14-04 FIX (2026-10-27): handleInboundConnection reserves a slot in h.peers
+// with a PLACEHOLDER Peer{ID, Addr, Connected, Direction} while the handshake
+// is in flight — no ctx, no cancel. Any teardown that iterates h.peers (Stop,
+// disconnectAllPeersForCertRotation) therefore reaches entries whose cancel is
+// nil. Calling nil there is an unrecoverable panic, and both of those loops
+// hold h.peersMu while iterating, so the panic also leaves the peer mutex
+// locked forever (every later peer operation deadlocks). Guard instead: a
+// placeholder has no goroutines to signal, so stopping it is a no-op.
+func (p *Peer) stop() {
+	if p == nil || p.cancel == nil {
+		return
+	}
+	p.cancel()
+}
+
 // disconnectCleanup runs sybil-resistance and peer-scorer disconnect hooks
 // exactly once per peer. Safe to call from both readLoop and writeLoop
 // defers. P2P-H01 FIX (R29).
@@ -2085,7 +2103,7 @@ func (h *Host) Stop() error {
 	// Close all peer connections
 	h.peersMu.Lock()
 	for _, peer := range h.peers {
-		peer.cancel()
+		peer.stop()
 		if peer.Conn != nil {
 			peer.Conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
 		}
@@ -2323,7 +2341,7 @@ func (h *Host) Disconnect(id PeerID) error {
 		"direction": peer.Direction.String(),
 	})
 
-	peer.cancel()
+	peer.stop()
 	if peer.Conn != nil {
 		peer.Conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
 	}
@@ -2340,7 +2358,7 @@ func (h *Host) disconnectPeer(peer *Peer) {
 		"addr":      peer.Addr,
 		"direction": peer.Direction.String(),
 	})
-	peer.cancel()
+	peer.stop()
 	if peer.Conn != nil {
 		peer.Conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
 	}
@@ -2369,7 +2387,7 @@ func (h *Host) disconnectPeer(peer *Peer) {
 //
 // This is registered as a rotation callback via
 // NodeCertificateManager.RegisterRotationCallback. It runs in the rotation
-// goroutine, so it must not block on network I/O. peer.cancel() and
+// goroutine, so it must not block on network I/O. peer.stop() and
 // Conn.Close() are non-blocking from the caller's perspective (they signal
 // the peer goroutines to exit; the actual teardown happens asynchronously).
 // The reconnection is launched as a separate goroutine.
@@ -2379,7 +2397,7 @@ func (h *Host) disconnectAllPeersForCertRotation() {
 	disconnected := 0
 	var reconnectAddrs []string
 	for _, peer := range h.peers {
-		peer.cancel()
+		peer.stop()
 		if peer.Conn != nil {
 			peer.Conn.Close() // #nosec G104 -- non-critical //nolint:errcheck
 		}
@@ -2813,7 +2831,7 @@ func (h *Host) handleConnection(conn net.Conn, dir Direction) error {
 			if dir == DirOutbound {
 				h.peers[peerID] = peer
 				h.peersMu.Unlock()
-				existing.cancel()
+				existing.stop()
 				if existing.Conn != nil {
 					existing.Conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
 				}
@@ -2834,7 +2852,7 @@ func (h *Host) handleConnection(conn net.Conn, dir Direction) error {
 			if dir == DirInbound {
 				h.peers[peerID] = peer
 				h.peersMu.Unlock()
-				existing.cancel()
+				existing.stop()
 				if existing.Conn != nil {
 					existing.Conn.Close() // #nosec G104 -- error intentionally ignored: non-critical operation //nolint:errcheck
 				}
@@ -3572,7 +3590,7 @@ func (h *Host) readLoop(peer *Peer) {
 	// Previously when readLoop exited (peer disconnect, malformed message,
 	// context cancel), it removed the peer from h.peers and closed
 	// peer.Conn, but did NOT:
-	//   1. Call peer.cancel() — so writeLoop's `<-peer.ctx.Done()` never
+	//   1. Call peer.stop() — so writeLoop's `<-peer.ctx.Done()` never
 	//      fired. writeLoop would block forever on `peer.sendCh`, leaking
 	//      the goroutine. Each disconnected peer leaked one goroutine plus
 	//      its 4096-buffered sendCh (up to 4096 * ~5KB = 20MB of queued
@@ -3581,7 +3599,7 @@ func (h *Host) readLoop(peer *Peer) {
 	//      starvation, similar to the DASClient leak in R20).
 	//   2. Close peer.sendCh — so any goroutine doing a blocking send
 	//      (SendMessage, broadcastTx, etc.) would also leak.
-	// Now we call peer.cancel() FIRST (signals writeLoop to exit via
+	// Now we call peer.stop() FIRST (signals writeLoop to exit via
 	// ctx.Done), then close peer.sendCh (unblocks any goroutine doing a
 	// blocking send on this peer). The close is guarded by a sync.Once
 	// (see Peer.closeOnce) to prevent double-close panics if disconnectPeer
@@ -3596,7 +3614,7 @@ func (h *Host) readLoop(peer *Peer) {
 		// This must happen BEFORE Conn.Close() so writeLoop's select can
 		// observe ctx.Done() and exit cleanly rather than blocking on
 		// sendCh.
-		peer.cancel()
+		peer.stop()
 		// P2P-R31-PANIC: retire the send channel (no close — see
 		// closeSendCh). Senders never block on it (all sends are
 		// select/default), so this is teardown bookkeeping only.
@@ -3916,7 +3934,7 @@ func (h *Host) writeLoop(peer *Peer) {
 	// closeOnce guard prevents double-close panics if both defers run.
 	defer func() {
 		// Signal readLoop to exit (it may be blocked on readFull).
-		peer.cancel()
+		peer.stop()
 		// P2P-R31-PANIC: retire the send channel (no close — see
 		// closeSendCh).
 		peer.closeSendCh()
@@ -6070,16 +6088,40 @@ type ActiveValidatorIdentityVerifier interface {
 // file-backed implementation): the persisted set is loaded when the hook
 // is installed and snapshotted on every mutation.
 //
+// OBS-13-1 (round 13, 2026-10-22): hard cap on the tracked tuple set.
+// Trim existed but no production code path ever called it, so a long-lived
+// node grew the map at the inbound status rate (56B key + map overhead per
+// tuple) with no upper bound. The cap is enforced inside Seen — the only
+// insertion path — so the bound holds no matter how callers schedule
+// maintenance. 2^18 tuples is ~25 MB worst case. Reaching it requires that
+// many DISTINCT status frames that already passed Dilithium3 verification
+// and the freshness window, so eviction here trades a vanishingly small
+// replay window for a hard memory bound.
+const defaultMaxSessionNonceEntries = 1 << 18
+
+// sessionNonceTrimDivisor controls how much headroom a cap-triggered trim
+// frees: drop down to max - max/10 so the next 10% of insertions do not
+// re-trigger the sweep on every single call. Mirrors the bounded-eviction
+// pattern used by message_validator's seenMessages.
+const sessionNonceTrimDivisor = 10
+
 // R38-P2-01 DEEP FIX (Protocol V2, 2026-08-02).
 type SessionNonceTracker struct {
-	mu        sync.Mutex
-	seen      map[[56]byte]struct{}
-	persister SessionNoncePersister
+	mu sync.Mutex
+	// seen is bounded by maxEntries; zero maxEntries means the package
+	// default (see defaultMaxSessionNonceEntries). There is no unbounded
+	// mode: OBS-13-1 showed an unbounded tracker is a slow memory leak.
+	seen       map[[56]byte]struct{}
+	maxEntries int
+	persister  SessionNoncePersister
 }
 
 // NewSessionNonceTracker constructs an empty tracker.
 func NewSessionNonceTracker() *SessionNonceTracker {
-	return &SessionNonceTracker{seen: make(map[[56]byte]struct{})}
+	return &SessionNonceTracker{
+		seen:       make(map[[56]byte]struct{}),
+		maxEntries: defaultMaxSessionNonceEntries,
+	}
 }
 
 // SessionNoncePersister is the optional persistence hook for the
@@ -6204,6 +6246,13 @@ func (t *SessionNonceTracker) Seen(addr types.Address, peerID PeerID, nonce [16]
 		return true
 	}
 	t.seen[k] = struct{}{}
+	if max := t.effectiveMaxLocked(); max > 0 && len(t.seen) > max {
+		t.trimLocked(max - max/sessionNonceTrimDivisor)
+		// Trim iterates the map in random order, so the tuple we just
+		// recorded can be the one evicted. Re-adding it keeps the freshest
+		// nonce inside the replay window; the 10% headroom leaves room.
+		t.seen[k] = struct{}{}
+	}
 	t.persistLocked()
 	return false
 }
@@ -6231,6 +6280,11 @@ func (t *SessionNonceTracker) SetPersister(p SessionNoncePersister) error {
 	}
 	for _, k := range keys {
 		t.seen[k] = struct{}{}
+	}
+	// OBS-13-1: a store written by an older build may exceed the current
+	// cap; enforce it on load so the bound holds from the first insert on.
+	if max := t.effectiveMaxLocked(); max > 0 && len(t.seen) > max {
+		t.trimLocked(max)
 	}
 	if len(keys) > 0 {
 		hostLog.Info("Loaded persisted session nonces", map[string]any{"count": len(keys)})
@@ -6275,6 +6329,59 @@ func (t *SessionNonceTracker) Trim(max int) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	before := len(t.seen)
+	t.trimLocked(max)
+	if len(t.seen) != before {
+		t.persistLocked()
+	}
+}
+
+// SetMaxEntries changes the hard cap enforced by Seen (OBS-13-1). A value
+// <= 0 restores the package default; there is deliberately no way to make
+// the tracker unbounded. If the tracker is currently over the new cap it is
+// trimmed immediately.
+func (t *SessionNonceTracker) SetMaxEntries(max int) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxEntries = max
+	effective := t.effectiveMaxLocked()
+	if effective > 0 && len(t.seen) > effective {
+		t.trimLocked(effective)
+		t.persistLocked()
+	}
+}
+
+// MaxEntries returns the effective hard cap.
+func (t *SessionNonceTracker) MaxEntries() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.effectiveMaxLocked()
+}
+
+// effectiveMaxLocked resolves the configured cap, falling back to the
+// package default for zero-value trackers built outside the constructor.
+// Callers must hold t.mu.
+func (t *SessionNonceTracker) effectiveMaxLocked() int {
+	if t.maxEntries > 0 {
+		return t.maxEntries
+	}
+	return defaultMaxSessionNonceEntries
+}
+
+// trimLocked drops entries until at most max remain. Deletion is a single
+// pass over the map, so the work is O(len(seen)) once — never the O(n^2)
+// repeated-scan pattern that R12-01 removed from message_validator.
+// Callers must hold t.mu and are responsible for persisting afterwards.
+func (t *SessionNonceTracker) trimLocked(max int) {
+	if max < 0 {
+		max = 0
+	}
 	if len(t.seen) <= max {
 		return
 	}
@@ -6284,10 +6391,9 @@ func (t *SessionNonceTracker) Trim(max int) {
 		delete(t.seen, k)
 		i++
 		if i >= drop {
-			break
+			return
 		}
 	}
-	t.persistLocked()
 }
 
 // SetActiveValidatorIdentityVerifier installs the Protocol V2 active-set

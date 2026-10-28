@@ -37,7 +37,12 @@ const (
 	// runs out of memory. Messages beyond the cap are rejected; the sender
 	// can retry once relay drains the queue.
 	ShardMaxPendingMsgs = 10000
-	ShardAssignDomain   = "QUANTAUREUM_SHARD_ASSIGN_V1"
+	// R19-F5 (2026-10-28): bounds the submitted-message-ID registry used by
+	// the relay path to distinguish validated submissions from P2P-direct
+	// relays. Sized to comfortably exceed ShardMaxPendingMsgs so a full
+	// pending queue never evicts IDs that are still queued.
+	ShardSubmittedTrackMax = 50000
+	ShardAssignDomain      = "QUANTAUREUM_SHARD_ASSIGN_V1"
 	// FIX: Quorum threshold for shard block finalization.
 	// Requires 2/3 of validators to attest before a block can be finalized.
 	ShardFinalityQuorumNum = 2
@@ -187,10 +192,21 @@ type ShardChain struct {
 	pendingMsgs      []*CrossShardMessage
 	receipts         map[types.Hash]*CrossShardReceipt
 	spentReceipts    map[types.Hash]bool
-	// AUDIT (2026) HIGH-17: track highest nonce per sender to enforce
-	// monotonicity and prevent cross-shard message replay via crafted IDs.
-	senderNonces map[types.Address]uint64
-	maxBlocks    int
+	// R19-F5 (2026-10-28): FIFO order for the receipts table, enabling
+	// oldest-entry eviction once ShardReceiptMaxPending is reached. The
+	// receipts map previously grew without bound on the relay path (the
+	// only delete was for blocks) — one fresh nonce per message minted one
+	// receipt each, with no cap and no cleanup.
+	receiptOrder []types.Hash
+	// R19-F5: bounded registry of message IDs that went through
+	// SubmitCrossShardMessage. The relay path consults it to distinguish
+	// "relay of an already-validated submission" from "P2P-direct relay of
+	// a never-validated message", which must run the full admission suite
+	// (payload cap, freshness, nonce monotonicity) before minting a receipt.
+	submittedMsgs  map[types.Hash]struct{}
+	submittedOrder []types.Hash
+	senderNonces   map[types.Address]uint64
+	maxBlocks      int
 	// P0-1 (2026-07-13): stateDB holds the shard's state database for real
 	// stateRoot computation. When set, ProposeBlock calls CommitWithBlock to
 	// compute the actual Verkle trie root. When nil (test/initial deployment),
@@ -534,6 +550,143 @@ func (sm *ShardManager) LoadAssignments() error {
 	return nil
 }
 
+// RestoreFromStore repopulates this chain's in-memory state from the
+// persistent store. It must be called after the shard's validator assignment
+// is loaded (LoadAssignments) and before the block producer starts, so that
+// replay protection and chain continuity survive a restart.
+//
+// R19-F2 FIX (2026-10-28): the write side of ShardStateStore existed since
+// P0-3 but nothing ever read it back, so every restart silently discarded
+// the HIGH-17 replay-protection state (spentReceipts, senderNonces) —
+// allowing cross-shard double-spends via re-created unspent receipts and
+// replay of old signed messages — as well as the block history (a restarted
+// node only accepted height 1 again). Restores:
+//   - latest height, and the retained block window [latest-maxBlocks+1, latest]
+//     (bounded by the same maxBlocks retention the in-memory map enforces)
+//   - commitments (finality anchors, for AuthenticateCommitment)
+//   - receipts + spentReceipts (cross-shard double-spend protection)
+//   - senderNonces (HIGH-17 nonce monotonicity across restarts)
+//
+// Missing store entries are skipped (the store may legitimately hold less
+// than the retention window); failures are fatal to restore so a partially
+// restored chain is never left believing it is complete.
+func (sc *ShardChain) RestoreFromStore() error {
+	if sc == nil {
+		return ErrShardNotFound
+	}
+	if sc.stateStore == nil {
+		return ErrStateStoreNotConfigured
+	}
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	// 1. Latest height.
+	latest, ok, err := sc.stateStore.GetLatestHeight(sc.shardID)
+	if err != nil {
+		return fmt.Errorf("restore: latest height: %w", err)
+	}
+	if ok && latest > sc.latest {
+		sc.latest = latest
+	}
+
+	// 2. Retained block window. Bound the scan to maxBlocks heights ending
+	// at latest, matching the in-memory retention policy; heights missing
+	// from the store are skipped.
+	if sc.latest > 0 {
+		var lowest uint64
+		if uint64(sc.maxBlocks) < sc.latest {
+			lowest = sc.latest - uint64(sc.maxBlocks) + 1
+		}
+		restoredBlocks := 0
+		for h := lowest; h <= sc.latest; h++ {
+			if _, exists := sc.blocks[h]; exists {
+				continue
+			}
+			blk, err := sc.stateStore.GetBlock(sc.shardID, h)
+			if err != nil {
+				return fmt.Errorf("restore: block %d: %w", h, err)
+			}
+			if blk == nil {
+				continue
+			}
+			sc.blocks[h] = blk
+			restoredBlocks++
+		}
+		// 3. Commitments over the same window.
+		for h := lowest; h <= sc.latest; h++ {
+			if _, exists := sc.commitments[h]; exists {
+				continue
+			}
+			cmt, found, err := sc.stateStore.GetCommitment(sc.shardID, h)
+			if err != nil {
+				return fmt.Errorf("restore: commitment %d: %w", h, err)
+			}
+			if found {
+				sc.commitments[h] = cmt
+			}
+		}
+		if restoredBlocks > 0 {
+			shardLogger.Info("shard blocks restored from state store",
+				map[string]any{"shard_id": sc.shardID, "latest": sc.latest,
+					"blocks": restoredBlocks, "window": [2]uint64{lowest, sc.latest}})
+		}
+	}
+
+	// 4. Receipts (cross-shard double-spend protection + relay dedup).
+	// R19-F5: respect the same ShardReceiptMaxPending bound as the live
+	// insertion path — the store may hold more than the cap (evicted
+	// entries are not deleted from the store), and restoring all of them
+	// would defeat the memory bound. Spent markers are restored
+	// independently below and are the security-critical state.
+	receiptCount := 0
+	if err := sc.stateStore.IterateReceipts(sc.shardID, func(msgID types.Hash, receipt *CrossShardReceipt) error {
+		if _, exists := sc.receipts[msgID]; exists {
+			return nil
+		}
+		if len(sc.receiptOrder) >= ShardReceiptMaxPending {
+			return nil
+		}
+		sc.receipts[msgID] = receipt
+		sc.receiptOrder = append(sc.receiptOrder, msgID)
+		receiptCount++
+		return nil
+	}); err != nil {
+		return fmt.Errorf("restore: receipts: %w", err)
+	}
+
+	// 5. Spent markers (HIGH-17: cross-shard double-spend protection).
+	spentCount := 0
+	if err := sc.stateStore.IterateSpentReceipts(sc.shardID, func(msgID types.Hash) error {
+		if !sc.spentReceipts[msgID] {
+			sc.spentReceipts[msgID] = true
+			spentCount++
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("restore: spent receipts: %w", err)
+	}
+
+	// 6. Sender nonces (HIGH-17: nonce monotonicity across restarts).
+	nonceCount := 0
+	if err := sc.stateStore.IterateSenderNonces(sc.shardID, func(sender types.Address, nonce uint64) error {
+		if cur, exists := sc.senderNonces[sender]; !exists || nonce > cur {
+			sc.senderNonces[sender] = nonce
+			nonceCount++
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("restore: sender nonces: %w", err)
+	}
+
+	if receiptCount+spentCount+nonceCount > 0 {
+		shardLogger.Info("shard replay-protection state restored from state store",
+			map[string]any{"shard_id": sc.shardID, "receipts": receiptCount,
+				"spent": spentCount, "nonces": nonceCount})
+	}
+	return nil
+}
+
 func NewShardChain(shardID uint64, validators []types.Address) *ShardChain {
 	return &ShardChain{
 		shardID:          shardID,
@@ -547,6 +700,7 @@ func NewShardChain(shardID uint64, validators []types.Address) *ShardChain {
 		pendingMsgs:      make([]*CrossShardMessage, 0),
 		receipts:         make(map[types.Hash]*CrossShardReceipt),
 		spentReceipts:    make(map[types.Hash]bool),
+		submittedMsgs:    make(map[types.Hash]struct{}),
 		senderNonces:     make(map[types.Address]uint64),
 		maxBlocks:        1024,
 	}
@@ -634,23 +788,28 @@ func (sc *ShardChain) SetStateStore(store *ShardStateStore) {
 	sc.stateStore = store
 }
 
-// PrepareBlockSigningHash computes the signing hash for a proposed block at
-// the next height (sc.latest + 1), so the proposer can sign it before calling
-// ProposeBlock.
+// PrepareBlockSigningHash builds the header for the next block (height
+// sc.latest + 1) and returns it together with the hash the proposer must
+// sign before calling ProposeBlock.
 //
 // P1-2 (2026-07-14): This bridges the gap between the proposer (who needs to
 // sign the block header) and ProposeBlock (which verifies the signature
-// internally). The proposer calls this method, signs the returned hash with
-// their Dilithium3 private key, then passes the signature to ProposeBlock.
+// internally).
 //
-// The signing hash excludes the Signature and Timestamp fields (timestamp is
-// set by ProposeBlock internally). See computeShardBlockSigningHash for details.
-func (sc *ShardChain) PrepareBlockSigningHash(proposer types.Address, txs [][]byte, crossMsgs []*CrossShardMessage) ([]byte, error) {
+// R19-F1 (2026-10-28): the returned header is COMPLETE — including the
+// proposer-set Timestamp and the caller-supplied VRF fields — and the
+// signing hash covers all of it. Previously this method hashed a header
+// WITHOUT the timestamp while ProposeBlock proposed a header WITH one, so
+// the signature never committed to the timestamp that entered the block
+// hash. The caller must pass the SAME header instance to ProposeBlock;
+// any deviation between prepare-time and propose-time chain state is
+// rejected there (parent/height/body-root re-checks).
+func (sc *ShardChain) PrepareBlockSigningHash(proposer types.Address, txs [][]byte, crossMsgs []*CrossShardMessage, vrfProof []byte, vrfOutput types.Hash) (*ShardBlockHeader, []byte, error) {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
 	if sc.status != ShardStatusActive {
-		return nil, ErrShardNotActive
+		return nil, nil, ErrShardNotActive
 	}
 
 	height := sc.latest + 1
@@ -669,9 +828,12 @@ func (sc *ShardChain) PrepareBlockSigningHash(proposer types.Address, txs [][]by
 		StateRoot:    stateRoot,
 		TxRoot:       txRoot,
 		CrossMsgRoot: crossMsgRoot,
+		Timestamp:    uint64(time.Now().Unix()),
 		Proposer:     proposer,
+		VRFProof:     vrfProof,
+		VRFOutput:    vrfOutput,
 	}
-	return computeShardBlockSigningHash(header), nil
+	return header, computeShardBlockSigningHash(header), nil
 }
 
 // InjectDependencies injects stateStore and electionVerifier into this shard
@@ -1424,14 +1586,54 @@ func (sc *ShardChain) Epoch() uint64 {
 // proof validity but NOT election results) has been removed as it was
 // insecure — any validator with a registered public key could propose blocks
 // in arbitrary slots.
-func (sc *ShardChain) ProposeBlock(proposer types.Address, txs [][]byte, crossMsgs []*CrossShardMessage, signature []byte, vrfProof []byte, vrfOutput types.Hash) (*ShardBlock, error) {
+// ProposeBlock stores a block whose header was built by
+// PrepareBlockSigningHash and signed by the proposer.
+//
+// R19-F1 (2026-10-28): the signature now covers the COMPLETE prepared header
+// (including Timestamp and VRF fields), so the caller passes the same header
+// instance it signed. ProposeBlock re-validates the header against current
+// chain state — height, parent hash, body roots, shard, proposer — so a
+// stale or mutated prepared header cannot be smuggled through.
+//
+// FIX: Previously ProposeBlock accepted any validator as
+// proposer without verifying a signature, and never set the Signature field on
+// the block header. This allowed any node to forge blocks under any validator's
+// identity. Now the proposer must supply a Dilithium3 signature over the block
+// header (excluding the Signature field itself), which is verified against the
+// proposer's registered public key.
+//
+// FIX: The stateRoot is still a zero placeholder because
+// computing the actual trie root requires state-DB integration that is not yet
+// available in the shard module. CommitBlockToMainChain now rejects zero
+// stateRoots, so proposed blocks cannot be committed until real stateRoot
+// computation is implemented. This fail-closed behavior prevents committing
+// blocks that commit to no specific state.
+//
+// audit-fix M-6 [MEDIUM]: ProposeBlock verifies VRF proof to ensure the
+// proposer was legitimately elected for this slot.
+//
+// FIX [HIGH]: ProposeBlock now requires an ElectionVerifier
+// to be set (via SetElectionVerifier). The verifier performs full VRF +
+// election verification, ensuring only the elected proposer can propose blocks.
+// If no ElectionVerifier is set, ProposeBlock returns ErrShardVRFSeedNotSet
+// (fail-closed). The vrfSeed-based fallback path (which only verified VRF
+// proof validity but NOT election results) has been removed as it was
+// insecure — any validator with a registered public key could propose blocks
+// in arbitrary slots.
+func (sc *ShardChain) ProposeBlock(header *ShardBlockHeader, txs [][]byte, crossMsgs []*CrossShardMessage, signature []byte) (*ShardBlock, error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
 	if sc.status != ShardStatusActive {
 		return nil, ErrShardNotActive
 	}
-
+	if header == nil {
+		return nil, ErrCrossMsgInvalid
+	}
+	if header.ShardID != sc.shardID {
+		return nil, fmt.Errorf("prepared header is for shard %d, not %d", header.ShardID, sc.shardID)
+	}
+	proposer := header.Proposer
 	if !sc.isValidatorLocked(proposer) {
 		return nil, fmt.Errorf("address %x is not a validator for shard %d", proposer[:4], sc.shardID)
 	}
@@ -1452,8 +1654,30 @@ func (sc *ShardChain) ProposeBlock(proposer types.Address, txs [][]byte, crossMs
 		return nil, fmt.Errorf("invalid public key for proposer %s: %w", proposer.ToHexAddress(), err)
 	}
 
-	// Compute height early — needed by the election verifier.
-	height := sc.latest + 1
+	// R19-F1 (2026-10-28): the prepared header carries the height, parent,
+	// roots, timestamp and VRF fields that were signed. Re-validate every
+	// chain-derived field against CURRENT state so a stale or mutated
+	// prepared header cannot be proposed: height must be next, the parent
+	// hash must match the current tip, and the body must hash to the roots
+	// the header commits to.
+	if header.Height != sc.latest+1 {
+		return nil, fmt.Errorf("prepared header height %d does not match next height %d", header.Height, sc.latest+1)
+	}
+	var expectedParent types.Hash
+	if parent, exists := sc.blocks[sc.latest]; exists {
+		expectedParent = computeShardBlockHash(parent.Header)
+	}
+	if header.ParentHash != expectedParent {
+		return nil, fmt.Errorf("prepared header parent %x does not match current tip %x",
+			header.ParentHash[:8], expectedParent[:8])
+	}
+	if computedTxRoot := computeTxRoot(txs); computedTxRoot != header.TxRoot {
+		return nil, fmt.Errorf("prepared header tx root does not match supplied txs")
+	}
+	if computedCrossRoot := computeCrossMsgRoot(crossMsgs); computedCrossRoot != header.CrossMsgRoot {
+		return nil, fmt.Errorf("prepared header cross-msg root does not match supplied crossMsgs")
+	}
+	height := header.Height
 
 	// FIX [HIGH]: Verify that the proposer was legitimately
 	// elected via VRF for this slot.
@@ -1469,7 +1693,7 @@ func (sc *ShardChain) ProposeBlock(proposer types.Address, txs [][]byte, crossMs
 	// Note: we already hold sc.mu (write lock) so we can read sc.electionVerifier
 	// directly.
 	if sc.electionVerifier != nil {
-		if err := sc.electionVerifier.VerifyProposerElection(proposer, vrfProof, vrfOutput, height); err != nil {
+		if err := sc.electionVerifier.VerifyProposerElection(proposer, header.VRFProof, header.VRFOutput, height); err != nil {
 			// P3-3 (2026-07-15): Election failure is a security event — a
 			// validator attempted to propose in a slot they were not elected to.
 			shardLogger.Warn("propose block rejected: election verification failed",
@@ -1484,35 +1708,8 @@ func (sc *ShardChain) ProposeBlock(proposer types.Address, txs [][]byte, crossMs
 		return nil, ErrShardVRFSeedNotSet
 	}
 
-	var parentHash types.Hash
-	if parent, exists := sc.blocks[sc.latest]; exists {
-		parentHash = computeShardBlockHash(parent.Header)
-	}
-
-	txRoot := computeTxRoot(txs)
-	crossMsgRoot := computeCrossMsgRoot(crossMsgs)
-
-	// P0-1 (2026-07-13): Compute the stateRoot using the attached stateDB
-	// (real Verkle trie root) or a deterministic non-zero fallback commitment
-	// derived from block contents. Previously this was always a zero hash,
-	// causing CommitBlockToMainChain to fail-closed with ErrShardStateRootZero.
-	// We already hold sc.mu (write lock), so use computeStateRootLocked.
-	stateRoot := computeStateRootLocked(sc.stateDB, sc.shardID, height, parentHash, txRoot, crossMsgRoot)
-
-	header := &ShardBlockHeader{
-		ShardID:      sc.shardID,
-		Height:       height,
-		ParentHash:   parentHash,
-		StateRoot:    stateRoot,
-		TxRoot:       txRoot,
-		CrossMsgRoot: crossMsgRoot,
-		Timestamp:    uint64(time.Now().Unix()), // R4-C1 NOTE: Proposer-set block timestamp — standard blockchain behavior. The proposer sets the time, validators check it's within bounds, and all nodes process the same block header. NOT a consensus determinism issue.
-		Proposer:     proposer,
-		VRFProof:     vrfProof,
-		VRFOutput:    vrfOutput,
-	}
-
-	// FIX: Verify signature over the header (without Signature field).
+	// FIX: Verify signature over the COMPLETE prepared header (R19-F1:
+	// including Timestamp and VRF fields).
 	msg := computeShardBlockSigningHash(header)
 	if !qaucrypto.Verify(pubKey, msg, signature) {
 		// P3-3 (2026-07-15): Invalid signature is a security event.
@@ -1783,10 +1980,13 @@ func (sc *ShardChain) ReceiveBlock(block *ShardBlock) error {
 
 	// SHRD- (2026-07-17): Timestamp drift check.
 	//
-	// The proposer sets header.Timestamp (standard blockchain behavior). The
-	// signature already covers the timestamp, so a proposer cannot retroactively
-	// change it. However, an elected proposer can still pick an arbitrary
-	// timestamp when signing. Reject blocks whose timestamp drifts more than
+	// The proposer sets header.Timestamp (standard blockchain behavior).
+	// R19-F1 (2026-10-28): the proposer's signature now COVERS the timestamp
+	// (it was previously omitted from the signing hash, leaving the same
+	// proposer signature valid for every timestamp variant of the block).
+	// An elected proposer can still pick an arbitrary timestamp when signing,
+	// but cannot equivocate between timestamp variants of the same block.
+	// Reject blocks whose timestamp drifts more than
 	// ShardMaxTimestampDrift seconds from the receiver's wall clock — this
 	// bounds the impact on cross-shard message Timestamp fields and block
 	// hashes, and fulfills the bound-check promise documented at the
@@ -2064,6 +2264,68 @@ func (sc *ShardChain) VerifyCrossShardMessageSignature(msg *CrossShardMessage) e
 	return sc.verifyCrossShardMessageSignatureLocked(msg)
 }
 
+// WasCrossMsgSubmitted reports whether msgID previously passed the full
+// SubmitCrossShardMessage admission suite (R19-F5). The registry is bounded
+// (ShardSubmittedTrackMax, FIFO eviction), so a very old submission may age
+// out — such a message then gets re-validated on relay, which is the safe
+// direction (re-validation can only reject, never admit more).
+func (sc *ShardChain) WasCrossMsgSubmitted(msgID types.Hash) bool {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	_, ok := sc.submittedMsgs[msgID]
+	return ok
+}
+
+// ValidateUnsubmittedCrossMsg runs the admission checks that
+// SubmitCrossShardMessage applies, for messages arriving directly on the
+// relay path (P2P) that never went through Submit (R19-F5). The caller must
+// NOT hold sc.mu.
+func (sc *ShardChain) ValidateUnsubmittedCrossMsg(msg *CrossShardMessage) error {
+	if msg == nil {
+		return ErrCrossMsgInvalid
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.status != ShardStatusActive {
+		return ErrShardNotActive
+	}
+	if msg.SourceShard != sc.shardID {
+		return fmt.Errorf("message source shard %d does not match this shard %d", msg.SourceShard, sc.shardID)
+	}
+	if msg.DestShard == msg.SourceShard {
+		return fmt.Errorf("%w: source and destination shard are both %d", ErrCrossMsgInvalid, msg.SourceShard)
+	}
+	if len(msg.Payload) > ShardCrossMsgMaxSize {
+		return fmt.Errorf("payload too large: %d > %d", len(msg.Payload), ShardCrossMsgMaxSize)
+	}
+	// Freshness window, matching the RPC admission path (±5 minutes).
+	// The future check runs first so a huge uint64 timestamp is rejected
+	// before the past check could wrap.
+	const crossMsgFreshness = 300
+	now := uint64(time.Now().Unix())
+	if msg.Timestamp > now+crossMsgFreshness {
+		return fmt.Errorf("%w: timestamp %d too far in the future (now %d)", ErrCrossMsgInvalid, msg.Timestamp, now)
+	}
+	if msg.Timestamp+crossMsgFreshness < now {
+		return fmt.Errorf("%w: timestamp %d too old (now %d)", ErrCrossMsgInvalid, msg.Timestamp, now)
+	}
+	// Nonce monotonicity: same rule as Submit; recording here means a
+	// P2P-direct message cannot mint unlimited receipts from one nonce.
+	if lastNonce, exists := sc.senderNonces[msg.Sender]; exists {
+		if msg.Nonce <= lastNonce {
+			return fmt.Errorf("%w: nonce %d <= last seen %d for sender %s", ErrCrossMsgInvalid, msg.Nonce, lastNonce, msg.Sender.ToHexAddress())
+		}
+	}
+	sc.senderNonces[msg.Sender] = msg.Nonce
+	if sc.stateStore != nil {
+		if err := sc.stateStore.PutSenderNonce(sc.shardID, msg.Sender, msg.Nonce); err != nil {
+			return fmt.Errorf("failed to persist sender nonce: %w", err)
+		}
+	}
+	return nil
+}
+
 func (sc *ShardChain) SubmitCrossShardMessage(msg *CrossShardMessage) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -2080,18 +2342,30 @@ func (sc *ShardChain) SubmitCrossShardMessage(msg *CrossShardMessage) error {
 		return fmt.Errorf("message source shard %d does not match this shard %d", msg.SourceShard, sc.shardID)
 	}
 
+	// R19-F8 (2026-10-28): reject self-addressed messages at the chain layer
+	// so the RPC and P2P entries share one semantic (the P2P producer already
+	// dropped them; the RPC entry and the chain layer did not).
+	if msg.DestShard == msg.SourceShard {
+		return fmt.Errorf("%w: source and destination shard are both %d", ErrCrossMsgInvalid, msg.SourceShard)
+	}
+
 	if len(msg.Payload) > ShardCrossMsgMaxSize {
 		return fmt.Errorf("payload too large: %d > %d", len(msg.Payload), ShardCrossMsgMaxSize)
 	}
 
-	// AUDIT ROUND-2 2026-08-17 FIX: bounded queue. Checked early
-	// (before signature verification) as fail-fast backpressure; rejection
-	// happens before the nonce is consumed so the sender can retry.
+	// R19-F6 (2026-10-28): when the queue is full, evict the OLDEST pending
+	// message instead of rejecting. The queue has no consumer yet (the block
+	// producer does not include cross-messages in blocks), so a one-time
+	// 10000-message flood used to disable cross-shard submission for the
+	// shard FOREVER (ErrCrossMsgQueueFull with no drain path). Eviction keeps
+	// the subsystem usable; the evicted message is logged and its sender can
+	// resubmit.
 	if len(sc.pendingMsgs) >= ShardMaxPendingMsgs {
-		shardLogger.Warn("cross-shard message rejected: pending queue full",
-			map[string]any{"shard_id": sc.shardID, "pending": len(sc.pendingMsgs),
-				"cap": ShardMaxPendingMsgs, "sender": msg.Sender.ToHexAddress()})
-		return ErrCrossMsgQueueFull
+		evicted := sc.pendingMsgs[0]
+		sc.pendingMsgs = sc.pendingMsgs[1:]
+		shardLogger.Warn("cross-shard message queue full: evicted oldest pending message",
+			map[string]any{"shard_id": sc.shardID, "evicted_id": evicted.ID.String(),
+				"cap": ShardMaxPendingMsgs})
 	}
 
 	// AUDIT (2026) GOV-FIX: Use the shared verification helper so
@@ -2127,6 +2401,17 @@ func (sc *ShardChain) SubmitCrossShardMessage(msg *CrossShardMessage) error {
 	}
 
 	sc.pendingMsgs = append(sc.pendingMsgs, msg)
+
+	// R19-F5 (2026-10-28): remember that this message passed the full
+	// admission suite, so the relay path can tell a validated submission
+	// from a P2P-direct relay that must run the whole suite itself.
+	// Bounded FIFO, same shape as the receipts cap.
+	sc.submittedMsgs[msg.ID] = struct{}{}
+	sc.submittedOrder = append(sc.submittedOrder, msg.ID)
+	if len(sc.submittedOrder) > ShardSubmittedTrackMax {
+		delete(sc.submittedMsgs, sc.submittedOrder[0])
+		sc.submittedOrder = sc.submittedOrder[1:]
+	}
 
 	// P3-1 (2026-07-15): Record cross-shard message counter and pending gauge.
 	if sc.metrics != nil {
@@ -2181,6 +2466,19 @@ func (sc *ShardChain) CreateReceipt(msg *CrossShardMessage, txHash types.Hash, b
 	}
 
 	sc.receipts[msg.ID] = receipt
+	// R19-F5 (2026-10-28): bound the receipts table. It previously grew for
+	// the lifetime of the process (the relay path minted one receipt per
+	// fresh nonce with no cap and no cleanup — ShardReceiptMaxPending was a
+	// dead constant). Evict the oldest entry when the cap is reached; the
+	// eviction is memory-bounding only — a spent marker for an evicted
+	// receipt stays in spentReceipts (and in the store), so replaying an
+	// evicted message still cannot double-spend.
+	sc.receiptOrder = append(sc.receiptOrder, msg.ID)
+	if len(sc.receiptOrder) > ShardReceiptMaxPending {
+		evict := sc.receiptOrder[0]
+		sc.receiptOrder = sc.receiptOrder[1:]
+		delete(sc.receipts, evict)
+	}
 
 	// P0-3 (2026-07-13): Persist receipt for cross-shard message tracking.
 	if sc.stateStore != nil {
@@ -2246,19 +2544,24 @@ func (sc *ShardChain) SpendReceipt(messageID types.Hash, spendSlot uint64) error
 		return fmt.Errorf("receipt not yet relayed")
 	}
 
+	// R19-F2 FIX (2026-10-28): the spent MARKER is persisted before the
+	// in-memory guard is set. The old order marked memory first and returned
+	// an error when the store write failed — leaving memory and disk
+	// inconsistent (memory says spent, disk says unspent; a restart would
+	// resurrect a spendable receipt). Fail-closed instead: on a marker write
+	// failure the receipt fields roll back, the in-memory guard stays unset,
+	// and nothing durable changed, so the caller can retry the spend.
 	receipt.Spent = true
 	receipt.SpentAt = spendSlot
-	sc.spentReceipts[messageID] = true
-
-	// P0-3 (2026-07-13): Persist spent marker and updated receipt.
-	// HIGH-17 safety: the spent marker prevents double-spending of receipts
-	// across restarts.
 	if sc.stateStore != nil {
 		if err := sc.stateStore.MarkReceiptSpent(sc.shardID, messageID); err != nil {
+			receipt.Spent = false
+			receipt.SpentAt = 0
 			return fmt.Errorf("failed to persist spent receipt marker: %w", err)
 		}
 		_ = sc.stateStore.PutReceipt(sc.shardID, messageID, receipt)
 	}
+	sc.spentReceipts[messageID] = true
 
 	return nil
 }
@@ -2344,6 +2647,12 @@ func (sm *ShardManager) RelayCrossShardMessage(sourceShardID, destShardID uint64
 		return nil, ErrCrossMsgDestInactive
 	}
 
+	// R19-F8 (2026-10-28): same self-addressed rejection as Submit, so both
+	// entries share one semantic.
+	if msg != nil && msg.SourceShard == msg.DestShard {
+		return nil, fmt.Errorf("%w: source and destination shard are both %d", ErrCrossMsgInvalid, msg.SourceShard)
+	}
+
 	// AUDIT (2026) GOV-FIX: Verify the message signature and
 	// canonical ID on the relay path, just as SubmitCrossShardMessage does.
 	// Previously this path bypassed HIGH-17's checks, allowing a caller who
@@ -2356,6 +2665,21 @@ func (sm *ShardManager) RelayCrossShardMessage(sourceShardID, destShardID uint64
 	// sufficient to prevent forgery and ID malleability on this path.
 	if err := sourceChain.VerifyCrossShardMessageSignature(msg); err != nil {
 		return nil, fmt.Errorf("relay rejected: signature/canonical ID verification failed: %w", err)
+	}
+
+	// R19-F5 (2026-10-28): the GOV-FIX assumption above — "the message has
+	// already been submitted (and nonce recorded) by the time it is
+	// relayed" — does not hold for the P2P entry: ShardBlockProducer relays
+	// wire messages that never went through Submit, so nonce monotonicity,
+	// the payload cap and freshness were all bypassed there, and every fresh
+	// nonce minted another receipt with no cap (unbounded growth). Messages
+	// that never passed Submit now run the full admission suite first;
+	// messages that did (tracked by the bounded submitted-ID registry) keep
+	// the original lenient relay semantics.
+	if !sourceChain.WasCrossMsgSubmitted(msg.ID) {
+		if err := sourceChain.ValidateUnsubmittedCrossMsg(msg); err != nil {
+			return nil, fmt.Errorf("relay rejected: unsubmitted message failed admission: %w", err)
+		}
 	}
 
 	receipt := sourceChain.CreateReceipt(msg, txHash, destHeight)
@@ -2612,6 +2936,11 @@ func (sm *ShardManager) GetAssignment(shardID uint64) (*ShardValidatorAssignment
 // fact without invalidating attestations.
 func computeShardBlockHash(header *ShardBlockHeader) types.Hash {
 	h := sha3.New256()
+	// R19-F11 (2026-10-28): domain separation. The signing hash below uses a
+	// DIFFERENT prefix, so a signature over one can never be replayed as the
+	// other and neither can collide with a raw SHA3-256 of the same fields
+	// under a different protocol meaning.
+	h.Write([]byte("QUANTAUREUM_SHARD_BLOCK_V1"))
 	var shardIDBytes [8]byte
 	var heightBytes [8]byte
 	var tsBytes [8]byte
@@ -2646,19 +2975,29 @@ func ComputeShardBlockHashPublic(header *ShardBlockHeader) types.Hash {
 }
 
 // computeShardBlockSigningHash computes the hash that the proposer signs when
-// creating a block. It excludes the Signature field (empty at signing time) and
-// the Timestamp field (set internally by ProposeBlock). The timestamp is still
-// protected by attester signatures in FinalizeBlock, which sign the full block
-// hash (including timestamp).
+// creating a block. It excludes the Signature field (empty at signing time).
+// R19-F1 FIX (2026-10-28): the Timestamp field IS included. It was previously
+// excluded on the theory that "the timestamp is still protected by attester
+// signatures" — but that left the proposer signature valid for EVERY
+// timestamp variant of the same block: any peer holding the broadcast block
+// could mint fork candidates by flipping Timestamp (staying inside each
+// receiver's drift window) while the proposer's signature kept verifying,
+// and the proposer could equivocate between two heights-identical blocks
+// with no slashable proposer signature distinguishing them. Attester
+// signatures remain the second layer (they cover the full block hash), but
+// the proposer must now commit to the timestamp it chose.
 // FIX: Used by ProposeBlock to verify the proposer's signature.
 // audit-fix M-6: Includes VRF proof and output so the proposer commits to them.
 func computeShardBlockSigningHash(header *ShardBlockHeader) []byte {
 	h := sha3.New256()
+	h.Write([]byte("QUANTAUREUM_SHARD_BLOCK_SIGN_V1"))
 	var shardIDBytes [8]byte
 	var heightBytes [8]byte
+	var tsBytes [8]byte
 	for i := 0; i < 8; i++ {
 		shardIDBytes[i] = byte(header.ShardID >> (8 * i))
 		heightBytes[i] = byte(header.Height >> (8 * i))
+		tsBytes[i] = byte(header.Timestamp >> (8 * i))
 	}
 	h.Write(shardIDBytes[:])
 	h.Write(heightBytes[:])
@@ -2666,6 +3005,7 @@ func computeShardBlockSigningHash(header *ShardBlockHeader) []byte {
 	h.Write(header.StateRoot[:])
 	h.Write(header.TxRoot[:])
 	h.Write(header.CrossMsgRoot[:])
+	h.Write(tsBytes[:])
 	h.Write(header.Proposer[:])
 	// audit-fix M-6: Include VRF fields in the signing hash.
 	h.Write(header.VRFProof)
@@ -2679,6 +3019,8 @@ func computeShardBlockSigningHash(header *ShardBlockHeader) []byte {
 // signature.
 func computeCrossShardMessageSigningHash(msg *CrossShardMessage) []byte {
 	h := sha3.New256()
+	// R19-F11 (2026-10-28): domain separation, mirroring the block hashes.
+	h.Write([]byte("QUANTAUREUM_CROSS_MSG_SIGN_V1"))
 	h.Write(msg.ID[:])
 	var srcBytes [8]byte
 	var dstBytes [8]byte

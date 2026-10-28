@@ -246,6 +246,17 @@ func (api *ShardAPI) SubmitCrossShardMessage(ctx context.Context, params json.Ra
 		return nil, &Error{Code: -32601, Message: err.Error()}
 	}
 
+	// R19-F6 (2026-10-28): validate that the destination shard exists before
+	// admitting the message. Previously only the source shard was checked,
+	// so messages pointed at nonexistent shards were queued (consuming
+	// pending-queue capacity) and could never be relayed.
+	if _, err := api.manager.GetShard(req.DestShard); err != nil {
+		return nil, &Error{Code: -32601, Message: "destination shard: " + err.Error()}
+	}
+	if req.DestShard == req.SourceShard {
+		return nil, &Error{Code: -32602, Message: "source and destination shard must differ"}
+	}
+
 	msg := &consensus.CrossShardMessage{
 		SourceShard: req.SourceShard,
 		DestShard:   req.DestShard,

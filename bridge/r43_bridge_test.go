@@ -240,7 +240,7 @@ func TestR43_BRIDGE_IP_01_SynchronousSweepAtCap(t *testing.T) {
 	// All 200k pre-existing entries are stale (old firstFail, no ban),
 	// so the sweep reclaims essentially all of them BEFORE the new entry
 	// is inserted.
-	_ = api.getIPState("brand-new-ip")
+	_, _ = api.getIPState("brand-new-ip")
 
 	api.ipLimiterMu.Lock()
 	finalSize := len(api.ipStates)

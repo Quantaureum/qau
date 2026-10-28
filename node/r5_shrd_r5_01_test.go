@@ -53,6 +53,9 @@ func (m *r5MockElectionVerifier) VerifyProposerElection(proposer types.Address, 
 // Kept private to node tests so we can sign messages without exporting the helper.
 func r5ComputeCrossShardMessageSigningHash(msg *consensus.CrossShardMessage) []byte {
 	h := sha3.New256()
+	// R19-F11: mirrors the domain prefix added to
+	// consensus.computeCrossShardMessageSigningHash.
+	h.Write([]byte("QUANTAUREUM_CROSS_MSG_SIGN_V1"))
 	h.Write(msg.ID[:])
 	var srcBytes [8]byte
 	var dstBytes [8]byte

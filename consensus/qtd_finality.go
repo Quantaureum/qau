@@ -1206,6 +1206,13 @@ func (qfs *QTDFinalityState) completeSealLocked(slot uint64, pending *PendingSea
 	for idx := range pending.PartialSigs {
 		sealers = append(sealers, idx)
 	}
+	// R19-F09 (2026-10-28): canonicalize the sealer order. The loop above
+	// iterates a Go map, whose order is randomized per run — the record's
+	// Sealers slice flows into the block header (ExecutiveSealers) and thus
+	// into the block hash, so two nodes sealing the same slot could produce
+	// different block hashes purely from map iteration order. GetEpochSealers
+	// already sorts (see below); the record path must too.
+	sort.Ints(sealers)
 
 	// MEDIUFIX: Validate that the number of submitted partial seals
 	// meets the threshold requirement before finalizing. Previously, this
@@ -1365,7 +1372,22 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 	}
 	if !known || canonicalRoot == (types.Hash{}) || canonicalRoot != types.Hash(blockHash) {
 		qfs.qpos.mu.Unlock()
-		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root",
+		// R19-F08 (2026-10-28): roll back the premature record. completeSealLocked
+		// writes instantFinalizedSlots[slot] BEFORE this canonical-root check
+		// runs (it runs here, asynchronously, because the codebase deliberately
+		// avoids nesting qpos.mu inside qfs.mu — see the LOCK ORDERING note at
+		// RequestSeal). Without the rollback, a seal whose blockHash is not the
+		// canonical root stayed in instantFinalizedSlots and IsSlotFinalized —
+		// and therefore the public qau_stardust_getSealStatus /
+		// qau_stardust_getFinality RPCs — reported it as finalized even though
+		// consensus never confirmed it (finalizedEpoch not advanced). Rollback
+		// makes the post-async state honest: a rejected seal is gone entirely
+		// (record + pending), the slot must be re-requested with the canonical
+		// hash.
+		qfs.mu.Lock()
+		delete(qfs.instantFinalizedSlots, slot)
+		qfs.mu.Unlock()
+		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root (record rolled back)",
 			map[string]any{"slot": slot, "epoch": epoch})
 		return
 	}
@@ -1544,6 +1566,12 @@ func (qfs *QTDFinalityState) GetFinalityRecord(slot uint64) *InstantFinalityReco
 			SealedAt:      record.SealedAt,
 			Sealers:       append([]int(nil), record.Sealers...),
 			FinalityDelay: record.FinalityDelay,
+			// R19-F10 (2026-10-28): copy the domain-separation context too.
+			// A copy that drops ChainID/Epoch reports zero, and the signing
+			// path treats a zero tuple as a legacy record with no canonical
+			// message to sign (see GetPendingSeal's copy for the same fix).
+			ChainID: record.ChainID,
+			Epoch:   record.Epoch,
 		}
 		return copy
 	}
@@ -2230,6 +2258,30 @@ func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []
 		qtdLogger.Error("QTD anchored group key CONFLICTS with established key",
 			map[string]any{"epoch": epoch})
 		return false
+	}
+	// R19-F02 (2026-10-28): first establishment used to adopt ANY key from
+	// ANY boundary block unconditionally — the one path where an
+	// attacker-chosen anchor could take root with no cross-check at all
+	// (a malicious proposer writes QTDGroupKey into a header; the field is
+	// not covered by the proposer signature, and an observing node with an
+	// empty history pins it, after which every seal verification for that
+	// epoch trusts the attacker's key). Harden the two cases:
+	//   - Node holds its own group key (qtdSigner configured — validators
+	//     and any node with DKG shares): the first anchor MUST match the
+	//     local key, which derives from the node's own share/ceremony and
+	//     is an independent trust root.
+	//   - Node has no signer (pure observer): trust-on-first-use to the
+	//     first anchor observed, which is the documented
+	//     ceremony-deployment-record legitimacy — now an explicit,
+	//     logged decision instead of an unexamined default.
+	if len(qfs.groupKeyHistory) == 0 && qfs.qtdSigner != nil {
+		if localKey := qfs.qtdSigner.GroupPublicKey(); len(localKey) > 0 && !bytes.Equal(localKey, key) {
+			qtdLogger.Error("QTD anchored group key REFUSED: first establishment does not match the local signer's group key",
+				map[string]any{"epoch": epoch,
+					"anchoredPrefix": fmt.Sprintf("%x", key[:8]),
+					"localPrefix":    fmt.Sprintf("%x", localKey[:8])})
+			return false
+		}
 	}
 	if len(qfs.groupKeyHistory) > 0 {
 		// Continuous chain-of-custody only. Two distinct cases at the leading

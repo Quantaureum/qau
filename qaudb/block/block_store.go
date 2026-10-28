@@ -3,6 +3,7 @@
 package block
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -83,7 +84,17 @@ var (
 	// known accumulator lets a restarting node recover the proposer
 	// schedule even if the R52 block replay is skipped or interrupted, so
 	// sealer proposer election never diverges from the canonical chain.
-	vrfAccPrefix = []byte("v") // epoch(8B BE) -> VRF accumulator hash
+	// R20-O FIX (2026-10-29): was "v" — which collided on the first byte with
+	// the slashing manager's "vote:" prefix (same shared keyspace, wired via
+	// block_producer.go SetDB(blockStore.GetDB())). LoadVRFAccumulators'
+	// iterator over "v" swept "vote:" entries and relied solely on an exact
+	// 9-byte length filter to skip them — one vote-key format change away
+	// from silent accumulator corruption. "xvrf:" is disjoint from every
+	// other prefix family in this keyspace (single-byte a/s/c/b/h/n/t/r/u/v
+	// and multi-byte vote:/min_/qpos-finality-v1/snap_). Persisted
+	// accumulators re-establish themselves from blocks after the upgrade
+	// (LoadVRFAccumulators is fail-closed-to-absent by design).
+	vrfAccPrefix = []byte("xvrf:") // epoch(8B BE) -> VRF accumulator hash
 
 	// R107-FINALITY-PERSIST: the latest durable Casper FFG checkpoint.
 	// Epochs are stored as big-endian uint64 values followed by justified
@@ -187,10 +198,19 @@ func (bs *BlockStore) PutVRFAccumulatorsBatch(accs map[uint64]types.Hash) error 
 // accumulator and a diverging proposer schedule, even if the replay is
 // skipped or interrupted. Corrupt/oversized values are skipped (fail-closed
 // to absent, which the caller then re-establishes from blocks).
+//
+// R20-O legacy migration (2026-10-29): the prefix was renamed "v" → "xvrf:"
+// to break the first-byte collision with the slashing manager's "vote:"
+// keys (same shared keyspace). Without migration, the first restart after
+// the upgrade would find NO entries under the new prefix and fall back to
+// the O(chain-height) R52 replay — losing the R111-VRF-FASTBOOT fast path
+// and stalling the chain for the replay duration. This one-time migration
+// copies legacy "v" entries (strict exact-length filter, which also excludes
+// the colliding "vote:" keys) to the new prefix, deletes them, and returns
+// the migrated set so the fastboot path works on the very first boot.
 func (bs *BlockStore) LoadVRFAccumulators() (map[uint64]types.Hash, error) {
 	out := make(map[uint64]types.Hash)
 	iter := bs.db.NewIterator(vrfAccPrefix, nil)
-	defer iter.Release()
 	for iter.Next() {
 		key := iter.Key()
 		if len(key) != len(vrfAccPrefix)+8 {
@@ -206,9 +226,87 @@ func (bs *BlockStore) LoadVRFAccumulators() (map[uint64]types.Hash, error) {
 		out[epoch] = acc
 	}
 	if err := iter.Error(); err != nil {
+		iter.Release()
 		return nil, err
 	}
-	return out, nil
+	iter.Release()
+
+	if len(out) > 0 {
+		return out, nil
+	}
+	return bs.migrateLegacyVRFAccumulators()
+}
+
+// legacyVRFAccScanPrefix is the migration scan prefix: the legacy first byte
+// "v" plus the 0x00 second byte every BE-encoded epoch key has (epochs are
+// far below 2^56). This structurally EXCLUDES the slashing manager's
+// "vote:addr:height" keys ("v" + 'o' = 0x6F) — on a production store they
+// number in the millions and BoltDB.NewIterator truncates at 100K entries
+// (ErrIteratorTruncated), which would fail the whole migration and kill the
+// fastboot path on every restart. Discovered in the R21 fleet rollout
+// (2026-10-29, S1 mainnet store).
+var legacyVRFAccScanPrefix = []byte("v\x00")
+
+// migrateLegacyVRFAccumulators copies pre-rename accumulator entries to the
+// current prefix and deletes the legacy keys. Returns the migrated map (an
+// empty map when there is nothing to migrate — a fresh node, or a store
+// whose fastboot entries were already migrated).
+func (bs *BlockStore) migrateLegacyVRFAccumulators() (map[uint64]types.Hash, error) {
+	legacy := make(map[uint64]types.Hash)
+	iter := bs.db.NewIterator(legacyVRFAccScanPrefix, nil)
+	for iter.Next() {
+		key := iter.Key()
+		// Strict shape check: the STORED key is exactly the 1-byte legacy
+		// prefix + 8-byte epoch = 9 bytes (the 2-byte scan prefix is only a
+		// filter — every matching key is still 9 bytes; "vote:" keys are 33
+		// and are excluded by the scan prefix anyway).
+		if len(key) != len(legacyVRFAccScanPrefix)+7 {
+			continue
+		}
+		if !bytes.HasPrefix(key, legacyVRFAccScanPrefix) {
+			continue
+		}
+		val := iter.Value()
+		if len(val) != types.HashLength {
+			continue
+		}
+		// Epoch occupies key[1:9] — the REAL 1-byte legacy prefix width, not
+		// the 2-byte scan prefix.
+		epoch := binary.BigEndian.Uint64(key[1 : 1+8])
+		var acc types.Hash
+		copy(acc[:], val)
+		if acc == (types.Hash{}) {
+			continue
+		}
+		legacy[epoch] = acc
+	}
+	if err := iter.Error(); err != nil {
+		iter.Release()
+		return nil, err
+	}
+	iter.Release()
+
+	if len(legacy) == 0 {
+		return legacy, nil
+	}
+
+	batch := bs.db.NewBatch()
+	for epoch, acc := range legacy {
+		var epochKey [8]byte
+		binary.BigEndian.PutUint64(epochKey[:], epoch)
+		if err := batch.Put(append(vrfAccPrefix, epochKey[:]...), acc[:]); err != nil {
+			return nil, err
+		}
+		// Delete the FULL legacy key ("v" + epoch), not the scan prefix —
+		// the stored key always starts with the real 1-byte prefix.
+		if err := batch.Delete(append([]byte("v"), epochKey[:]...)); err != nil {
+			return nil, err
+		}
+	}
+	if err := batch.Write(); err != nil {
+		return nil, err
+	}
+	return legacy, nil
 }
 
 const (

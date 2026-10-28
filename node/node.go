@@ -5200,6 +5200,24 @@ func (n *Node) initSharding() error {
 		nodeLog.Warn("ShardManager LoadAssignments failed (non-fatal, starting with empty table): %v", err)
 	}
 
+	// R19-F2 (2026-10-28): restore each loaded shard's chain state (blocks,
+	// commitments, receipts, spent markers, sender nonces) from the store.
+	// The write side existed since P0-3 but nothing ever read it back, so
+	// HIGH-17 replay protection was silently lost on every restart. Failures
+	// are logged per shard and non-fatal for the same reason as above — a
+	// fresh store simply has nothing to restore — but a PARTIAL restore of a
+	// shard aborts that shard's restore (RestoreFromStore fails closed) so a
+	// half-restored chain is never treated as complete.
+	for _, chain := range n.shardManager.GetActiveShards() {
+		if err := chain.RestoreFromStore(); err != nil {
+			if errors.Is(err, consensus.ErrStateStoreNotConfigured) {
+				continue
+			}
+			nodeLog.Warn("shard %d state restore failed (replay protection may be incomplete): %v",
+				chain.ShardID(), err)
+		}
+	}
+
 	nodeLog.Info("ShardManager enabled (db=%s, committer=persisted, electionVerifier=QPOS-backed, stateStore=persisted, "+
 		"authorizer=system-caller, assignments=loaded, "+
 		"maxCount=%d, blockSize=%d, interval=%ds, minValidators=%d, slotResolver=%q)",
