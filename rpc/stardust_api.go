@@ -110,12 +110,33 @@ func (api *StardustAPI) GetFinality(ctx context.Context, params json.RawMessage)
 	}
 
 	if record != nil {
-		result["isFinalized"] = true
+		// R22: record PRESENCE is not finality. The record is retained as the
+		// threshold-agreement proof even when the sealed block is not the
+		// canonical root, so isFinalized must be the cross-checked answer
+		// (record epoch <= QPOS finalizedEpoch, R39-P2-01) rather than
+		// "a record exists". Before R22 the record was deleted on a
+		// non-canonical root, which made presence equivalent to finality by
+		// accident — and destroyed a quorum-approved seal on a timing race.
+		result["isFinalized"] = qfs.IsSlotFinalized(slot)
 		result["blockHash"] = "0x" + hex.EncodeToString(record.BlockHash[:])
 		result["qtdSignature"] = "0x" + hex.EncodeToString(record.QTDSignature)
 		result["sealers"] = record.Sealers
 		result["finalityDelay"] = record.FinalityDelay.String()
 		result["sealedAt"] = record.SealedAt.Unix()
+		// R22 (2026-10-29): the record is the threshold-agreement PROOF and
+		// is deliberately retained even when the sealed block is not the
+		// canonical root (qtd_finality.go R22 note — the R19-F08 rollback was
+		// reverted because it destroyed that proof on a timing race). The two
+		// facts a consumer needs are therefore reported separately:
+		//   - isFinalized (above): consensus has finalized the seal's epoch
+		//                          (R39-P2-01 cross-check). This is the field
+		//                          existing clients read; it never turns true
+		//                          just because a record exists.
+		//   - canonical:           the sealed blockHash IS the slot's canonical
+		//                          root (false also means "not yet confirmed",
+		//                          which the caller must not read as
+		//                          "proven non-canonical").
+		result["canonical"] = qfs.IsCanonicalSeal(slot)
 	} else {
 		result["isFinalized"] = qfs.IsSlotFinalized(slot)
 	}
@@ -469,6 +490,12 @@ func (api *StardustAPI) GetSealStatus(ctx context.Context, params json.RawMessag
 			result["blockHash"] = "0x" + hex.EncodeToString(rec.BlockHash[:])
 			result["sealerCount"] = len(rec.Sealers)
 			result["sealedAt"] = rec.SealedAt
+			// R22: report whether the sealed block is the slot's canonical
+			// root. `finalized` above is the R39-P2-01 cross-checked view;
+			// `canonical` states the block-binding fact directly so a client
+			// can tell "agreement recorded" from "this specific block is the
+			// canonical one".
+			result["canonical"] = qfs.IsCanonicalSeal(slot)
 		}
 		return result, nil
 	}

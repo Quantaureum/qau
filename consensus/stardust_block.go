@@ -25,6 +25,19 @@ func PopulateStardustFields(header *encoding.BlockHeader, qpos *QPOS) error {
 		header.FinalityType = 1
 
 		record := qfs.GetFinalityRecord(header.Slot)
+		// R22 (2026-10-29): a record now survives even when its block is not
+		// the slot's canonical root (the R19-F08 rollback was reverted — see
+		// qtd_finality.go). Never present another block's threshold signature
+		// as THIS block's finality proof: copy it only when the slot's
+		// canonical root is still unknown (the normal case at production time)
+		// or actually equals the recorded hash. A proven-stale record is left
+		// out, so the header advertises no signature rather than a mismatched
+		// one (VerifyStardustFinality would reject it anyway — fail-closed).
+		if record != nil {
+			if root, known := qpos.GetSlotBlockRoot(header.Slot); known && root != record.BlockHash {
+				record = nil
+			}
+		}
 		if record != nil {
 			header.QTDSignature = make([]byte, len(record.QTDSignature))
 			copy(header.QTDSignature, record.QTDSignature)

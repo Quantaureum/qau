@@ -1372,22 +1372,37 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 	}
 	if !known || canonicalRoot == (types.Hash{}) || canonicalRoot != types.Hash(blockHash) {
 		qfs.qpos.mu.Unlock()
-		// R19-F08 (2026-10-28): roll back the premature record. completeSealLocked
-		// writes instantFinalizedSlots[slot] BEFORE this canonical-root check
-		// runs (it runs here, asynchronously, because the codebase deliberately
-		// avoids nesting qpos.mu inside qfs.mu — see the LOCK ORDERING note at
-		// RequestSeal). Without the rollback, a seal whose blockHash is not the
-		// canonical root stayed in instantFinalizedSlots and IsSlotFinalized —
-		// and therefore the public qau_stardust_getSealStatus /
-		// qau_stardust_getFinality RPCs — reported it as finalized even though
-		// consensus never confirmed it (finalizedEpoch not advanced). Rollback
-		// makes the post-async state honest: a rejected seal is gone entirely
-		// (record + pending), the slot must be re-requested with the canonical
-		// hash.
-		qfs.mu.Lock()
-		delete(qfs.instantFinalizedSlots, slot)
-		qfs.mu.Unlock()
-		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root (record rolled back)",
+		// R22 (2026-10-29): the R19-F08 rollback of the finalized record is
+		// REVERTED here. The record is the threshold-agreement PROOF: the
+		// R4-CORE-04 design (and its pinned test
+		// TestR4CORE04_CompleteSeal_RejectsNonCanonicalAtFinalize) requires
+		// that a quorum-approved seal STAYS recorded even when its block hash
+		// is not the canonical root — only the consensus finality state
+		// (finalizedEpoch/finalizedRoot/justifiedRoot) must not advance on a
+		// non-canonical hash, which is exactly what the branch above does.
+		//
+		// Why the rollback was wrong:
+		//  1. It destroyed legitimate evidence. A seal requested while the
+		//     slot's canonical root was not yet known (RequestSeal explicitly
+		//     allows that — the block may not be imported yet) was DELETED by
+		//     this asynchronous check whenever the root had not landed by the
+		//     time the threshold completed. A quorum-approved seal can then be
+		//     destroyed by pure timing — a liveness defect on the QTD path.
+		//  2. It broke two existing tests only by scheduling luck: both
+		//     read the record synchronously while this goroutine deletes it
+		//     asynchronously, so they passed or failed depending on whether
+		//     the goroutine had been scheduled yet (reproduced locally:
+		//     2 failures in 40 runs of TestPopulateStardustFieldsWithProvinces).
+		//  3. The "the RPCs over-report" concern it aimed at is already
+		//     covered without destroying data: IsSlotFinalized cross-checks
+		//     the record against the QPOS finalized epoch (R39-P2-01), so a
+		//     record whose epoch consensus has not finalized is not reported
+		//     as finalized to real consumers (the "finalized" block qualifier
+		//     and the sync sentinel). R22 additionally exposes the canonical
+		//     status of a seal explicitly (IsCanonicalSeal) so the public
+		//     QTD status RPCs can report "agreement recorded" and "canonical /
+		//     consensus-finalized" as distinct facts.
+		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root",
 			map[string]any{"slot": slot, "epoch": epoch})
 		return
 	}
@@ -1576,6 +1591,48 @@ func (qfs *QTDFinalityState) GetFinalityRecord(slot uint64) *InstantFinalityReco
 		return copy
 	}
 	return nil
+}
+
+// IsCanonicalSeal reports whether a recorded QTD seal's block hash is the
+// canonical root for its slot (R22, 2026-10-29). Introduced together with the
+// revert of the R19-F08 record rollback: the record now survives as the
+// threshold-agreement PROOF even when its block is not (yet) canonical, so
+// the public QTD status RPCs need an explicit way to state that distinction
+// honestly instead of deleting the record.
+//
+// Semantics (three-way, deliberately NOT collapsed to a bare bool-true when
+// unknown):
+//   - no record for the slot                     -> false
+//   - record present, canonical root UNKNOWN     -> false (cannot confirm)
+//   - record present, root == record.BlockHash   -> true
+//   - record present, root != record.BlockHash   -> false (proven non-canonical)
+//
+// Callers must treat false as "not confirmed canonical", never as "proven
+// non-canonical" (the two different false cases above are not distinguished
+// here on purpose — a bare "confirmed" bit is what consumers need).
+//
+// Lock order: the canonical root is snapshotted from the QPOS BEFORE taking
+// qfs.mu, preserving the sanctioned qpos.mu → qfs.mu order (the reverse
+// nesting is what the codebase deliberately avoids — see RequestSeal).
+func (qfs *QTDFinalityState) IsCanonicalSeal(slot uint64) bool {
+	if qfs == nil {
+		return false
+	}
+	var root types.Hash
+	var known bool
+	if qfs.qpos != nil {
+		root, known = qfs.qpos.GetSlotBlockRoot(slot)
+	}
+	qfs.mu.RLock()
+	defer qfs.mu.RUnlock()
+	record, exists := qfs.instantFinalizedSlots[slot]
+	if !exists {
+		return false
+	}
+	if !known {
+		return false
+	}
+	return root == record.BlockHash
 }
 
 func (qfs *QTDFinalityState) VerifyInstantFinality(slot uint64, blockHash types.Hash, qtdSignature []byte) bool {
