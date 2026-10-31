@@ -244,7 +244,7 @@ func (bs *BlockStore) LoadVRFAccumulators() (map[uint64]types.Hash, error) {
 // number in the millions and BoltDB.NewIterator truncates at 100K entries
 // (ErrIteratorTruncated), which would fail the whole migration and kill the
 // fastboot path on every restart. Discovered in the R21 fleet rollout
-// (2026-10-29, S1 mainnet store).
+// (2026-10-29, mainnet store).
 var legacyVRFAccScanPrefix = []byte("v\x00")
 
 // migrateLegacyVRFAccumulators copies pre-rename accumulator entries to the
@@ -997,12 +997,158 @@ func (bs *BlockStore) scanLatestHeightUnlocked() uint64 {
 // block whose parent chain is unbroken. Caller MUST hold bs.mu.
 // R37-P3-04 FIX (2026-07-31): extracted from FindContinuousTip so that
 // DeleteBlocksFromHeight can use it while already holding the write lock.
+//
+// R32 (2026-10-31): databases that implement prefixScanner run the walk as
+// ONE read transaction with a sequential cursor (~seconds at 337k heights);
+// the per-height fallback preserves the exact original semantics everywhere
+// else. Both paths MUST agree on number-index gaps and on header damage
+// within the recent window — pinned by
+// TestR32_FindContinuousTip_PathAgreement; the WindowScope test pins the one
+// deliberate difference (deep header damage is fallback-only — see
+// findContinuousTipScan).
 func (bs *BlockStore) findContinuousTipLocked() uint64 {
 	latestHeight := bs.scanLatestHeightUnlocked()
 	if latestHeight == 0 {
 		return 0
 	}
+	if scanner, ok := bs.db.(prefixScanner); ok {
+		if tip, err := bs.findContinuousTipScan(scanner, latestHeight); err == nil {
+			return tip
+		}
+		// Scanner failure (db-level View error): fall through to the
+		// per-height path rather than guessing.
+	}
+	return bs.findContinuousTipPerHeight(latestHeight)
+}
 
+// prefixScanner is implemented by databases that can walk a key prefix in a
+// single read transaction (R32 — see BoltDB.PrefixScanAndFinalize).
+type prefixScanner interface {
+	PrefixScanAndFinalize(prefix []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error
+}
+
+// findContinuousTipScan is the R32/R32c single-transaction continuity walk.
+// Its contract matches the per-height path EXACTLY for number-index gaps and
+// for header corruption/parent-linkage breaks within the last
+// continuityParentWindow heights. A header failure OLDER than the window is
+// outside STARTUP detection on scanner databases (the per-height fallback —
+// which retains the full check — only runs on non-scanner databases or when
+// the scan itself errors): the window bound is what keeps the startup walk
+// affordable — decoding every 30KB header on a 337k chain made
+// Syncer.Start unaffordable (R32-01).
+//
+// R33 NOTE (round-13 review, must not be overstated): the narrowed scope
+// means the R53 startup fragmentation repair at the Node.Start call site no
+// longer sees DEEP parent-linkage damage — its premise ("the scan stops at
+// the first ParentHash gap") holds only for the recent window now. The
+// residual exposure is bounded: current write rules prevent creating
+// linkage damage (P3-CHAIN-INTEGRITY no-overwrite + import-time parent
+// check), fleet stores were repeatedly repaired by pre-R32 restarts, and a
+// bit-rot-damaged segment surfaces via fork recovery instead of the
+// immediate startup repair. A background deep-integrity pass is the
+// registered follow-up (R33 candidate).
+// continuityParentWindow bounds the parent-linkage verification of the
+// single-transaction continuity scan (R32c, 2026-10-31). The scan's phase 1
+// walks the number→hash index (cheap, no header reads); phase 2 verifies the
+// parent chain with full header decoding for the LAST window heights only.
+// The original per-height scan decoded EVERY header on the chain — 30KB
+// headers × 337k heights made Syncer.Start unaffordable (40-90 min, fleet
+// freeze R32-01). Corruption OLDER than the window is still caught by the
+// ordinary sync re-execution and import validation.
+const continuityParentWindow = 64
+
+func (bs *BlockStore) findContinuousTipScan(scanner prefixScanner, latestHeight uint64) (uint64, error) {
+	tip := uint64(0)
+	result := uint64(0)
+	type recentEntry struct {
+		height uint64
+		hash   types.Hash
+	}
+	recent := make([]recentEntry, 0, continuityParentWindow)
+
+	// Phase 1: number-index continuity (cursor only — no header reads).
+	walk := func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool {
+		if len(key) != len(numberPrefix)+8 {
+			return false
+		}
+		h := binary.BigEndian.Uint64(key[len(numberPrefix):])
+		// R32b (2026-10-31) FIX (caught live on the fleet during rollout): the number
+		// index ALSO carries a height-0 genesis entry (the original per-height
+		// loop never read it — it starts at h=1). The first revision stopped
+		// the walk on that entry (h==0 → break), so the scan returned 0 and
+		// Syncer.Start "corrected" a 337k-height node down to the genesis —
+		// forcing a full re-sync. Height 0 is simply not part of the scan's
+		// domain: SKIP any zero entry (continue, never break).
+		if h == 0 {
+			return true
+		}
+		if h > latestHeight {
+			return false
+		}
+		if h != tip+1 {
+			return false // gap or out-of-order entry: stop at the discontinuity
+		}
+		var hash types.Hash
+		copy(hash[:], value)
+		tip = h
+		recent = append(recent, recentEntry{height: h, hash: hash})
+		if len(recent) > continuityParentWindow {
+			recent = recent[len(recent)-continuityParentWindow:]
+		}
+		return true
+	}
+
+	// Phase 2 (same read transaction): parent-linkage verification for the
+	// recent window only. The parent of recent[0] may sit one height BELOW
+	// the window — resolved through the number index. A failing header
+	// (missing, undecodable, parent mismatch) lowers the result to the height
+	// before it; corruption OLDER than the window is left to the ordinary
+	// sync re-execution and import validation.
+	finalize := func(lookup func([]byte) ([]byte, bool)) {
+		result = tip
+		for i, entry := range recent {
+			var parentHash types.Hash
+			if i > 0 {
+				parentHash = recent[i-1].hash
+			} else if entry.height > 1 {
+				parentKey := make([]byte, len(numberPrefix)+8)
+				copy(parentKey, numberPrefix)
+				binary.BigEndian.PutUint64(parentKey[len(numberPrefix):], entry.height-1)
+				pv, ok := lookup(parentKey)
+				if !ok {
+					break // the parent's number entry is gone: stop verifying
+				}
+				copy(parentHash[:], pv)
+			}
+			hdrData, ok := lookup(append(headerPrefix, entry.hash[:]...))
+			if !ok {
+				result = entry.height - 1
+				return
+			}
+			hdr, err := encoding.UnmarshalBlockHeader(hdrData)
+			if err != nil || hdr == nil {
+				result = entry.height - 1
+				return
+			}
+			if entry.height > 1 && hdr.ParentHash != parentHash {
+				result = entry.height - 1
+				return
+			}
+		}
+	}
+
+	err := scanner.PrefixScanAndFinalize(numberPrefix, walk, finalize)
+	if err != nil {
+		return 0, err
+	}
+	return result, nil
+}
+
+// findContinuousTipPerHeight is the original per-height continuity walk
+// (R37-P3-04 semantics, byte-for-byte). It issues three standalone database
+// Gets per height — O(height) read transactions — and is retained as the
+// fallback for databases without a single-transaction prefix scan.
+func (bs *BlockStore) findContinuousTipPerHeight(latestHeight uint64) uint64 {
 	tip := uint64(0)
 	for h := uint64(1); h <= latestHeight; h++ {
 		numberKey := make([]byte, 8)

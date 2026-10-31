@@ -861,7 +861,10 @@ func (bp *BlockProducer) initValidatorSet() {
 		}
 		if stored, err := bp.node.blockStore.GetLatestBlock(); err == nil && stored != nil && stored.Header != nil {
 			storedHash := block.ComputeBlockHash(stored.Header)
-			qpos.AdoptHeaderFinality(stored.Header.JustifiedEpoch, stored.Header.FinalizedEpoch, storedHash)
+			// R30 F8 (2026-10-30): the stored head may predate the validator
+			// rule that binds checkpoints to the block's own epoch, so the seed
+			// goes through the same guard as every import.
+			bp.node.adoptHeaderFinality(qpos, stored.Header, storedHash)
 			bpLog.Info("R106: seeded QPOS finality from stored head: height=%d justified=%d finalized=%d",
 				stored.Header.Height, stored.Header.JustifiedEpoch, stored.Header.FinalizedEpoch)
 		}
@@ -883,6 +886,12 @@ func (bp *BlockProducer) initValidatorSet() {
 					"registered — refusing to re-anchor (fail-closed)")
 			}
 		}
+		// R30 F5: after the optional re-anchor, the restored checkpoint must be
+		// backed by this store. A checkpoint ahead of the local chain pins the
+		// finality floor above every block we hold, which blocks every rollback and
+		// re-sync from that point on and cannot be repaired from disk (the ratchet
+		// only moves forward).
+		bp.node.checkPersistedFinalityBacking(qpos, bp.node.blockStore)
 	}
 	qposAdv, err := consensus.NewQPOSAdvancedWithQPOS(qpos, genesisRoot)
 	if err != nil {
@@ -1545,6 +1554,11 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 	bp.waitForPreviousSlotBlock(slot)
 
 	// ===== Phase 1: Quick lock — read parent info, copy state =====
+	// LOCK DISCIPLINE (R30 F12): every exit from Phase 1 must release
+	// node.mu exactly once — the returns below unlock explicitly, and the
+	// state-isolation refusal goes through skipSlotForBuildState, which owns
+	// the unlock so that it cannot be forgotten. Do not add a bare `return`
+	// between here and the unlock after the state copy.
 	bp.node.mu.Lock()
 	if !bp.node.running {
 		bp.node.mu.Unlock()
@@ -1611,6 +1625,19 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 
 	nodeName := bp.node.config.Name
 	epoch := consensus.SlotToEpoch(slot)
+
+	// R30 F9 (2026-10-30): refuse to seal a slot that is not ahead of the
+	// head's own slot. The head can legitimately be in the future (R38-P0-03
+	// accepts blocks up to MaxFutureSlotGap ahead), and a block built on it
+	// with the local clock's slot is illegal for every peer — see
+	// canExtendHead. The node does not validate its own block, so without this
+	// it adopted the rejected block as its head and orphaned itself.
+	if parentSlot := bp.node.currentBlock.Header.Slot; !canExtendHead(slot, parentSlot) {
+		bpLog.Info("tryProduceBlock: slot=%d is not ahead of the head's slot %d — cannot legally extend the head, skipping",
+			slot, parentSlot)
+		bp.node.mu.Unlock()
+		return
+	}
 
 	// DevMode: use simplified flow but still with state isolation
 	if bp.node.config.DevMode || bp.node.config.DevBlocks {
@@ -1707,7 +1734,10 @@ func (bp *BlockProducer) tryProduceBlock(slot uint64) {
 			// CopyForBuild only refuses when the working state could not be
 			// isolated from live disk state. Building anyway would propose a
 			// block whose execution writes state the node may then throw away.
-			bpLog.Error("Cannot isolate build state (R7-01); skipping slot %d", slot)
+			//
+			// R30 F12 (2026-10-30): Phase 1 still holds node.mu here, so the
+			// skip has to release it — see skipSlotForBuildState.
+			bp.skipSlotForBuildState(slot)
 			return
 		}
 	}
@@ -3485,6 +3515,86 @@ func (bp *BlockProducer) processBlobsForDA(slot uint64, txs []*encoding.Transact
 	}
 }
 
+// reloadConflictHeadLocked resolves a PutBlock conflict for a block this producer
+// just committed: the store's height index already holds a different block at that
+// height, so that block is the canonical one and the head has to follow it.
+//
+// R30 F6 (2026-10-30): this used to assign n.currentBlock directly. The height
+// index is written by the syncer BEFORE fork choice decides, so it may hold a
+// branch fork choice REFUSED; adopting it here would bypass that decision, and a
+// same-height swap to a different slot would also skip the slot-root re-anchoring.
+// It now goes through commitHeadSwitchLocked like every other head switch.
+//
+// Returns true when the head matches the store's canonical block at newHeight. On
+// refusal the head keeps our produced block, which the store does not hold, so
+// local state stops being trusted: the node must not extend a block it never
+// stored. The caller holds n.mu.
+func (n *Node) reloadConflictHeadLocked(newHeight uint64, rejected *encoding.Block) bool {
+	if n == nil || n.blockStore == nil || n.currentBlock == nil || n.currentBlock.Header == nil {
+		return false
+	}
+	if rejected == nil || rejected.Header == nil {
+		return false
+	}
+	// Only reload if currentBlock still points to our rejected block. If the
+	// syncer already updated currentBlock to the peer's block, leave it alone.
+	if n.currentBlock.Header.Height != newHeight {
+		return false
+	}
+	rejectedHash := block.ComputeBlockHash(rejected.Header)
+	if block.ComputeBlockHash(n.currentBlock.Header) != rejectedHash {
+		return false
+	}
+
+	canonicalBlock, err := n.blockStore.GetBlockByNumber(newHeight)
+	if err != nil || canonicalBlock == nil || canonicalBlock.Header == nil {
+		return false
+	}
+	canonicalHash := block.ComputeBlockHash(canonicalBlock.Header)
+	if canonicalHash == rejectedHash {
+		// The store holds this block after all — nothing to reload.
+		return true
+	}
+
+	if !n.commitHeadSwitchLocked("postCommitBlock", canonicalBlock, canonicalHash, n.currentBlock, rejectedHash, n.forkChoiceQPOS()) {
+		n.markStateTrustBroken(fmt.Sprintf(
+			"produced block %d lost its height to a block that rewrites finalized history; the store no longer holds this node's head",
+			newHeight))
+		return false
+	}
+	if n.syncer != nil {
+		n.syncer.UpdateCurrentHeight(newHeight)
+	}
+	// R30 F10 (2026-10-30): the head now points at a block this node never
+	// executed. tryProduceBlock commits its built state BEFORE postCommitBlock
+	// stores the block, so by the time PutBlock reports the conflict, local
+	// state is the state of OUR produced block. Adopting the store's block is
+	// still the right head move (the store is canonical), but the two blocks
+	// only agree on state when their roots match.
+	//
+	// On a mismatch the producer used to keep sealing on that state: the next
+	// block executes the canonical parent's transactions over state the parent
+	// never produced, so its state root is rejected by every peer — the node
+	// forks itself off instead of noticing. Reporting it here stops production
+	// (the R87 state-trust gate) while chain following continues.
+	if n.stateDB != nil && rejected.Header.StateRoot != canonicalBlock.Header.StateRoot {
+		// R30 (2026-10-30) F16 companion: the syncer's state baseline still
+		// claims that everything through newHeight was verified, but the block
+		// at newHeight that the store holds has never been executed against this
+		// node's state. Lower the baseline to the parent, so a rebuild driven by
+		// stateVerifiedHeight re-executes the canonical block instead of
+		// resuming above it and leaving the divergence in place.
+		if n.syncer != nil {
+			n.syncer.noteStateRolledBackTo(newHeight)
+		}
+		n.markStateTrustBroken(fmt.Sprintf(
+			"block %d was reloaded from the canonical store (state root %x) after this node had already applied its own build (state root %x): local state no longer matches the head",
+			newHeight, canonicalBlock.Header.StateRoot[:8], rejected.Header.StateRoot[:8]))
+	}
+	nodeLog.Info("postCommitBlock: reloaded canonical block %d (hash=%x)", newHeight, canonicalHash[:8])
+	return true
+}
+
 // postCommitBlock performs post-commit I/O operations (disk, network, staking sync)
 // AFTER the lock has been released. This prevents deadlocks caused by holding n.mu
 // during potentially slow operations like syncStakingFromBlock or BroadcastBlock.
@@ -3524,23 +3634,7 @@ func (bp *BlockProducer) postCommitBlock(
 			if errors.Is(err, block.ErrBlockConflict) {
 				bpLog.Warn("postCommitBlock: PutBlock conflict at height %d — peer block stored first, reloading canonical block", newHeight)
 				bp.node.mu.Lock()
-				// Only reload if currentBlock still points to our rejected
-				// block. If syncer already updated currentBlock to the peer's
-				// block, leave it alone.
-				if bp.node.currentBlock != nil && bp.node.currentBlock.Header.Height == newHeight {
-					currentHash := block.ComputeBlockHash(bp.node.currentBlock.Header)
-					rejectedHash := block.ComputeBlockHash(newBlock.Header)
-					if currentHash == rejectedHash {
-						if canonicalBlock, gerr := bp.node.blockStore.GetBlockByNumber(newHeight); gerr == nil && canonicalBlock != nil {
-							bp.node.currentBlock = canonicalBlock
-							if bp.node.syncer != nil {
-								bp.node.syncer.UpdateCurrentHeight(newHeight)
-							}
-							canonicalHash := block.ComputeBlockHash(canonicalBlock.Header)
-							bpLog.Info("postCommitBlock: reloaded canonical block %d (hash=%x)", newHeight, canonicalHash[:8])
-						}
-					}
-				}
+				bp.node.reloadConflictHeadLocked(newHeight, newBlock)
 				bp.node.mu.Unlock()
 				return
 			}
@@ -3831,6 +3925,18 @@ func (bp *BlockProducer) checkpointReBroadcastLoop(height uint64, blockHash, sta
 func (bp *BlockProducer) produceBlock(slot uint64) {
 	if bp.node.currentBlock == nil {
 		bpLog.Warn("currentBlock is nil, skipping block production")
+		return
+	}
+
+	// R30 F11 (2026-10-30): the shared chokepoint re-checks the slot. The legacy
+	// and DevBlocks callers capture `slot` before they (re-)acquire node.mu —
+	// the fallback proposer waits for waitForFallback while unlocked — so the
+	// head can have advanced to a block at or past that slot by the time we get
+	// here. Sealing then re-creates exactly what canExtendHead refuses in
+	// tryProduceBlock: a block whose slot is not ahead of its parent's, which
+	// every peer rejects while this node adopts it as head.
+	if headSlot := bp.node.currentBlock.Header.Slot; !canExtendHead(slot, headSlot) {
+		bpLog.Info("produceBlock: slot=%d is not ahead of the head's slot %d — refusing to seal", slot, headSlot)
 		return
 	}
 

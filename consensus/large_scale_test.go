@@ -139,6 +139,10 @@ func TestLargeScale_10KValidators_CommitteeAllocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	for slot := uint64(0); slot < 32; slot++ {
 		committee, err := qpos.GetCommitteeForSlot(slot)
@@ -171,6 +175,10 @@ func TestLargeScale_50KValidators_CommitteeAllocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	for slot := uint64(0); slot < 32; slot++ {
 		committee, err := qpos.GetCommitteeForSlot(slot)
@@ -205,6 +213,10 @@ func TestLargeScale_CommitteeCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	committee1, err := qpos.GetCommitteeForSlot(0)
 	if err != nil {
@@ -265,6 +277,7 @@ func BenchmarkLargeScale_Validators_DeepCopy_10K(b *testing.B) {
 func BenchmarkLargeScale_GetCommitteeForSlot_10K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(10000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetCommitteeForSlot(uint64(i % 32))
@@ -274,6 +287,7 @@ func BenchmarkLargeScale_GetCommitteeForSlot_10K(b *testing.B) {
 func BenchmarkLargeScale_GetProposerForSlot_10K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(10000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetProposerForSlot(uint64(i % 32))
@@ -283,6 +297,7 @@ func BenchmarkLargeScale_GetProposerForSlot_10K(b *testing.B) {
 func BenchmarkLargeScale_GetCommitteeForSlot_50K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(50000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetCommitteeForSlot(uint64(i % 32))
@@ -292,6 +307,7 @@ func BenchmarkLargeScale_GetCommitteeForSlot_50K(b *testing.B) {
 func BenchmarkLargeScale_GetProposerForSlot_50K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(50000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetProposerForSlot(uint64(i % 32))
@@ -301,6 +317,7 @@ func BenchmarkLargeScale_GetProposerForSlot_50K(b *testing.B) {
 func BenchmarkLargeScale_ShuffleForEpoch_10K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(10000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// SECURITY (audit CORE-04): computeDeterministicShuffleForEpoch now
@@ -314,6 +331,7 @@ func BenchmarkLargeScale_ShuffleForEpoch_10K(b *testing.B) {
 func BenchmarkLargeScale_ShuffleForEpoch_50K(b *testing.B) {
 	vs, _ := NewValidatorSet(generateValidators(50000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// SECURITY (audit CORE-04): computeDeterministicShuffleForEpoch now
@@ -358,6 +376,10 @@ func TestLargeScale_200KValidators_SmokeTest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	committee, err := qpos.GetCommitteeForSlot(0)
 	if err != nil {
@@ -393,6 +415,10 @@ func TestLargeScale_200KValidators_FullEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	uniqueProposers := make(map[types.Address]bool)
 	for slot := uint64(0); slot < SlotsPerEpoch; slot++ {
@@ -424,6 +450,10 @@ func TestLargeScale_200KValidators_CommitteeCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	validatorSeen := make(map[types.Address]bool)
 	for slot := uint64(0); slot < SlotsPerEpoch; slot++ {
@@ -459,6 +489,10 @@ func TestLargeScale_200KValidators_Performance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	setupGenesisForBenchmark()
 
@@ -548,6 +582,10 @@ func TestLargeScale_ThreeProvinces_10K(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	qpos.InitChambers()
 	coordinator := qpos.GetChambersCoordinator()
@@ -603,6 +641,7 @@ func BenchmarkLargeScale_200K_GetCommitteeForSlot(b *testing.B) {
 	setupGenesisForBenchmark()
 	vs, _ := NewValidatorSet(generateValidators(200000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetCommitteeForSlot(uint64(i % 32))
@@ -616,6 +655,7 @@ func BenchmarkLargeScale_200K_GetProposerForSlot(b *testing.B) {
 	setupGenesisForBenchmark()
 	vs, _ := NewValidatorSet(generateValidators(200000))
 	qpos, _ := NewQPOS(vs)
+	defer qpos.Stop() // OBS-R24-1: stop the background loop (see qtd_r24 tests)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		qpos.GetProposerForSlot(uint64(i % 32))
@@ -656,6 +696,9 @@ func TestLargeScale_CommitteeAllocationLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping committee allocation latency test in short mode")
 	}
+	if raceEnabled {
+		t.Skip("wall-clock latency budgets are not meaningful under the race detector (5-20x slowdown)")
+	}
 
 	setupGenesisForBenchmark()
 
@@ -693,6 +736,9 @@ func TestLargeScale_CommitteeAllocationLatency(t *testing.T) {
 func TestLargeScale_ProposerSelectionLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping proposer selection latency test in short mode")
+	}
+	if raceEnabled {
+		t.Skip("wall-clock latency budgets are not meaningful under the race detector (5-20x slowdown)")
 	}
 
 	setupGenesisForBenchmark()
@@ -740,6 +786,10 @@ func TestLargeScale_Security_NoDuplicateCommitteeMembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	for slot := uint64(0); slot < SlotsPerEpoch; slot++ {
 		committee, err := qpos.GetCommitteeForSlot(slot)
@@ -770,6 +820,10 @@ func TestLargeScale_Security_NoDuplicateProposer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	proposers := make(map[types.Address]int)
 	for slot := uint64(0); slot < SlotsPerEpoch; slot++ {
@@ -798,6 +852,10 @@ func TestLargeScale_Security_CommitteeMemberInValidatorSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
+	// R24 (2026-10-30): stop the QPOS background loop; a leaked
+	// drainEvidenceQueueLoop goroutine pins the whole QPOS and its validator
+	// set for the lifetime of the process (OBS-R24-1).
+	defer qpos.Stop()
 
 	for slot := uint64(0); slot < 10; slot++ {
 		committee, err := qpos.GetCommitteeForSlot(slot)

@@ -7,9 +7,10 @@ package consensus
 // Audit (R39-P2-01): IsSlotFinalized previously consulted ONLY the local
 // instantFinalizedSlots map; a peer-induced or bug-induced map entry would
 // be reported as finalized even though QPOS hadn't reached the epoch yet.
-// Consumers (RPC "finalized", fork chooser, sync sentinel) would trust a
-// slot as instant-finalized while the chain's actual finality marker was
-// still behind, exposing the node to short-range reorg exploitation.
+// Consumers (the three-chambers lifecycle gates, GetEpochSealers,
+// IsSlotQTDFinalized) would trust a slot as instant-finalized while the
+// chain's actual finality marker was still behind, exposing the node to
+// short-range reorg exploitation.
 //
 // The fix returns false when BOTH map entry exists AND record.Epoch >
 // QPOS.finalizedEpoch (cross-check fails). When record.Epoch == 0 (legacy

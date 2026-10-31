@@ -264,6 +264,14 @@ type Syncer struct {
 	// height, we drop it silently instead of rolling back again.
 	forkAccepted map[uint64]bool
 
+	// forkRefusedFinality records fork heights whose rollback was refused
+	// because it would have deleted blocks at or below the local finality
+	// floor (R30, 2026-10-30). Sticky for the process lifetime: the refused
+	// branch can never become canonical on this node (the finalized prefix is
+	// irreversible), so the stickiness only suppresses re-logging the same
+	// refusal for every child block of that fork.
+	forkRefusedFinality map[uint64]bool
+
 	// R101-FINALITY-RESUME: epoch of the last epoch-block-root backfill pass.
 	// checkSync re-derives and injects completed-epoch boundary roots from the
 	// canonical store at most once per epoch (restarting nodes lose the whole
@@ -416,6 +424,7 @@ func NewSyncer(host *p2p.Host, blockStore *block.BlockStore, stateDB *state.Stat
 		forkRecoveryAttempts: make(map[uint64]int),
 		forkAccepted:         make(map[uint64]bool),
 		forkAbandonedHash:    make(map[uint64]types.Hash),
+		forkRefusedFinality:  make(map[uint64]bool),
 		// R38-P1-08: initialize the in-memory unvalidated-blocks marker.
 		unvalidatedBlocks:    make(map[types.Hash]uint64),
 		lastSyncProgress:     time.Now(),
@@ -849,6 +858,68 @@ func (s *Syncer) processGenesisBlock(blk *encoding.Block) error {
 // ProcessBlock processes an incoming block
 var processBlockCount uint64
 
+// rollbackTouchesFinality reports whether deleting every block at or above
+// `from` would delete history this node has already finalized, the checkpoint
+// slot it compared against, and whether that answer could be established at all
+// (R30, 2026-10-30).
+//
+// Finality is irreversible: the finalized checkpoint block and every ancestor
+// of it are final, so a rollback whose SURVIVING tip sits below that block would
+// delete history this node itself voted to finalize and has already rewound
+// account state for. No node that finalized the prefix can ever accept that
+// branch, so honoring it only leaves this node on a chain its own finality
+// contradicts — and, for a validator, attesting to it.
+//
+// The criterion is the SURVIVING tip (`from-1`), not the first deleted block
+// (R30 F22, 2026-10-30 — auditor finding C1). Adjacent heights may skip slots,
+// so the first deleted block can sit above the checkpoint while the block that
+// survives sits below it. Reading block(from) then let this gate pass a rollback
+// that fork choice refused LATER — after the store had been truncated and state
+// rewound — leaving the head on a deleted block with nothing left to reconcile
+// it. `kept.Slot < checkpointSlot` is also exactly the fork-choice predicate
+// (ReanchorConflictsWithFinality over the abandoned range (ancestor, replaced
+// head]), so the two authorities cannot disagree.
+//
+// proven=false means the surviving tip's slot could not be established (the
+// store no longer holds it, or `from` is zero so nothing survives); the answer
+// is then fail-closed and callers must not read it as "touches finality".
+func (s *Syncer) rollbackTouchesFinality(from uint64) (touches bool, checkpointSlot uint64, proven bool) {
+	if s.qpos == nil {
+		return false, 0, true
+	}
+	// R30 F21 (2026-10-30): the irreversible boundary is the finalized
+	// checkpoint BLOCK's slot, not the finalized epoch's boundary slot. When the
+	// boundary slot was skipped the checkpoint sits below it, and treating the
+	// whole band below the boundary as final refused rollbacks that only dropped
+	// blocks ABOVE the checkpoint — on a chain with skipped slots that band is
+	// the region right above the head, so the node could not follow a legitimate
+	// fork. The method falls back to the boundary slot when the checkpoint root
+	// cannot be located, which keeps this fail-closed.
+	checkpointSlot, ok := s.qpos.FinalizedCheckpointSlot()
+	if !ok {
+		return false, 0, true
+	}
+	if from == 0 {
+		// Nothing would survive: this deletes genesis along with the rest.
+		return true, checkpointSlot, true
+	}
+	if s.blockStore == nil {
+		return true, checkpointSlot, false
+	}
+	kept, err := s.blockStore.GetBlockByHeight(from - 1)
+	if err != nil || kept == nil || kept.Header == nil {
+		return true, checkpointSlot, false
+	}
+	return kept.Header.Slot < checkpointSlot, checkpointSlot, true
+}
+
+// rollbackBelowFinality is rollbackTouchesFinality with the unprovable case
+// folded into "refuse": every store-rollback caller treats it as a veto.
+func (s *Syncer) rollbackBelowFinality(from uint64) (bool, uint64) {
+	touches, checkpointSlot, _ := s.rollbackTouchesFinality(from)
+	return touches, checkpointSlot
+}
+
 func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 	if blk == nil || blk.Header == nil {
 		return ErrBlockValidationFailed
@@ -931,11 +1002,20 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 				s.mu.Lock()
 				attempts := s.forkRecoveryAttempts[forkPoint]
 				alreadyAccepted := s.forkAccepted[forkPoint]
+				alreadyRefused := s.forkRefusedFinality[forkPoint]
 				peerCount := s.safePeerCount()
 				if peerCount < 3 {
 					peerCount = 3 // minimum threshold for small networks
 				}
 				s.mu.Unlock()
+
+				// R30 (2026-10-30): this fork point was already refused for
+				// rewriting finalized history. Drop its blocks silently from now
+				// on — re-running the rollback path would only re-log the same
+				// refusal for every child of the refused branch.
+				if alreadyRefused {
+					return ErrForkDetected
+				}
 
 				// If we've already accepted a fork at this height and rolled
 				// back, a block that descends from the branch we ABANDONED is a
@@ -966,6 +1046,19 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 					// All peers have been tried. Accept the fork as canonical and roll back.
 					syncLog.Warn("FORK ACCEPTED at height %d: all %d peers agree on this chain (attempts=%d). Rolling back to %d and re-syncing.",
 						forkPoint, peerCount, attempts+1, rollbackHeight)
+
+					// R30 (2026-10-30) SAFETY: finality floor. Deleting at or below
+					// the floor removes blocks this node already finalized; the
+					// rollback would then be followed by a re-sync of a branch that
+					// contradicts its own finality. Refuse and drop the block.
+					if blocked, floor := s.rollbackBelowFinality(forkPoint); blocked {
+						syncLog.Error("FORK REFUSED at height %d: rolling back to %d would delete blocks at or below the finality floor (slot %d). Keeping the finalized chain and dropping this fork; if the fork is genuine this node must be re-synced from a finality-compatible checkpoint.",
+							forkPoint, rollbackHeight, floor)
+						s.mu.Lock()
+						s.forkRefusedFinality[forkPoint] = true
+						s.mu.Unlock()
+						return ErrForkDetected
+					}
 
 					deleted, err := s.blockStore.DeleteBlocksFromHeight(forkPoint)
 					if err != nil {
@@ -1040,6 +1133,19 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 					// Cascading or all peers tried. Accept fork immediately.
 					syncLog.Warn("FORK ACCEPTED at height %d (cascading=%v, attempts=%d/%d). Rolling back and re-syncing.",
 						forkPoint, isCascading, attempts+1, peerCount)
+
+					// R30 (2026-10-30) SAFETY: same finality floor as the
+					// non-cascading branch above. A cascade is exactly where a
+					// deep reorg silently deletes finalized blocks, so it must
+					// not inherit an exemption from the earlier acceptances.
+					if blocked, floor := s.rollbackBelowFinality(forkPoint); blocked {
+						syncLog.Error("FORK REFUSED at height %d (cascading): rolling back would delete blocks at or below the finality floor (slot %d). Keeping the finalized chain and dropping this fork.",
+							forkPoint, floor)
+						s.mu.Lock()
+						s.forkRefusedFinality[forkPoint] = true
+						s.mu.Unlock()
+						return ErrForkDetected
+					}
 
 					deleted, err := s.blockStore.DeleteBlocksFromHeight(forkPoint)
 					if err != nil {
@@ -1425,6 +1531,29 @@ func (s *Syncer) applyBlock(blk *encoding.Block) error {
 	return s.applyBlockInternal(blk, !s.strictStateRoot)
 }
 
+// canonicalStoreHoldsBlock reports whether blockHash is the block the store
+// currently keeps at height (R30 F16).
+//
+// The block store holds at most one block per height (PutBlock refuses to
+// overwrite a different hash, and a block is only stored once its parent is),
+// so "is stored at its height" and "is the canonical block at its height" are
+// the same question. Callers that are about to write canonical QPOS state use
+// this to confirm the block they are applying is still the one the store
+// describes, instead of trusting a read that a concurrent rollback may have
+// invalidated.
+func canonicalStoreHoldsBlock(bs *block.BlockStore, height uint64, blockHash types.Hash) bool {
+	if bs == nil {
+		return false
+	}
+	// GetBlockHash reads only the height index, so this costs one key lookup
+	// per applied block instead of a full block decode.
+	storedHash, err := bs.GetBlockHash(height)
+	if err != nil {
+		return false
+	}
+	return storedHash == blockHash
+}
+
 // SetStrictStateRoot enables or disables strict state-root validation.
 // When enabled, a state-root mismatch causes applyBlock to return an error
 // (rejecting the block) instead of only logging a warning.
@@ -1659,9 +1788,23 @@ func (s *Syncer) applyBlockInternal(blk *encoding.Block, skipStateRootValidation
 	// verification and the snapshot's only consumers are the slot→root
 	// mapping used by ElectionVerifier, which is keyed by hash and so will
 	// agree with the canonical chain at sync completion.
+	// R30 F16 (2026-10-30): the snapshot these calls populate is CANONICAL
+	// state — slotBlockRoots is what finality counts attestations against, and
+	// epochBlockRoots is what a checkpoint lookup resolves. Recording a root
+	// for a block the store does not hold at that height would therefore make a
+	// deleted or never-stored block look canonical, and the only thing standing
+	// between that and a wrong finalization would be fork choice's later
+	// cleanup. PutBlock refuses a second block at an occupied height, so the
+	// block just stored by ProcessBlock IS the canonical block at its height;
+	// this function is also reached from rebuildState and from tests, where
+	// that no longer has to be true (a rollback can truncate the block out
+	// between the read and the apply), so verify it instead of assuming it.
 	if s.qpos != nil {
 		blockHash := block.ComputeBlockHash(blk.Header)
-		if err := s.qpos.ApplyBlockHeader(blk, blockHash); err != nil {
+		if !canonicalStoreHoldsBlock(s.blockStore, blk.Header.Height, blockHash) {
+			syncLog.Warn("R30 F16: block %d (hash=%x) is not the canonical block at its height anymore — skipping the QPOS snapshot write so a dropped block cannot anchor a canonical slot root",
+				blk.Header.Height, blockHash[:8])
+		} else if err := s.qpos.ApplyBlockHeader(blk, blockHash); err != nil {
 			// Best-effort: failures here MUST NOT abort sync (the caller's
 			// strictStateRoot is the authoritative gate). Log a WARN so
 			// operators can see incremental reconstruction failures.
@@ -4307,6 +4450,13 @@ func (s *Syncer) deepForkRecovery(peerBlock *encoding.Block) {
 
 	deleteFrom := rewindHeight + 1
 	if deleteFrom <= peerBlock.Header.Height-1 {
+		// R30 (2026-10-30) SAFETY: a deep fork is the one path that can reach
+		// far below the local tip, so the finality floor applies here too.
+		if blocked, floor := s.rollbackBelowFinality(deleteFrom); blocked {
+			syncLog.Error("Deep fork: refusing to delete blocks from height %d — at or below the finality floor (slot %d). Keeping the finalized chain.",
+				deleteFrom, floor)
+			return
+		}
 		deleted, err := s.blockStore.DeleteBlocksFromHeight(deleteFrom)
 		if err != nil {
 			syncLog.Error("Deep fork: failed to delete blocks from height %d: %v", deleteFrom, err)

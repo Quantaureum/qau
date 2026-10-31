@@ -244,6 +244,20 @@ func (sc *ExecutiveChamber) IsActive() bool {
 func (sc *ExecutiveChamber) DKGDuration() time.Duration {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
+	return sc.dkgDurationLocked()
+}
+
+// dkgDurationLocked computes the DKG duration with sc.mu already held.
+//
+// R24 (2026-10-30) FIX: Stats() used to call DKGDuration() while holding
+// sc.mu.RLock() itself — a recursive RLock. Go's RWMutex is not reentrant
+// under writer contention: once a writer (RecordSeal, from the seal-completion
+// path) is queued between the two acquisitions, the inner RLock waits for the
+// writer and the writer waits for the outer RLock — both goroutines stuck
+// forever. The window is hit whenever a chamber-status RPC (Stats) races a
+// seal completion (RecordSeal), which the R24 determinism battery caught in
+// the field (a 28-minute stuck pair in the goroutine dump).
+func (sc *ExecutiveChamber) dkgDurationLocked() time.Duration {
 	if sc.dkgEndTime.IsZero() || sc.dkgStartTime.IsZero() {
 		return 0
 	}
@@ -262,7 +276,7 @@ func (sc *ExecutiveChamber) Stats() map[string]any {
 		"state":       sc.state.String(),
 		"sealCount":   sc.sealCount,
 		"sealFail":    sc.sealFail,
-		"dkgDuration": sc.DKGDuration().String(),
+		"dkgDuration": sc.dkgDurationLocked().String(),
 	}
 }
 

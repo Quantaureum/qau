@@ -1025,15 +1025,18 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to initialize syncer: %w", err)
 	}
 
-	// Initialize history expirer — prunes ancient block history past the
-	// retention window. Disabled by default; enable via QAU_HISTORY_EXPIRY=1.
+	// Initialize history expirer. Block-history pruning is unsupported in this
+	// release (R30 F4): deleting blocks below the tip breaks store continuity
+	// (FindContinuousTip scans upward from height 1 and stops at the first gap,
+	// so the next restart truncates the chain) and leaves a restored finality
+	// checkpoint without the blocks it is anchored to. Start() therefore refuses
+	// while it is enabled; the QAU_HISTORY_EXPIRY gate is kept so an operator who
+	// opts in gets an explicit error instead of silence.
 	histCfg := DefaultHistoryExpirationConfig()
-	if os.Getenv("QAU_HISTORY_EXPIRY") != "1" {
-		histCfg.Enabled = false
-	}
+	histCfg.Enabled = os.Getenv("QAU_HISTORY_EXPIRY") == "1"
 	n.historyExpirer = NewHistoryExpirer(histCfg, &blockStoreReaderAdapter{blockStore: n.blockStore})
-	if err := n.historyExpirer.Start(); err != nil {
-		nodeLog.Warn("History expirer not started: %v", err)
+	if err := n.historyExpirer.Start(); err != nil && !errors.Is(err, ErrHistoryExpirationDisabled) {
+		nodeLog.Error("History expirer not started: %v", err)
 	}
 
 	// Initialize high availability components
@@ -6754,6 +6757,68 @@ func shouldCreateElectionVerifierProducer(devMode, validatorEnabled, blockProduc
 	return !shouldStartProducingBlocks(devMode, validatorEnabled, blockProducer, syncOnlyMode)
 }
 
+// truncateFragmentedChain repairs a fragmented block store by deleting the
+// orphaned blocks above continuousTip (R53), unless doing so would reach into
+// this node's finalized history (R30, 2026-10-30).
+//
+// Fragmentation means the store reports blocks above a ParentHash gap: those
+// orphans make the VRF rebuild cover the wrong range and the proposer election
+// diverge, so they have to go. They must NOT go when the deletion would reach at
+// or below the finality floor, though: the checkpoint restored from disk before
+// this point would then describe a block that no longer exists, and every later
+// rollback would be refused against a floor the store can no longer satisfy.
+// A store fragmented below finality is beyond automatic repair, so the
+// truncation is refused, production is stopped, and an operator has to re-sync
+// from a finality-compatible snapshot.
+//
+// Returns the number of deleted blocks (0 when refused), whether the truncation
+// was left undone, and the store error if any.
+//
+// R30 F22 (2026-10-30) FIX (auditor finding W1): the guard asks about the block
+// that SURVIVES (continuousTip), which is by definition readable here, and it
+// separates "this would delete finalized history" (stop producing, operator must
+// re-sync) from "the surviving tip's slot cannot be established" (leave the
+// store alone, but do not claim a finality violation). Folding the two together
+// meant a store whose height index had holes — a main cause of fragmentation —
+// was permanently declared broken and the R53 self-repair never ran again.
+func (n *Node) truncateFragmentedChain(continuousTip, latestHeight uint64) (truncated int, refused bool, err error) {
+	if n.blockStore == nil || continuousTip >= latestHeight {
+		return 0, false, nil
+	}
+	nodeLog.Warn("R53 FIX: fragmented chain detected (continuousTip=%d < latestHeight=%d), truncating orphans",
+		continuousTip, latestHeight)
+	truncFrom := continuousTip + 1
+	if continuousTip == 0 {
+		truncFrom = 1
+	}
+	if n.syncer != nil {
+		touchesFinality, checkpointSlot, proven := n.syncer.rollbackTouchesFinality(truncFrom)
+		if touchesFinality && proven {
+			nodeLog.Error("R53 FIX: refusing to truncate the fragmented chain from height %d: the surviving block at height %d sits below the finalized checkpoint (slot %d), so the repair would delete finalized blocks. Keeping the store as-is; re-sync from a finality-compatible snapshot instead.",
+				truncFrom, continuousTip, checkpointSlot)
+			n.markStateTrustBroken(fmt.Sprintf(
+				"fragmented chain store reaches into finalized history (truncate from height %d, surviving block height %d, finalized checkpoint slot %d)",
+				truncFrom, continuousTip, checkpointSlot))
+			return 0, true, nil
+		}
+		if touchesFinality {
+			// Not proven: nothing is known to be finalized, so trust is kept, but
+			// the truncation cannot be proven safe either. Leave the store and let
+			// the next pass retry once the height index is readable again.
+			nodeLog.Error("R53 FIX: cannot establish the slot of the surviving block at height %d, so truncating from height %d cannot be checked against the finalized checkpoint (slot %d); leaving the fragmented store untouched and keeping production state as-is",
+				continuousTip, truncFrom, checkpointSlot)
+			return 0, true, nil
+		}
+	}
+	truncated, err = n.blockStore.DeleteBlocksFromHeight(truncFrom)
+	if err != nil {
+		nodeLog.Error("R53 FIX: failed to truncate fragmented chain: %v (will attempt VRF rebuild on available data)", err)
+		return truncated, false, err
+	}
+	nodeLog.Info("R53 FIX: truncated %d orphaned blocks above continuousTip=%d", truncated, continuousTip)
+	return truncated, false, nil
+}
+
 func (n *Node) startServices() error {
 	// Start block producer in dev mode (unless sync-only mode is enabled)
 	if n.config.DevMode && !n.config.SyncOnlyMode {
@@ -6831,6 +6896,16 @@ func (n *Node) startServices() error {
 	// leaving the remaining VRF outputs permanently lost -> proposer election
 	// diverges -> chain fork.
 	//
+	// R33 NOTE (2026-10-31, round-13 review): since R32c the startup
+	// continuity scan verifies parent linkage only for the LAST
+	// continuityParentWindow (64) heights — deep linkage damage older than
+	// that window no longer lowers the returned tip here. The repair below
+	// therefore fires for number-index gaps and RECENT linkage damage; deep
+	// damage (only creatable by pre-2026-08-17 write rules, long since
+	// repaired on every live store by earlier restarts) surfaces via fork
+	// recovery instead. A background deep-integrity pass is the registered
+	// follow-up.
+	//
 	// Fix: Before VRF rebuild, if continuousTip < latestHeight, truncate the
 	// orphaned blocks above continuousTip so the chain is consistent and VRF
 	// rebuild covers the full range. This is the in-memory equivalent of what
@@ -6839,23 +6914,7 @@ func (n *Node) startServices() error {
 		if latestHeight, err := n.blockStore.GetLatestHeight(); err == nil && latestHeight > 0 {
 			continuousTip := n.blockStore.FindContinuousTip()
 			if continuousTip < latestHeight {
-				nodeLog.Warn("R53 FIX: fragmented chain detected (continuousTip=%d < latestHeight=%d), truncating orphans",
-					continuousTip, latestHeight)
-				var truncated int
-				var truncErr error
-				if continuousTip > 0 {
-					// Delete blocks above the continuous tip.
-					truncated, truncErr = n.blockStore.DeleteBlocksFromHeight(continuousTip + 1)
-				} else {
-					// Chain fully disconnected — clear all non-genesis blocks
-					// so the node resyncs from genesis.
-					truncated, truncErr = n.blockStore.DeleteBlocksFromHeight(1)
-				}
-				if truncErr != nil {
-					nodeLog.Error("R53 FIX: failed to truncate fragmented chain: %v (will attempt VRF rebuild on available data)", truncErr)
-				} else {
-					nodeLog.Info("R53 FIX: truncated %d orphaned blocks above continuousTip=%d", truncated, continuousTip)
-				}
+				_, _, _ = n.truncateFragmentedChain(continuousTip, latestHeight)
 			}
 		}
 	}
@@ -8465,8 +8524,19 @@ func (n *Node) blockInsertLoop() {
 					oldHead = n.currentBlock
 					oldHeadHash = block.ComputeBlockHash(n.currentBlock.Header)
 				}
+				// R30 (2026-10-30) SAFETY: the finality decision and the commit are
+				// one atomic step. commitHeadSwitchLocked plans the re-anchor (a
+				// read-only walk of the store) and hands it to the QPOS, which
+				// refuses under its own lock when the abandoned range reaches at or
+				// below the finality floor — writing nothing. Only an accepted plan
+				// lets the head move, so a fork that rewrites irreversible history
+				// leaves shouldSwitch=false and every side effect below skipped.
+				if shouldSwitch && !n.commitHeadSwitchLocked("blockInsertLoop", blk, blockHash, oldHead, oldHeadHash, n.forkChoiceQPOS()) {
+					shouldSwitch = false
+				}
 				if shouldSwitch {
-					n.currentBlock = blk
+					// The head itself was committed by commitHeadSwitchLocked above;
+					// only the adoption side effects remain.
 					// R79-STAKING-RESYNC (2026-08-28): the gate used to be
 					// `!syncer.IsSyncing()`, but on a live chain the syncer
 					// stays in "syncing" state almost permanently (it keeps
@@ -8619,12 +8689,10 @@ func (n *Node) blockInsertLoop() {
 						// finalized across nodes). For linear extensions (no reorg)
 						// this is a no-op and the SetSlotBlockRoot below records the
 						// new head's own slot.
-						if oldHead != nil {
-							n.reanchorSlotRootsAfterReorg(
-								n.blockProducer.QPOS(), n.blockStore,
-								blk, blockHash, oldHead, oldHeadHash,
-							)
-						}
+						// R30 (2026-10-30): commitHeadSwitchLocked already re-anchored the
+						// abandoned range (or refused the switch, in which case
+						// shouldSwitch is false and nothing here runs). Every write below
+						// therefore belongs to a branch this node's own finality accepts.
 						// P0-3 FIX (2026-07-13): Record per-slot block root for GOV-05 fix.
 						// This allows the Review Chamber to classify attestations against
 						// the correct canonical block for each slot, not just the epoch boundary.
@@ -8642,13 +8710,16 @@ func (n *Node) blockInsertLoop() {
 						// and reports finalizedEpoch=0 forever. Same anchor position + same
 						// canonical-head gating as SetSlotBlockRoot, mirroring R54-ACC's
 						// header-derived SetEpochVRFAccumulator one line below.
-						n.blockProducer.QPOS().AdoptHeaderFinality(blk.Header.JustifiedEpoch, blk.Header.FinalizedEpoch, blockHash)
+						// R30 F8 (2026-10-30): routed through adoptHeaderFinality so an
+						// out-of-bounds claim (only possible from data stored before the
+						// validator rule) is refused instead of ratcheting the floor.
+						n.adoptHeaderFinality(n.blockProducer.QPOS(), blk.Header, blockHash)
 						// R54-ACC (2026-08-07): Record the per-epoch VRF accumulator
 						// from the ON-CHAIN header value. This assignment is
 						// idempotent and path-independent, so it is safe to run
 						// unconditionally (produce, sync, reorg). The old XOR-based
 						// AccumulateVRFOutput was gated by isLinearExtension and
-						// recomputed by reanchorSlotRootsAfterReorg, and any
+						// recomputed by the re-anchor plan, and any
 						// asymmetry between those paths diverged the accumulator →
 						// different proposer → chain fork. The header value is
 						// identical on every node, so this converges deterministically.
@@ -9460,9 +9531,30 @@ func (n *Node) handleIncomingStatus(data []byte, from p2p.PeerID) {
 	}
 }
 
-// reanchorSlotRootsAfterReorg walks the new canonical head back to the common
-// ancestor with the old (replaced) head and re-anchors slotBlockRoots for
-// every slot on the new canonical segment (AUDIT R4-CORE-02, 2026-07-15).
+// slotReanchorPlan is the outcome of walking a reorg back to its common
+// ancestor: everything the QPOS needs to clean the abandoned range, derived
+// WITHOUT touching QPOS state (R30, 2026-10-30).
+//
+// Building the plan is separate from applying it because the fork choice has to
+// decide whether to adopt a head BEFORE it commits it: a reorg whose abandoned
+// range starts at or below the local finality floor must be refused outright
+// (consensus refuses it inside reanchorSlotRoots), and refusing after the head
+// had already been switched would leave the head and the canonical roots
+// describing different chains. The same plan is then applied verbatim, so the
+// decision and the write can never disagree.
+type slotReanchorPlan struct {
+	roots         map[uint64]types.Hash
+	vrfAccUpdates map[uint64]types.Hash
+	bounds        consensus.ReanchorBounds
+
+	ancestorSlot     uint64
+	newHeadSlot      uint64
+	replacedHeadSlot uint64
+}
+
+// planSlotReanchor walks the new canonical head back to the common ancestor
+// with the old (replaced) head and derives the re-anchoring the QPOS must
+// perform (AUDIT R4-CORE-02, 2026-07-15). Pure: it reads the block store only.
 //
 // Without this, a multi-block reorg leaves slotBlockRoots[reorged_slot]
 // pointing at the abandoned fork's roots (SetSlotBlockRoot only records the
@@ -9472,30 +9564,56 @@ func (n *Node) handleIncomingStatus(data []byte, from p2p.PeerID) {
 // roots across nodes with different import orders (accountable safety
 // failure).
 //
-// This is a no-op for linear extensions (new head's parent IS the old head):
-// no stale roots can exist, so we return without touching slotBlockRoots and
-// let the caller's SetSlotBlockRoot record the new head's own slot.
+// Returns nil when nothing can go stale: linear extension (the new head's
+// parent IS the old head — the caller's SetSlotBlockRoot covers it), or a
+// missing input.
 //
 // The walk is bounded by maxReorgDepth (2 epochs / 64 slots). Reorgs deeper
 // than this are extremely unusual; if encountered, we re-anchor what we can
 // and log a warning — the affected deep slots' attestations may be
 // miscounted, but this is strictly better than leaving ALL reorged slots
 // stale (the pre-fix behavior).
-func (n *Node) reanchorSlotRootsAfterReorg(
-	qpos *consensus.QPOS,
+func planSlotReanchor(
 	bs *block.BlockStore,
 	newHead *encoding.Block,
 	newHeadHash types.Hash,
 	oldHead *encoding.Block,
 	oldHeadHash types.Hash,
-) {
-	if qpos == nil || bs == nil || newHead == nil || oldHead == nil {
-		return
+) *slotReanchorPlan {
+	return planSlotReanchorWithHint(bs, newHead, newHeadHash, oldHead, oldHeadHash, nil)
+}
+
+// reanchorAncestorHint is a common ancestor the CALLER can still observe even
+// though the old head's ancestry is gone (its blocks were already deleted).
+//
+// R30 F15 (2026-10-30): after a store truncation the old head and its parents no
+// longer exist, so the old-chain walk in planSlotReanchor fails and the plan
+// degrades to "abandoned range starts at the newest block we walked" — which is
+// up to 64 slots below the new head and therefore always reaches below the
+// finality floor. Every head switch on a truncated store was then vetoed and the
+// node kept a head pointing at a deleted block until a restart. When the store
+// still holds the block the new head descends from, that block IS the ancestor,
+// so the caller supplies it instead of giving up.
+type reanchorAncestorHint struct {
+	slot uint64
+	hash types.Hash
+}
+
+func planSlotReanchorWithHint(
+	bs *block.BlockStore,
+	newHead *encoding.Block,
+	newHeadHash types.Hash,
+	oldHead *encoding.Block,
+	oldHeadHash types.Hash,
+	hint *reanchorAncestorHint,
+) *slotReanchorPlan {
+	if bs == nil || newHead == nil || oldHead == nil {
+		return nil
 	}
 	// Linear extension: new head's parent IS the old head → no stale roots
 	// can exist. Skip the walk entirely.
 	if newHead.Header.ParentHash == oldHeadHash {
-		return
+		return nil
 	}
 
 	const maxReorgDepth = 2 * consensus.SlotsPerEpoch // 64 slots
@@ -9533,7 +9651,12 @@ func (n *Node) reanchorSlotRootsAfterReorg(
 	// Walk the OLD chain back to find the common ancestor: the first hash
 	// that also appears in the new chain. Everything on the new chain ABOVE
 	// that ancestor needs re-anchoring.
+	//
+	// The ancestor's own hash is captured too (R29, 2026-10-30): it is the
+	// canonical tip every abandoned slot fell back to, so it is the correct
+	// checkpoint value for an epoch the new chain does not reach yet.
 	ancestorSlot, found := uint64(0), false
+	ancestorHash := types.Hash{}
 	// R55-ACC-ONCHAIN (2026-08-07): We no longer collect the old chain's
 	// segment to zero out abandoned-fork VRF accumulators — see the comment
 	// at the newAcc construction below. The walk below is retained solely to
@@ -9543,6 +9666,7 @@ func (n *Node) reanchorSlotRootsAfterReorg(
 	for i := 0; i < maxReorgDepth; i++ {
 		if s, ok := newHashSlots[curHash]; ok {
 			ancestorSlot = s
+			ancestorHash = curHash
 			found = true
 			break
 		}
@@ -9555,6 +9679,16 @@ func (n *Node) reanchorSlotRootsAfterReorg(
 		}
 		cur = parent
 		curHash = block.ComputeBlockHash(parent.Header)
+	}
+
+	if !found && hint != nil {
+		// The old chain's ancestry is unavailable (truncated store). The hint is
+		// only usable when it really is on the new chain: the roots map and the
+		// clean range are both derived from the ancestor slot, so a stale hint
+		// would understate the abandoned range.
+		if s, ok := newHashSlots[hint.hash]; ok && s == hint.slot {
+			ancestorSlot, ancestorHash, found = s, hint.hash, true
+		}
 	}
 
 	if !found {
@@ -9588,9 +9722,14 @@ func (n *Node) reanchorSlotRootsAfterReorg(
 			roots[e.slot] = e.hash
 		}
 	}
-	if len(roots) == 0 {
-		return
-	}
+	// R29 (2026-10-30) FIX (auditor finding B1): an empty roots map is NOT a
+	// reason to stop. It is precisely the pure head-rollback shape — the new
+	// head is the common ancestor, so the new chain contributes no block above
+	// it — and the slots in (ancestorSlot, oldHead.Slot] still hold the
+	// abandoned chain's roots. Returning here left every one of them
+	// classifying as canonical (and reporting as final) against a block the
+	// rollback removed, with no later pass to correct it. The QPOS entry point
+	// derives the range from the bounds in that case.
 
 	// R54-ACC (2026-08-07): Derive the per-epoch VRF accumulator for every
 	// epoch touched by this reorg directly from the NEW canonical chain's
@@ -9636,22 +9775,244 @@ func (n *Node) reanchorSlotRootsAfterReorg(
 		}
 	}
 
-	qpos.ReanchorSlotRoots(roots, newAcc)
-
-	// Also re-anchor epoch boundary roots on the new canonical segment, so
-	// the epoch-root fallback in tryUpdateFinality / getExpectedBlockRoot
-	// does not read a stale root from the abandoned fork.
+	// R27 (2026-10-30) FIX (auditor finding N1): the head being replaced must be
+	// reported too. Fork choice can switch to an equal-height head at an earlier
+	// slot (and sync rollbacks move the head backwards), so slots in
+	// (newHeadSlot, oldHeadSlot] still hold the abandoned chain's roots. The
+	// plain entry point would leave them there — their seals would keep
+	// classifying as canonical against a live root and the RPCs would keep
+	// reporting reorged-away blocks as final.
+	//
+	// R28 (2026-10-30) FIX (auditor findings R27-O1/R27-O3): also report the
+	// common ancestor (so the slots the new chain SKIPPED between the ancestor
+	// and its first re-anchored block are cleaned too) and the epoch checkpoint
+	// the new chain implies for every epoch the reorg reaches into.
+	//
+	// The checkpoint of an epoch binds the chain tip at the START of that epoch
+	// (R42-P3), so it is derived from the LOWEST-slot new-chain block of the
+	// epoch: the block itself when it sits on the boundary slot, its parent
+	// otherwise. newChain is ordered newest -> oldest, so later iterations
+	// overwrite with lower slots and the final value is the epoch's first
+	// canonical block. Epochs with no new-chain block above the ancestor are
+	// absent from this map; the QPOS fills them from AncestorHash, which is the
+	// tip they all fall back to (R29, 2026-10-30 — auditor finding N7).
+	epochRoots := make(map[uint64]types.Hash)
 	for _, e := range newChain {
-		if e.slot > ancestorSlot && e.slot%consensus.SlotsPerEpoch == 0 {
-			qpos.SetEpochBlockRoot(consensus.SlotToEpoch(e.slot), e.hash)
+		if e.slot <= ancestorSlot {
+			break
+		}
+		if e.slot%consensus.SlotsPerEpoch == 0 {
+			epochRoots[consensus.SlotToEpoch(e.slot)] = e.hash
 		} else {
-			// R42-P3 FIX: Also ensure epoch boundary for non-boundary-slot blocks.
-			qpos.EnsureEpochBlockRoot(consensus.SlotToEpoch(e.slot), e.parentHash)
+			epochRoots[consensus.SlotToEpoch(e.slot)] = e.parentHash
 		}
 	}
+	return &slotReanchorPlan{
+		roots:         roots,
+		vrfAccUpdates: newAcc,
+		bounds: consensus.ReanchorBounds{
+			AncestorSlot:     ancestorSlot,
+			AncestorKnown:    found,
+			AncestorHash:     ancestorHash,
+			ReplacedHeadSlot: oldHead.Header.Slot,
+			EpochRoots:       epochRoots,
+		},
+		ancestorSlot:     ancestorSlot,
+		newHeadSlot:      newHead.Header.Slot,
+		replacedHeadSlot: oldHead.Header.Slot,
+	}
+}
 
-	nodeLog.Info("R4-CORE-02: re-anchored %d slot roots after reorg (ancestor slot %d, new head slot %d)",
-		len(roots), ancestorSlot, newHead.Header.Slot)
+// oldHeadHashUnavailable reports whether the block store has stopped returning
+// head at head's own height, which means the store was truncated at or below
+// the head rather than the reorg simply being deeper than the ancestor walk
+// (R30 F18).
+//
+// The comparison MUST be by hash: a reorg replaces the tip at its own height, so
+// the height is occupied again by the time the head switch runs. Only a store
+// that still answers with the head's own hash proves the head's ancestry is
+// intact.
+func oldHeadHashUnavailable(bs *block.BlockStore, head *encoding.Block, headHash types.Hash) bool {
+	if bs == nil || head == nil || head.Header == nil {
+		return false
+	}
+	storedHash, err := bs.GetBlockHash(head.Header.Height)
+	if err != nil {
+		return true
+	}
+	return storedHash != headHash
+}
+
+// truncationAncestorHint returns the highest ancestor of blk that the block
+// store still holds as its canonical block at that height, which is therefore
+// the highest block this node can PROVE both chains share (R30 F15).
+//
+// It is only consulted when the old chain's ancestry is gone: the store was
+// truncated at or below the old head, so every block at or above the truncation
+// point is missing and the walk stops at the surviving tip.
+func truncationAncestorHint(bs *block.BlockStore, blk *encoding.Block) (*reanchorAncestorHint, bool) {
+	if bs == nil || blk == nil || blk.Header == nil {
+		return nil, false
+	}
+	const maxWalk = 2 * consensus.SlotsPerEpoch
+	cur := blk
+	for i := 0; i < maxWalk; i++ {
+		if cur.Header.Height == 0 {
+			return nil, false
+		}
+		parent, err := bs.GetBlock(cur.Header.ParentHash)
+		if err != nil || parent == nil || parent.Header == nil {
+			return nil, false
+		}
+		parentHash := block.ComputeBlockHash(parent.Header)
+		stored, serr := bs.GetBlockByHeight(parent.Header.Height)
+		if serr == nil && stored != nil && stored.Header != nil &&
+			block.ComputeBlockHash(stored.Header) == parentHash {
+			return &reanchorAncestorHint{slot: parent.Header.Slot, hash: parentHash}, true
+		}
+		cur = parent
+	}
+	return nil, false
+}
+
+// forkChoiceQPOS returns the QPOS that owns this node's finality state, or nil
+// when the node has no block producer (and therefore no finality state to
+// enforce).
+func (n *Node) forkChoiceQPOS() *consensus.QPOS {
+	if n.blockProducer == nil {
+		return nil
+	}
+	return n.blockProducer.QPOS()
+}
+
+// commitHeadSwitchLocked commits a pending head switch, with the finality floor
+// as an integral part of the decision (R30, 2026-10-30). The caller holds n.mu.
+//
+// The re-anchoring is APPLIED here rather than by the caller afterwards, and the
+// head is assigned only when the QPOS accepts it. That ordering IS the fix: the
+// authority that owns finality decides while the head is still the old one, so
+// a refusal leaves nothing half-done — no head to revert, no slot root written
+// for the rejected branch, and no caller-side side effect (staking, events,
+// metrics) able to observe a head that this node's own finality contradicts.
+//
+// Applying here is safe with respect to locking: consensus never calls back
+// into the node, so n.mu → qpos.mu is a one-way order (the block producer
+// already writes QPOS state under n.mu).
+//
+// R30 F25 (2026-10-30) — auditor finding S2, accepted as-is: the apply also
+// runs the QTD seal re-drive and the finality persist under n.mu. Moving them
+// out would mean committing the head in one step and re-driving in another,
+// reopening the window this function exists to close (a head this node's own
+// finality contradicts, observable by a caller). The cost is lock hold time,
+// not correctness: the re-driven work is proportional to the abandoned range
+// (≤ maxReorgDepth slots), the persist is one small key write, and the order
+// n.mu → qpos.mu → qfs.mu/store has no cycle because neither consensus nor the
+// store calls back into the node.
+//
+// qpos may be nil (no block producer ⇒ no finality state); the head is then
+// adopted unconditionally, which is what every caller did before the guard.
+//
+// Returns false when the switch was REFUSED; the caller must then treat the
+// block as non-canonical (shouldSwitch=false) and skip every canonical-head
+// side effect.
+func (n *Node) commitHeadSwitchLocked(
+	caller string,
+	blk *encoding.Block,
+	blockHash types.Hash,
+	oldHead *encoding.Block,
+	oldHeadHash types.Hash,
+	qpos *consensus.QPOS,
+) bool {
+	return n.commitHeadSwitchWithHintLocked(caller, blk, blockHash, oldHead, oldHeadHash, qpos, nil)
+}
+
+// commitHeadSwitchWithHintLocked is commitHeadSwitchLocked for callers that can
+// prove a common ancestor the store walk cannot reach (R30 F24, 2026-10-30).
+//
+// hint must be a block both chains provably share — planSlotReanchorWithHint
+// re-checks it against the new chain before using it. The operator rollback path
+// passes the block it is moving the head TO: that block IS the ancestor, and
+// without the hint a rollback deeper than the ancestor window left the abandoned
+// range below the window un-bounded, so its slot roots were never cleaned (the
+// RPCs kept reporting deleted blocks as canonical and final) while the finality
+// check was answering about a range that started too high (R30 F24 — auditor
+// finding S1).
+func (n *Node) commitHeadSwitchWithHintLocked(
+	caller string,
+	blk *encoding.Block,
+	blockHash types.Hash,
+	oldHead *encoding.Block,
+	oldHeadHash types.Hash,
+	qpos *consensus.QPOS,
+	hint *reanchorAncestorHint,
+) bool {
+	plan := planSlotReanchorWithHint(n.blockStore, blk, blockHash, oldHead, oldHeadHash, hint)
+	// R30 F15 (2026-10-30): the walk cannot reach an ancestor that has already
+	// been truncated out of the store. Without a hint the plan claims the
+	// abandoned range starts up to maxReorgDepth slots below the new head, which
+	// always reaches below the finality floor — so the head could never move on a
+	// truncated store. Retry with the ancestor the store still holds.
+	if plan != nil && !plan.bounds.AncestorKnown && hint == nil && oldHead != nil && oldHead.Header != nil && n.blockStore != nil {
+		// Only a genuinely truncated store needs (and may trust) the hint: when
+		// the old head is still stored the failed walk means a reorg deeper than
+		// maxReorgDepth, and answering "the ancestor is the new head's parent"
+		// would understate that abandoned range — the veto must stay conservative
+		// there.
+		//
+		// R30 F18 (2026-10-30): "still stored" is a hash comparison, not a
+		// height lookup. A reorg replaces the tip AT its own height, so the
+		// height read succeeds while returning a different block; treating that
+		// as "the old head is still here" skipped the hint and vetoed a switch
+		// the node has to make, freezing the head on a block the store had
+		// already replaced.
+		if oldHeadHashUnavailable(n.blockStore, oldHead, oldHeadHash) {
+			if hint, ok := truncationAncestorHint(n.blockStore, blk); ok {
+				plan = planSlotReanchorWithHint(n.blockStore, blk, blockHash, oldHead, oldHeadHash, hint)
+			}
+		}
+	}
+	if plan != nil && !plan.bounds.AncestorKnown && qpos != nil {
+		// R30 F24 (2026-10-30): the abandoned range starts at an ancestor this
+		// node cannot locate, so the plan can only describe the newest window —
+		// it UNDERSTATES the range that would really be abandoned. Both answers
+		// derived from it are therefore unsound: the finality check may accept a
+		// reorg that reaches below the checkpoint, and the cleanup leaves the
+		// slots below the window anchored to the abandoned branch. Refuse: the
+		// node keeps a chain its own finality still describes, and a genuine deep
+		// reorg resolves through the syncer's truncation paths, which hand fork
+		// choice the surviving tip as a trusted ancestor.
+		//
+		// R30 F26 (2026-10-30): the refusal is only justified while there is an
+		// irreversible block to protect. With nothing finalized yet (no adopted
+		// checkpoint, or the genesis checkpoint at slot 0) no abandoned range can
+		// rewrite finalized history — the QPOS guard itself would accept it — so
+		// refusing here would freeze the head on a branch the network has left,
+		// for as long as the node runs. That is the same liveness trap F21
+		// removed on the other side. The best-effort plan is then applied exactly
+		// as it was before F24, and "slot roots below the ancestor window stay
+		// stale" remains the documented deep-reorg limitation.
+		if checkpointSlot, finalized := qpos.FinalizedCheckpointSlot(); finalized && checkpointSlot > 0 {
+			nodeLog.Error("%s: refusing head switch to height %d (slot %d): the common ancestor with the replaced head (slot %d) is not in the store and cannot be bounded, so the abandoned range cannot be checked against the finalized checkpoint at slot %d or cleaned — keeping the previous head; a re-sync is required",
+				caller, blk.Header.Height, blk.Header.Slot, plan.replacedHeadSlot, checkpointSlot)
+			return false
+		}
+		nodeLog.Warn("%s: head switch to height %d (slot %d) has no locatable common ancestor with the replaced head (slot %d); applying the best-effort re-anchor because nothing is finalized yet",
+			caller, blk.Header.Height, blk.Header.Slot, plan.replacedHeadSlot)
+	}
+	if plan != nil && qpos != nil {
+		if !qpos.ReanchorSlotRootsBounded(plan.roots, plan.vrfAccUpdates, plan.bounds) {
+			// The QPOS refused under its own lock: the abandoned range reaches
+			// at or below the finality floor. It wrote nothing, and neither do
+			// we — the previous head stays canonical and this branch is dropped.
+			nodeLog.Error("%s: refusing head switch to height %d (slot %d): its reorg (ancestor slot %d, new head slot %d, replaced head slot %d) rewrites history this node has already finalized — keeping the previous head and dropping this branch",
+				caller, blk.Header.Height, blk.Header.Slot, plan.ancestorSlot, plan.newHeadSlot, plan.replacedHeadSlot)
+			return false
+		}
+		nodeLog.Info("R4-CORE-02: re-anchored %d slot roots after reorg (ancestor slot %d, new head slot %d, replaced head slot %d)",
+			len(plan.roots), plan.ancestorSlot, plan.newHeadSlot, plan.replacedHeadSlot)
+	}
+	n.currentBlock = blk
+	return true
 }
 
 // handleIncomingBlock handles an incoming block from the network
@@ -9705,6 +10066,11 @@ func (n *Node) handleIncomingBlock(data []byte) {
 
 	go n.syncer.ProcessPendingBlocks(blockHash)
 
+	// R30 (2026-10-30) SAFETY: the finality decision and the commit are one
+	// atomic step (see commitHeadSwitchLocked). The live path used to switch the
+	// head first and ask the QPOS afterwards, which left head and canonical roots
+	// on different chains and re-applied the conflicting head's slot root /
+	// adopted finality here regardless of what the QPOS decided.
 	n.mu.Lock()
 	shouldSwitch := false
 	if n.currentBlock == nil {
@@ -9733,8 +10099,12 @@ func (n *Node) handleIncomingBlock(data []byte) {
 		oldHead = n.currentBlock
 		oldHeadHash = block.ComputeBlockHash(n.currentBlock.Header)
 	}
-	if shouldSwitch {
-		n.currentBlock = blk
+	// R30 (2026-10-30) SAFETY: see blockInsertLoop — a fork whose abandoned range
+	// reaches at or below local finality is refused inside the QPOS while the head
+	// is still the old one, so shouldSwitch=false and no canonical-head side
+	// effect runs for it.
+	if shouldSwitch && !n.commitHeadSwitchLocked("handleIncomingBlock", blk, blockHash, oldHead, oldHeadHash, n.forkChoiceQPOS()) {
+		shouldSwitch = false
 	}
 	n.mu.Unlock()
 
@@ -9745,13 +10115,10 @@ func (n *Node) handleIncomingBlock(data []byte) {
 	// non-canonical forks) overwrote the canonical slot root — an attacker
 	// who influences import order could flip the finality canonical root.
 	if shouldSwitch && n.blockProducer != nil && n.blockProducer.QPOS() != nil {
-		// AUDIT R4-CORE-02 (2026-07-15): Re-anchor slot roots on reorg.
-		if oldHead != nil {
-			n.reanchorSlotRootsAfterReorg(
-				n.blockProducer.QPOS(), n.blockStore,
-				blk, blockHash, oldHead, oldHeadHash,
-			)
-		}
+		// R30 (2026-10-30): the re-anchoring (and its finality veto) already ran
+		// inside commitHeadSwitchLocked, which only lets the head move when the
+		// QPOS accepted the reorg. The writes below are the new head's own
+		// records; they are never reached for a rejected branch.
 		// P0-3 FIX (2026-07-13): Record per-slot block root for GOV-05 fix.
 		n.blockProducer.QPOS().SetSlotBlockRoot(blk.Header.Slot, blockHash)
 		// R106-FINALITY-SYNC (2026-09-02) FIX: adopt the checkpoint epochs the
@@ -9760,7 +10127,7 @@ func (n *Node) handleIncomingBlock(data []byte) {
 		// block flows through both paths) is a no-op. Kept here so a live head
 		// switch adopts finality even when blockInsertLoop is busy draining a
 		// large sync buffer.
-		n.blockProducer.QPOS().AdoptHeaderFinality(blk.Header.JustifiedEpoch, blk.Header.FinalizedEpoch, blockHash)
+		n.adoptHeaderFinality(n.blockProducer.QPOS(), blk.Header, blockHash)
 		// AUDIT R4-CORE-01 (2026-07-15): VRF accumulation OWNERSHIP NOTE:
 		// AccumulateVRFOutput is already called by blockInsertLoop at line 6738
 		// (gated by shouldSwitch=true). Calling it HERE AGAIN would DOUBLE-COUNT

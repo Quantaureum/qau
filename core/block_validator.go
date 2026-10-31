@@ -105,8 +105,12 @@ var (
 	// ErrEpochSlotMismatch is returned when header.Epoch does not equal
 	// SlotToEpoch(header.Slot) (R37-P1-CORE-01 epoch/slot binding).
 	ErrEpochSlotMismatch = errors.New("header epoch does not match slot")
-	ErrInvalidChainID    = errors.New("invalid chain ID: replay attack protection")
-	ErrInvalidKeyVersion = errors.New("invalid block key version: validator not configured")
+	// ErrInvalidFinalityCheckpoint is returned when the justified/finalized
+	// epochs a header carries are ahead of the header's own epoch (R30 F8
+	// finality-checkpoint binding).
+	ErrInvalidFinalityCheckpoint = errors.New("header finality checkpoint is ahead of the block's epoch")
+	ErrInvalidChainID            = errors.New("invalid chain ID: replay attack protection")
+	ErrInvalidKeyVersion         = errors.New("invalid block key version: validator not configured")
 	// ErrInvalidBaseFee is returned when header.BaseFee does not match the
 	// EIP-1559 derivation from the parent block (audit R4-ECON-01).
 	ErrInvalidBaseFee = errors.New("invalid base fee")
@@ -833,6 +837,28 @@ func (v *BlockValidator) ValidateHeader(header, parent *encoding.BlockHeader) er
 	if header.Epoch != consensus.SlotToEpoch(header.Slot) {
 		return fmt.Errorf("%w: epoch %d, slot %d maps to epoch %d",
 			ErrEpochSlotMismatch, header.Epoch, header.Slot, consensus.SlotToEpoch(header.Slot))
+	}
+
+	// R30 F8 (2026-10-30) SAFETY: bind the finality checkpoints to the block's
+	// own epoch — the same class of fix as the R37-P1-CORE-01 Epoch-Slot
+	// binding above, for the last two free fields in the header.
+	//
+	// Every node adopts these fields into its QPOS state
+	// (AdoptHeaderFinality), and the adopted finalized epoch becomes that
+	// node's finality floor: below Floor no reorg, store rollback or rollback
+	// of any kind is ever allowed again. Nothing used to stop a proposer from
+	// stamping FinalizedEpoch = 2^40 — the ratchet only moves forward, so one
+	// such block would pin the floor above every block the chain will ever
+	// produce and freeze reorgs and recovery permanently. Worse, the victim
+	// stamps the poisoned value into its own headers, so the damage spreads
+	// to every peer that syncs from it.
+	//
+	// An honest proposer stamps both fields from its own ratchet, which can
+	// only reference epochs the chain has already crossed, so honest blocks
+	// always satisfy the bound and the rule is a no-op for them.
+	if !consensus.HeaderFinalityCheckpointsValid(header.JustifiedEpoch, header.FinalizedEpoch, header.Epoch) {
+		return fmt.Errorf("%w: justified=%d finalized=%d but the block is in epoch %d (slot %d)",
+			ErrInvalidFinalityCheckpoint, header.JustifiedEpoch, header.FinalizedEpoch, header.Epoch, header.Slot)
 	}
 
 	// Check parent hash

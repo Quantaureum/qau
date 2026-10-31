@@ -578,48 +578,105 @@ func (q *QPOS) setEpochBlockRootLocked(epoch uint64, blockRoot types.Hash) {
 // (prevEpochStartSlot..prevEpochEndSlot), so entries for slots older than
 // the finalized epoch's start are never read again.
 func (q *QPOS) SetSlotBlockRoot(slot uint64, blockRoot types.Hash) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.slotBlockRoots[slot] = blockRoot
-	// Prune when the map exceeds 3 epochs worth of slots (3 * 32 = 96).
-	if len(q.slotBlockRoots) > 3*SlotsPerEpoch {
-		var pruneCutoff uint64
-		if q.finalizedEpoch > 1 {
-			pruneCutoff = EpochStartSlot(q.finalizedEpoch - 1)
-		} else {
-			// During initial sync (no finalized epoch yet), prune entries
-			// older than 2 epochs before the current slot.
-			pruneCutoff = 0
-			if slot > 2*SlotsPerEpoch {
-				pruneCutoff = slot - 2*SlotsPerEpoch
+	var qfs *QTDFinalityState
+	func() {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		q.slotBlockRoots[slot] = blockRoot
+		// R30 F23 (2026-10-30): keep the checkpoint pin alive. Pruning below can
+		// drop the checkpoint's own slot root once it ages out of the window, and
+		// a node that restarted with an empty map only ever learns it here.
+		if blockRoot != (types.Hash{}) && blockRoot == q.finalizedRoot {
+			q.finalizedSlotPin = finalizedCheckpointPin{root: blockRoot, slot: slot}
+		}
+		// Prune when the map exceeds 3 epochs worth of slots (3 * 32 = 96).
+		if len(q.slotBlockRoots) > 3*SlotsPerEpoch {
+			var pruneCutoff uint64
+			if q.finalizedEpoch > 1 {
+				pruneCutoff = EpochStartSlot(q.finalizedEpoch - 1)
+			} else {
+				// During initial sync (no finalized epoch yet), prune entries
+				// older than 2 epochs before the current slot.
+				pruneCutoff = 0
+				if slot > 2*SlotsPerEpoch {
+					pruneCutoff = slot - 2*SlotsPerEpoch
+				}
+			}
+			// AUDIT (2026) R4-CORE-03 FIX: When finality stalls, the
+			// finalizedEpoch-based cutoff stops advancing and slotBlockRoots
+			// grows without bound. Fall back to a wall-clock cutoff based on
+			// the current slot. Keep the last 3 epochs of slots.
+			if q.currentSlot > 3*SlotsPerEpoch {
+				wallClockCutoff := q.currentSlot - 3*SlotsPerEpoch
+				if wallClockCutoff > pruneCutoff {
+					pruneCutoff = wallClockCutoff
+				}
+			}
+			for s := range q.slotBlockRoots {
+				if s < pruneCutoff {
+					delete(q.slotBlockRoots, s)
+				}
 			}
 		}
-		// AUDIT (2026) R4-CORE-03 FIX: When finality stalls, the
-		// finalizedEpoch-based cutoff stops advancing and slotBlockRoots
-		// grows without bound. Fall back to a wall-clock cutoff based on
-		// the current slot. Keep the last 3 epochs of slots.
-		if q.currentSlot > 3*SlotsPerEpoch {
-			wallClockCutoff := q.currentSlot - 3*SlotsPerEpoch
-			if wallClockCutoff > pruneCutoff {
-				pruneCutoff = wallClockCutoff
-			}
-		}
-		for s := range q.slotBlockRoots {
-			if s < pruneCutoff {
-				delete(q.slotBlockRoots, s)
-			}
-		}
+		qfs = q.qtdFinality
+	}()
+
+	// R23 (2026-10-29): re-drive the QTD finalization for this slot. A seal
+	// that completed BEFORE the canonical root landed was recorded (the
+	// threshold agreement is a valid proof) but never advanced the QPOS
+	// finality state, and nothing re-ran it — the slot silently lost its
+	// instant finality and the chain kept waiting for the ordinary epoch
+	// finalizer.
+	//
+	// Lock order: q.mu is RELEASED before the QTD state is touched. The
+	// re-drive takes qfs.mu (to read the seal record) and then qpos.mu
+	// (inside advanceQPOSFinalityForSeal), so calling it while holding q.mu
+	// would create the qpos.mu → qfs.mu → qpos.mu cycle this codebase
+	// deliberately avoids.
+	if qfs != nil {
+		qfs.reconcileCanonicalSeal(slot, blockRoot)
 	}
 }
 
 // GetSlotBlockRoot returns the canonical block root for a specific slot.
 // Returns the zero hash and false if no block root has been recorded for the
 // slot.
+//
+// R27 (2026-10-30) FIX (auditor finding N2): a recorded ZERO root is reported
+// as "not known". The all-zero value is a placeholder, not a block hash, and
+// every consumer must reach the same verdict for it — normalising here (the
+// read entry point) is what keeps the admission check, the seal driver, the
+// announcement path and the reporting layer from disagreeing about the same
+// stored value.
 func (q *QPOS) GetSlotBlockRoot(slot uint64) (types.Hash, bool) {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	root, ok := q.slotBlockRoots[slot]
-	return root, ok
+	if !ok || root == (types.Hash{}) {
+		return types.Hash{}, false
+	}
+	return root, true
+}
+
+// GetEpochBlockRoot returns the canonical checkpoint root recorded for an
+// epoch (R24, 2026-10-29).
+//
+// It is the POSITIVE canonicality evidence used when a slot's own root is
+// not known: when the epoch checkpoint IS the sealed block, the seal
+// provably attests a canonical block. It is never negative evidence — a
+// checkpoint root that differs from the sealed hash says nothing about the
+// sealed block (they are different blocks at different slots).
+//
+// Returns the zero hash and false if no checkpoint root has been recorded for
+// the epoch.
+func (q *QPOS) GetEpochBlockRoot(epoch uint64) (types.Hash, bool) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	root, ok := q.epochBlockRoots[epoch]
+	if !ok || root == (types.Hash{}) {
+		return types.Hash{}, false
+	}
+	return root, true
 }
 
 // AccumulateVRFOutput XORs a proposer's VRF output into the per-epoch VRF
@@ -893,11 +950,17 @@ func (q *QPOS) SetAllEpochVRFAccumulators(accs map[uint64]types.Hash) {
 //  1. Overwrites slotBlockRoots[s] = roots[s] for each slot in roots
 //     (canonicalizing the new chain), and
 //  2. DELETES any slotBlockRoots entry whose slot falls inside the reorged
-//     range [min(roots), max(roots)] but is NOT in roots — these belong to
-//     the abandoned fork and would otherwise poison finality.
+//     range but is NOT in roots — these belong to the abandoned fork and
+//     would otherwise poison finality. The range is [min(roots), max(roots)],
+//     widened by the bounds the caller observed: down to the common ancestor
+//     and up to the replaced head, and it still applies when roots is empty
+//     (see ReanchorBounds).
 //
-// Entries below the range (predating the reorg, still canonical) and above
-// the range (future slots) are left untouched.
+// Entries below the range (predating the reorg, still canonical) are left
+// untouched. Entries above the range are left untouched by THIS entry point
+// because they are assumed to be future slots — see
+// ReanchorSlotRootsWithStaleAbove for the head-rollback case where that
+// assumption does not hold.
 //
 // CONSENSUS-DETERMINISM FIX (2026-08-04): vrfAccUpdates carries the
 // recomputed per-epoch VRF accumulator for every epoch touched by the reorg
@@ -913,116 +976,588 @@ func (q *QPOS) SetAllEpochVRFAccumulators(accs map[uint64]types.Hash) {
 // function of the canonical chain. The updates are applied ONLY when the
 // reorg is accepted (not rejected for touching finalized history), so the
 // accumulator never diverges from slotBlockRoots.
-func (q *QPOS) ReanchorSlotRoots(roots map[uint64]types.Hash, vrfAccUpdates map[uint64]types.Hash) {
-	if len(roots) == 0 {
-		return
-	}
-	// Compute the slot range to clean. min/max are over the NEW canonical
-	// segment; any pre-existing entry in [min,max] not in roots is stale.
-	//
-	// SHRD- (Info, 2026-07-17): minSlot/maxSlot are computed before
-	// q.mu.Lock() is taken below. This is safe because `roots` is a
-	// caller-local map (built in reanchorSlotRootsAfterReorg as
-	// `roots := make(map[uint64]types.Hash, len(newChain))`) and is not
-	// shared with any other goroutine, so no concurrent modification can
-	// occur between this point and the lock acquisition. Only the
-	// q.slotBlockRoots mutations (steps 1 and 2 below) require the lock.
-	var minSlot, maxSlot uint64
-	first := true
-	for s := range roots {
-		if first {
-			minSlot, maxSlot = s, s
-			first = false
-			continue
-		}
-		if s < minSlot {
-			minSlot = s
-		}
-		if s > maxSlot {
-			maxSlot = s
-		}
-	}
+func (q *QPOS) ReanchorSlotRoots(roots map[uint64]types.Hash, vrfAccUpdates map[uint64]types.Hash) bool {
+	return q.reanchorSlotRoots(roots, vrfAccUpdates, ReanchorBounds{})
+}
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
+// ReanchorSlotRootsWithStaleAbove is ReanchorSlotRoots for a reorg whose new
+// head sits at a LOWER slot than the head it replaces (R27, 2026-10-30 —
+// auditor finding N1).
+//
+// The plain entry point assumes every recorded root above the re-anchored
+// range belongs to a FUTURE slot, which is true only while the head keeps
+// moving forward. Fork choice also accepts a switch to an equal-height head at
+// an earlier slot, and sync-time rollbacks do the same: then slots in
+// (newHeadSlot, oldHeadSlot] keep the abandoned chain's roots, their seals keep
+// classifying as canonical against a live root, and the public RPCs keep
+// reporting those reorged-away blocks as final.
+//
+// staleAbove is the slot of the head being REPLACED (inclusive). Every recorded
+// slot root in (maxSlot, staleAbove] is part of the abandoned chain and is
+// removed; every removed slot's seal classification is invalidated too, and the
+// epoch checkpoint roots of epochs above the new head are dropped (nothing
+// canonical exists there — otherwise the checkpoint fallback could still
+// confirm a seal over a reorged-away block).
+//
+// Passing staleAbove <= maxSlot makes this identical to ReanchorSlotRoots.
+func (q *QPOS) ReanchorSlotRootsWithStaleAbove(roots map[uint64]types.Hash, vrfAccUpdates map[uint64]types.Hash, staleAbove uint64) bool {
+	return q.reanchorSlotRoots(roots, vrfAccUpdates, ReanchorBounds{ReplacedHeadSlot: staleAbove})
+}
 
-	// CONS-R13-M04 (2026-07-21): Refuse to re-anchor roots that fall inside
-	// or below the finalized epoch. Casper FFG finality is IRREVERSIBLE: a
-	// finalized epoch's slot roots (and all earlier epochs) must never
-	// change. A reorg that touches a finalized slot would either:
-	//   (a) overwrite canonicalRoots[slot] with a different hash, OR
-	//   (b) delete canonicalRoots[slot] (step 2 below) — making the
-	//       finalized block look "unknown" to subsequent tryUpdateFinality
-	//       calls, causing finality accounting divergence across nodes,
-	//       or allowing QTD instant-finality's canonical-root check to
-	//       fail-closed (QUANTUM-) on a previously-finalized slot.
+// ReanchorBounds describes the part of the chain a reorg ABANDONS, so that
+// reanchorSlotRoots can clean exactly that range and nothing else (R28,
+// 2026-10-30 — auditor findings R27-O1 and R27-O3).
+//
+// Every field is an OBSERVED property of the walk the caller performed; the
+// zero value means "the caller did not observe it", which keeps the entry
+// points that cannot know a bound on the conservative (do-not-delete) side.
+type ReanchorBounds struct {
+	// AncestorSlot is the slot of the common ancestor block between the new
+	// canonical chain and the abandoned one. It is only meaningful when
+	// AncestorKnown is true; when the caller could not locate the ancestor
+	// (deep reorg, chain still syncing) the zero value must be ignored, or
+	// the whole prefix of canonical slot roots would be wiped.
 	//
-	// Both outcomes violate accountable safety: finalized history must
-	// never be rewritten. Fail-closed: reject the entire reorg (do NOT
-	// partially apply it) and log the violation so operators can
-	// investigate the reorg source.
-	//
-	// We check against q.finalizedEpoch (the latest finalized epoch).
-	// Slots in epochs > finalizedEpoch may legitimately be reorged (the
-	// chain above finality is the "hot" forkchoice region).
-	if finalized := q.finalizedEpoch; finalized > 0 || q.finalizedRoot != (types.Hash{}) {
-		finalizedEpochStartSlot := finalized * SlotsPerEpoch
-		if maxSlot < finalizedEpochStartSlot {
-			// Entire reorg range predates finalized epoch — forbidden.
-			log.Printf("[ERROR] qpos: ReanchorSlotRoots: refusing reorg of finalized history: "+
-				"reorg range [%d,%d] is below finalized epoch %d (finalizedRoot=%s)",
-				minSlot, maxSlot, finalized, q.finalizedRoot.String())
-			return
-		}
-		if minSlot < finalizedEpochStartSlot {
-			// Partial overlap: reorg crosses finalized boundary.
-			// Refuse the whole reorg rather than partially applying it.
-			log.Printf("[ERROR] qpos: ReanchorSlotRoots: refusing reorg that crosses finalized boundary: "+
-				"reorg range [%d,%d] overlaps finalized epoch %d (finalizedRoot=%s)",
-				minSlot, maxSlot, finalized, q.finalizedRoot.String())
-			return
-		}
-	}
+	// When known, every slot in (AncestorSlot, min(roots)) has NO canonical
+	// block on the new chain, so any recorded root there belongs to the
+	// abandoned fork. That lower bound is what closes the gap left by the
+	// original R4-CORE-02 range: a new chain that SKIPS the epoch boundary
+	// slot (e.g. ancestor 30, blocks 31 then 33) leaves slotBlockRoots[32]
+	// pointing at the abandoned chain, because 32 is neither in roots (no
+	// canonical block) nor inside [min(roots), ...].
+	AncestorSlot uint64
 
-	// 1. Overwrite with the new canonical roots.
-	for s, r := range roots {
-		q.slotBlockRoots[s] = r
-	}
-	// 2. Delete stale entries that fell inside the reorged range but are
-	//    not on the new canonical chain.
-	for s := range q.slotBlockRoots {
-		if s >= minSlot && s <= maxSlot {
-			if _, ok := roots[s]; !ok {
-				delete(q.slotBlockRoots, s)
+	// AncestorKnown reports that AncestorSlot was located by walking both
+	// chains back to a shared block.
+	AncestorKnown bool
+
+	// ReplacedHeadSlot is the slot of the head being REPLACED (inclusive).
+	// Recorded slot roots in (max(roots), ReplacedHeadSlot] belong to the
+	// abandoned chain when the new head sits at a lower slot than the head it
+	// replaces (head rollback / sync rollback).
+	//
+	// Together with AncestorSlot it also delimits the range when roots is
+	// EMPTY (R29, 2026-10-30 — auditor finding B1): a rollback whose new head
+	// IS the common ancestor contributes no re-anchored slot at all, and the
+	// abandoned range is still (AncestorSlot, ReplacedHeadSlot].
+	ReplacedHeadSlot uint64
+
+	// AncestorHash is the block hash of the common ancestor. It is the
+	// canonical chain tip the abandoned slots fell back to: for an epoch
+	// whose boundary no new-chain block reaches yet, the checkpoint IS that
+	// tip (R42-P3), so the ancestor hash is the correct value to record
+	// instead of dropping the checkpoint (R29, 2026-10-30 — auditor finding
+	// N7). Only meaningful when AncestorKnown is true.
+	AncestorHash types.Hash
+
+	// EpochRoots carries the checkpoint root the NEW canonical chain implies
+	// for every epoch the reorg reaches into: the boundary block itself when
+	// the block at slot e*SlotsPerEpoch is on the new chain, otherwise that
+	// block's parent (the chain tip at the start of the epoch, per the
+	// R42-P3 rule). Epochs absent from the map have no canonical block above
+	// the common ancestor and are left without a checkpoint.
+	//
+	// Only epochs the abandoned range actually reaches are rewritten (a
+	// checkpoint depends on blocks up to its own boundary slot and nothing
+	// above it); see reanchorSlotRoots.
+	EpochRoots map[uint64]types.Hash
+}
+
+// ReanchorSlotRootsBounded is the full entry point: the caller passes what it
+// observed about the abandoned range (common ancestor, replaced head, and the
+// epoch checkpoints the new chain implies) and this method cleans exactly that
+// range. ReanchorSlotRoots and ReanchorSlotRootsWithStaleAbove are the
+// conservative specialisations of it.
+//
+// The bool reports whether the reorg was ACCEPTED: false means it was refused
+// for rewriting finalized history and no state was touched.
+func (q *QPOS) ReanchorSlotRootsBounded(roots map[uint64]types.Hash, vrfAccUpdates map[uint64]types.Hash, bounds ReanchorBounds) bool {
+	return q.reanchorSlotRoots(roots, vrfAccUpdates, bounds)
+}
+
+// ReanchorCleanRange derives the slot range a reorg ABANDONS from the
+// re-anchored segment and the bounds the caller observed (R30, 2026-10-30).
+//
+// `roots` is the NEW canonical segment; any pre-existing entry in the range
+// that is not in roots is stale. The range is widened by what the caller
+// observed about the abandoned branch:
+//
+//   - to reaches the replaced head's slot (R27, 2026-10-30): a rollback
+//     leaves the abandoned chain's roots behind above the new head's own
+//     slot.
+//   - from reaches the slot after the common ancestor (R28, 2026-10-30 —
+//     auditor finding R27-O3): every slot between the ancestor and the first
+//     re-anchored block has no canonical block on the new chain either — the
+//     new chain simply SKIPPED it. Only extended when the ancestor is known:
+//     a caller that could not find it (deep reorg, chain still syncing) must
+//     not wipe the canonical prefix.
+//
+// R29 (2026-10-30) FIX (auditor finding B1): an EMPTY roots map is not a
+// no-op. It is exactly the pure head-rollback shape — the new head IS the
+// common ancestor, so the new chain contributes no block above it — and the
+// abandoned range (ancestor, replaced head] still has to be cleaned.
+// Returning early left every slot root of that range pointing at a block the
+// rollback removed: its seal kept classifying as canonical against that live
+// root and the RPCs kept reporting a deleted block as final, with no later
+// pass to correct it (the chain re-extends linearly from the ancestor, and a
+// linear extension is a no-op here).
+//
+// It is exported so the fork choice can run the SAME computation before it
+// commits a head (R30): a reorg the QPOS would refuse must reject the head
+// switch, not just the root bookkeeping.
+//
+// ok=false means the bounds describe no abandoned range at all (linear
+// extension, or too little information to act on) — every caller treats that
+// as "nothing to do".
+func ReanchorCleanRange(roots map[uint64]types.Hash, bounds ReanchorBounds) (from, to uint64, ok bool) {
+	if len(roots) > 0 {
+		var minSlot, maxSlot uint64
+		first := true
+		for s := range roots {
+			if first {
+				minSlot, maxSlot = s, s
+				first = false
+				continue
+			}
+			if s < minSlot {
+				minSlot = s
+			}
+			if s > maxSlot {
+				maxSlot = s
 			}
 		}
+		from, to = minSlot, maxSlot
+		if bounds.AncestorKnown && bounds.AncestorSlot+1 < from {
+			from = bounds.AncestorSlot + 1
+		}
+		if bounds.ReplacedHeadSlot > to {
+			to = bounds.ReplacedHeadSlot
+		}
+		return from, to, true
 	}
-	// CONSENSUS-DETERMINISM FIX (2026-08-04): Apply the recomputed per-epoch
-	// VRF accumulator for the epochs touched by this reorg. This runs only on
-	// the accepted path (we are past the finalized-history rejection above),
-	// so the accumulator is guaranteed to stay consistent with slotBlockRoots.
-	// The shuffle caches for epochs depending on these accumulators are reset
-	// by the CONS- cache-clear below (so the next shuffle recomputes from
-	// the new accumulator).
-	if len(vrfAccUpdates) > 0 {
-		for e, v := range vrfAccUpdates {
-			// A zero accumulator means the epoch no longer has canonical VRF
-			// outputs after the reorg (e.g., all blocks in the epoch were
-			// reorged away). Store it explicitly so the seed logic reads a
-			// deterministic value rather than a stale one.
-			q.epochVRFAccumulator[e] = v
+	if bounds.AncestorKnown && bounds.ReplacedHeadSlot > bounds.AncestorSlot {
+		// Pure head rollback: the whole abandoned range is above the ancestor.
+		return bounds.AncestorSlot + 1, bounds.ReplacedHeadSlot, true
+	}
+	return 0, 0, false
+}
+
+// ReanchorConflictsWithFinality reports whether accepting a reorg described by
+// (roots, bounds) would rewrite finalized history on a node whose finality
+// checkpoint block sits at finalSlot: the abandoned range would start at or
+// below that block, i.e. the reorg replaces or deletes a canonical block that is
+// already final.
+//
+// finalSlot MUST be the slot of the finalized checkpoint BLOCK (R42-P3), not the
+// finalized epoch's boundary slot: in a chain that skips slots the boundary slot
+// can hold no block at all, and comparing against it refuses legal reorgs that
+// only replace blocks above the checkpoint (R30 F21). See
+// FinalizedCheckpointSlot, which derives it.
+//
+// It is the single definition of the rule: reanchorSlotRoots enforces exactly
+// this predicate under q.mu, so a caller that refuses a head before committing
+// it cannot disagree with the guard that would have refused the same write.
+// Pure, so it is testable without any QPOS state (R30).
+func ReanchorConflictsWithFinality(roots map[uint64]types.Hash, bounds ReanchorBounds, finalSlot uint64) bool {
+	from, _, ok := ReanchorCleanRange(roots, bounds)
+	return ok && from <= finalSlot
+}
+
+// FinalityFloorSlot returns the finalized epoch's boundary slot (finalizedEpoch
+// * SlotsPerEpoch) together with whether anything is finalized yet.
+//
+// It is an UPPER BOUND on the slot of the finalized checkpoint block: the
+// checkpoint is the highest canonical block at or below this slot (R42-P3), so
+// it sits at this slot only when the boundary slot itself carries a block. Use
+// it for "which region of the chain is frozen" questions (store rollbacks,
+// operator diagnostics); use FinalizedCheckpointSlot for "would this reorg
+// replace finalized history" decisions.
+func (q *QPOS) FinalityFloorSlot() (uint64, bool) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.finalityFloorSlotLocked()
+}
+
+// finalizedCheckpointPin records the slot that holds the finalized checkpoint
+// block, bound to the checkpoint root it belongs to so it invalidates itself
+// when finality advances (a new checkpoint has a different root).
+//
+// R30 F23 (2026-10-30): the slot-root map cannot answer this question for the
+// lifetime of a node — it starts empty on every restart and is pruned while the
+// node runs — and the epoch boundary slot is only an upper bound (R42-P3).
+// Without the pin, every reorg decision taken after a restart compared the
+// abandoned range against the boundary slot, i.e. it silently fell back to the
+// F21 defect (legal reorgs in the (checkpoint, boundary] band refused) for as
+// long as the node ran.
+type finalizedCheckpointPin struct {
+	root types.Hash
+	slot uint64
+}
+
+// SetFinalizedCheckpointSlot pins the slot holding the current finalized
+// checkpoint block. It is called by the node after a restart, when the
+// checkpoint root has just been restored from disk and the slot-root map is
+// still empty, so the caller has to resolve the slot from the block store.
+//
+// Returns false (and pins nothing) when the slot cannot be the checkpoint's:
+// the root must be the current finalized root and the slot must not lie above
+// the finalized epoch's boundary slot. The caller keeps the conservative
+// fallback in that case — an unpinned checkpoint is compared as its boundary
+// slot, which refuses reorgs that would actually be legal, never the reverse.
+func (q *QPOS) SetFinalizedCheckpointSlot(root types.Hash, slot uint64) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if root == (types.Hash{}) || q.finalizedRoot != root {
+		return false
+	}
+	if slot > q.finalizedEpoch*SlotsPerEpoch {
+		return false
+	}
+	q.finalizedSlotPin = finalizedCheckpointPin{root: root, slot: slot}
+	return true
+}
+
+// pinFinalizedCheckpointSlotLocked refreshes the pin from the slot-root map
+// after finality moved. Caller MUST hold q.mu.
+//
+// A pin that already belongs to the current checkpoint root is exact (a block
+// hash identifies one block, hence one slot) and is left alone; otherwise the
+// map is scanned once, at the moment finality advances, which is far cheaper
+// than scanning it on every reorg decision.
+func (q *QPOS) pinFinalizedCheckpointSlotLocked() {
+	if q.finalizedRoot == (types.Hash{}) {
+		q.finalizedSlotPin = finalizedCheckpointPin{}
+		return
+	}
+	if q.finalizedSlotPin.root == q.finalizedRoot {
+		return
+	}
+	boundary := q.finalizedEpoch * SlotsPerEpoch
+	slot, found := uint64(0), false
+	for s, root := range q.slotBlockRoots {
+		if s > boundary || root != q.finalizedRoot {
+			continue
+		}
+		if !found || s > slot {
+			slot, found = s, true
 		}
 	}
-	// CONS-FIX: After a reorg the epoch VRF accumulator may differ on
-	// the new canonical chain (AccumulateVRFOutput recomputes it from the
-	// new slot roots). The shuffleCache and committeeCache, however, are
-	// keyed only by epoch/slot and would otherwise keep returning the
-	// pre-fork proposer/committee ordering. Reset both caches so the next
-	// GetCommitteeForSlot / IsProposer recomputes from the new accumulator.
-	for k := range q.shuffleCache {
-		delete(q.shuffleCache, k)
+	if found {
+		q.finalizedSlotPin = finalizedCheckpointPin{root: q.finalizedRoot, slot: slot}
 	}
-	for k := range q.committeeCache {
-		delete(q.committeeCache, k)
+}
+
+// FinalizedCheckpointSlot returns the slot of the finalized checkpoint BLOCK
+// (the highest canonical block at or below the finalized epoch's boundary slot)
+// together with whether anything is finalized yet.
+//
+// This is the boundary a reorg must not cross: the checkpoint block and every
+// ancestor of it are final, everything ABOVE it is still reorgable. Comparing
+// against the boundary slot instead (FinalityFloorSlot) is not equivalent — the
+// boundary slot carries no block whenever the chain skipped it, so the whole
+// band between the checkpoint block and that slot was treated as final and legal
+// reorgs that only replace blocks above the checkpoint were refused. On a chain
+// with skipped slots that band sits immediately above the head, so the refusal
+// could strand a node on a branch its peers had legitimately abandoned
+// (R30 F21, 2026-10-30).
+//
+// The checkpoint root is located by hash in the slot-root map. When it cannot be
+// found (pruned, never recorded, or a zero root) the boundary slot is returned
+// instead, which is the strictly more conservative answer: refusing a legal
+// reorg costs liveness, accepting an illegal one breaks finality.
+func (q *QPOS) FinalizedCheckpointSlot() (uint64, bool) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.finalizedCheckpointSlotLocked()
+}
+
+// finalizedCheckpointSlotLocked is FinalizedCheckpointSlot for callers that
+// already hold q.mu.
+func (q *QPOS) finalizedCheckpointSlotLocked() (uint64, bool) {
+	boundary, ok := q.finalityFloorSlotLocked()
+	if !ok {
+		return 0, false
 	}
+	if q.finalizedRoot == (types.Hash{}) {
+		return boundary, true
+	}
+	// The pin was resolved when finality moved (or pinned from the block store
+	// after a restart) and is keyed by the checkpoint root, so it stays exact
+	// while the slot-root map is pruned or empty (R30 F23).
+	if pin := q.finalizedSlotPin; pin.root == q.finalizedRoot && pin.slot <= boundary {
+		return pin.slot, true
+	}
+	// A block hash identifies exactly one block, so a slot root equal to the
+	// checkpoint root IS the checkpoint block: no slot above it can match.
+	// Skipped slots cost a scan of the map, which only reorg decisions pay.
+	slot, found := uint64(0), false
+	for s, root := range q.slotBlockRoots {
+		if s > boundary || root != q.finalizedRoot {
+			continue
+		}
+		if !found || s > slot {
+			slot, found = s, true
+		}
+	}
+	if !found {
+		return boundary, true
+	}
+	return slot, true
+}
+
+// finalityFloorSlotLocked is FinalityFloorSlot for callers that already hold
+// q.mu.
+func (q *QPOS) finalityFloorSlotLocked() (uint64, bool) {
+	if q.finalizedEpoch == 0 && q.finalizedRoot == (types.Hash{}) {
+		return 0, false
+	}
+	return q.finalizedEpoch * SlotsPerEpoch, true
+}
+
+func (q *QPOS) reanchorSlotRoots(roots map[uint64]types.Hash, vrfAccUpdates map[uint64]types.Hash, bounds ReanchorBounds) bool {
+	// SHRD- (Info, 2026-07-17): the range is computed before q.mu.Lock() is
+	// taken below. This is safe because `roots` is a caller-local map (built
+	// in reanchorSlotRootsAfterReorg as `roots := make(map[uint64]types.Hash,
+	// len(newChain))`) and is not shared with any other goroutine, so no
+	// concurrent modification can occur between this point and the lock
+	// acquisition. Only the q.slotBlockRoots mutations (steps 1 and 2 below)
+	// require the lock.
+	cleanMin, cleanMax, haveRange := ReanchorCleanRange(roots, bounds)
+	if !haveRange {
+		return true
+	}
+
+	// R25 (2026-10-30) FIX (auditor finding N2): a reorg that reverts a slot
+	// can make that slot's sealed block CANONICAL again — exactly the case
+	// SetSlotBlockRoot re-drives (R23). ReanchorSlotRoots updated slotBlockRoots
+	// directly with no QTD hook, so a sealed block that became canonical
+	// again through a reorg was never re-classified, re-marked, or counted,
+	// and its stale Differs/Unknown would survive the next root pruning.
+	//
+	// The locked body is wrapped in a closure (the QTD re-drive must run AFTER
+	// q.mu is released, mirroring SetSlotBlockRoot, so reconcile's
+	// advanceQPOSFinalityForSeal can take qpos.mu without an inversion). The
+	// re-drive is skipped when qfs was not captured (the reorg was rejected
+	// for touching finalized history, so no state changed).
+	var qfs *QTDFinalityState
+	var applied map[uint64]types.Hash
+	accepted := true
+	func() {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+
+		// CONS-R13-M04 (2026-07-21): Refuse to re-anchor roots that fall inside
+		// or below the finalized epoch. Casper FFG finality is IRREVERSIBLE: a
+		// finalized epoch's slot roots (and all earlier epochs) must never
+		// change. A reorg that touches a finalized slot would either:
+		//   (a) overwrite canonicalRoots[slot] with a different hash, OR
+		//   (b) delete canonicalRoots[slot] (step 2 below) — making the
+		//       finalized block look "unknown" to subsequent tryUpdateFinality
+		//       calls, causing finality accounting divergence across nodes,
+		//       or allowing QTD instant-finality's canonical-root check to
+		//       fail-closed (QUANTUM-) on a previously-finalized slot.
+		//
+		// Both outcomes violate accountable safety: finalized history must
+		// never be rewritten. Fail-closed: reject the entire reorg (do NOT
+		// partially apply it) and log the violation so operators can
+		// investigate the reorg source.
+		//
+		// We check against q.finalizedEpoch (the latest finalized epoch).
+		// Slots in epochs > finalizedEpoch may legitimately be reorged (the
+		// chain above finality is the "hot" forkchoice region).
+		// R28 (2026-10-30) SAFETY: the check below uses cleanMin — the START of
+		// the abandoned range — not minSlot, the first re-anchored slot. The two
+		// differ exactly when the common ancestor sits BELOW the finalized
+		// boundary while the new chain skips back above it: the reorg then
+		// rewrites history that starts below finality, and steps 2/3 would
+		// delete finalized slot roots and checkpoints. Checking the abandoned
+		// start is what keeps the irreversible-history invariant true for the
+		// range this method actually cleans.
+		//
+		// R29 (2026-10-30) FIX (auditor finding N1): the boundary is INCLUSIVE.
+		// The block on the finalized epoch's boundary slot IS its checkpoint
+		// root (R42-P3), so cleanMin == finalizedEpochStartSlot means the reorg
+		// replaces or drops that very block — steps 1/2 would overwrite or
+		// delete its slot root, which no reorg may do. (If the new chain
+		// contained the SAME boundary block, the ancestor would have been found
+		// at that slot or above, so cleanMin would start higher.)
+		//
+		// The R28 maxSlot branch is gone (auditor finding N2): cleanMin <= cleanMax
+		// always holds here, so "the whole range is below finality" is a
+		// strict special case of the single check below.
+		if finalizedSlot, ok := q.finalizedCheckpointSlotLocked(); ok {
+			// R30 (2026-10-30): the conflict test is the exported predicate so
+			// the rule has exactly one implementation. The fork choice used to
+			// call it before committing a head; it now calls this method instead
+			// (the decision is this method's refusal), but keeping the predicate
+			// as the single definition of "does this reorg touch finalized
+			// history" is what stops a caller from re-deriving the range
+			// differently. cleanMin/cleanMax above are kept for the log.
+			//
+			// R30 F21 (2026-10-30): the boundary is the finalized checkpoint
+			// BLOCK's slot, not the epoch's boundary slot. The two differ when
+			// the boundary slot was skipped: the blocks between the checkpoint
+			// and the boundary are NOT final, so protecting them refused legal
+			// reorgs and could strand this node on an abandoned branch.
+			if ReanchorConflictsWithFinality(roots, bounds, finalizedSlot) {
+				// The abandoned range starts at or below the finalized
+				// checkpoint block: accepting it would rewrite irreversible
+				// history. Refuse the whole reorg rather than partially applying it.
+				log.Printf("[ERROR] qpos: ReanchorSlotRoots: refusing reorg of finalized history: "+
+					"abandoned range [%d,%d] reaches the finalized checkpoint block at slot %d "+
+					"(epoch %d, boundary slot %d, finalizedRoot=%s)",
+					cleanMin, cleanMax, finalizedSlot, q.finalizedEpoch,
+					q.finalizedEpoch*SlotsPerEpoch, q.finalizedRoot.String())
+				accepted = false
+				return
+			}
+		}
+
+		// 1. Overwrite with the new canonical roots.
+		for s, r := range roots {
+			q.slotBlockRoots[s] = r
+		}
+		// 2. Delete stale entries that fell inside the reorged range but are
+		//    not on the new canonical chain.
+		for s := range q.slotBlockRoots {
+			if s >= cleanMin && s <= cleanMax {
+				if _, ok := roots[s]; !ok {
+					delete(q.slotBlockRoots, s)
+				}
+			}
+		}
+		// 3. Re-derive the epoch checkpoint roots of every epoch the abandoned
+		//    range reaches into.
+		//
+		//    R27 (2026-10-30) added the "epoch above the new head" case; R28
+		//    (2026-10-30, auditor findings R27-O1/R27-O3) generalises it.
+		//
+		//    A checkpoint for epoch e is a function of the canonical blocks at
+		//    slots <= e*SlotsPerEpoch (the block on the boundary slot itself,
+		//    else the highest block below it — R42-P3). The reorg can therefore
+		//    only invalidate it when the abandoned range starts at or below that
+		//    boundary. This covers both the epoch ABOVE the new head (no
+		//    canonical block exists there at all) and the epoch a rollback
+		//    partially rewrote (a same-epoch rollback leaves the old epoch's
+		//    first block behind as the checkpoint). When the reorg starts ABOVE
+		//    the boundary the recorded checkpoint is still correct and must not
+		//    be touched: EpochRoots only describes the re-anchored segment, so
+		//    its derived value would name a mid-epoch block as the epoch start.
+		//
+		//    The justified and finalized checkpoints are never dropped or
+		//    rewritten, matching the R104-EPOCHROOT-PRUNE-JUSTIFIED rule in
+		//    setEpochBlockRootLocked: attestations carry Source.Epoch =
+		//    justifiedEpoch and ProcessAttestation fail-closes (CONS-003) when
+		//    the canonical root for that epoch is missing, so deleting it would
+		//    stall finality. Keeping the anchor is the fail-safe choice.
+		//    R29 (2026-10-30) FIX (auditor finding N7): an epoch whose checkpoint
+		//    the abandoned range invalidates, but which the new chain has no
+		//    block in, is not left empty. Its checkpoint is still determined:
+		//    every canonical block up to that epoch's boundary lies at or below
+		//    the common ancestor, so the checkpoint IS the ancestor (R42-P3).
+		//    Dropping it made ProcessAttestation fail-closed (CONS-003) for every
+		//    vote whose Source.Epoch fell in that epoch, and nothing re-created
+		//    it — the checkpoint is only re-recorded when the new chain reaches a
+		//    boundary slot, which a skipping chain never does.
+		//
+		//    Ceil() is written as a divide-plus-adjust rather than
+		//    SlotToEpoch(cleanMin + SlotsPerEpoch - 1) so a slot range can
+		//    never wrap around.
+		firstReachedEpoch := SlotToEpoch(cleanMin)
+		if cleanMin%SlotsPerEpoch != 0 {
+			firstReachedEpoch++
+		}
+		// The invalidated epochs are collected while they are removed so the
+		// fallback below walks a set bounded by the map size. A numeric walk up
+		// to SlotToEpoch(cleanMax) would spin under q.mu if the replaced head's
+		// slot were absurdly large.
+		var fallenEpochs []uint64
+		for e := range q.epochBlockRoots {
+			if e == q.justifiedEpoch || e == q.finalizedEpoch {
+				continue
+			}
+			if e >= firstReachedEpoch {
+				fallenEpochs = append(fallenEpochs, e)
+				delete(q.epochBlockRoots, e)
+			}
+		}
+		for e, root := range bounds.EpochRoots {
+			if root == (types.Hash{}) || e < firstReachedEpoch {
+				continue
+			}
+			if e == q.justifiedEpoch || e == q.finalizedEpoch {
+				continue
+			}
+			q.epochBlockRoots[e] = root
+		}
+		if bounds.AncestorKnown && bounds.AncestorHash != (types.Hash{}) {
+			for _, e := range fallenEpochs {
+				if root, ok := bounds.EpochRoots[e]; ok && root != (types.Hash{}) {
+					continue
+				}
+				q.epochBlockRoots[e] = bounds.AncestorHash
+			}
+		}
+		// CONSENSUS-DETERMINISM FIX (2026-08-04): Apply the recomputed per-epoch
+		// VRF accumulator for the epochs touched by this reorg. This runs only on
+		// the accepted path (we are past the finalized-history rejection above),
+		// so the accumulator is guaranteed to stay consistent with slotBlockRoots.
+		// The shuffle caches for epochs depending on these accumulators are reset
+		// by the CONS- cache-clear below (so the next shuffle recomputes from
+		// the new accumulator).
+		if len(vrfAccUpdates) > 0 {
+			for e, v := range vrfAccUpdates {
+				// A zero accumulator means the epoch no longer has canonical VRF
+				// outputs after the reorg (e.g., all blocks in the epoch were
+				// reorged away). Store it explicitly so the seed logic reads a
+				// deterministic value rather than a stale one.
+				q.epochVRFAccumulator[e] = v
+			}
+		}
+		// CONS-FIX: After a reorg the epoch VRF accumulator may differ on
+		// the new canonical chain (AccumulateVRFOutput recomputes it from the
+		// new slot roots). The shuffleCache and committeeCache, however, are
+		// keyed only by epoch/slot and would otherwise keep returning the
+		// pre-fork proposer/committee ordering. Reset both caches so the next
+		// GetCommitteeForSlot / IsProposer recomputes from the new accumulator.
+		for k := range q.shuffleCache {
+			delete(q.shuffleCache, k)
+		}
+		for k := range q.committeeCache {
+			delete(q.committeeCache, k)
+		}
+		// Only the accepted path reaches here: capture the QTD finality engine
+		// and the applied roots for the post-unlock re-drive.
+		qfs = q.qtdFinality
+		applied = roots
+	}()
+	if !accepted {
+		return false
+	}
+
+	// Re-drive QTD classification for every re-anchored slot, exactly like
+	// SetSlotBlockRoot: refresh the persisted canonical classification, the
+	// epoch markers, and the executive seal counter. Idempotent — the re-drive
+	// only advances markers when the epoch is ahead of the marker and counts a
+	// record at most once (claimSealCount), so a slot whose block is still the
+	// same canonical one is a no-op.
+	// R26 (2026-10-30) FIX (auditor finding D1) / R28 (2026-10-30) GENERALISED:
+	// a seal recorded for a slot inside the ABANDONED range (common ancestor,
+	// replaced head] attests a block that is not canonical any more. Its
+	// persisted "matches" classification must be dropped to Unknown — without
+	// it the public RPCs kept reporting the reorged-away block as final. The
+	// range form (rather than only the slots whose root this reorg deleted)
+	// also covers records whose per-slot root was PRUNED before the reorg: the
+	// live classification is Unknown for them, so GetSlotSealDetails falls back
+	// to the persisted value and would otherwise resurrect the stale verdict.
+	// Re-anchored slots are excluded — reconcileCanonicalSeal just re-classified
+	// them from the new canonical root. The record itself (the
+	// threshold-agreement proof) always survives.
+	if qfs != nil {
+		for s, r := range applied {
+			qfs.reconcileCanonicalSeal(s, r)
+		}
+		qfs.invalidateCanonicalSealsInRange(cleanMin, cleanMax, applied)
+	}
+	return true
 }

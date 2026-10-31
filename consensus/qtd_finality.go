@@ -274,6 +274,37 @@ type InstantFinalityRecord struct {
 	// ChainID/Epoch == 0 and fall back to raw blockHash verification.
 	ChainID uint64
 	Epoch   uint64
+
+	// CanonicalState records HOW the slot's canonical root related to this
+	// seal's block hash when the classification was made (R24, 2026-10-29).
+	//
+	// Why it lives on the record: the QPOS keeps only a few epochs of
+	// per-slot roots (older ones are pruned), while seal records are kept
+	// for thousands of slots. Without a persisted classification, a
+	// retained seal over a side-branch block would fall back to "the epoch
+	// marker says the epoch is final" once its slot root was pruned — and
+	// the public RPCs would report that fork block as final together with
+	// its hash. Persisting the classification keeps the honest answer
+	// available for the whole lifetime of the record.
+	//
+	// Semantics:
+	//   SealRootMatches — the sealed block WAS the canonical root of its
+	//     slot (or the epoch checkpoint it belongs to) when classified.
+	//   SealRootDiffers — the sealed block PROVABELY is not the canonical
+	//     root: it can never be reported final.
+	//   SealRootUnknown — the classification could not be made yet (the
+	//     canonical root had not landed). It is refreshed when the root
+	//     lands (see reconcileCanonicalSeal).
+	//
+	// The field is in-memory only (the seal record map is never persisted),
+	// so adding it is not a storage migration.
+	CanonicalState SealRootState
+
+	// SealCounted marks that this record's completion was already counted
+	// in the executive chamber's seal counter (R24, 2026-10-29). The seal
+	// can be completed on one path and re-driven on another (the canonical
+	// root landing late), and both paths must not count it twice.
+	SealCounted bool
 }
 
 type PendingSeal struct {
@@ -512,15 +543,33 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 	// This is the first line of defense — the second is in
 	// completeSealLockedFinalize.
 	//
-	//  LOCK ORDERING: Read the canonical root BEFORE acquiring qfs.mu
-	// to avoid the qfs.mu → qpos.mu lock ordering that previously caused
-	// deadlocks. GetSlotBlockRoot acquires qpos.mu.RLock() internally.
-	if canonicalRoot, ok := qfs.qpos.GetSlotBlockRoot(slot); ok {
-		if canonicalRoot != blockHash {
-			return fmt.Errorf("R4-CORE-04: refusing to seal slot %d: blockHash %s is not the canonical root %s",
-				slot, blockHash.String(), canonicalRoot.String())
-		}
+	//  LOCK ORDERING: every QPOS read below happens BEFORE qfs.mu is taken.
+	//  GetSlotBlockRoot / HasChambers / GetChambersCoordinator acquire
+	//  qpos.mu internally, and the stake snapshot reads the validator set
+	//  under qpos.mu as well. Holding qfs.mu across them would nest
+	//  qfs.mu → qpos.mu — the exact inversion this file documents as
+	//  forbidden (R23, 2026-10-29; the previous version did that here).
+	canonicalRoot, canonicalKnown := qfs.qpos.GetSlotBlockRoot(slot)
+	// A recorded ZERO slot root is reported as "not known" by GetSlotBlockRoot
+	// itself (R27, 2026-10-30), so the admission check below can never mistake
+	// a placeholder for a hard "not canonical" verdict — and the record-
+	// replacement rule further down treats the slot as unclassified, which is
+	// the fail-closed direction.
+	if canonicalKnown && canonicalRoot != blockHash {
+		return fmt.Errorf("R4-CORE-04: refusing to seal slot %d: blockHash %s is not the canonical root %s",
+			slot, blockHash.String(), canonicalRoot.String())
 	}
+	hasChambers := qfs.qpos.HasChambers()
+	coordinator := qfs.qpos.GetChambersCoordinator()
+	// R30-IMPLEMENT (2026-07-27): P3-QTD-01 — snapshot sealer stakes and
+	// compute the required weight threshold (ceil(2/3 * totalStake)) via the
+	// shared helper. This ensures RequestSeal, ReceiveSealAnnouncement, and
+	// completeSealLocked all use the SAME weight threshold for the same
+	// epoch, preventing divergence that could allow minority-stake finalization.
+	// R47-QTD-QUORUM (2026-09-26): the stake basis is the full validator set
+	// (see snapshotSealerStakes) because the authorized sealer set is
+	// the DKG threshold-group holder set, which covers every validator.
+	memberStakes, _, requiredWeight := qfs.snapshotSealerStakesFor(coordinator)
 
 	qfs.mu.Lock()
 	defer qfs.mu.Unlock()
@@ -529,15 +578,42 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 		return fmt.Errorf("seal already requested for slot %d", slot)
 	}
 
-	if _, exists := qfs.instantFinalizedSlots[slot]; exists {
-		return fmt.Errorf("slot %d already finalized", slot)
+	if existing, exists := qfs.instantFinalizedSlots[slot]; exists {
+		// R23 (2026-10-29) LIVENESS: a seal record that provably attests a
+		// NON-canonical block must not wedge the canonical block of that slot
+		// forever. The record is kept for the threshold-agreement proof
+		// (R4-CORE-04), which used to mean the slot could never be sealed
+		// again ("slot already finalized") — the canonical block then had no
+		// way to obtain a seal of its own.
+		//
+		// A stale record is recognized ONLY when the canonical root is known
+		// and differs from the sealed hash, i.e. when the record provably
+		// attests a side-branch block. In that case the request proceeds: the
+		// stale record is NOT deleted here (the quorum agreement it carries is
+		// evidence and must survive until a new seal actually replaces it —
+		// completeSealLocked overwrites the slot's record when the canonical
+		// seal completes). While the new seal is pending, the status API keeps
+		// reporting the stale agreement together with canonical=false, so a
+		// client can see both facts instead of a silent hole.
+		//
+		// When the root is unknown the record may still be the canonical one
+		// (the block may not be imported yet), so it is kept and the request
+		// is refused — refusing is safe there, the caller retries once the
+		// root lands.
+		//
+		// The canonical root was snapshotted before qfs.mu was taken: a root
+		// that changes in between can only cause a redundant re-seal (the
+		// record may become canonical again) or a refused request that the
+		// caller retries — never a wrong seal.
+		if !canonicalKnown || canonicalRoot == existing.BlockHash {
+			return fmt.Errorf("slot %d already finalized", slot)
+		}
 	}
 
-	if !qfs.qpos.HasChambers() {
+	if !hasChambers {
 		return fmt.Errorf("chambers not initialized")
 	}
 
-	coordinator := qfs.qpos.GetChambersCoordinator()
 	if coordinator == nil {
 		return fmt.Errorf("chambers coordinator not available")
 	}
@@ -565,16 +641,7 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 		}
 	}
 
-	// R30-IMPLEMENT (2026-07-27): P3-QTD-01 — snapshot sealer stakes and
-	// compute the required weight threshold (ceil(2/3 * totalStake)) via the
-	// shared helper. This ensures RequestSeal, ReceiveSealAnnouncement, and
-	// completeSealLocked all use the SAME weight threshold for the same
-	// epoch, preventing divergence that could allow minority-stake finalization.
-	// R47-QTD-QUORUM (2026-09-26): the stake basis is the full validator set
-	// (see snapshotSealerStakesLocked) because the authorized sealer set is
-	// the DKG threshold-group holder set, which covers every validator.
 	epoch := SlotToEpoch(slot)
-	memberStakes, _, requiredWeight := qfs.snapshotSealerStakesLocked(coordinator)
 
 	qfs.pendingSeals[slot] = &PendingSeal{
 		Slot:      slot,
@@ -623,6 +690,18 @@ func (qfs *QTDFinalityState) RequestSeal(slot uint64, blockHash types.Hash) erro
 // placeholder strings like "auto-seal", NOT a cryptographic check.
 
 func (qfs *QTDFinalityState) SubmitPartialSeal(validatorIndex int, slot uint64, signature []byte) error {
+	// R23 (2026-10-29) LOCK ORDER: the two QPOS reads below are performed
+	// BEFORE qfs.mu is taken. CanSeal acquires qpos.mu.RLock() and
+	// GetValidatorSet returns a deep copy under qpos.mu.RLock(). Doing
+	// them inside the qfs.mu critical section nested qfs.mu → qpos.mu,
+	// which this file documents as a forbidden inversion.
+	//
+	// The two results are computed eagerly but EVALUATED in their original
+	// positions below, so the error ordering observed by callers is
+	// unchanged (pending-seal checks still precede the authorization check).
+	canSeal := qfs.qpos.CanSeal(validatorIndex, SlotToEpoch(slot))
+	validatorSet := qfs.qpos.GetValidatorSet()
+
 	qfs.mu.Lock()
 	defer qfs.mu.Unlock()
 
@@ -680,7 +759,7 @@ func (qfs *QTDFinalityState) SubmitPartialSeal(validatorIndex int, slot uint64, 
 		return fmt.Errorf("seal already completed for slot %d", slot)
 	}
 
-	if !qfs.qpos.CanSeal(validatorIndex, SlotToEpoch(slot)) {
+	if !canSeal {
 		return fmt.Errorf("validator %d not authorized to seal for slot %d", validatorIndex, slot)
 	}
 
@@ -691,7 +770,7 @@ func (qfs *QTDFinalityState) SubmitPartialSeal(validatorIndex int, slot uint64, 
 	// standard Dilithium3 verification — they require TSS-level verification
 	// which is logged as a warning for production monitoring.
 	if len(signature) == crypto.Dilithium3SignatureSize {
-		validators := qfs.qpos.GetValidatorSet()
+		validators := validatorSet
 		if validators != nil {
 			validatorList := validators.Validators()
 			if validatorIndex >= 0 && validatorIndex < len(validatorList) {
@@ -1359,52 +1438,219 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 		}
 	}()
 
+	// R24 (2026-10-29): the canonical classification of the seal is computed
+	// FIRST and persisted on the record, so the answer survives the pruning
+	// of the per-slot canonical root. The classification is a point-in-time
+	// fact ("was this block the canonical root when it was checked?"), and it
+	// is refreshed whenever the canonical root lands (reconcileCanonicalSeal).
+	state := qfs.advanceQPOSFinalityForSeal(slot, types.Hash(blockHash))
+	qfs.persistCanonicalState(slot, types.Hash(blockHash), state)
+	if state != SealRootMatches {
+		return
+	}
+
+	// AUDIT (2026) CORE B-5 FIX: GetChambersCoordinator() can return nil
+	// if chambers are torn down or never initialized between RequestSeal and
+	// this async goroutine. Without this check, the nil coordinator would
+	// panic on .GetExecutiveChamber(), crashing the node (unrecovered
+	// goroutine in SubmitPartialSeal's `go completeSealLockedFinalize`).
+	coordinator := qfs.qpos.GetChambersCoordinator()
+	if coordinator == nil {
+		return
+	}
+	executive := coordinator.GetExecutiveChamber()
+	if executive != nil {
+		// R24 (2026-10-29): the seal counter is bumped at most ONCE per
+		// record. A seal can be completed on this path and re-driven later
+		// (the canonical root landing late), and both paths reach this
+		// counter — counting it twice would misreport the chamber's
+		// activity.
+		if qfs.claimSealCount(slot, types.Hash(blockHash)) {
+			executive.RecordSeal(true)
+		}
+	}
+}
+
+// claimSealCount marks the slot's seal record as counted and reports whether
+// this call was the one that counted it (R24, 2026-10-29).
+//
+// The flag lives on the record, so it is reset when a new seal replaces the
+// record — the replacement is a different agreement and gets its own count.
+//
+// The caller must NOT hold qfs.mu.
+func (qfs *QTDFinalityState) claimSealCount(slot uint64, blockHash types.Hash) bool {
+	qfs.mu.Lock()
+	defer qfs.mu.Unlock()
+	record, ok := qfs.instantFinalizedSlots[slot]
+	if !ok || record.BlockHash != blockHash {
+		return false
+	}
+	if record.SealCounted {
+		return false
+	}
+	record.SealCounted = true
+	return true
+}
+
+// persistCanonicalState stores the canonical classification of a slot's seal
+// record (R24, 2026-10-29).
+//
+// The classification is written only when the stored record still attests the
+// same block: a record replaced by a newer seal must not inherit the old
+// classification.
+//
+// The caller must NOT hold qfs.mu.
+func (qfs *QTDFinalityState) persistCanonicalState(slot uint64, sealedHash types.Hash, state SealRootState) {
+	qfs.mu.Lock()
+	defer qfs.mu.Unlock()
+	record, ok := qfs.instantFinalizedSlots[slot]
+	if !ok || record.BlockHash != sealedHash {
+		return
+	}
+	// R25 (2026-10-30) FIX (auditor finding N1): never DOWNGRADE a known
+	// classification to unknown. The asynchronous finalizer runs its
+	// advanceQPOSFinalityForSeal ONCE, at threshold completion, and may
+	// observe the slot root as absent (Unknown) even though a faster path
+	// (the reconcile on root-arrival, or the announcement itself) has already
+	// persisted a definite classification. Without this guard that stale
+	// Unknown write overwrote the recorded Matches, and after QPOS prunes the
+	// live root GetSlotSealDetails would fall back to the persisted Unknown —
+	// a genuinely canonical, marker-advanced seal reporting "unknown" and
+	// not-final. The guard is asymmetric on purpose: Unknown→known and
+	// known→known (a reorg flipping canonicality, e.g. Differs↔Matches) both
+	// overwrite, but known→Unknown does not.
+	if state == SealRootUnknown && record.CanonicalState != SealRootUnknown {
+		return
+	}
+	record.CanonicalState = state
+}
+
+// invalidateCanonicalSealsInRange drops every persisted "matches" classification
+// whose slot lies in the range an accepted reorg just ABANDONED (R28,
+// 2026-10-30).
+//
+// The abandoned range is (common ancestor, replaced head]: every slot in it was
+// on the old chain and the new chain contains either no block there or a
+// different one. A seal recorded for such a slot therefore attests a block that
+// is NOT canonical any more, whatever the persisted classification says.
+//
+// This generalises the R26 per-slot reset (auditor finding D1, which only
+// covered the slots whose root the reorg DELETED) to the whole abandoned range,
+// which also covers the records whose per-slot root was PRUNED before the
+// reorg: their live classification is Unknown, so GetSlotSealDetails falls back
+// to the persisted value (R24) and the RPCs kept reporting an abandoned block as
+// final. keep holds the re-anchored slots (the new canonical segment) — those
+// are re-driven by reconcileCanonicalSeal instead of being invalidated.
+//
+// Only a persisted "matches" is downgraded. A persisted "differs" already says
+// the seal attests a non-canonical block, and "unknown" says nothing.
+//
+// The caller must NOT hold qfs.mu (and must not hold qpos.mu either — the
+// canonical segment is passed in precisely so this needs no QPOS read).
+func (qfs *QTDFinalityState) invalidateCanonicalSealsInRange(from, to uint64, keep map[uint64]types.Hash) {
+	if qfs == nil || from > to {
+		return
+	}
+	qfs.mu.Lock()
+	defer qfs.mu.Unlock()
+	for slot, record := range qfs.instantFinalizedSlots {
+		if record == nil || slot < from || slot > to {
+			continue
+		}
+		if _, ok := keep[slot]; ok {
+			continue
+		}
+		if record.CanonicalState == SealRootMatches {
+			record.CanonicalState = SealRootUnknown
+		}
+	}
+}
+
+// advanceQPOSFinalityForSeal advances the QPOS finality state for a QTD seal
+// whose block is the canonical block of its slot (R23, 2026-10-29 — extracted
+// from completeSealLockedFinalize so the asynchronous path and the
+// reconcile-on-root-arrival path share ONE implementation and cannot drift).
+//
+// It returns the CANONICALITY CLASSIFICATION of the seal and touches NO
+// finality state unless the classification is SealRootMatches:
+//
+//   - SealRootMatches — the sealed block IS the canonical root of its slot
+//     (or the epoch checkpoint it belongs to). The markers are advanced.
+//   - SealRootDiffers — the canonical root is known and differs: the seal
+//     provably attests a non-canonical block. This is the R4-CORE-04 second
+//     line of defense: it stops a quorum-approved seal over a side-branch
+//     block from advancing finalizedEpoch/finalizedRoot/justifiedEpoch/
+//     justifiedRoot.
+//   - SealRootUnknown — the canonical root is not known (the block has not
+//     been imported yet, or its root was pruned). Nothing is advanced and
+//     nothing is proven; the seal keeps waiting for the root to land.
+//
+// R24 (2026-10-29): the epoch checkpoint root is used as POSITIVE evidence
+// only. A checkpoint root that differs from the sealed hash says nothing
+// about the sealed block (they are different blocks), so it yields
+// SealRootUnknown instead of the previous "reject" verdict — the fail-closed
+// behavior is unchanged (nothing is advanced), but the classification no
+// longer claims a non-canonicality it cannot prove.
+//
+// Locking: the caller must NOT hold qfs.mu and must NOT hold qpos.mu — this
+// function takes qpos.mu itself. The seal RECORD is never touched here: the
+// record is the threshold-agreement PROOF and the R4-CORE-04 design (and its
+// pinned test TestR4CORE04_CompleteSeal_RejectsNonCanonicalAtFinalize)
+// requires it to survive even when its block is not canonical.
+//
+// R22 (2026-10-29) note on the reverted R19-F08 rollback: that rollback
+// deleted the record on this branch. It was wrong because
+//  1. it destroyed legitimate evidence — a seal requested while the slot's
+//     canonical root was not yet known (RequestSeal explicitly allows that —
+//     the block may not be imported yet) was DELETED whenever the root had
+//     not landed by the time the threshold completed, so a quorum-approved
+//     seal could be destroyed by pure timing;
+//  2. it broke two existing tests only by scheduling luck (2 failures in 40
+//     local runs of TestPopulateStardustFieldsWithProvinces), because the
+//     asynchronous delete raced the synchronous readers.
+//
+// The over-reporting concern it aimed at is handled in the REPORTING layer
+// instead: GetSlotSealStatus / IsBlockFinalized state the canonical binding
+// explicitly, and the public QTD status RPCs expose it as a separate field.
+func (qfs *QTDFinalityState) advanceQPOSFinalityForSeal(slot uint64, blockHash types.Hash) SealRootState {
 	epoch := SlotToEpoch(slot)
+
 	qfs.qpos.mu.Lock()
+	defer qfs.qpos.mu.Unlock()
 
 	checkpointRoot := blockHash
 	if epochRoot, ok := qfs.qpos.epochBlockRoots[epoch]; ok && epochRoot != (types.Hash{}) {
 		checkpointRoot = epochRoot
 	}
+
+	// Canonicality: the per-slot root is authoritative; the epoch checkpoint
+	// root is positive evidence only.
+	state := SealRootUnknown
 	canonicalRoot, known := qfs.qpos.slotBlockRoots[slot]
-	if !known {
-		canonicalRoot, known = qfs.qpos.epochBlockRoots[epoch]
+	if known && canonicalRoot == (types.Hash{}) {
+		// A recorded zero root carries no information (R25/N3): treat it
+		// exactly like an ABSENT root — epoch checkpoint included — so this
+		// path and sealRootState cannot disagree about the same input
+		// (R27, 2026-10-30).
+		known = false
 	}
-	if !known || canonicalRoot == (types.Hash{}) || canonicalRoot != types.Hash(blockHash) {
-		qfs.qpos.mu.Unlock()
-		// R22 (2026-10-29): the R19-F08 rollback of the finalized record is
-		// REVERTED here. The record is the threshold-agreement PROOF: the
-		// R4-CORE-04 design (and its pinned test
-		// TestR4CORE04_CompleteSeal_RejectsNonCanonicalAtFinalize) requires
-		// that a quorum-approved seal STAYS recorded even when its block hash
-		// is not the canonical root — only the consensus finality state
-		// (finalizedEpoch/finalizedRoot/justifiedRoot) must not advance on a
-		// non-canonical hash, which is exactly what the branch above does.
-		//
-		// Why the rollback was wrong:
-		//  1. It destroyed legitimate evidence. A seal requested while the
-		//     slot's canonical root was not yet known (RequestSeal explicitly
-		//     allows that — the block may not be imported yet) was DELETED by
-		//     this asynchronous check whenever the root had not landed by the
-		//     time the threshold completed. A quorum-approved seal can then be
-		//     destroyed by pure timing — a liveness defect on the QTD path.
-		//  2. It broke two existing tests only by scheduling luck: both
-		//     read the record synchronously while this goroutine deletes it
-		//     asynchronously, so they passed or failed depending on whether
-		//     the goroutine had been scheduled yet (reproduced locally:
-		//     2 failures in 40 runs of TestPopulateStardustFieldsWithProvinces).
-		//  3. The "the RPCs over-report" concern it aimed at is already
-		//     covered without destroying data: IsSlotFinalized cross-checks
-		//     the record against the QPOS finalized epoch (R39-P2-01), so a
-		//     record whose epoch consensus has not finalized is not reported
-		//     as finalized to real consumers (the "finalized" block qualifier
-		//     and the sync sentinel). R22 additionally exposes the canonical
-		//     status of a seal explicitly (IsCanonicalSeal) so the public
-		//     QTD status RPCs can report "agreement recorded" and "canonical /
-		//     consensus-finalized" as distinct facts.
+	switch {
+	case known:
+		if canonicalRoot == blockHash {
+			state = SealRootMatches
+		} else {
+			state = SealRootDiffers
+		}
+	default:
+		if epochRoot, ok := qfs.qpos.epochBlockRoots[epoch]; ok && epochRoot != (types.Hash{}) && epochRoot == blockHash {
+			state = SealRootMatches
+		}
+	}
+
+	if state != SealRootMatches {
 		qtdLogger.Warn("qtd_finality: rejecting seal without a matching canonical root",
-			map[string]any{"slot": slot, "epoch": epoch})
-		return
+			map[string]any{"slot": slot, "epoch": epoch, "canonicalState": state.String()})
+		return state
 	}
 
 	changed := false
@@ -1420,24 +1666,93 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 	}
 	if changed {
 		qfs.qpos.finalityPersistPending = true
+		// R31 (2026-10-31) FIX (round-10 review nit 1): this is the FOURTH
+		// finality-adoption point; the other three refresh the checkpoint-slot
+		// pin and this one did not. The refresh re-derives the pin whenever
+		// the finalized root is locatable at or below the finalized epoch's
+		// boundary slot — e.g. a restart whose store-resolved pin failed and
+		// recovered later, or a root re-derived below a skipped boundary.
+		// DOCUMENTED LIMIT (round-11 finding, pinned by
+		// TestR31_FinalizedCheckpointSlotMidEpochDegradation): when the
+		// finalized root names a MID-EPOCH block (a skipped boundary slot
+		// leaves the epoch root unrecorded), the pin model cannot express it
+		// — the pin scan and its reader both bound slots at the boundary — so
+		// FinalizedCheckpointSlot degrades to the boundary by design. The
+		// direction under-protects the instant-final block relative to
+		// instant-finality semantics (fail-safe for liveness, never
+		// over-refuses), consistent with the F21 boundary-fallback model.
+		qfs.qpos.pinFinalizedCheckpointSlotLocked()
 	}
 	if changed || qfs.qpos.finalityPersistPending {
 		qfs.qpos.persistFinalityLocked()
 	}
-	qfs.qpos.mu.Unlock()
+	return SealRootMatches
+}
 
-	// AUDIT (2026) CORE B-5 FIX: GetChambersCoordinator() can return nil
-	// if chambers are torn down or never initialized between RequestSeal and
-	// this async goroutine. Without this check, the nil coordinator would
-	// panic on .GetExecutiveChamber(), crashing the node (unrecovered
-	// goroutine in SubmitPartialSeal's `go completeSealLockedFinalize`).
-	coordinator := qfs.qpos.GetChambersCoordinator()
-	if coordinator == nil {
+// reconcileCanonicalSeal re-drives the QTD finalization for a slot whose
+// canonical root has just landed (R23, 2026-10-29).
+//
+// The asynchronous finalizer runs ONCE, when the threshold completes. If the
+// canonical root for the slot was not known at that moment, the seal was
+// recorded but never advanced the QPOS finality state — and nothing re-ran
+// it, so the slot silently lost its instant finality (a liveness defect: the
+// QTD seal existed, yet the chain kept waiting for the ordinary epoch
+// finalizer).
+//
+// The QPOS calls this when it records a canonical slot root, which closes the
+// window.
+//
+// R24 (2026-10-29): the re-drive now also REFRESHES the canonical
+// classification of the record:
+//   - the landed root equals the sealed hash -> the seal provably attests
+//     the canonical block (SealRootMatches) and the markers are advanced;
+//   - the landed root differs from the sealed hash -> the seal provably
+//     attests a NON-canonical block (SealRootDiffers) and nothing is
+//     advanced. The record is kept (it is the threshold-agreement proof),
+//     but it can never be reported as final.
+//
+// The executive chamber's seal counter is bumped at most once per record
+// (see claimSealCount): the asynchronous path and this re-drive may both
+// observe the same completion.
+func (qfs *QTDFinalityState) reconcileCanonicalSeal(slot uint64, root types.Hash) {
+	if qfs == nil || qfs.qpos == nil {
 		return
 	}
-	executive := coordinator.GetExecutiveChamber()
-	if executive != nil {
-		executive.RecordSeal(true)
+	qfs.mu.RLock()
+	record, ok := qfs.instantFinalizedSlots[slot]
+	qfs.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if root == (types.Hash{}) {
+		// R26 (2026-10-30) FIX (auditor finding D2): a zero root is "no
+		// information", never proof of non-canonicality. Writing Differs here
+		// would freeze a verdict the data does not support.
+		return
+	}
+	if record.BlockHash != root {
+		// The canonical root of this slot is now known and differs from the
+		// sealed hash: the retained seal attests a side-branch block. Record
+		// that classification so the reporting layer keeps saying "not
+		// final" even after the per-slot root is pruned, and advance
+		// nothing.
+		qfs.persistCanonicalState(slot, record.BlockHash, SealRootDiffers)
+		return
+	}
+	// The retained seal now provably belongs to the canonical block of this
+	// slot: advance the QPOS finality state through the same fail-closed path
+	// the asynchronous finalizer uses.
+	state := qfs.advanceQPOSFinalityForSeal(slot, root)
+	qfs.persistCanonicalState(slot, root, state)
+	if state != SealRootMatches {
+		return
+	}
+	if coordinator := qfs.qpos.GetChambersCoordinator(); coordinator != nil {
+		if executive := coordinator.GetExecutiveChamber(); executive != nil {
+			if qfs.claimSealCount(slot, root) {
+				executive.RecordSeal(true)
+			}
+		}
 	}
 }
 
@@ -1450,11 +1765,18 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 // qfs.mu before writing the map, or a future refactor that lets callers
 // populate the map outside the VerifyInstantFinality gate) would be
 // reported as finalized even though QPOS itself hasn't reached the
-// corresponding epoch yet. Consumers (RPC eth_getBlockByNumber with
-// "finalized" qualifier, sync sentinel, slash-condition tests) would
-// then trust a slot as "instant-finalized" while the chain's actual
-// finality marker is still behind — exposing the node to short-range
-// reorg exploitation if a fork chooser later honors IsSlotFinalized.
+// corresponding epoch yet. A consumer would then trust a slot as
+// "instant-finalized" while the chain's actual finality marker is still
+// behind — exposing the node to short-range reorg exploitation if a fork
+// chooser later honors IsSlotFinalized.
+//
+// R23 (2026-10-29) CORRECTION: an earlier revision of this comment named
+// "RPC eth_getBlockByNumber with the 'finalized' qualifier" and a "sync
+// sentinel" as the affected consumers. Neither exists in this codebase —
+// the name was carried over from the original R39 audit notes without being
+// re-verified against the tree. The real consumers are the three-chambers
+// lifecycle gates, GetEpochSealers, IsSlotQTDFinalized and the QTD status
+// RPCs.
 //
 // Mitigation: dual-source guard. A slot is finalized iff BOTH:
 //
@@ -1468,6 +1790,12 @@ func (qfs *QTDFinalityState) completeSealLockedFinalize(slot uint64, blockHash [
 // "map-only" code path that consumers must understand as "exists = local
 // node previously sealed this slot via QTD, but QPOS's finality state is
 // not part of the contract here".
+//
+// R23 (2026-10-29): this function answers the CONSENSUS-level question
+// ("is a seal agreement recorded for this slot, and has the epoch marker
+// caught up"). It cannot distinguish a canonical seal from a seal over a
+// side-branch block. The public RPCs use IsBlockFinalized instead, which
+// binds the answer to the canonical root.
 //
 // Lock ordering: we call qpos.GetFinalizedEpoch() BEFORE acquiring
 // qfs.mu — qpos.GetFinalizedEpoch takes qpos.mu.RLock internally, and
@@ -1515,11 +1843,24 @@ func (qfs *QTDFinalityState) IsSlotFinalized(slot uint64) bool {
 	// stardust_verification_test.go's ThreeChambersFlow fixture is the
 	// canonical example: it constructs a real QPOS but never advances
 	// finalizedEpoch, relying on IsSlotFinalized's map-presence check
-	// alone to confirm QTD completion. The audit's finding specifically
-	// calls out CONSUMERS — RPC eth_getBlockByNumber with "finalized"
-	// qualifier, sync sentinel — not the test-helper gating paths; the
-	// cross-check functionally disables the test flow without this
-	// bootstrapping fallback.
+	// alone to confirm QTD completion.
+	//
+	// R23 (2026-10-29) CORRECTION: an earlier revision of this comment
+	// claimed the audit "specifically called out CONSUMERS — RPC
+	// eth_getBlockByNumber with the 'finalized' qualifier, sync sentinel".
+	// That was inaccurate: neither consumer exists in this codebase. The
+	// actual consumers of IsSlotFinalized are:
+	//   - consensus/three_provinces.go (chamber lifecycle gates)
+	//   - consensus/qtd_finality.go GetEpochSealers
+	//   - consensus/block.go IsSlotQTDFinalized (public wrapper)
+	//   - rpc/stardust_api.go (qau_stardust_getFinality / qau_tss_getSealStatus
+	//     / qau_tss_submitPartialSeal)
+	// The public RPCs no longer read this function for their primary
+	// finality answer (R23 added the block-level IsBlockFinalized), so the
+	// map-only fallback can no longer make the RPCs over-report a
+	// side-branch seal as finalized. The fallback is retained for the
+	// bootstrap window and for the chamber lifecycle gates, which must not
+	// stall while the epoch marker is still catching up.
 	//
 	// Both guards: if EITHER side is zero, fall back to map-only.
 	if qposFinalizedEpoch == 0 || record.Epoch == 0 {
@@ -1531,8 +1872,8 @@ func (qfs *QTDFinalityState) IsSlotFinalized(slot uint64) bool {
 	// chain segment safe from reorg" signal, and a QTD-sealed slot in an
 	// epoch the QPOS hasn't finalized is still technically reorgable by
 	// a fork with conflicting QPOS finality. We return false here so
-	// that consumers (fork chooser, RPC "finalized" block, sync
-	// sentinel) get a single consistent answer.
+	// that consumers (the three-chambers lifecycle gates,
+	// GetEpochSealers, IsSlotQTDFinalized) get a single consistent answer.
 	return record.Epoch <= qposFinalizedEpoch
 }
 
@@ -1587,18 +1928,318 @@ func (qfs *QTDFinalityState) GetFinalityRecord(slot uint64) *InstantFinalityReco
 			// message to sign (see GetPendingSeal's copy for the same fix).
 			ChainID: record.ChainID,
 			Epoch:   record.Epoch,
+			// R24 (2026-10-29): carry the canonical classification and the
+			// seal-counter de-duplication flag into the copy. Dropping
+			// CanonicalState would make every copied record look
+			// "unclassified", and the reporting layer would lose the
+			// evidence that survives the pruning of the per-slot root.
+			CanonicalState: record.CanonicalState,
+			SealCounted:    record.SealCounted,
 		}
 		return copy
 	}
 	return nil
 }
 
+// SealRootState classifies how the canonical root of a slot relates to the
+// block carried by a recorded QTD seal (R23, 2026-10-29).
+//
+// The three states are kept distinct on purpose: "the root is not known yet"
+// and "the root is known and differs" are opposite facts, and collapsing
+// them into a single boolean is what let the public RPCs over-report
+// finality for a side-branch seal.
+type SealRootState uint8
+
+const (
+	// SealRootUnknown: no canonical root is known for the slot — either the
+	// block has not been imported yet, or the per-slot root was pruned (the
+	// QPOS keeps only a few epochs of per-slot roots).
+	SealRootUnknown SealRootState = iota
+	// SealRootMatches: the canonical root equals the sealed block hash.
+	SealRootMatches
+	// SealRootDiffers: the canonical root is known and differs from the
+	// sealed block hash — the seal provably attests a NON-canonical block.
+	SealRootDiffers
+)
+
+// String returns a short human-readable label for the root state.
+func (s SealRootState) String() string {
+	switch s {
+	case SealRootMatches:
+		return "matches"
+	case SealRootDiffers:
+		return "differs"
+	default:
+		return "unknown"
+	}
+}
+
+// SlotSealStatus bundles the independent finality facts about a slot's QTD
+// seal (R23, 2026-10-29). Each field is an independent statement; no single
+// boolean can carry all of them.
+type SlotSealStatus struct {
+	// SealRecorded: a threshold seal agreement is recorded for the slot.
+	// The record is the PROOF that the executive chamber reached quorum — it
+	// survives even when the sealed block is not the canonical one (R4-CORE-04).
+	SealRecorded bool
+	// RootState: how the slot's canonical root relates to the sealed hash.
+	RootState SealRootState
+	// EpochFinal: the QPOS consensus finality marker has reached the epoch
+	// that contains the slot.
+	EpochFinal bool
+	// ConsensusFinalized: the STRICT consensus-layer answer — a seal
+	// agreement is recorded for the slot AND the QPOS marker has reached the
+	// slot's epoch (the fact IsSealConsensusFinalized reports). It says
+	// nothing about the canonical block; IsFinalized is the block-level
+	// answer. Computed from the SAME record/marker snapshot as the fields
+	// above (R26, 2026-10-30), so a caller can publish it next to them
+	// without a second read.
+	ConsensusFinalized bool
+}
+
+// IsFinalized reports the honest BLOCK-level finality answer for a slot.
+//
+//	no seal recorded                          -> false
+//	canonical root matches the sealed hash    -> true  (QTD instant finality)
+//	canonical root known and differs          -> false (proven non-canonical:
+//	                                                  never final, regardless
+//	                                                  of the epoch marker)
+//	canonical root unknown                    -> false (cannot confirm)
+//
+// R24 (2026-10-29) CORRECTION: the unknown case used to fall back to the
+// epoch marker ("the slot's epoch is final, therefore the sealed block is
+// final"). That fallback is an over-report: the epoch marker says nothing
+// about WHICH block was sealed, so once the per-slot root of a retained
+// side-branch seal was pruned, the public RPCs reported that fork block as
+// final together with its hash — the very defect R23 set out to remove.
+// The unknown case is now fail-closed: "cannot confirm" is reported as "not
+// final", and the epoch marker is exposed as its own independent fact
+// (EpochFinal / the epochFinalized RPC field) for clients that need it.
+//
+// The pruned-root case is still answered honestly: the canonical
+// classification is persisted with the seal record (see
+// InstantFinalityRecord.CanonicalState), so a seal that WAS canonical keeps
+// reporting final after its slot root is pruned.
+func (s SlotSealStatus) IsFinalized() bool {
+	if !s.SealRecorded {
+		return false
+	}
+	return s.RootState == SealRootMatches
+}
+
+// GetSlotSealStatus returns the independent finality facts for a slot's QTD
+// seal (R23, 2026-10-29).
+//
+// Lock order: the record is read under qfs.mu and the canonical root under
+// qpos.mu, never nested — qfs.mu is released before the root is read, which
+// preserves the sanctioned qpos.mu → qfs.mu order.
+func (qfs *QTDFinalityState) GetSlotSealStatus(slot uint64) SlotSealStatus {
+	status, _ := qfs.GetSlotSealDetails(slot)
+	return status
+}
+
+// GetSlotSealDetails returns the seal status and the seal record of a slot
+// from ONE consistent record snapshot (R23, 2026-10-29).
+//
+// The two values are derived from the same record read, so a caller that
+// reports both (the public RPCs) can never mix the facts of two different
+// records.
+//
+// R24 (2026-10-29): the canonical classification is resolved in two steps.
+// The LIVE canonical root is authoritative when it is known; when it is not
+// (the block has not been imported yet, or its per-slot root was pruned), the
+// classification persisted with the record is used. That is what keeps a
+// canonical seal reportable as final after the pruning of its slot root,
+// while a retained side-branch seal keeps reporting "not final" instead of
+// silently inheriting the epoch marker's verdict.
+func (qfs *QTDFinalityState) GetSlotSealDetails(slot uint64) (SlotSealStatus, *InstantFinalityRecord) {
+	var status SlotSealStatus
+	if qfs == nil {
+		return status, nil
+	}
+	record := qfs.GetFinalityRecord(slot)
+	if record == nil {
+		return status, nil
+	}
+	status.SealRecorded = true
+	// The epoch that contains the slot is derived from the slot itself —
+	// the same value the strict RPC accessor (IsSealConsensusFinalized)
+	// cross-checks against, so the two surfaces can never disagree about
+	// which epoch the marker must have reached.
+	status.EpochFinal = qfs.isEpochFinalized(SlotToEpoch(record.Slot))
+	if qfs.qpos == nil {
+		// No QPOS to cross-check against: the recorded agreement is all
+		// there is (same rule IsSealConsensusFinalized applies).
+		status.ConsensusFinalized = true
+	} else {
+		status.ConsensusFinalized = status.EpochFinal
+	}
+	state, raced := qfs.sealRootState(slot, record.BlockHash)
+	status.RootState = applyPersistedFallback(state, raced, record.CanonicalState)
+	return status, record
+}
+
+// applyPersistedFallback decides whether the classification persisted with the
+// record may stand in for a live "unknown" (R26, 2026-10-30).
+//
+// It is a pure function of its inputs on purpose: the decision is the whole
+// point of R26/D3, and keeping it separate lets a unit test pin it without
+// having to provoke a canonical-head switch between two root reads.
+//
+//   - a live verdict (matches / differs) always wins;
+//   - a RACED read never falls back — the head moved, so "unknown" is the
+//     honest answer, not a stale classification of unknown age;
+//   - a read that found no root at all (the block is not imported yet, or the
+//     per-slot root was pruned) falls back to the persisted classification,
+//     which is what keeps a canonical seal reportable after pruning (R24).
+func applyPersistedFallback(live SealRootState, raced bool, persisted SealRootState) SealRootState {
+	if live != SealRootUnknown || raced {
+		return live
+	}
+	return persisted
+}
+
+// sealRootState classifies the slot's canonical root against the sealed hash.
+//
+// The root is read AFTER the record lookup (so the comparison uses the
+// freshest root) and read TWICE: a canonical-head switch between the two
+// reads makes the snapshots disagree, and the state then falls back to
+// Unknown instead of reporting a stale match (R23, 2026-10-29 — the R22
+// accessor read the root BEFORE the record and could report a stale true).
+//
+// When the slot's own root is not known, the epoch checkpoint root is
+// consulted as POSITIVE evidence only (R24, 2026-10-29): if the checkpoint
+// IS the sealed block, the seal provably attests a canonical block. A
+// checkpoint root that differs from the sealed hash is NOT negative
+// evidence (they are different blocks), so the state stays Unknown.
+//
+// The classification mirrors the canonicality notion used by
+// advanceQPOSFinalityForSeal, so the reporting layer and the marker
+// advancement can never disagree about which block is canonical.
+//
+// The second return value reports a RACED read: the two root reads disagreed,
+// so the head moved mid-classification. Callers must not substitute a stored
+// classification for that answer (R26, 2026-10-30) — "the head moved" is not
+// "the root is missing".
+//
+// A recorded ZERO root never reaches this comparison: the normalisation lives in
+// the accessor QPOS.GetSlotBlockRoot (R27, 2026-10-30 — auditor finding N2), so
+// the "known" branch below can only see a real block hash (R28, 2026-10-30 —
+// auditor finding R27-O2 removed the older per-caller zero branch that this
+// change left unreachable).
+func (qfs *QTDFinalityState) sealRootState(slot uint64, sealedHash types.Hash) (SealRootState, bool) {
+	if qfs.qpos == nil {
+		return SealRootUnknown, false
+	}
+	root1, known1 := qfs.qpos.GetSlotBlockRoot(slot)
+	root2, known2 := qfs.qpos.GetSlotBlockRoot(slot)
+	if known1 && known2 && root1 == root2 {
+		if root1 == sealedHash {
+			return SealRootMatches, false
+		}
+		return SealRootDiffers, false
+	}
+	if known1 != known2 || root1 != root2 {
+		// The two reads disagree: the canonical head moved between them.
+		// Reporting a match (or a mismatch) would be a guess.
+		return SealRootUnknown, true
+	}
+	// The slot's own root is unknown — try the epoch checkpoint root.
+	epoch := SlotToEpoch(slot)
+	check1, epochKnown1 := qfs.qpos.GetEpochBlockRoot(epoch)
+	check2, epochKnown2 := qfs.qpos.GetEpochBlockRoot(epoch)
+	if epochKnown1 && epochKnown2 && check1 == check2 && check1 == sealedHash {
+		return SealRootMatches, false
+	}
+	return SealRootUnknown, false
+}
+
+// isEpochFinalized reports whether the QPOS consensus finality marker has
+// reached the given epoch.
+//
+// A zero finalized epoch is ambiguous: it means "epoch 0" once the restored
+// checkpoint names a root for it, and "nothing has been finalized yet" before
+// that. The finalized root disambiguates the two (R23, 2026-10-29).
+//
+// R24 (2026-10-29) FIX: the epoch argument was IGNORED in the zero-epoch
+// branch — a named finalized root at epoch 0 made EVERY epoch look
+// finalized, so a seal in any epoch was reported with epochFinalized=true
+// and (through the old unknown-root fallback) as a final block. A named root
+// at epoch 0 proves epoch 0 and nothing else, so the branch now requires the
+// queried epoch to be epoch 0 as well.
+func (qfs *QTDFinalityState) isEpochFinalized(epoch uint64) bool {
+	if qfs.qpos == nil {
+		return false
+	}
+	finalizedEpoch := qfs.qpos.GetFinalizedEpoch()
+	if finalizedEpoch == 0 {
+		return epoch == 0 && qfs.qpos.GetFinalizedRoot() != (types.Hash{})
+	}
+	return epoch <= finalizedEpoch
+}
+
+// IsSealConsensusFinalized reports the STRICT consensus-layer answer for a
+// slot's seal: a threshold agreement is recorded for the slot AND the QPOS
+// finality marker has actually reached the slot's epoch (R24, 2026-10-29).
+//
+// This is the honest version of the "consensus seal finalized" fact that the
+// public RPCs report. IsSlotFinalized keeps its map-only fallback (a record
+// with no epoch context, or a QPOS whose marker has not moved yet) because
+// the three-chambers lifecycle gates must not stall while the epoch marker
+// is still catching up — but that fallback cannot be published as a
+// "the marker has caught up" statement.
+//
+// With the marker at epoch 0 (the re-anchored / restored-checkpoint state)
+// only epoch 0 counts as finalized, and only when a named finalized root
+// exists. The cross-check is performed for every epoch, epoch 0 included —
+// the epoch that contains a slot is derived from the slot itself, so there
+// is no "no epoch context" case left to skip it (R24, 2026-10-29).
+func (qfs *QTDFinalityState) IsSealConsensusFinalized(slot uint64) bool {
+	if qfs == nil {
+		return false
+	}
+	status, record := qfs.GetSlotSealDetails(slot)
+	if record == nil {
+		return false
+	}
+	// R26 (2026-10-30) FIX (auditor finding D4): the answer is computed inside
+	// the same record/marker snapshot the public RPCs publish
+	// (SlotSealStatus.ConsensusFinalized). This method used to re-read the
+	// record and the markers, so a caller that also published the snapshot
+	// could emit two booleans derived from two different moments. It also
+	// drops the separate "no QPOS" branch: GetSlotSealDetails applies the
+	// same rule when qfs.qpos is nil.
+	//
+	// R24 (2026-10-29) FIX (auditor finding X09) — unchanged semantics: the
+	// epoch cross-check is performed for EVERY epoch, epoch 0 included. The
+	// previous revision treated record.Epoch == 0 as "no epoch context" and
+	// returned true without consulting the marker. That shortcut was wrong
+	// twice over: (a) epoch 0 is a real epoch (slots 0..31), so an epoch-0
+	// seal was published as "the consensus marker has caught up" even when
+	// nothing had been finalized at all; (b) the epoch that contains a slot
+	// is derivable from the slot itself, so the cross-check is always
+	// performable. The marker is indexed by the epoch that CONTAINS the slot,
+	// so SlotToEpoch(record.Slot) is authoritative here — the record's stored
+	// Epoch is the SIGNING epoch and agrees with it by construction.
+	return status.ConsensusFinalized
+}
+
+// IsBlockFinalized reports the honest block-level finality answer for a slot:
+// a QTD seal counts as final only when the sealed block is the slot's
+// canonical block. When the canonical root cannot be confirmed, the block is
+// NOT reported as final (R24, 2026-10-29 — the epoch marker is no longer a
+// substitute for the canonical binding).
+//
+// This is the answer the public RPCs must use. IsSlotFinalized answers a
+// different question ("is a seal agreement recorded, and has the epoch
+// marker caught up"), which cannot distinguish a canonical seal from a seal
+// over a side-branch block.
+func (qfs *QTDFinalityState) IsBlockFinalized(slot uint64) bool {
+	return qfs.GetSlotSealStatus(slot).IsFinalized()
+}
+
 // IsCanonicalSeal reports whether a recorded QTD seal's block hash is the
-// canonical root for its slot (R22, 2026-10-29). Introduced together with the
-// revert of the R19-F08 record rollback: the record now survives as the
-// threshold-agreement PROOF even when its block is not (yet) canonical, so
-// the public QTD status RPCs need an explicit way to state that distinction
-// honestly instead of deleting the record.
+// canonical root for its slot (R22, 2026-10-29; hardened in R23).
 //
 // Semantics (three-way, deliberately NOT collapsed to a bare bool-true when
 // unknown):
@@ -1609,30 +2250,47 @@ func (qfs *QTDFinalityState) GetFinalityRecord(slot uint64) *InstantFinalityReco
 //
 // Callers must treat false as "not confirmed canonical", never as "proven
 // non-canonical" (the two different false cases above are not distinguished
-// here on purpose — a bare "confirmed" bit is what consumers need).
-//
-// Lock order: the canonical root is snapshotted from the QPOS BEFORE taking
-// qfs.mu, preserving the sanctioned qpos.mu → qfs.mu order (the reverse
-// nesting is what the codebase deliberately avoids — see RequestSeal).
+// here on purpose — a bare "confirmed" bit is what consumers need). Use
+// GetSlotSealStatus when the distinction matters.
 func (qfs *QTDFinalityState) IsCanonicalSeal(slot uint64) bool {
 	if qfs == nil {
 		return false
 	}
-	var root types.Hash
-	var known bool
-	if qfs.qpos != nil {
-		root, known = qfs.qpos.GetSlotBlockRoot(slot)
-	}
-	qfs.mu.RLock()
-	defer qfs.mu.RUnlock()
-	record, exists := qfs.instantFinalizedSlots[slot]
-	if !exists {
+	return qfs.GetSlotSealStatus(slot).RootState == SealRootMatches
+}
+
+// SealAlreadyCovers reports whether a slot already carries a threshold
+// agreement that makes another sealing drive for the given block pointless
+// (R24, 2026-10-29).
+//
+// It answers with TWO facts, not one:
+//
+//   - the slot's retained agreement covers EXACTLY this block — the drive
+//     would re-derive the same agreement; or
+//   - the slot's retained agreement is provably CANONICAL — the slot is
+//     already sealed on the canonical chain and a drive for a different
+//     block would be refused by the canonical-binding check anyway.
+//
+// A retained agreement over a block that is NOT known to be canonical does
+// NOT answer "yes": the canonical block of that slot still needs a seal of
+// its own, and the agreement that eventually completes replaces the stale
+// record (R24, 2026-10-29 — auditor finding X03: the node-layer drivers
+// used to abort as soon as ANY record existed, which wedged the canonical
+// seal of a slot whose earlier agreement attested a side-branch block).
+//
+// The caller must NOT hold qfs.mu.
+func (qfs *QTDFinalityState) SealAlreadyCovers(slot uint64, blockHash types.Hash) bool {
+	if qfs == nil {
 		return false
 	}
-	if !known {
+	record := qfs.GetFinalityRecord(slot)
+	if record == nil {
 		return false
 	}
-	return root == record.BlockHash
+	if record.BlockHash == blockHash {
+		return true
+	}
+	return qfs.IsCanonicalSeal(slot)
 }
 
 func (qfs *QTDFinalityState) VerifyInstantFinality(slot uint64, blockHash types.Hash, qtdSignature []byte) bool {
@@ -1949,27 +2607,33 @@ const (
 // economic bar would be computed against the wrong total. The ceil(2/3 *
 // total) formula is unchanged — only the basis is widened.
 func (qfs *QTDFinalityState) snapshotSealerStakes() (sealerStakes map[int]*big.Int, totalStake, requiredWeight *big.Int) {
-	qfs.mu.RLock()
-	defer qfs.mu.RUnlock()
 	if qfs.qpos == nil {
 		return nil, nil, nil
 	}
+	// R23 (2026-10-29): the coordinator is fetched under qpos.mu and the
+	// snapshot is taken WITHOUT holding qfs.mu. The previous version held
+	// qfs.mu.RLock across both QPOS reads — a qfs.mu → qpos.mu nesting that
+	// contradicts the lock order this file documents everywhere else.
 	coordinator := qfs.qpos.GetChambersCoordinator()
 	if coordinator == nil {
 		return nil, nil, nil
 	}
-	return qfs.snapshotSealerStakesLocked(coordinator)
+	return qfs.snapshotSealerStakesFor(coordinator)
 }
 
-// snapshotSealerStakesLocked is the internal variant that assumes the
-// caller already holds qfs.mu (at least RLock) and has a coordinator
-// reference. It snapshots every validator's stake and computes the required
-// weight as ceil(2/3 * totalStake).
+// snapshotSealerStakesFor snapshots every validator's stake and computes the
+// required weight as ceil(2/3 * totalStake) for the given coordinator.
 //
-// R30-IMPLEMENT (2026-07-27): P3-QTD-01. Caller must hold qfs.mu.
+// R30-IMPLEMENT (2026-07-27): P3-QTD-01.
 // R47-QTD-QUORUM (2026-09-26): basis switched from the executive members
 // for the epoch to the full validator set — see snapshotSealerStakes.
-func (qfs *QTDFinalityState) snapshotSealerStakesLocked(coordinator *ThreeChambersCoordinator) (sealerStakes map[int]*big.Int, totalStake, requiredWeight *big.Int) {
+//
+// R23 (2026-10-29): this helper reads QPOS state only (the validator set via
+// a deep copy) and touches NO QTDFinalityState field, so it does NOT require
+// qfs.mu. Keeping it lock-free is what lets RequestSeal take the snapshot
+// before entering the qfs.mu critical section, which in turn keeps the lock
+// order free of any qfs.mu → qpos.mu nesting.
+func (qfs *QTDFinalityState) snapshotSealerStakesFor(coordinator *ThreeChambersCoordinator) (sealerStakes map[int]*big.Int, totalStake, requiredWeight *big.Int) {
 	if coordinator == nil {
 		return nil, nil, nil
 	}
@@ -2536,16 +3200,57 @@ func (qfs *QTDFinalityState) ReceiveSealAnnouncement(slot uint64, blockHash type
 	}
 
 	// Seal accepted — store the finality record.
+	//
+	// R24 (2026-10-29): snapshot the canonical root ONE MORE TIME, outside
+	// qfs.mu (the lock order forbids qfs.mu → qpos.mu). The root read at the
+	// top of this function may be stale by now: the canonical head can move
+	// while the signature is verified.
+	var canonicalRoot types.Hash
+	var canonicalKnown bool
+	if qfs.qpos != nil {
+		canonicalRoot, canonicalKnown = qfs.qpos.GetSlotBlockRoot(slot)
+	}
+	if canonicalKnown && canonicalRoot != blockHash {
+		// The canonical head moved while the announcement was being
+		// verified: the announced seal attests a non-canonical block
+		// (R4-CORE-04). Reject it.
+		return false
+	}
+
 	qfs.mu.Lock()
 	defer qfs.mu.Unlock()
 
-	// Idempotent: if already finalized, don't overwrite.
-	if _, exists := qfs.instantFinalizedSlots[slot]; exists {
-		return true
+	if existing, exists := qfs.instantFinalizedSlots[slot]; exists {
+		if existing.BlockHash == blockHash {
+			// Idempotent: the same agreement is already stored.
+			return true
+		}
+		// R24 (2026-10-29) LIVENESS / CONSISTENCY: a DIFFERENT agreement is
+		// stored for this slot. The old code returned early ("already
+		// finalized") and kept the stale record forever, so a peer that had
+		// re-sealed the canonical block after a provably non-canonical seal
+		// could never make this node accept the canonical seal: the nodes
+		// then disagreed about the same slot — the sealing node reported
+		// canonicalState="matches" while this node kept reporting "differs"
+		// and never advanced its QPOS markers.
+		//
+		// The stale record is replaced ONLY when the local canonical root is
+		// known and equals the announced hash: that proves the stored
+		// record attests a side-branch block and the announced seal attests
+		// the canonical one. Without that proof the stored record is kept
+		// (it is the threshold-agreement proof, and the R4-CORE-04 design
+		// requires it to survive) and the announcement is ignored.
+		if !canonicalKnown || canonicalRoot != blockHash {
+			return true
+		}
 	}
 
 	sealersCopy := append([]int(nil), sealers...)
 	sealedAt := time.Unix(int64(slot), 0)
+	canonicalState := SealRootUnknown
+	if canonicalKnown {
+		canonicalState = SealRootMatches
+	}
 	record := &InstantFinalityRecord{
 		Slot:         slot,
 		BlockHash:    blockHash,
@@ -2559,6 +3264,9 @@ func (qfs *QTDFinalityState) ReceiveSealAnnouncement(slot uint64, blockHash type
 		// to re-derive it from the signature alone.
 		ChainID: qfs.chainID,
 		Epoch:   epoch,
+		// R24 (2026-10-29): persist the canonical classification so the
+		// honest answer survives the pruning of the per-slot root.
+		CanonicalState: canonicalState,
 	}
 	qfs.instantFinalizedSlots[slot] = record
 

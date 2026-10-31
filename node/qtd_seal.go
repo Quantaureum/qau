@@ -743,7 +743,13 @@ func (n *Node) computeAndCompleteQTDSeal(slot uint64, blockHash types.Hash) {
 	if qfs == nil {
 		return
 	}
-	if qfs.GetFinalityRecord(slot) != nil {
+	// R24 (2026-10-29): skip the drive only when the slot already carries a
+	// threshold agreement that covers THIS block, or a provably canonical
+	// agreement for the slot. A retained agreement over a non-canonical block
+	// must not wedge the canonical seal of that slot — the consensus layer
+	// replaces the stale record when the new agreement completes (auditor
+	// finding X03).
+	if qfs.SealAlreadyCovers(slot, blockHash) {
 		return
 	}
 	if pending := qfs.GetPendingSeal(slot); pending == nil {

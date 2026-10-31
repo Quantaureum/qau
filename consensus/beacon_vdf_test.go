@@ -2,6 +2,7 @@
 package consensus
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -203,7 +204,13 @@ func TestApplyVDFDisabled(t *testing.T) {
 }
 
 // TestApplyVDFTimeout covers the degradation path: an evaluation that
-// cannot finish inside the deadline returns ErrVDFTimeout.
+// cannot finish inside the deadline returns ErrVDFTimeout — and the
+// abandoned evaluator is CANCELED, not left running (R24, 2026-10-30).
+//
+// The negative control is goroutine-count based: the witness buffer grows by
+// one full state vector per timestep, so an evaluator that ignored the
+// cancellation would keep running for minutes and keep consuming memory. The
+// poll below must see it gone within seconds.
 func TestApplyVDFTimeout(t *testing.T) {
 	beacon := buildFinalizableBeacon(1)
 	out, err := beacon.Finalize()
@@ -213,8 +220,18 @@ func TestApplyVDFTimeout(t *testing.T) {
 	cfg := smallVDFConfig()
 	cfg.TimeSteps = 4_000_000 // far beyond any deadline at current speed
 	cfg.Timeout = 150 * time.Millisecond
+
+	before := runtime.NumGoroutine()
 	if _, err := ApplyVDF(out, cfg); err == nil {
 		t.Fatal("expected timeout error")
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if left := runtime.NumGoroutine(); left > before {
+		t.Fatalf("the timed-out evaluator goroutine is still running (goroutines %d > baseline %d) — cancellation was ignored", left, before)
 	}
 }
 

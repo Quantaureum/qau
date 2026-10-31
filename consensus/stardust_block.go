@@ -10,6 +10,37 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
+// PopulateStardustFields fills the QTD/stardust fields of a block header.
+//
+// Finality semantics carried by the header (R23, 2026-10-29):
+//
+// The header can only carry the FINALITY TYPE (0 = CasperFFG, 1 = QTD
+// instant), never the statement "this block is final". Two structural
+// reasons:
+//
+//	L1 — self-reference. The block hash is computed OVER the header, and
+//	     the QTD seal is over the block hash. At population time the block
+//	     hash does not exist yet, so a field like "Finalized = true" could
+//	     not be bound to the hash it claims to finalize; whatever it said
+//	     would be excluded from (or self-contradictory with) the very hash
+//	     it describes. The header therefore advertises the finality
+//	     MECHANISM, and the binding fact is published out of band.
+//
+//	L2 — hash stability. FinalityType is part of the encoded header and
+//	     therefore part of the block hash. Redefining what the field means
+//	     (for example "1 = this block is final" instead of "1 = QTD
+//	     instant finality is in use") would change the hash of every
+//	     block produced by the new code while the old code produces the
+//	     old hashes — during a staggered fleet rollout the two node
+//	     populations would build different blocks for the same slot and
+//	     fork the chain. The R23 canonical-binding fix is therefore
+//	     deliberately confined to the reporting layer (the RPCs), which is
+//	     version-agnostic and cannot fork the chain.
+//
+// The QTD signature is copied into the header only when it belongs to THIS
+// block: a record whose sealed hash is provably not the slot's canonical
+// root is left out, so the header advertises no signature rather than
+// another block's (VerifyStardustFinality would reject it anyway).
 func PopulateStardustFields(header *encoding.BlockHeader, qpos *QPOS) error {
 	if header == nil {
 		return fmt.Errorf("nil block header")

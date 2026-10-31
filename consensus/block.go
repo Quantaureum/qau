@@ -399,6 +399,16 @@ type QPOS struct {
 	finalizedEpoch uint64
 	finalizedRoot  types.Hash
 
+	// R30 F23 (2026-10-30): where the finalized checkpoint BLOCK sits. The
+	// slot-root map is in-memory only — empty after every restart and pruned
+	// while the node runs — so it cannot answer "which slot holds the
+	// checkpoint" for long-lived state, and the epoch boundary slot is only an
+	// UPPER BOUND on that answer (R42-P3). Remembering the resolved slot, keyed
+	// by the checkpoint root it belongs to, keeps reorg-boundary decisions exact
+	// across pruning and restarts. See QPOS.SetFinalizedCheckpointSlot and
+	// finalizedCheckpointSlotLocked in qpos_forkchoice.go.
+	finalizedSlotPin finalizedCheckpointPin
+
 	// Justified checkpoint (1 epoch before finalized)
 	justifiedEpoch     uint64
 	justifiedRoot      types.Hash

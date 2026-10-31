@@ -68,12 +68,35 @@ Request/response example:
 
 | Method | Registration location | Permission | Description |
 |------|---------|------|------|
-| `qau_tss_getSealStatus` | `stardust_api.go:73` | read-only handler, **not listed in PublicMethods** (requires API Key) | Queries seal status by slot: `slot`/`finalized`; when complete includes `blockHash`/`sealerCount`/`sealedAt`; when in progress includes `pending`/`partialSigCount`/`requiredCount`/`completed`/`sealers` |
-| `qau_stardust_getDKGStatus` | `stardust_api.go:79` | read-only, **not listed in PublicMethods** | Returns `available`(bool), `reason`, or the DKG progress |
-| `qau_tss_requestSeal` | `stardust_api.go:74-75` | **admin** | Externally triggers a QTD joint signature; parameters `{slot, blockHash, slotHex}` |
-| `qau_tss_submitPartialSeal` | `stardust_api.go:76-77` | **admin** | Submits a partial signature |
+| `qau_tss_getSealStatus` | `stardust_api.go:76` | read-only handler, **not listed in PublicMethods** (requires API Key) | Queries the seal status by slot. Always returns the independent finality facts (`finalized`, `consensusSealFinalized`, `sealRecorded`, `canonical`, `canonicalState`, `epochFinalized`); a seal record adds `blockHash`/`sealerCount`/`sealedAt`; a seal in progress adds `pending`/`partialSigCount`/`requiredCount`/`completed`. See §1.5 for the field semantics |
+| `qau_stardust_getDKGStatus` | `stardust_api.go:82` | read-only, **not listed in PublicMethods** | Returns `available`(bool), `reason`, or the DKG progress |
+| `qau_tss_requestSeal` | `stardust_api.go:77-78` | **admin** | Externally triggers a QTD joint signature; parameters `{slot, blockHash, slotHex}` |
+| `qau_tss_submitPartialSeal` | `stardust_api.go:79-80` | **admin** | Submits a partial signature |
 
 > ⚠️ Finding: `qau_tss_getSealStatus` and `qau_stardust_getDKGStatus` are read-only queries but are not in PublicMethods, which is inconsistent with how `qau_tss_status` is handled. It is recommended to add them to the whitelist during P4-2 (see section 3).
+
+### 1.5 QTD finality facts reported by the RPCs
+
+`qau_stardust_getFinality` and `qau_tss_getSealStatus` report the finality of a slot as **independent facts** instead of one collapsed boolean. A QTD seal over a block that is not the canonical block of its slot is a quorum agreement, not a finality — collapsing the two made the node report a side-branch block as finalized.
+
+Both endpoints read the status and the record as ONE snapshot (R24, 2026-10-29), and the consensus-layer boolean is derived from that same snapshot too (R26, 2026-10-30), so the fields of a single response can never mix two different records or two different moments.
+
+| Field | `getFinality` | `getSealStatus` | Meaning |
+|-------|---------------|-----------------|---------|
+| `isFinalized` / `finalized` | yes | yes | The **block-level** answer: the sealed block is the canonical block of its slot. False when the canonical root is known and differs from the sealed hash — and also false while the root is unknown/unproven (a concurrent head switch, or a root not yet recorded): the fail-closed rule is `true` only for `canonicalState == matches` |
+| `sealRecorded` | yes | yes | A threshold seal agreement exists for the slot. The agreement is kept even when its block is not canonical — it is the proof that the executive chamber reached quorum |
+| `canonical` | yes | yes | The sealed block **is** the canonical root of the slot |
+| `canonicalState` | yes | yes | `matches` (canonical), `differs` (provably a side-branch block) or `unknown` (the canonical root is not known yet). When the live per-slot root has been pruned (QPOS keeps only a few epochs of slot roots), the classification persisted with the seal record answers instead — a canonical seal stays `matches` and a side-branch seal stays `differs` after pruning (R24, 2026-10-29). Two cases override that fallback (R26/R28, 2026-10-30): a reorg that ABANDONS the slot — the new chain has no block there, or a different one — resets the persisted classification to `unknown` (the sealed block is no longer canonical), and a canonical-head switch observed between two root reads is reported as `unknown` for that one call rather than as a stale classification |
+| `epochFinalized` | yes | yes | The QPOS consensus finality marker has reached the epoch that contains the slot. At epoch 0 this requires a named finalized root (the restored-checkpoint / genesis convention) |
+| `consensusSealFinalized` | yes | yes | The **consensus-layer** view (R24, 2026-10-29): a seal agreement is recorded for the slot AND the epoch marker has caught up to the slot's epoch — the cross-check is performed for every epoch, epoch 0 included. It makes no claim about the canonical block: a side-branch seal never advances the marker itself, but the marker can still reach its epoch through other slots' canonical seals. Use the block-level answer to decide finality. Computed inside the same snapshot as the other fields (R26, 2026-10-30) |
+| `blockHash`, `sealerCount`, `sealedAt` | yes | yes | The sealed record. `blockHash` is the block the agreement covers, which may be a side-branch block. `sealedAt` is the seal time as **Unix seconds (a JSON number)** in both endpoints (R24, 2026-10-29 — previously `getSealStatus` emitted an RFC3339 string) |
+| `pendingBlockHash`, `pendingSealerCount` | – | yes | The seal that is still collecting signatures. Present only when a record and a pending seal coexist (a re-seal of a slot whose previous agreement covered a non-canonical block); the legacy `blockHash`/`sealerCount` keys stay bound to the record in that case |
+
+`qau_tss_submitPartialSeal` (admin) reports the same `finalized` semantics as the block-level answer above (R24, 2026-10-29): the canonical block of the slot carries a threshold agreement.
+
+A client must use the block-level answer (`isFinalized` / `finalized`) to decide whether a block is final, and the other fields to explain *why*. `qau_stardust_verifyFinality` follows the same split (R29, 2026-10-30): its `valid` field states only that the presented signature proves a threshold seal over the block, and it now reports `canonicalState` / `isFinalized` next to it so the two questions cannot be conflated.
+
+The invalidation above is scoped to the abandoned range the node can actually observe (R29, 2026-10-30): the common-ancestor walk covers up to `maxReorgDepth` (64 slots), the range is bounded by the head switch that triggered it, and a reorg that reaches finalized history is refused outright instead of being applied. A record for a slot outside that range keeps the classification it was last given — `matches` there means "confirmed canonical the last time this node looked", not "re-confirmed after the latest head switch".
 
 ---
 

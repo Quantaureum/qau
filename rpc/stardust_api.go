@@ -102,43 +102,70 @@ func (api *StardustAPI) GetFinality(ctx context.Context, params json.RawMessage)
 		}, nil
 	}
 
-	record := qfs.GetFinalityRecord(slot)
+	// R24 (2026-10-29): the status and the record are read as ONE snapshot.
+	// The previous revision read them separately (GetFinalityRecord followed
+	// by GetSlotSealStatus), so a concurrent seal completion could produce a
+	// response whose record and whose status described DIFFERENT moments —
+	// e.g. a record for one block next to the classification of another.
+	// GetSlotSealDetails returns both from a single lookup.
+	//
+	// R26 (2026-10-30): the consensus-layer boolean is part of that snapshot
+	// too (SlotSealStatus.ConsensusFinalized). It used to be computed by a
+	// separate IsSealConsensusFinalized call, which re-read the record and the
+	// markers — the last remaining way for one response to mix two moments.
+	status, record := qfs.GetSlotSealDetails(slot)
 	result := map[string]any{
 		"slot":              slot,
 		"finalityType":      qfs.GetFinalityType().String(),
 		"isInstantFinality": qfs.IsInstantFinality(),
+		// R23 (2026-10-29): isFinalized is now the honest BLOCK-level answer
+		// — a QTD seal counts as final only when the sealed block is the
+		// canonical block of its slot (canonicalState == matches). R24 made
+		// this fail-closed: when the canonical root is unknown (or was
+		// pruned) the seal is NOT reported final unless a matching
+		// classification was persisted with the record.
+		//
+		// Before R23 this field carried IsSlotFinalized, which cannot tell a
+		// canonical seal from a seal over a side-branch block: a quorum seal
+		// over a fork block was reported as finalized together with that
+		// fork block's hash. The three independent facts are now reported
+		// separately so a client can combine them explicitly:
+		//   - sealRecorded:      a threshold agreement exists for the slot
+		//   - canonical/canonicalState:
+		//                        the sealed block IS the slot's canonical root
+		//                        ("matches"), provably is NOT ("differs"), or
+		//                        the root is not known yet ("unknown")
+		//   - epochFinalized:    the QPOS consensus finality marker reached the
+		//                        slot's epoch
+		//   - consensusSealFinalized: the CONSENSUS-layer view: a seal agreement
+		//                        is recorded for the slot AND the QPOS epoch
+		//                        marker has caught up to the slot's epoch
+		//                        (SlotSealStatus.ConsensusFinalized, read from
+		//                        the same snapshot as the fields above).
+		//                        It is NOT a statement about the canonical
+		//                        block: a side-branch seal never advances the
+		//                        marker itself, but the marker can still reach
+		//                        its epoch through OTHER slots' canonical
+		//                        seals. Use isFinalized for the block-level
+		//                        answer.
+		"isFinalized":            status.IsFinalized(),
+		"sealRecorded":           status.SealRecorded,
+		"canonical":              status.RootState == consensus.SealRootMatches,
+		"canonicalState":         status.RootState.String(),
+		"epochFinalized":         status.EpochFinal,
+		"consensusSealFinalized": status.ConsensusFinalized,
 	}
 
 	if record != nil {
 		// R22: record PRESENCE is not finality. The record is retained as the
 		// threshold-agreement proof even when the sealed block is not the
-		// canonical root, so isFinalized must be the cross-checked answer
-		// (record epoch <= QPOS finalizedEpoch, R39-P2-01) rather than
-		// "a record exists". Before R22 the record was deleted on a
-		// non-canonical root, which made presence equivalent to finality by
-		// accident — and destroyed a quorum-approved seal on a timing race.
-		result["isFinalized"] = qfs.IsSlotFinalized(slot)
+		// canonical root, so the block hash is reported together with the
+		// explicit canonical binding above — never as an implicit "finalized".
 		result["blockHash"] = "0x" + hex.EncodeToString(record.BlockHash[:])
 		result["qtdSignature"] = "0x" + hex.EncodeToString(record.QTDSignature)
 		result["sealers"] = record.Sealers
 		result["finalityDelay"] = record.FinalityDelay.String()
 		result["sealedAt"] = record.SealedAt.Unix()
-		// R22 (2026-10-29): the record is the threshold-agreement PROOF and
-		// is deliberately retained even when the sealed block is not the
-		// canonical root (qtd_finality.go R22 note — the R19-F08 rollback was
-		// reverted because it destroyed that proof on a timing race). The two
-		// facts a consumer needs are therefore reported separately:
-		//   - isFinalized (above): consensus has finalized the seal's epoch
-		//                          (R39-P2-01 cross-check). This is the field
-		//                          existing clients read; it never turns true
-		//                          just because a record exists.
-		//   - canonical:           the sealed blockHash IS the slot's canonical
-		//                          root (false also means "not yet confirmed",
-		//                          which the caller must not read as
-		//                          "proven non-canonical").
-		result["canonical"] = qfs.IsCanonicalSeal(slot)
-	} else {
-		result["isFinalized"] = qfs.IsSlotFinalized(slot)
 	}
 
 	return result, nil
@@ -268,11 +295,28 @@ func (api *StardustAPI) VerifyFinality(ctx context.Context, params json.RawMessa
 
 	valid := consensus.VerifyStardustFinality(header, blockHash, api.qpos)
 
-	return map[string]any{
+	// R29 (2026-10-30) FIX (auditor finding N6): `valid` answers ONE question —
+	// does the presented signature prove a threshold seal over this block? A
+	// seal agreement is kept after a reorg (it is the quorum proof), so
+	// `valid: true` never meant "this block is final" and clients kept reading
+	// it that way. Publish the block-level answer next to it, from the same
+	// snapshot the other finality RPCs use, so the two can never be conflated.
+	resp := map[string]any{
 		"slot":         req.Slot,
 		"finalityType": req.FinalityType,
 		"valid":        valid,
-	}, nil
+	}
+	if qfs := api.qpos.GetQTDFinality(); qfs != nil {
+		status, record := qfs.GetSlotSealDetails(req.Slot)
+		sealedThisBlock := record != nil && record.BlockHash == blockHash
+		resp["sealRecorded"] = status.SealRecorded
+		resp["canonical"] = status.RootState == consensus.SealRootMatches
+		resp["canonicalState"] = status.RootState.String()
+		resp["epochFinalized"] = status.EpochFinal
+		resp["consensusSealFinalized"] = status.ConsensusFinalized
+		resp["isFinalized"] = valid && sealedThisBlock && status.IsFinalized()
+	}
+	return resp, nil
 }
 
 func (api *StardustAPI) GetQTDFinalityStatus(ctx context.Context, params json.RawMessage) (any, *Error) {
@@ -479,32 +523,70 @@ func (api *StardustAPI) GetSealStatus(ctx context.Context, params json.RawMessag
 		return nil, NewError(ErrCodeInvalidParams, "invalid slot parameter")
 	}
 
-	finalized := qfs.IsSlotFinalized(slot)
+	// R23 (2026-10-29): the seal status is now reported as independent facts
+	// instead of a single boolean, and the record payload is emitted whenever
+	// a record EXISTS — not only when the consensus view says "finalized".
+	//
+	// Before R23 a retained agreement over a non-canonical block was
+	// invisible here (the record branch was gated on `finalized`), and a
+	// concurrently pending seal overwrote the `blockHash` / `sealerCount`
+	// keys of the record, so a client could not tell which block it was
+	// looking at.
+	status, rec := qfs.GetSlotSealDetails(slot)
+	pending := qfs.GetPendingSeal(slot)
+	// R26 (2026-10-30): the consensus boolean comes from the SAME snapshot as
+	// the record and the classification (status.ConsensusFinalized).
+	return sealStatusResult(slot, status, rec, pending, status.ConsensusFinalized), nil
+}
+
+// sealStatusResult assembles the qau_tss_getSealStatus response body from the
+// independent finality facts of a slot (R23, 2026-10-29).
+//
+// It is a pure function of its arguments on purpose: the response SCHEMA is
+// part of the public contract, and the states that matter most (a retained
+// side-branch seal next to a re-seal in flight) cannot be produced from
+// outside the consensus package. Keeping the mapping separate from the
+// consensus reads lets the schema be pinned directly by unit tests.
+func sealStatusResult(slot uint64, status consensus.SlotSealStatus, rec *consensus.InstantFinalityRecord, pending *consensus.PendingSeal, consensusSealFinalized bool) map[string]any {
 	result := map[string]any{
-		"slot":      slot,
-		"finalized": finalized,
-	}
-	if finalized {
-		rec := qfs.GetFinalityRecord(slot)
-		if rec != nil {
-			result["blockHash"] = "0x" + hex.EncodeToString(rec.BlockHash[:])
-			result["sealerCount"] = len(rec.Sealers)
-			result["sealedAt"] = rec.SealedAt
-			// R22: report whether the sealed block is the slot's canonical
-			// root. `finalized` above is the R39-P2-01 cross-checked view;
-			// `canonical` states the block-binding fact directly so a client
-			// can tell "agreement recorded" from "this specific block is the
-			// canonical one".
-			result["canonical"] = qfs.IsCanonicalSeal(slot)
-		}
-		return result, nil
+		"slot": slot,
+		// finalized: the honest BLOCK-level answer — a seal counts as final
+		// only when the sealed block is the canonical block of its slot
+		// (canonicalState == matches). R24 made this fail-closed: an unknown
+		// (or pruned) canonical root does NOT report the seal as final
+		// unless a matching classification was persisted with the record.
+		"finalized": status.IsFinalized(),
+		// consensusSealFinalized: the CONSENSUS-layer view
+		// (SlotSealStatus.ConsensusFinalized) — a seal agreement is recorded for
+		// the slot AND the QPOS epoch marker has caught up to the slot's epoch.
+		// It says nothing about the canonical block: a side-branch seal never
+		// advances the marker itself, but the marker can still reach its epoch
+		// through OTHER slots' canonical seals. The block-level answer is
+		// "finalized" above. R26 (2026-10-30): this value is computed from the
+		// same snapshot as the fields below, not by a second read.
+		"consensusSealFinalized": consensusSealFinalized,
+		// The three independent facts behind those two booleans.
+		"sealRecorded":   status.SealRecorded,
+		"canonical":      status.RootState == consensus.SealRootMatches,
+		"canonicalState": status.RootState.String(),
+		"epochFinalized": status.EpochFinal,
 	}
 
-	// Not yet finalized — report pending seal progress if any.
-	pending := qfs.GetPendingSeal(slot)
+	if rec != nil {
+		result["blockHash"] = "0x" + hex.EncodeToString(rec.BlockHash[:])
+		result["sealerCount"] = len(rec.Sealers)
+		// R24 (2026-10-29): sealedAt is emitted as UNIX SECONDS in BOTH
+		// finality RPCs. The previous revision emitted the Go time.Time here
+		// (an RFC3339 string) while qau_stardust_getFinality emitted
+		// record.SealedAt.Unix() (a number), so the same field had two
+		// different JSON types depending on the endpoint a client asked.
+		// The numeric form is the one the published getFinality contract
+		// documents, so it wins here.
+		result["sealedAt"] = rec.SealedAt.Unix()
+	}
+
 	if pending != nil {
 		result["pending"] = true
-		result["blockHash"] = "0x" + hex.EncodeToString(pending.BlockHash[:])
 		result["partialSigCount"] = len(pending.PartialSigs)
 		result["requiredCount"] = pending.RequiredCount
 		result["completed"] = pending.Completed
@@ -513,9 +595,21 @@ func (api *StardustAPI) GetSealStatus(ctx context.Context, params json.RawMessag
 		// monitor which executive members are active/inactive and infer QTD
 		// threshold progress for targeted attacks. Only expose the count,
 		// which is sufficient for liveness monitoring.
-		result["sealerCount"] = len(pending.PartialSigs)
+		//
+		// R23: a record and a pending seal can coexist — the pending seal is
+		// the re-seal of a slot whose previous agreement covered a
+		// non-canonical block (R23 liveness fix). The legacy key names stay
+		// bound to the RECORD in that case, and the pending seal gets its
+		// own keys, so a client can never mistake one for the other.
+		if rec == nil {
+			result["blockHash"] = "0x" + hex.EncodeToString(pending.BlockHash[:])
+			result["sealerCount"] = len(pending.PartialSigs)
+		} else {
+			result["pendingBlockHash"] = "0x" + hex.EncodeToString(pending.BlockHash[:])
+			result["pendingSealerCount"] = len(pending.PartialSigs)
+		}
 	}
-	return result, nil
+	return result
 }
 
 // RequestSeal triggers a QTD seal request for a slot.
@@ -703,12 +797,21 @@ func (api *StardustAPI) SubmitPartialSeal(ctx context.Context, params json.RawMe
 	}
 
 	// Report post-submission status.
-	finalized := qfs.IsSlotFinalized(req.Slot)
+	//
+	// R24 (2026-10-29): the published "finalized" field is the honest
+	// BLOCK-level answer — the canonical block of the slot carries a
+	// threshold agreement. The previous revision used the consensus-layer
+	// accessor, which reports true for ANY recorded agreement (including one
+	// over a side-branch block) and for a slot whose epoch marker has not
+	// caught up yet. The same field name now means the same thing in every
+	// finality RPC (qau_stardust_getFinality, qau_tss_getSealStatus and
+	// qau_tss_submitPartialSeal).
+	status, _ := qfs.GetSlotSealDetails(req.Slot)
 	result := map[string]any{
 		"success":        true,
 		"slot":           req.Slot,
 		"validatorIndex": req.ValidatorIndex,
-		"finalized":      finalized,
+		"finalized":      status.IsFinalized(),
 		"signatureSize":  len(sigBytes),
 	}
 	if pending := qfs.GetPendingSeal(req.Slot); pending != nil {

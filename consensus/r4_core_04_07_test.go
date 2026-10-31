@@ -214,10 +214,33 @@ func TestR4CORE04_CompleteSeal_RejectsNonCanonicalAtFinalize(t *testing.T) {
 	// Verify qpos.finalizedRoot was NOT updated to the non-canonical hash.
 	qpos.mu.RLock()
 	finalizedRoot := qpos.finalizedRoot
+	finalizedEpoch := qpos.finalizedEpoch
+	justifiedRoot := qpos.justifiedRoot
+	justifiedEpoch := qpos.justifiedEpoch
 	qpos.mu.RUnlock()
 
 	if finalizedRoot == nonCanonicalHash {
 		t.Fatal("R4-CORE-04 REGRESSION: qpos.finalizedRoot was written with non-canonical blockHash — completeSealLockedFinalize failed to reject non-canonical seal")
+	}
+
+	// R23 (2026-10-29): the rejection must cover EVERY finality marker, not
+	// only finalizedRoot. A non-canonical seal must not advance the finalized
+	// or the justified epoch either, and must not become the justified root.
+	//
+	// NOTE: this test seals slot 5, which lives in epoch 0 (SlotToEpoch is
+	// slot/32). Epoch 0 can never advance the markers — the comparison is
+	// "epoch > finalizedEpoch" — so the epoch assertions here are the
+	// vacuous form. The strong form (a slot in epoch >= 1, where a marker
+	// advance would be observable) is pinned by
+	// TestR23_NonCanonicalSeal_AdvancesNoFinalityMarker.
+	if finalizedEpoch != 0 {
+		t.Fatalf("R23 REGRESSION: a non-canonical seal advanced finalizedEpoch to %d", finalizedEpoch)
+	}
+	if justifiedEpoch != 0 {
+		t.Fatalf("R23 REGRESSION: a non-canonical seal advanced justifiedEpoch to %d", justifiedEpoch)
+	}
+	if justifiedRoot != (types.Hash{}) {
+		t.Fatalf("R23 REGRESSION: a non-canonical seal wrote justifiedRoot %s", justifiedRoot.String())
 	}
 	t.Logf("=== R4-CORE-04: completeSealLockedFinalize correctly rejected non-canonical finalize (finalizedRoot=%s, not nonCanonicalHash=%s) ===",
 		finalizedRoot.String(), nonCanonicalHash.String())

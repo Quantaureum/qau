@@ -1636,11 +1636,13 @@ func (a *blockStoreReaderAdapter) GetLatestHeight() uint64 {
 	return height
 }
 
-// GetOldestHeight returns the oldest block height known to the store.
-// BlockStore does not track this explicitly, so we return 0 (genesis)
-// as the conservative lower bound.
+// GetOldestHeight returns the oldest height an expiry pass may delete from.
+// BlockStore does not track this explicitly. R30 F4 (2026-10-30): this used to
+// return 0 "as a conservative lower bound", which made HistoryExpirer delete the
+// genesis block along with every block below the retention window. Genesis is
+// height 0 and is never releasable, so the floor is 1.
 func (a *blockStoreReaderAdapter) GetOldestHeight() uint64 {
-	return 0
+	return 1
 }
 
 // forkRecoveryBackend adapts Node to rpc.ForkRecoveryManager.
@@ -1677,9 +1679,111 @@ func (a *forkRecoveryBackend) RollbackToFork(forkHeight uint64) (int, error) {
 		return 0, fmt.Errorf("refusing to rollback to height 0 (genesis re-seed protection)")
 	}
 
-	// First, truncate block store at/above forkHeight.
-	deleted, err := a.node.blockStore.DeleteBlocksFromHeight(forkHeight)
+	// R30 (2026-10-30) SAFETY: local finality is irreversible. Deleting at or
+	// below the finality floor would truncate history this node already
+	// finalized, and the subsequent re-sync can only restore a chain that
+	// contradicts it. Refuse and leave the store intact; a node in that state
+	// needs a finality-compatible checkpoint sync, not a fork rollback.
+	//
+	// R30 F14 (2026-10-30): the criterion is the SURVIVING tip, not the first
+	// deleted block. Blocks above the floor may be dropped freely; the block at
+	// forkHeight-1 becomes the head, so the rollback is legal exactly while that
+	// block still sits at or above the floor. Checking the first deleted block
+	// let a deep rollback through this gate only for fork choice to refuse it
+	// afterwards (from the deleted head's missing ancestry), which is how a
+	// truncated store ended up with a head pointing at a deleted block.
+	ancestor, aerr := a.node.blockStore.GetBlockByHeight(forkHeight - 1)
+	if aerr != nil || ancestor == nil || ancestor.Header == nil {
+		return 0, fmt.Errorf("cannot read the rollback target block %d: %v", forkHeight-1, aerr)
+	}
+	ancestorHash := block.ComputeBlockHash(ancestor.Header)
+	if a.node.blockProducer != nil {
+		if qpos := a.node.blockProducer.QPOS(); qpos != nil {
+			// R30 F21 (2026-10-30): compare against the finalized checkpoint
+			// BLOCK's slot. The surviving tip is legal while the checkpoint block
+			// is at or below it; using the epoch boundary slot instead treated
+			// the (checkpoint, boundary] band as final and refused rollbacks
+			// that only dropped blocks above the checkpoint.
+			if checkpointSlot, ok := qpos.FinalizedCheckpointSlot(); ok && ancestor.Header.Slot < checkpointSlot {
+				return 0, fmt.Errorf("refusing rollback to height %d: the surviving block %d sits below the finality checkpoint (slot %d) — the finalized blocks above it would be deleted",
+					forkHeight, forkHeight-1, checkpointSlot)
+			}
+		}
+	}
+
+	// R30 F14 (2026-10-30): move the head BEFORE truncating the store. Fork
+	// choice derives the abandoned range by walking the old head's ancestry, so
+	// it can only do that while those blocks still exist. Doing it after the
+	// truncation made every found=false walk fall back to "abandoned range
+	// starts at the newest walked slot", which reaches below the finality floor
+	// and is refused — and the refusal used to be swallowed, leaving a deleted
+	// head, a truncated store and a rewound state behind a successful RPC reply.
+	//
+	// A refusal now aborts the whole rollback: nothing is deleted and the state
+	// is not rewound, so the three witnesses (head, store, state) stay aligned.
+	deleted := 0
+	var err error
+	a.node.mu.Lock()
+	// R31 (2026-10-31) FIX (round-10 review nit 2): the ancestor was read
+	// BEFORE the lock; a concurrent fork resolution could have replaced the
+	// block at forkHeight-1 in between, so the finality pre-gate above would
+	// answer about a block that is no longer the rollback target. Re-read it
+	// under the lock and refuse on any identity change — the head switch below
+	// would otherwise target a stale block.
+	if fresh, ferr := a.node.blockStore.GetBlockByHeight(forkHeight - 1); ferr != nil || fresh == nil || fresh.Header == nil || block.ComputeBlockHash(fresh.Header) != ancestorHash {
+		a.node.mu.Unlock()
+		return 0, fmt.Errorf("refusing rollback to height %d: the rollback target block %d changed concurrently", forkHeight, forkHeight-1)
+	}
+	oldHead := a.node.currentBlock
+	// R30 F17 (2026-10-30): a rollback may only move the head DOWN. When the
+	// store already holds blocks above the head (the head lags the store during
+	// sync) and the operator asks for a fork height above it, the "rollback"
+	// would move the head forward and then truncate above it — leaving the head
+	// at a height the state rollback cannot reach (state never moves forward),
+	// i.e. exactly the three-way mismatch this function now avoids. Refuse.
+	if oldHead != nil && oldHead.Header != nil && ancestor.Header.Height > oldHead.Header.Height {
+		a.node.mu.Unlock()
+		return 0, fmt.Errorf("refusing rollback to height %d: the current head is at height %d, so this is not a rollback",
+			forkHeight, oldHead.Header.Height)
+	}
+	if oldHead != nil && oldHead.Header != nil {
+		oldHash := block.ComputeBlockHash(oldHead.Header)
+		// R30 F24 (2026-10-30): hand fork choice the ancestor this rollback is
+		// moving to. It IS a block both branches share (it stays canonical), so
+		// the abandoned range is bounded from the bottom instead of being
+		// described by the newest walk window: a rollback deeper than that window
+		// used to leave every slot root below it anchored to a deleted block
+		// while the finality check answered about a range that started too high.
+		hint := &reanchorAncestorHint{slot: ancestor.Header.Slot, hash: ancestorHash}
+		if oldHash != ancestorHash && !a.node.commitHeadSwitchWithHintLocked("forkRecoveryRollback", ancestor, ancestorHash, oldHead, oldHash, a.node.forkChoiceQPOS(), hint) {
+			a.node.mu.Unlock()
+			return 0, fmt.Errorf("refusing rollback to height %d: fork choice vetoed moving the head to block %d — the boundary is above this node's finality floor, or the abandoned range could not be bounded",
+				forkHeight, forkHeight-1)
+		}
+	} else {
+		a.node.currentBlock = ancestor
+	}
+	if a.node.syncer != nil {
+		a.node.syncer.UpdateCurrentHeight(forkHeight - 1)
+	}
+	a.node.mu.Unlock()
+
+	// R30 F19 (2026-10-30): from this point on the head has already moved down,
+	// so a failure of either remaining step leaves state AHEAD of the head (the
+	// state still contains the poisoned branch's transitions) while the store is
+	// partly truncated. Nothing on the import path can reconcile that: the next
+	// block is applied on top of state that already includes it, so this node
+	// would compute divergent roots and push them to peers. Stop producing and
+	// ask the operator to rebuild, which is exactly what state trust breakage
+	// means elsewhere (R87-STATE-TRUST).
+
+	// Only now truncate: the head already points at forkHeight-1 and fork choice
+	// has cleaned the abandoned slot roots, so the store is simply following.
+	deleted, err = a.node.blockStore.DeleteBlocksFromHeight(forkHeight)
 	if err != nil {
+		a.node.markStateTrustBroken(fmt.Sprintf(
+			"fork recovery moved the head to height %d but could not truncate the block store at %d: %v — the store still holds blocks above the head",
+			forkHeight-1, forkHeight, err))
 		nodeLog.Error("ForkRecovery: DeleteBlocksFromHeight(%d) failed: %v", forkHeight, err)
 		return 0, fmt.Errorf("DeleteBlocksFromHeight: %w", err)
 	}
@@ -1697,6 +1801,9 @@ func (a *forkRecoveryBackend) RollbackToFork(forkHeight uint64) (int, error) {
 			return a.node.stateDB.RollbackToHeight(forkHeight)
 		})
 		if err != nil {
+			a.node.markStateTrustBroken(fmt.Sprintf(
+				"fork recovery moved the head and truncated the store at height %d but could not roll the state back: %v — local state is now ahead of the head",
+				forkHeight, err))
 			nodeLog.Error("ForkRecovery: stateDB.RollbackToHeight(%d) failed: %v", forkHeight, err)
 			return deleted, fmt.Errorf("stateDB.RollbackToHeight: %w", err)
 		}

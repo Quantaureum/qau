@@ -555,6 +555,13 @@ func TestR38P1_08_Deep_SyncerCallsApplyBlockHeader(t *testing.T) {
 	blk := &encoding.Block{Header: child, Transactions: nil}
 	childHash := block.ComputeBlockHash(child)
 
+	// ProcessBlock stores the block before applying it; R30 F16 additionally
+	// requires the applied block to still be the store's block at its height
+	// before the QPOS snapshot may record its slot root.
+	if err := bs.PutBlock(blk); err != nil {
+		t.Fatalf("PutBlock(child): %v", err)
+	}
+
 	// Run applyBlockInternal directly. We accept any error from this call
 	// (the minimal harness can't satisfy every invariant the real syncer
 	// enforces downstream); the PASS criterion is solely that the QPOS

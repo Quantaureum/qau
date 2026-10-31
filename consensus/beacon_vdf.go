@@ -284,18 +284,35 @@ func ApplyVDF(output *BeaconOutput, cfg VDFBeaconConfig) ([32]byte, error) {
 
 	type result struct {
 		out *vdf.VDFOutput
+		err error
 	}
+	// R24 (2026-10-30) FIX: the evaluator is CANCELED on timeout. The
+	// previous revision simply abandoned the goroutine: the witness buffer
+	// grows by one full state vector per timestep, so an abandoned
+	// evaluation kept running to completion and kept consuming memory —
+	// a misconfigured TimeSteps (or repeated timeouts) leaked unbounded
+	// evaluator memory (found by the R24 -count=100 determinism battery,
+	// which OOMed the machine through this path).
 	done := make(chan result, 1)
+	stop := make(chan struct{})
 	start := time.Now()
 	go func() {
-		done <- result{out: vdf.ExecuteVDFParallel(y, a, 1, cfg.TimeSteps, q, workers)}
+		out, err := vdf.ExecuteVDFParallelStop(stop, y, a, 1, cfg.TimeSteps, q, workers)
+		done <- result{out: out, err: err}
 	}()
 
 	var out *vdf.VDFOutput
 	select {
 	case r := <-done:
+		if r.err != nil {
+			beaconVDFMetrics.timeouts.Add(1)
+			return [32]byte{}, fmt.Errorf("beacon vdf: evaluation canceled: %w", r.err)
+		}
 		out = r.out
 	case <-time.After(cfg.Timeout):
+		// Tell the abandoned evaluator to stop; its partial buffers become
+		// collectable once it observes the stop (checked every 64 steps).
+		close(stop)
 		beaconVDFMetrics.timeouts.Add(1)
 		return [32]byte{}, fmt.Errorf("%w: T=%d exceeded %s", ErrVDFTimeout, cfg.TimeSteps, cfg.Timeout)
 	}

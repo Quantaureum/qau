@@ -2,9 +2,11 @@
 package vdf
 
 import (
+	"errors"
 	"math/rand"
 	"runtime"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -155,5 +157,47 @@ func TestExecuteVDFLightEquivalence(t *testing.T) {
 	ref.Sum(want[:0])
 	if whash != want {
 		t.Fatal("light witness hash differs from full witness hash")
+	}
+}
+
+// TestExecuteVDFParallelStop_CancelsEarly requires the cancellation hook to
+// abort the evaluation promptly instead of running it to completion (R24,
+// 2026-10-30): the beacon timeout path closes the stop channel, and an
+// evaluator that ignored it would keep growing the witness buffer (one full
+// state vector per timestep) until the full T had elapsed.
+func TestExecuteVDFParallelStop_CancelsEarly(t *testing.T) {
+	q := QBC
+	r := rand.New(rand.NewSource(23))
+	y := make(StateVector, ModuleSize)
+	for i := range y {
+		y[i] = randomSubringElement(r, q)
+	}
+	a := randomMatrix(r, q, ModuleSize)
+
+	stop := make(chan struct{})
+	close(stop) // canceled before the first step
+	start := time.Now()
+	if _, err := ExecuteVDFParallelStop(stop, y, a, 1, 1_000_000, q, 4); err == nil {
+		t.Fatal("a pre-canceled evaluation must report ErrVDFCanceled")
+	} else if !errors.Is(err, ErrVDFCanceled) {
+		t.Fatalf("err = %v, want ErrVDFCanceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cancellation took %s — the evaluator did not stop early", elapsed)
+	}
+
+	// A nil stop channel must stay bit-identical to the plain parallel form.
+	plain := ExecuteVDFParallel(y, a, 1, 6, q, 4)
+	withStop, err := ExecuteVDFParallelStop(nil, y, a, 1, 6, q, 4)
+	if err != nil {
+		t.Fatalf("nil stop channel returned %v", err)
+	}
+	if len(plain.Witness) != len(withStop.Witness) {
+		t.Fatal("witness length differs from the plain parallel evaluation")
+	}
+	for i := range plain.Witness {
+		if !plain.Witness[i].Equal(withStop.Witness[i]) {
+			t.Fatalf("witness element %d differs from the plain parallel evaluation", i)
+		}
 	}
 }

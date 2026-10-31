@@ -12,6 +12,15 @@ import (
 var (
 	ErrHistoryExpirationDisabled = errors.New("history expiration is disabled")
 	ErrInvalidRetentionPeriod    = errors.New("invalid retention period")
+	// ErrHistoryExpiryUnsupported reports that block-history pruning was
+	// requested but is refused. R30 F4 (2026-10-30): deleting blocks from the
+	// bottom of the store leaves a gap that BlockStore.findContinuousTipLocked
+	// cannot see past (it scans upward from height 1 and stops at the first
+	// missing height), so the next restart reports continuousTip == 0 and the
+	// R53 fragmented-chain repair deletes everything above genesis. It also
+	// removes the blocks a restored finality checkpoint is anchored to. State
+	// pruning is the supported way to bound disk usage.
+	ErrHistoryExpiryUnsupported = errors.New("block-history expiry is unsupported: deleting blocks below the tip breaks store continuity and leaves restored finality checkpoints without backing blocks; use state pruning instead")
 )
 
 const (
@@ -29,9 +38,13 @@ type HistoryExpirationConfig struct {
 	PruneInterval   uint64
 }
 
+// DefaultHistoryExpirationConfig returns the default configuration. R30 F4:
+// Enabled is false because block-history pruning is unsupported (see
+// ErrHistoryExpiryUnsupported); the retention values remain for a future,
+// continuity-aware implementation.
 func DefaultHistoryExpirationConfig() HistoryExpirationConfig {
 	return HistoryExpirationConfig{
-		Enabled:         true,
+		Enabled:         false,
 		RetentionBlocks: DefaultHistoryRetentionBlocks,
 		RetentionTime:   DefaultHistoryRetentionTime,
 		PruneBatchSize:  1000,
@@ -89,20 +102,11 @@ func (he *HistoryExpirer) Start() error {
 		return ErrHistoryExpirationDisabled
 	}
 
-	if he.running {
-		return nil
-	}
-
-	he.running = true
-	// R46-RP-02 FIX: Track the goroutine with a WaitGroup so Stop() can
-	// wait for it to exit, preventing the race where Stop() closes stopCh
-	// and makes a new one while the goroutine is still reading the old one.
-	he.wg.Add(1)
-	go func() {
-		defer he.wg.Done()
-		he.pruneLoop()
-	}()
-	return nil
+	// R30 F4: refuse to start instead of corrupting the store. This is the only
+	// production entry point, so blocking it here keeps pruneLoop from ever
+	// running.
+	nodeLog.Error("history expiry: refusing to enable block-history pruning; deleting blocks below the tip breaks store continuity and finality backing. Unset QAU_HISTORY_EXPIRY and use state pruning instead")
+	return ErrHistoryExpiryUnsupported
 }
 
 func (he *HistoryExpirer) Stop() {
@@ -142,39 +146,61 @@ func (he *HistoryExpirer) pruneLoop() {
 	}
 }
 
+// pruneHistory runs one prune pass from the background loop. R30 F4: dormant,
+// because Start() refuses to launch pruneLoop while block-history pruning is
+// unsupported. It stays wired to pruneOnce so that the algorithm keeps its unit
+// tests and any future, continuity-aware implementation has one call site.
 func (he *HistoryExpirer) pruneHistory() {
+	if _, err := he.pruneOnce(); err != nil && !errors.Is(err, ErrHistoryExpirationDisabled) {
+		nodeLog.Warn("history expiry: prune pass skipped: %v", err)
+	}
+}
+
+// pruneOnce is the pruning algorithm itself: it deletes the range
+// [oldestHeight, latestHeight-retention] when that range is non-empty and enough
+// new history has accumulated since the last pass.
+//
+// R30 F4 (2026-10-30): this must NOT be reachable from production code paths
+// while ErrHistoryExpiryUnsupported stands — see that error for why deleting the
+// bottom of the store breaks continuity and finality backing. The genesis clamp
+// below is defense in depth: an adapter that reports 0 (BlockStore does not
+// track its oldest height) must never cause the genesis block to be deleted.
+func (he *HistoryExpirer) pruneOnce() (uint64, error) {
 	he.mu.Lock()
 	config := he.config
 	he.mu.Unlock()
 
 	if !config.Enabled {
-		return
+		return 0, ErrHistoryExpirationDisabled
 	}
 
 	currentHeight := he.blockStore.GetLatestHeight()
 	if currentHeight < config.RetentionBlocks {
-		return
+		return 0, nil
 	}
 
 	pruneBefore := currentHeight - config.RetentionBlocks
 
 	he.mu.Lock()
-	if pruneBefore <= he.stats.LastPrunedBlock+config.PruneInterval {
-		he.mu.Unlock()
-		return
-	}
+	tooSoon := pruneBefore <= he.stats.LastPrunedBlock+config.PruneInterval
 	he.mu.Unlock()
+	if tooSoon {
+		return 0, nil
+	}
 
 	startTime := time.Now()
 
 	oldestHeight := he.blockStore.GetOldestHeight()
+	if oldestHeight < 1 {
+		oldestHeight = 1
+	}
 	if oldestHeight >= pruneBefore {
-		return
+		return 0, nil
 	}
 
 	bytesFreed, err := he.blockStore.DeleteBlockRange(oldestHeight, pruneBefore)
 	if err != nil {
-		return
+		return 0, err
 	}
 
 	he.mu.Lock()
@@ -184,6 +210,8 @@ func (he *HistoryExpirer) pruneHistory() {
 	he.stats.LastPruneTime = startTime
 	he.stats.LastPruneDuration = time.Since(startTime)
 	he.mu.Unlock()
+
+	return bytesFreed, nil
 }
 
 func (he *HistoryExpirer) GetStats() HistoryExpirationStats {
@@ -218,6 +246,10 @@ func (he *HistoryExpirer) UpdateConfig(config HistoryExpirationConfig) error {
 		he.stopCh = make(chan struct{})
 	}
 
+	// R30 F4: UpdateConfig can note the requested configuration, but it can never
+	// start the pruner: Start() is the only place that sets he.running and it now
+	// refuses while block-history pruning is unsupported. The stats mirror the
+	// requested config, not the running state.
 	he.config = config
 	he.stats.Enabled = config.Enabled
 	he.stats.RetentionBlocks = config.RetentionBlocks
@@ -237,6 +269,9 @@ func (he *HistoryExpirer) UpdateConfig(config HistoryExpirationConfig) error {
 	return nil
 }
 
+// ForcePrune forces a prune pass. R30 F4: refused while block-history pruning is
+// unsupported — the operator-facing way to reclaim space is state pruning, not
+// deleting the bottom of the block store (see ErrHistoryExpiryUnsupported).
 func (he *HistoryExpirer) ForcePrune() (uint64, error) {
 	he.mu.Lock()
 	config := he.config
@@ -246,28 +281,6 @@ func (he *HistoryExpirer) ForcePrune() (uint64, error) {
 		return 0, ErrHistoryExpirationDisabled
 	}
 
-	currentHeight := he.blockStore.GetLatestHeight()
-	if currentHeight < config.RetentionBlocks {
-		return 0, nil
-	}
-
-	pruneBefore := currentHeight - config.RetentionBlocks
-	oldestHeight := he.blockStore.GetOldestHeight()
-	if oldestHeight >= pruneBefore {
-		return 0, nil
-	}
-
-	bytesFreed, err := he.blockStore.DeleteBlockRange(oldestHeight, pruneBefore)
-	if err != nil {
-		return 0, err
-	}
-
-	he.mu.Lock()
-	he.stats.LastPrunedBlock = pruneBefore
-	he.stats.TotalBlocksPruned += pruneBefore - oldestHeight
-	he.stats.TotalBytesFreed += bytesFreed
-	he.stats.LastPruneTime = time.Now()
-	he.mu.Unlock()
-
-	return bytesFreed, nil
+	nodeLog.Error("history expiry: refusing forced block-history prune; deleting blocks below the tip breaks store continuity and finality backing. Use state pruning instead")
+	return 0, ErrHistoryExpiryUnsupported
 }

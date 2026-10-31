@@ -429,8 +429,12 @@ func (n *Node) tdilithium3SealSigningStart(slot uint64, blockHash types.Hash, or
 		tdilithium3SealTrace("slot %d: no QTD finality engine", slot)
 		return false
 	}
-	if qfs.GetFinalityRecord(slot) != nil {
-		tdilithium3SealTrace("slot %d: already finalized", slot)
+	// R24 (2026-10-29): a retained agreement over a NON-canonical block must
+	// not wedge the canonical seal of that slot. Skip the session only when
+	// the slot already carries an agreement that covers this block, or a
+	// provably canonical one (auditor finding X03).
+	if qfs.SealAlreadyCovers(slot, blockHash) {
+		tdilithium3SealTrace("slot %d: already sealed for this slot", slot)
 		return false
 	}
 	pending := qfs.GetPendingSeal(slot)

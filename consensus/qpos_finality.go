@@ -364,6 +364,10 @@ func (q *QPOS) tryUpdateFinality() {
 		if q.votingManager != nil {
 			q.votingManager.syncFinalityFromQPOS(q.justifiedEpoch, q.finalizedEpoch, q.justifiedRoot, q.finalizedRoot)
 		}
+		// R30 F23 (2026-10-30): resolve the checkpoint block's slot now, while
+		// the slot-root map still holds it, so later pruning cannot degrade the
+		// reorg boundary back to the epoch boundary slot.
+		q.pinFinalizedCheckpointSlotLocked()
 		q.persistFinalityLocked()
 	}
 }
@@ -415,6 +419,16 @@ func (q *QPOS) GetFinalizedEpoch() uint64 {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.finalizedEpoch
+}
+
+// GetFinalizedRoot returns the root of the finalized epoch checkpoint.
+// A zero hash means "no finalized checkpoint root is recorded" — which is
+// how a zero finalized epoch is told apart from "epoch 0 is finalized"
+// (R23, 2026-10-29).
+func (q *QPOS) GetFinalizedRoot() types.Hash {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.finalizedRoot
 }
 
 func (q *QPOS) CheckFinality() (justifiedEpoch, finalizedEpoch uint64, changed bool) {
@@ -538,6 +552,21 @@ func (q *QPOS) ReanchorFinalityToGenesis() bool {
 	return true
 }
 
+// HeaderFinalityCheckpointsValid reports whether the checkpoint epochs a block
+// header carries are backed by the chain that header sits on.
+//
+// R30 F8 (2026-10-30): a checkpoint references an epoch the chain has already
+// crossed, so neither claimed epoch may be ahead of the header's own epoch.
+// These two fields are consensus data with irreversible local effects: every
+// node adopts them through AdoptHeaderFinality, and the adopted finalized epoch
+// becomes that node's finality floor (FinalityFloorSlot), below which no reorg
+// or store rollback is ever allowed again. Honest proposers stamp both fields
+// from their own ratchet, which only ever references past epochs, so the bound
+// is a no-op for them — it rejects only claims no honest chain can back.
+func HeaderFinalityCheckpointsValid(justifiedEpoch, finalizedEpoch, headerEpoch uint64) bool {
+	return justifiedEpoch <= headerEpoch && finalizedEpoch <= headerEpoch
+}
+
 // LOCK CONTRACT: takes q.mu internally; safe to call from any import path.
 func (q *QPOS) AdoptHeaderFinality(justifiedEpoch, finalizedEpoch uint64, headerHash types.Hash) {
 	q.mu.Lock()
@@ -560,6 +589,7 @@ func (q *QPOS) AdoptHeaderFinality(justifiedEpoch, finalizedEpoch uint64, header
 	jRoot, fRoot := q.justifiedRoot, q.finalizedRoot
 	if adopted {
 		q.finalityPersistPending = true
+		q.pinFinalizedCheckpointSlotLocked()
 		q.persistFinalityLocked()
 	}
 	q.mu.Unlock()
@@ -654,6 +684,10 @@ func (q *QPOS) RestoreFinalityState(
 	q.finalizedEpoch = finalizedEpoch
 	q.finalizedRoot = finalizedRoot
 	q.registerRestoredCheckpointRootsLocked()
+	// R30 F23 (2026-10-30): a restored checkpoint has no slot-root entry (the
+	// map is rebuilt from live imports, which resume at the head), so the pin
+	// is left unset here and resolved by the node from the block store via
+	// SetFinalizedCheckpointSlot.
 	if justifiedGenesisRoot != (types.Hash{}) {
 		q.epochBlockRoots[0] = justifiedGenesisRoot
 		q.slotBlockRoots[0] = justifiedGenesisRoot

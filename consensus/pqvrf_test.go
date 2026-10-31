@@ -160,26 +160,58 @@ func TestPQVRF_Pseudorandomness_Statistical(t *testing.T) {
 	})
 
 	t.Run("ByteUniformity_ChiSquared", func(t *testing.T) {
-		buckets := make([]int, 256)
-		for _, output := range outputs {
-			for _, b := range output {
-				buckets[b]++
+		// R24 (2026-10-30): the VRF key is generated fresh per run, so the
+		// chi-squared statistic is a random variable and a single-round check
+		// at α=0.01 fails ~1% of runs BY DESIGN — under the -count=100
+		// determinism battery that is a guaranteed false alarm (observed in
+		// the R24 battery: 320.97 vs 310.457). The verdict is therefore
+		// MAJORITY OVER 3 INDEPENDENT ROUNDS (fresh key each): a real
+		// non-uniformity fails every round, while the false-positive rate
+		// drops to ~3e-4 per battery. The FIRST round reuses the samples
+		// already generated above.
+		const criticalValue = 310.457 // df=255, α=0.01
+		chi2For := func(samples [][PQVRFOutputSize]byte) float64 {
+			buckets := make([]int, 256)
+			for _, output := range samples {
+				for _, b := range output {
+					buckets[b]++
+				}
+			}
+			expected := float64(len(samples)*PQVRFOutputSize) / 256.0
+			chi2 := 0.0
+			for _, count := range buckets {
+				diff := float64(count) - expected
+				chi2 += diff * diff / expected
+			}
+			return chi2
+		}
+
+		exceeds := 0
+		firstChi2 := chi2For(outputs)
+		if firstChi2 > criticalValue {
+			exceeds++
+		}
+		for round := 0; round < 2 && exceeds < 2; round++ {
+			roundKey, _ := generateTestKeyPair(t)
+			roundOutputs := make([][PQVRFOutputSize]byte, numSamples)
+			for i := 0; i < numSamples; i++ {
+				var input [8]byte
+				binary.BigEndian.PutUint64(input[:], uint64(i))
+				_, output, err := PQVRFEval(roundKey, input[:])
+				if err != nil {
+					t.Fatalf("PQVRFEval(round %d, %d): %v", round, i, err)
+				}
+				roundOutputs[i] = output.Value
+			}
+			if chi2 := chi2For(roundOutputs); chi2 > criticalValue {
+				exceeds++
 			}
 		}
 
-		expected := float64(numSamples*PQVRFOutputSize) / 256.0
-		chiSquared := 0.0
-		for _, count := range buckets {
-			diff := float64(count) - expected
-			chiSquared += diff * diff / expected
-		}
-
-		df := 255
-		criticalValue := 310.457
-		if chiSquared > criticalValue {
-			t.Errorf("chi-squared = %.2f > critical value %.3f (df=%d, α=0.01)", chiSquared, criticalValue, df)
+		if exceeds >= 2 {
+			t.Errorf("chi-squared exceeded the critical value %.3f (df=255, α=0.01) in %d of 3 independent rounds — output is not byte-uniform (first round: %.2f)", criticalValue, exceeds, firstChi2)
 		} else {
-			t.Logf("chi-squared = %.2f < critical value %.3f ✅ (df=%d, α=0.01)", chiSquared, criticalValue, df)
+			t.Logf("chi-squared = %.2f (first of 3 majority rounds) < critical value %.3f ✅ (df=255, α=0.01)", firstChi2, criticalValue)
 		}
 	})
 
@@ -212,39 +244,52 @@ func TestPQVRF_Pseudorandomness_Statistical(t *testing.T) {
 }
 
 func TestPQVRF_Pseudorandomness_OutputDistribution(t *testing.T) {
-	sk, _ := generateTestKeyPair(t)
-
 	const numSamples = 2000
 	const numBuckets = 256
 
-	bucketCounts := make([]int, numBuckets)
-
-	for i := 0; i < numSamples; i++ {
-		var input [8]byte
-		binary.BigEndian.PutUint64(input[:], uint64(i))
-
-		_, output, err := PQVRFEval(sk, input[:])
-		if err != nil {
-			t.Fatalf("PQVRFEval(%d): %v", i, err)
+	// R24 (2026-10-30): same majority-over-3-rounds rule as
+	// TestPQVRF_Pseudorandomness_Statistical/ByteUniformity_ChiSquared — the
+	// key is fresh per run, so a single-round α=0.01 verdict is a random
+	// variable (with only ~7.8 expected samples per bucket this round is the
+	// noisier of the two). A real distribution bias fails every round.
+	const criticalValue = 310.457 // df=255, α=0.01
+	chi2For := func(key *crypto.PrivateKey) float64 {
+		bucketCounts := make([]int, numBuckets)
+		for i := 0; i < numSamples; i++ {
+			var input [8]byte
+			binary.BigEndian.PutUint64(input[:], uint64(i))
+			_, output, err := PQVRFEval(key, input[:])
+			if err != nil {
+				t.Fatalf("PQVRFEval(%d): %v", i, err)
+			}
+			bucketCounts[output.Value[0]]++
 		}
-
-		bucket := output.Value[0]
-		bucketCounts[bucket]++
+		expected := float64(numSamples) / float64(numBuckets)
+		chi2 := 0.0
+		for _, count := range bucketCounts {
+			diff := float64(count) - expected
+			chi2 += diff * diff / expected
+		}
+		return chi2
 	}
 
-	expected := float64(numSamples) / float64(numBuckets)
-	chiSquared := 0.0
-	for _, count := range bucketCounts {
-		diff := float64(count) - expected
-		chiSquared += diff * diff / expected
+	exceeds := 0
+	firstKey, _ := generateTestKeyPair(t)
+	firstChi2 := chi2For(firstKey)
+	if firstChi2 > criticalValue {
+		exceeds++
+	}
+	for round := 0; round < 2 && exceeds < 2; round++ {
+		roundKey, _ := generateTestKeyPair(t)
+		if chi2 := chi2For(roundKey); chi2 > criticalValue {
+			exceeds++
+		}
 	}
 
-	df := numBuckets - 1
-	criticalValue := 310.457
-	if chiSquared > criticalValue {
-		t.Errorf("chi-squared = %.2f > critical value %.3f (df=%d, α=0.01)", chiSquared, criticalValue, df)
+	if exceeds >= 2 {
+		t.Errorf("chi-squared exceeded the critical value %.3f (df=%d, α=0.01) in %d of 3 independent rounds — output distribution is not uniform (first round: %.2f)", criticalValue, numBuckets-1, exceeds, firstChi2)
 	} else {
-		t.Logf("output distribution chi-squared = %.2f < critical value %.3f ✅ (df=%d, α=0.01)", chiSquared, criticalValue, df)
+		t.Logf("output distribution chi-squared = %.2f (first of 3 majority rounds) < critical value %.3f ✅ (df=%d, α=0.01)", firstChi2, criticalValue, numBuckets-1)
 	}
 }
 

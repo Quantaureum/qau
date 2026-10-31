@@ -14,6 +14,23 @@ import (
 
 // ── Filter methods ──
 
+// cleanupFilter uninstalls the given filter at test cleanup.
+//
+// The FilterManager is a package-level singleton shared by every test and
+// every -count iteration, with a per-client cap of 10 live filters and a
+// 5-minute cleanup window. A test that creates a filter without uninstalling
+// it therefore breaks every filter test that runs later in the same binary
+// (the next addFilter is refused, and a test that ignores the create error
+// panics on its type assertion). Every filter-creating test must register
+// this cleanup.
+func cleanupFilter(t *testing.T, api *API, filterID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		params, _ := json.Marshal([]string{filterID})
+		_, _ = api.UninstallFilter(ctx(), params)
+	})
+}
+
 func TestNewFilter_NoParams(t *testing.T) {
 	api := newTestAPI()
 	_, err := api.NewFilter(ctx(), nil)
@@ -35,6 +52,7 @@ func TestNewBlockFilter(t *testing.T) {
 	if !ok || filterID == "" {
 		t.Error("expected non-empty filter ID string")
 	}
+	cleanupFilter(t, api, filterID)
 }
 
 func TestNewPendingTransactionFilter(t *testing.T) {
@@ -45,6 +63,7 @@ func TestNewPendingTransactionFilter(t *testing.T) {
 	if !ok || filterID == "" {
 		t.Error("expected non-empty filter ID string")
 	}
+	cleanupFilter(t, api, filterID)
 }
 
 func TestUninstallFilter_NoParams(t *testing.T) {
@@ -64,8 +83,10 @@ func TestUninstallFilter_InvalidID(t *testing.T) {
 
 func TestUninstallFilter_ValidID(t *testing.T) {
 	api := newTestAPI()
-	// First create a block filter
-	result, _ := api.NewBlockFilter(ctx(), nil)
+	// First create a block filter — the create error must be asserted: a nil
+	// result would panic the type assertion below.
+	result, err := api.NewBlockFilter(ctx(), nil)
+	requireOK(t, result, err)
 	filterID := result.(string)
 
 	// Then uninstall it
@@ -89,8 +110,10 @@ func TestGetFilterChanges_InvalidID(t *testing.T) {
 
 func TestGetFilterChanges_BlockFilter(t *testing.T) {
 	api := newTestAPI()
-	result, _ := api.NewBlockFilter(ctx(), nil)
+	result, err := api.NewBlockFilter(ctx(), nil)
+	requireOK(t, result, err)
 	filterID := result.(string)
+	cleanupFilter(t, api, filterID)
 
 	params, _ := json.Marshal([]string{filterID})
 	changes, err := api.GetFilterChanges(ctx(), params)
@@ -99,8 +122,10 @@ func TestGetFilterChanges_BlockFilter(t *testing.T) {
 
 func TestGetFilterChanges_PendingTxFilter(t *testing.T) {
 	api := newTestAPI()
-	result, _ := api.NewPendingTransactionFilter(ctx(), nil)
+	result, err := api.NewPendingTransactionFilter(ctx(), nil)
+	requireOK(t, result, err)
 	filterID := result.(string)
+	cleanupFilter(t, api, filterID)
 
 	params, _ := json.Marshal([]string{filterID})
 	changes, err := api.GetFilterChanges(ctx(), params)

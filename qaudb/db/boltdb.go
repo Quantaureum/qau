@@ -1056,3 +1056,55 @@ func (bb *boltBatch) Reset() {
 func (bb *boltBatch) ValueSize() int {
 	return bb.size
 }
+
+// PrefixScanAndFinalize walks every key that carries the given prefix, in
+// ascending key order, inside ONE read transaction. For each entry the walk
+// callback receives COPIES of (key, value) plus a lookup function that reads
+// any other key within the SAME transaction (returns ok=false when absent);
+// the callback returns false to stop the walk early. When the walk finishes
+// (early stop or end of prefix), finalize — if non-nil — runs STILL INSIDE
+// the same transaction with the same lookup, so a second pass over the
+// window it just collected costs nothing extra.
+//
+// R32 (2026-10-31): this exists so a large index can be audited without
+// opening one read transaction per key. The block store's continuity scan
+// used three standalone Gets per height — ~1M transactions at 337k heights —
+// and held the store's read lock for 40-90 minutes on the arm64 fleet while
+// Node.Start was still inside Syncer.Start (nodes sat half-initialized with
+// zero peers for the whole walk). A single-transaction cursor answers the
+// same question in seconds.
+func (b *BoltDB) PrefixScanAndFinalize(prefix []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error {
+	return b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(defaultBucket)
+		if bkt == nil {
+			return fmt.Errorf("bucket %q not found", defaultBucket)
+		}
+		lookup := func(key []byte) ([]byte, bool) {
+			v := bkt.Get(key)
+			if v == nil {
+				return nil, false
+			}
+			out := make([]byte, len(v))
+			copy(out, v)
+			return out, true
+		}
+		c := bkt.Cursor()
+		start := append(append([]byte{}, prefix...), 0x00)
+		for k, v := c.Seek(start); k != nil; k, v = c.Next() {
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			kc := make([]byte, len(k))
+			copy(kc, k)
+			vc := make([]byte, len(v))
+			copy(vc, v)
+			if !walk(kc, vc, lookup) {
+				break
+			}
+		}
+		if finalize != nil {
+			finalize(lookup)
+		}
+		return nil
+	})
+}

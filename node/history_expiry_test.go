@@ -55,8 +55,10 @@ func (m *mockBlockStore) GetOldestHeight() uint64 {
 
 func TestDefaultHistoryExpirationConfig(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
-	if !cfg.Enabled {
-		t.Error("expected enabled by default")
+	// R30 F4: block-history pruning is unsupported, so the default must not ask
+	// for it (Start() would refuse).
+	if cfg.Enabled {
+		t.Error("expected disabled by default")
 	}
 	if cfg.RetentionBlocks != DefaultHistoryRetentionBlocks {
 		t.Errorf("expected %d retention blocks, got %d", DefaultHistoryRetentionBlocks, cfg.RetentionBlocks)
@@ -95,29 +97,32 @@ func TestHistoryExpirer_Start_Disabled(t *testing.T) {
 
 func TestHistoryExpirer_Start_Enabled(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
 	bs := newMockBlockStore()
 	he := NewHistoryExpirer(cfg, bs)
 
+	// R30 F4: enabling block-history pruning must be refused, and nothing may be
+	// deleted on the way out.
 	err := he.Start()
-	if err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if !errors.Is(err, ErrHistoryExpiryUnsupported) {
+		t.Fatalf("expected ErrHistoryExpiryUnsupported, got %v", err)
+	}
+	if bs.deletedFrom != 0 || bs.deletedTo != 0 {
+		t.Errorf("Start must not delete anything, got delete range [%d, %d]", bs.deletedFrom, bs.deletedTo)
 	}
 	he.Stop()
 }
 
-func TestHistoryExpirer_Start_DoubleStart(t *testing.T) {
+func TestHistoryExpirer_Start_RepeatedRefusal(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
 	bs := newMockBlockStore()
 	he := NewHistoryExpirer(cfg, bs)
 
-	err := he.Start()
-	if err != nil {
-		t.Fatalf("first Start failed: %v", err)
-	}
-
-	err = he.Start()
-	if err != nil {
-		t.Errorf("second Start should return nil, got: %v", err)
+	for i := 0; i < 2; i++ {
+		if err := he.Start(); !errors.Is(err, ErrHistoryExpiryUnsupported) {
+			t.Fatalf("Start #%d: expected ErrHistoryExpiryUnsupported, got %v", i+1, err)
+		}
 	}
 
 	he.Stop()
@@ -127,6 +132,7 @@ func TestHistoryExpirer_Start_DoubleStart(t *testing.T) {
 
 func TestHistoryExpirer_Stop_NotRunning(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
 	bs := newMockBlockStore()
 	he := NewHistoryExpirer(cfg, bs)
 
@@ -138,6 +144,7 @@ func TestHistoryExpirer_Stop_NotRunning(t *testing.T) {
 
 func TestHistoryExpirer_GetStats_Initial(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
 	bs := newMockBlockStore()
 	he := NewHistoryExpirer(cfg, bs)
 
@@ -221,16 +228,39 @@ func TestHistoryExpirer_ForcePrune_Disabled(t *testing.T) {
 	}
 }
 
-func TestHistoryExpirer_ForcePrune_NotEnoughHistory(t *testing.T) {
+func TestHistoryExpirer_ForcePrune_Refused(t *testing.T) {
 	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
+	bs := newMockBlockStore()
+	bs.latestHeight = 500
+	bs.bytesFreed = 10000
+	he := NewHistoryExpirer(cfg, bs)
+
+	freed, err := he.ForcePrune()
+	if !errors.Is(err, ErrHistoryExpiryUnsupported) {
+		t.Fatalf("expected ErrHistoryExpiryUnsupported, got %v", err)
+	}
+	if freed != 0 {
+		t.Errorf("expected 0 bytes freed, got %d", freed)
+	}
+	if bs.deletedFrom != 0 || bs.deletedTo != 0 {
+		t.Errorf("ForcePrune must not delete anything, got [%d, %d]", bs.deletedFrom, bs.deletedTo)
+	}
+}
+
+// ── pruneOnce (the dormant algorithm, kept under test) ──
+
+func TestHistoryExpirer_PruneOnce_NotEnoughHistory(t *testing.T) {
+	cfg := DefaultHistoryExpirationConfig()
+	cfg.Enabled = true
 	bs := newMockBlockStore()
 	bs.latestHeight = 100
 	bs.oldestHeight = 0
 	he := NewHistoryExpirer(cfg, bs)
 
-	freed, err := he.ForcePrune()
+	freed, err := he.pruneOnce()
 	if err != nil {
-		t.Fatalf("ForcePrune failed: %v", err)
+		t.Fatalf("pruneOnce failed: %v", err)
 	}
 	// Current height (100) < retention blocks, nothing to prune
 	if freed != 0 {
@@ -238,7 +268,7 @@ func TestHistoryExpirer_ForcePrune_NotEnoughHistory(t *testing.T) {
 	}
 }
 
-func TestHistoryExpirer_ForcePrune_WithHistory(t *testing.T) {
+func TestHistoryExpirer_PruneOnce_WithHistory(t *testing.T) {
 	cfg := HistoryExpirationConfig{
 		Enabled:         true,
 		RetentionBlocks: 100,
@@ -251,20 +281,21 @@ func TestHistoryExpirer_ForcePrune_WithHistory(t *testing.T) {
 	bs.bytesFreed = 10000
 	he := NewHistoryExpirer(cfg, bs)
 
-	freed, err := he.ForcePrune()
+	freed, err := he.pruneOnce()
 	if err != nil {
-		t.Fatalf("ForcePrune failed: %v", err)
+		t.Fatalf("pruneOnce failed: %v", err)
 	}
 	if freed != 10000 {
 		t.Errorf("expected 10000 bytes freed, got %d", freed)
 	}
-	// Should delete from oldest (0) to latest-retention (400)
-	if bs.deletedFrom != 0 || bs.deletedTo != 400 {
-		t.Errorf("expected delete range [0, 400], got [%d, %d]", bs.deletedFrom, bs.deletedTo)
+	// An adapter reporting 0 must never cost us the genesis block: the delete
+	// range starts at 1 and ends at latest-retention (400).
+	if bs.deletedFrom != 1 || bs.deletedTo != 400 {
+		t.Errorf("expected delete range [1, 400], got [%d, %d]", bs.deletedFrom, bs.deletedTo)
 	}
 }
 
-func TestHistoryExpirer_ForcePrune_DeleteError(t *testing.T) {
+func TestHistoryExpirer_PruneOnce_DeleteError(t *testing.T) {
 	cfg := HistoryExpirationConfig{
 		Enabled:         true,
 		RetentionBlocks: 100,
@@ -275,13 +306,13 @@ func TestHistoryExpirer_ForcePrune_DeleteError(t *testing.T) {
 	bs.deleteErr = errors.New("delete failed")
 	he := NewHistoryExpirer(cfg, bs)
 
-	_, err := he.ForcePrune()
+	_, err := he.pruneOnce()
 	if err == nil {
-		t.Error("expected error from ForcePrune when delete fails")
+		t.Error("expected error from pruneOnce when delete fails")
 	}
 }
 
-func TestHistoryExpirer_ForcePrune_OldestAbovePruneBefore(t *testing.T) {
+func TestHistoryExpirer_PruneOnce_OldestAbovePruneBefore(t *testing.T) {
 	cfg := HistoryExpirationConfig{
 		Enabled:         true,
 		RetentionBlocks: 100,
@@ -291,9 +322,9 @@ func TestHistoryExpirer_ForcePrune_OldestAbovePruneBefore(t *testing.T) {
 	bs.oldestHeight = 450 // oldest is above pruneBefore (400)
 	he := NewHistoryExpirer(cfg, bs)
 
-	freed, err := he.ForcePrune()
+	freed, err := he.pruneOnce()
 	if err != nil {
-		t.Fatalf("ForcePrune failed: %v", err)
+		t.Fatalf("pruneOnce failed: %v", err)
 	}
 	if freed != 0 {
 		t.Errorf("expected 0 bytes freed when oldest > pruneBefore, got %d", freed)
@@ -308,6 +339,9 @@ func TestHistoryExpirationErrors(t *testing.T) {
 	}
 	if ErrInvalidRetentionPeriod == nil {
 		t.Error("expected non-nil ErrInvalidRetentionPeriod")
+	}
+	if ErrHistoryExpiryUnsupported == nil {
+		t.Error("expected non-nil ErrHistoryExpiryUnsupported")
 	}
 }
 
