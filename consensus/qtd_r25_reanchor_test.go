@@ -17,20 +17,22 @@ import (
 // QPOS prunes the live root a canonical seal degrades to "unknown" and loses
 // its final status.
 func TestR25_PersistCanonicalStateNeverDowngradesToUnknown(t *testing.T) {
-	qpos, coordinator, _ := setupStardustWithQTD(t, 3)
+	qpos, _, _ := setupStardustWithQTD(t, 3)
 	qfs := qpos.GetQTDFinality()
 	const slot = uint64(32) // epoch 1
 	hash := types.Hash{0xC1}
 
-	r23AssignExecutive(t, coordinator, SlotToEpoch(slot))
-	approveSlot(coordinator, slot)
-	qpos.SetSlotBlockRoot(slot, hash)
-	if err := qfs.RequestSeal(slot, hash); err != nil {
-		t.Fatalf("RequestSeal: %v", err)
-	}
-	r23CompleteSeal(t, qfs, slot)
+	// R32d (2026-10-31, CI failure): the record is INJECTED rather than
+	// produced by the real seal pipeline. The pipeline's asynchronous
+	// finalizer persists its own classification concurrently, so the explicit
+	// writes below raced it — on CI the finalizer's Matches landed after the
+	// test's Differs and overwrote it ("no scheduling luck", the R24-05
+	// rule this test originally violated). The guard semantics under test
+	// live entirely in persistCanonicalState; the injected record exercises
+	// them deterministically.
+	r23InjectSealRecord(t, qfs, slot, hash)
 
-	// The classification is known (the live root matches the sealed hash).
+	// The classification is known (a faster path recorded canonical).
 	qfs.persistCanonicalState(slot, hash, SealRootMatches)
 	if got := r24SealRecordClassification(t, qfs, slot); got != SealRootMatches {
 		t.Fatalf("classification = %s, want matches", got.String())
