@@ -358,3 +358,90 @@ func TestR32_FindContinuousTip_RecentWindowCorruption(t *testing.T) {
 		t.Fatalf("fast recent-window tip = %d, want %d — in-window corruption must be caught", fast, recentAt-1)
 	}
 }
+
+// TestR33_VerifyFullContinuity_UnboundedDamagedAt pins the R33 background
+// pass: VerifyFullContinuity verifies parent linkage for EVERY height (the
+// unbounded window), so a DEEP header failure — outside the startup scan's
+// 64-height window — is still reported through damagedAt. This is exactly
+// the detection the windowed startup scan deliberately skips.
+func TestR33_VerifyFullContinuity_UnboundedDamagedAt(t *testing.T) {
+	const chain = 120
+
+	d, err := db.NewBoltDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewBoltDB: %v", err)
+	}
+	defer d.Close()
+	r32BuildChain(t, d, chain, types.Hash{}, 0x60)
+
+	// Deep corruption at height 5 (outside the startup scan's window).
+	fakeHash := types.Hash{0x42}
+	if err := d.Put(r37NumberKey(5), fakeHash[:]); err != nil {
+		t.Fatalf("redirect number key: %v", err)
+	}
+	if err := d.Put(append(headerPrefix, fakeHash[:]...), []byte{0xde, 0xad, 0xbe, 0xef}); err != nil {
+		t.Fatalf("inject corrupt header: %v", err)
+	}
+
+	bs := NewBlockStore(d)
+	tip, damagedAt, gapAt, err := bs.VerifyFullContinuity()
+	if err != nil {
+		t.Fatalf("VerifyFullContinuity: %v", err)
+	}
+	if tip != 4 || damagedAt != 5 {
+		t.Fatalf("deep corruption must be reported: got (tip=%d, damagedAt=%d), want (4, 5)", tip, damagedAt)
+	}
+	if gapAt != 0 {
+		t.Fatalf("gapAt = %d, want 0 (the deep damage is a header failure, not a gap)", gapAt)
+	}
+
+	// Clean chain on a fresh store: no damage, full tip.
+	d2, err := db.NewBoltDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewBoltDB(2): %v", err)
+	}
+	defer d2.Close()
+	r32BuildChain(t, d2, 100, types.Hash{}, 0x61)
+	bs2 := NewBlockStore(d2)
+	tip, damagedAt, gapAt2, err := bs2.VerifyFullContinuity()
+	if err != nil {
+		t.Fatalf("VerifyFullContinuity(clean): %v", err)
+	}
+	if tip != 100 || damagedAt != 0 {
+		t.Fatalf("clean chain: got (tip=%d, damagedAt=%d), want (100, 0)", tip, damagedAt)
+	}
+	if gapAt2 != 0 {
+		t.Fatalf("gapAt2 = %d, want 0", gapAt2)
+	}
+
+	// The height-0 genesis entry (the fleet shape) is skipped.
+	d3, err := db.NewBoltDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewBoltDB(3): %v", err)
+	}
+	defer d3.Close()
+	r32BuildChain(t, d3, 30, types.Hash{}, 0x62)
+	genesisHash := types.Hash{0xEE}
+	if err := d3.Put(r37NumberKey(0), genesisHash[:]); err != nil {
+		t.Fatalf("inject genesis number entry: %v", err)
+	}
+	hdr := &encoding.BlockHeader{Version: 1, Height: 0, ParentHash: types.Hash{}, ChainID: 1668}
+	hdrData, err := encoding.MarshalBlockHeader(hdr)
+	if err != nil {
+		t.Fatalf("marshal genesis header: %v", err)
+	}
+	if err := d3.Put(append(headerPrefix, genesisHash[:]...), hdrData); err != nil {
+		t.Fatalf("inject genesis header: %v", err)
+	}
+	bs3 := NewBlockStore(d3)
+	tip, damagedAt, gapAt3, err := bs3.VerifyFullContinuity()
+	if err != nil {
+		t.Fatalf("VerifyFullContinuity(height-0): %v", err)
+	}
+	if tip != 30 || damagedAt != 0 {
+		t.Fatalf("height-0 entry must be skipped: got (tip=%d, damagedAt=%d), want (30, 0)", tip, damagedAt)
+	}
+	if gapAt3 != 0 {
+		t.Fatalf("gapAt3 = %d, want 0", gapAt3)
+	}
+}

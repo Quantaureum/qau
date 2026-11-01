@@ -1073,7 +1073,7 @@ func (bb *boltBatch) ValueSize() int {
 // Node.Start was still inside Syncer.Start (nodes sat half-initialized with
 // zero peers for the whole walk). A single-transaction cursor answers the
 // same question in seconds.
-func (b *BoltDB) PrefixScanAndFinalize(prefix []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error {
+func (b *BoltDB) PrefixScanAndFinalize(prefix []byte, start []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error {
 	return b.db.View(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(defaultBucket)
 		if bkt == nil {
@@ -1089,8 +1089,11 @@ func (b *BoltDB) PrefixScanAndFinalize(prefix []byte, walk func(key, value []byt
 			return out, true
 		}
 		c := bkt.Cursor()
-		start := append(append([]byte{}, prefix...), 0x00)
-		for k, v := c.Seek(start); k != nil; k, v = c.Next() {
+		seek := append(append([]byte{}, prefix...), 0x00)
+		if len(start) > 0 {
+			seek = append(append([]byte{}, prefix...), start...)
+		}
+		for k, v := c.Seek(seek); k != nil; k, v = c.Next() {
 			if !bytes.HasPrefix(k, prefix) {
 				break
 			}

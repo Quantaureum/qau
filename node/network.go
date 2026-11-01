@@ -14,18 +14,16 @@ const (
 	TestnetGenesisHash = "6e0fdada5beaaf93ed556b82a0daa405b28cb56e3eda2609b820e92683768384"
 )
 
-var mainnetBootnodes = []string{
-	"enode://65b6dcc0aeb5e0458996d3c6934a36c5213caf8074e4153c3f9e0f5f225789f7@163.192.142.82:9000",
-	"enode://3ef6a7c05e64d2218ce250ae345c05bee2836b3dd24843f6840b1c26773875a1@217.142.189.163:9000",
-	"enode://d552745f67d0dfebe9b407a2fad4ff5340ce6273e4d7920ff7080115be9186f1@149.118.59.251:9000",
-	"enode://57879ea427537fd3690ed35353a32d1e87035f696995cd4da5126cb2fee05d3d@149.118.61.186:9000",
-	"enode://ebf49fb21426f10430e48bf513f07750dc88dfa15c1d65d322b9f922ff1d61da@149.118.62.16:9000",
-	"enode://949dcd8f80c032022d2bb7836afc1de9628c49d2f3325131d45d73d5908451e5@149.118.55.2:9000",
-}
+// Bootnode enodes are DEPLOYMENT TOPOLOGY (real server IPs + node identity
+// keys) and are intentionally NOT hard-coded here: they are supplied
+// per-deployment through the config's "bootstrapPeers" field, and running
+// nodes discover peers through the persisted nodes file and UDP discovery.
+// R33 topology cleanup (2026-11-01): the previously hard-coded enodes were
+// dead data — NetworkPresetByName has no production callers — and were
+// removed; operators maintain their real bootnode list out of band.
+var mainnetBootnodes = []string{}
 
-var testnetBootnodes = []string{
-	"enode://a885858e043178c7c6f6a50471612391bcd2637a0ac2aa149a6eff4f12c0915f@149.118.53.59:9000",
-}
+var testnetBootnodes = []string{}
 
 // NetworkPreset describes the client's built-in network identity.
 type NetworkPreset struct {

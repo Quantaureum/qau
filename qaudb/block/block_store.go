@@ -1024,7 +1024,7 @@ func (bs *BlockStore) findContinuousTipLocked() uint64 {
 // prefixScanner is implemented by databases that can walk a key prefix in a
 // single read transaction (R32 — see BoltDB.PrefixScanAndFinalize).
 type prefixScanner interface {
-	PrefixScanAndFinalize(prefix []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error
+	PrefixScanAndFinalize(prefix []byte, start []byte, walk func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool, finalize func(lookup func([]byte) ([]byte, bool))) error
 }
 
 // findContinuousTipScan is the R32/R32c single-transaction continuity walk.
@@ -1043,10 +1043,10 @@ type prefixScanner interface {
 // the first ParentHash gap") holds only for the recent window now. The
 // residual exposure is bounded: current write rules prevent creating
 // linkage damage (P3-CHAIN-INTEGRITY no-overwrite + import-time parent
-// check), fleet stores were repeatedly repaired by pre-R32 restarts, and a
-// bit-rot-damaged segment surfaces via fork recovery instead of the
-// immediate startup repair. A background deep-integrity pass is the
-// registered follow-up (R33 candidate).
+// check), fleet stores were repeatedly repaired by pre-R32 restarts, and
+// deep damage is now detected post-boot by startDeepIntegrityCheck (R33),
+// which fails closed instead of auto-truncating; bit-rot-damaged segments
+// also surface via fork recovery.
 // continuityParentWindow bounds the parent-linkage verification of the
 // single-transaction continuity scan (R32c, 2026-10-31). The scan's phase 1
 // walks the number→hash index (cheap, no header reads); phase 2 verifies the
@@ -1058,7 +1058,173 @@ type prefixScanner interface {
 const continuityParentWindow = 64
 
 func (bs *BlockStore) findContinuousTipScan(scanner prefixScanner, latestHeight uint64) (uint64, error) {
+	tip, _, err := bs.findContinuousTipScanCore(scanner, latestHeight)
+	return tip, err
+}
+
+// verifySegmentHeights bounds each read transaction of the background
+// full-continuity pass (R33): a segment of 10k heights keeps the mmap-growth
+// and DB-close waits of a single scan segment to ~seconds, so a live node's
+// writers (whose bbolt writes queue behind any mmap remap the read tx
+// triggers) and an operator shutdown are never stuck for the length of the
+// whole walk.
+const verifySegmentHeights = 10000
+
+// ErrChainChangedDuringPass is returned by VerifyFullContinuity when the
+// chain moved under the pass (a fork-point truncation or reorg between two
+// segment snapshots). The caller maps it to a WARN and stops — the verified
+// prefix stands, and a re-run after the node settles covers the rest.
+var ErrChainChangedDuringPass = errors.New("block store changed during the continuity pass")
+
+// VerifyFullContinuity verifies the parent linkage of EVERY height in
+// segments of verifySegmentHeights heights — the full-semantics background
+// form of the windowed startup scan (R33, 2026-11-01). Each segment runs in
+// its own read transaction, so mmap-growth and DB-close waits are bounded by
+// one segment (~seconds), and NO store lock is taken (the bbolt snapshot is
+// consistent on its own).
+//
+// Returns:
+//   - tip:         the last verified continuous height;
+//   - damagedAt:   the first height whose header is missing, undecodable, or
+//     fails to link to its parent (fail-closed upstream — production stops);
+//     0 when none within the walked range;
+//   - gapAt:       the first height with a MISSING number entry (0 = none).
+//     A gap is reported separately and NOT failed closed: a live
+//     DeleteBlocksFromHeight truncation leaves a gapless prefix, so a real
+//     gap in a snapshot is pre-existing fragmentation or external damage —
+//     the startup R53 repair owns that class; the pass stops at the gap
+//     (heights above it cannot be verified).
+//   - err:         a db-level failure (transient) — callers must not
+//     interpret it as damage.
+func (bs *BlockStore) VerifyFullContinuity() (tip uint64, damagedAt uint64, gapAt uint64, err error) {
+	latestHeight := bs.scanLatestHeight()
+	if latestHeight == 0 {
+		return 0, 0, 0, nil
+	}
+	scanner, ok := bs.db.(prefixScanner)
+	if !ok {
+		// R33 (round-17 FIX): report the unavailability instead of a
+		// fabricated "verified" result — the caller's WARN path then logs
+		// "pass skipped" honestly. (The previous revision returned
+		// latestHeight/0/nil, which the caller logged as "full chain
+		// verified continuous" although nothing had been verified.)
+		return 0, 0, 0, fmt.Errorf(
+			"deep-integrity scan unavailable: the block store does not implement the single-transaction prefix scan")
+	}
+	tip = uint64(0)
+	carried := types.Hash{} // parent hash of the next segment's first height
+	for start := uint64(1); start <= latestHeight; start += verifySegmentHeights {
+		end := start + verifySegmentHeights - 1
+		if end > latestHeight {
+			end = latestHeight
+		}
+		// R33b SKEW GUARD (round-18 finding 1): the segments are separate
+		// snapshots; a fork-point truncation between them would otherwise be
+		// invisible (a truncated suffix never trips the gap check) or
+		// misreport as header damage (an empty segment zeroes the carried
+		// parent). Verify that the chain is still where the previous segment
+		// left it before walking on.
+		if start > 1 {
+			prevKey := make([]byte, len(numberPrefix)+8)
+			copy(prevKey, numberPrefix)
+			binary.BigEndian.PutUint64(prevKey[len(numberPrefix):], start-1)
+			curHashData, err := bs.db.Get(prevKey)
+			var curHash types.Hash
+			if err == nil && len(curHashData) == len(curHash) {
+				copy(curHash[:], curHashData)
+			}
+			if curHash != carried {
+				return tip, 0, 0, ErrChainChangedDuringPass
+			}
+		}
+		segTip, segLast, segGap, segDamaged, segErr := bs.verifyHeightRange(scanner, start, end, carried)
+		if segErr != nil {
+			return tip, 0, 0, segErr
+		}
+		if segDamaged != 0 {
+			return segTip, segDamaged, 0, nil
+		}
+		if segGap != 0 {
+			return segTip, 0, segGap, nil
+		}
+		// R33b (round-18 finding 1): a segment that ends EARLY (no gap, no
+		// damage — the entries simply stop) means the chain/snapshot ends
+		// here: heights above segTip were NOT verified. Stop honestly instead
+		// of letting the loop's start advance fabricate progress.
+		if segTip < end {
+			return segTip, 0, 0, nil
+		}
+		tip = segTip
+		carried = segLast
+	}
+	return tip, 0, 0, nil
+}
+
+// verifyHeightRange verifies heights [start..end] with the FULL per-height
+// semantics (number entry present, header decodes, ParentHash links to the
+// previous height) inside ONE read transaction, starting the cursor at
+// start. carriedParent is the hash of height start-1 (zero for height 1,
+// where the parent check is skipped); the caller keeps the cross-segment
+// tip. Returns the segment's verified tip, the last height's hash, and the
+// first gap/damage heights (0 = none).
+func (bs *BlockStore) verifyHeightRange(scanner prefixScanner, start, end uint64, carriedParent types.Hash) (segTip uint64, lastHash types.Hash, gapAt uint64, damagedAt uint64, err error) {
+	segTip = start - 1
+	prevHash := carriedParent
+	startKey := make([]byte, 8)
+	binary.BigEndian.PutUint64(startKey, start)
+	err = scanner.PrefixScanAndFinalize(numberPrefix, startKey, func(key, value []byte, lookup func([]byte) ([]byte, bool)) bool {
+		if len(key) != len(numberPrefix)+8 {
+			return false
+		}
+		h := binary.BigEndian.Uint64(key[len(numberPrefix):])
+		if h == 0 {
+			return true // genesis entry below the walked range: skip
+		}
+		if h > end {
+			return false
+		}
+		if h != segTip+1 {
+			gapAt = segTip + 1
+			return false
+		}
+		var hash types.Hash
+		copy(hash[:], value)
+		hdrData, ok := lookup(append(headerPrefix, hash[:]...))
+		if !ok {
+			damagedAt = h
+			return false
+		}
+		hdr, err := encoding.UnmarshalBlockHeader(hdrData)
+		if err != nil || hdr == nil {
+			damagedAt = h
+			return false
+		}
+		if h > 1 && hdr.ParentHash != prevHash {
+			damagedAt = h
+			return false
+		}
+		segTip = h
+		prevHash = hash
+		lastHash = hash
+		return true
+	}, nil)
+	return segTip, lastHash, gapAt, damagedAt, nil
+}
+
+// findContinuousTipScanCore is the STARTUP scan's single-transaction walk:
+// phase 2 verifies parent linkage for the LAST continuityParentWindow (64)
+// heights only. The whole-chain background verification is
+// VerifyFullContinuity → verifyHeightRange (chunked segments, full
+// per-height semantics) — this function deliberately does NOT offer an
+// unbounded mode: the first R33 revision routed the background pass through
+// it (one read tx for the whole chain, the R16-2 mmap-stall shape) before
+// the chunked form replaced it, and the dead branch invited a wrong
+// "verified" log on non-scanner stores. damagedAt reports the first height
+// whose header or parent linkage fails the windowed verification (0 when
+// none does within the walked range).
+func (bs *BlockStore) findContinuousTipScanCore(scanner prefixScanner, latestHeight uint64) (uint64, uint64, error) {
 	tip := uint64(0)
+	damagedAt := uint64(0)
 	result := uint64(0)
 	type recentEntry struct {
 		height uint64
@@ -1099,11 +1265,11 @@ func (bs *BlockStore) findContinuousTipScan(scanner prefixScanner, latestHeight 
 	}
 
 	// Phase 2 (same read transaction): parent-linkage verification for the
-	// recent window only. The parent of recent[0] may sit one height BELOW
-	// the window — resolved through the number index. A failing header
+	// recent window only — deep corruption is left to sync re-execution and
+	// to the chunked background pass (VerifyFullContinuity). A failing header
 	// (missing, undecodable, parent mismatch) lowers the result to the height
-	// before it; corruption OLDER than the window is left to the ordinary
-	// sync re-execution and import validation.
+	// before it; damagedAt is returned for diagnostics (the startup caller
+	// consumes only the tip).
 	finalize := func(lookup func([]byte) ([]byte, bool)) {
 		result = tip
 		for i, entry := range recent {
@@ -1122,26 +1288,26 @@ func (bs *BlockStore) findContinuousTipScan(scanner prefixScanner, latestHeight 
 			}
 			hdrData, ok := lookup(append(headerPrefix, entry.hash[:]...))
 			if !ok {
-				result = entry.height - 1
+				result, damagedAt = entry.height-1, entry.height
 				return
 			}
 			hdr, err := encoding.UnmarshalBlockHeader(hdrData)
 			if err != nil || hdr == nil {
-				result = entry.height - 1
+				result, damagedAt = entry.height-1, entry.height
 				return
 			}
 			if entry.height > 1 && hdr.ParentHash != parentHash {
-				result = entry.height - 1
+				result, damagedAt = entry.height-1, entry.height
 				return
 			}
 		}
 	}
 
-	err := scanner.PrefixScanAndFinalize(numberPrefix, walk, finalize)
+	err := scanner.PrefixScanAndFinalize(numberPrefix, nil, walk, finalize)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return result, nil
+	return result, damagedAt, nil
 }
 
 // findContinuousTipPerHeight is the original per-height continuity walk

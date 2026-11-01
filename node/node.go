@@ -1121,6 +1121,14 @@ func (n *Node) Start() error {
 	// No-op when the node was started without a config file (default/in-memory).
 	n.startConfigHotReload()
 
+	// R33 (2026-11-01): whole-chain parent-linkage verification in the
+	// background. The startup scan verifies only the recent window (R32c);
+	// this one-shot pass covers every height without blocking boot and
+	// without holding the store lock. Detection fails closed
+	// (markStateTrustBroken) — deep damage is never auto-repaired while
+	// running.
+	n.startDeepIntegrityCheck()
+
 	return nil
 }
 
@@ -6896,15 +6904,16 @@ func (n *Node) startServices() error {
 	// leaving the remaining VRF outputs permanently lost -> proposer election
 	// diverges -> chain fork.
 	//
-	// R33 NOTE (2026-10-31, round-13 review): since R32c the startup
-	// continuity scan verifies parent linkage only for the LAST
-	// continuityParentWindow (64) heights — deep linkage damage older than
-	// that window no longer lowers the returned tip here. The repair below
-	// therefore fires for number-index gaps and RECENT linkage damage; deep
+	// R33 NOTE (2026-10-31, round-13 review; updated 2026-11-01 round 16):
+	// since R32c the startup continuity scan verifies parent linkage only
+	// for the LAST continuityParentWindow (64) heights — deep linkage damage
+	// older than that window no longer lowers the returned tip here, so this
+	// repair fires for number-index gaps and RECENT linkage damage. DEEP
 	// damage (only creatable by pre-2026-08-17 write rules, long since
-	// repaired on every live store by earlier restarts) surfaces via fork
-	// recovery instead. A background deep-integrity pass is the registered
-	// follow-up.
+	// repaired on every live store by earlier restarts) is now detected
+	// post-boot by startDeepIntegrityCheck, which FAILS CLOSED (production
+	// stops, operator rebuilds) instead of auto-truncating a running node;
+	// fork recovery remains the sync-time surface.
 	//
 	// Fix: Before VRF rebuild, if continuousTip < latestHeight, truncate the
 	// orphaned blocks above continuousTip so the chain is consistent and VRF
