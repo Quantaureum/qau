@@ -1208,6 +1208,9 @@ func (bs *BlockStore) verifyHeightRange(scanner prefixScanner, start, end uint64
 		lastHash = hash
 		return true
 	}, nil)
+	if err != nil {
+		return segTip, lastHash, gapAt, damagedAt, err
+	}
 	return segTip, lastHash, gapAt, damagedAt, nil
 }
 
