@@ -1,28 +1,60 @@
 // Quantaureum Node source, version 1.0.0.
-// airdrop: Quantaureum mainnet airdrop batch sender.
+// airdrop: Quantaureum mainnet airdrop batch sender (distributor side of the
+// three-phase payout protocol).
 //
-// Pulls pending registrations (status=pending/approved) from the website's
-// airdrop admin API, signs transfer transactions locally with a Dilithium3
-// key, submits them via eth_sendRawTransaction, and writes the txHash back
-// to the website once confirmed.
+// Per registration the distributor drives:
+//
+//	reserve   POST /api/airdrop/admin/reserve {id} — atomically claim the row
+//	          (the website's conditional UPDATE is the single-payment
+//	          guarantee; 409 = another distributor holds it → skip, never pay)
+//	commit    build + sign + broadcast the commit tx (nonce N), wait receipt
+//	reveal    sign the reveal tx (nonce N+1) but DO NOT broadcast yet
+//	intent    POST /api/airdrop/admin/record {id, phase:"intent", txHash, nonce}
+//	          — the reveal hash is stored BEFORE the reveal is broadcast, so
+//	          a crash in between can be reconciled against the chain instead
+//	          of paying the address a second time
+//	broadcast eth_sendRawTransaction the reveal tx, wait for a 0x1 receipt
+//	paid      POST /api/airdrop/admin/record {id, phase:"paid", txHash} —
+//	          written only after the receipt confirmed the transfer
+//	failed    POST /api/airdrop/admin/record {id, phase:"failed", note} —
+//	          releases the reservation with a retry backoff
+//
+// Stuck rows (reserved/broadcast with no confirmed receipt, e.g. from a
+// crashed run) are reconciled at startup: a 0x1 receipt is written back as
+// paid; an unrecoverable state is released for a later attempt.
+//
+// Pre-flight guards: eth_chainId must equal -chain, and when -expect-address
+// is set the payout key must derive exactly that address (catches a stale
+// key file or a mis-pointed RPC before a single transaction is signed).
 //
 // Usage:
 //
-//	AIRDROP_ADMIN_KEY=<key> airdrop -keyfile <dilithium3 key file> -chain <chainID> -rpc <RPC URL> -site <site API base URL>
+//	AIRDROP_ADMIN_KEY=<key> airdrop -keyfile <dilithium3 key> -chain 1668 \
+//	  -rpc http://127.0.0.1:8545 -site https://quantaureum.com \
+//	  -expect-address 0x… [-limit 50]
 //
-// Common flags:
+// Flags:
 //
-//	-limit  max registrations per run (default 200)
-//	-dry-run print the pending list only; no signing, no sending
-//	-confirm-timeout seconds to wait for a receipt (default 30)
+//	-keyfile          path to the Dilithium3 key file
+//	-chain            chain ID (decimal)
+//	-rpc              node JSON-RPC endpoint (the local validator; never the
+//	                 public query node)
+//	-site             website API base URL
+//	-limit            max registrations per run (default 200)
+//	-dry-run          print the pending list only; no signing, no sending,
+//	                 no reserving
+//	-confirm-timeout  timeout waiting for a receipt (default 30s)
+//	-reconcile-grace  minimum age of a stuck reservation before it is
+//	                 reconciled (default 30m; skips rows a live run owns)
+//	-expect-address   payout account must derive this address (0x-prefixed)
+//	-lockfile         single-instance lock (default <tempdir>/qau-airdrop.lock)
+//	-batch            pay a CSV (address,amountQau[,memo]) instead of the
+//	                 website pending list (tier-B tranches; no site calls)
 //
-// Environment variables (overridden by same-name flags):
-//
-//	AIRDROP_KEY_FILE / AIRDROP_RPC_URL / AIRDROP_CHAIN_ID / AIRDROP_SITE_URL / AIRDROP_ADMIN_KEY
-//
-// Security note: the key file and AIRDROP_ADMIN_KEY belong on the payout
-// server (127.0.0.1 environments) only — never commit them. The website side
-// (guard.ts) requires an admin JWT or X-Admin-Key on the admin endpoints.
+// Env vars (overridden by same-name flags): AIRDROP_KEY_FILE, AIRDROP_RPC_URL,
+// AIRDROP_CHAIN_ID, AIRDROP_SITE_URL, AIRDROP_ADMIN_KEY, AIRDROP_EXPECT_ADDRESS.
+// The key file and the admin key belong on the payout server only — never
+// commit them.
 package main
 
 import (
@@ -30,12 +62,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -56,10 +90,13 @@ type config struct {
 	rpcURL         string
 	siteURL        string
 	adminKey       string
+	expectAddress  string
 	limit          int
 	dryRun         bool
 	batchFile      string
 	confirmTimeout time.Duration
+	reconcileGrace time.Duration
+	lockFile       string
 }
 
 func loadConfig() config {
@@ -74,13 +111,16 @@ func loadConfig() config {
 
 	flag.StringVar(&c.keyFile, "keyfile", envOr("AIRDROP_KEY_FILE", ""), "path to the Dilithium3 private key file")
 	flag.Uint64Var(&c.chainID, "chain", 0, "chain ID (decimal)")
-	flag.StringVar(&c.rpcURL, "rpc", envOr("AIRDROP_RPC_URL", "http://localhost:8545"), "node JSON-RPC endpoint")
-	flag.StringVar(&c.siteURL, "site", envOr("AIRDROP_SITE_URL", "http://localhost:3000"), "website API base URL")
+	flag.StringVar(&c.rpcURL, "rpc", envOr("AIRDROP_RPC_URL", "http://127.0.0.1:8545"), "node JSON-RPC endpoint (local validator)")
+	flag.StringVar(&c.siteURL, "site", envOr("AIRDROP_SITE_URL", "http://127.0.0.1:3000"), "website API base URL")
 	flag.StringVar(&c.adminKey, "adminkey", "", "deprecated and rejected; set AIRDROP_ADMIN_KEY env var")
+	flag.StringVar(&c.expectAddress, "expect-address", envOr("AIRDROP_EXPECT_ADDRESS", ""), "payout account must derive this address (0x-prefixed)")
 	flag.IntVar(&c.limit, "limit", 200, "max registrations to process in one run")
-	flag.BoolVar(&c.dryRun, "dry-run", false, "print the pending list only, do not send")
+	flag.BoolVar(&c.dryRun, "dry-run", false, "print the pending list only; no signing, no sending, no reserving")
 	flag.StringVar(&c.batchFile, "batch", envOr("AIRDROP_BATCH_FILE", ""), "pay a CSV file (address,amountQau[,memo]) instead of the website pending list")
 	flag.DurationVar(&c.confirmTimeout, "confirm-timeout", 30*time.Second, "timeout waiting for a receipt")
+	flag.DurationVar(&c.reconcileGrace, "reconcile-grace", 30*time.Minute, "min age of a stuck reservation before it is reconciled")
+	flag.StringVar(&c.lockFile, "lockfile", filepath.Join(os.TempDir(), "qau-airdrop.lock"), "single-instance lock file")
 
 	flag.Parse()
 
@@ -94,7 +134,7 @@ func loadConfig() config {
 	if c.chainID == 0 {
 		fatal("chain ID required: -chain <chainID> or AIRDROP_CHAIN_ID")
 	}
-	if c.keyFile == "" {
+	if c.keyFile == "" && !c.dryRun {
 		fatal("key file required: -keyfile <path> or AIRDROP_KEY_FILE")
 	}
 	flagWasSet := false
@@ -111,6 +151,9 @@ func loadConfig() config {
 	if c.adminKey == "" && !c.dryRun && c.batchFile == "" {
 		fatal("admin key required: set AIRDROP_ADMIN_KEY env var (not needed for dry-run)")
 	}
+	if c.expectAddress != "" && !strings.HasPrefix(c.expectAddress, "0x") {
+		fatal("-expect-address must be a 0x-prefixed address")
+	}
 	return c
 }
 
@@ -118,6 +161,15 @@ func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "airdrop: "+format+"\n", args...)
 	os.Exit(1)
 }
+
+// ---------------------------------------------------------------------------
+// HTTP clients (timeouts bounded so one hung endpoint cannot stall a batch)
+// ---------------------------------------------------------------------------
+
+var (
+	rpcClient  = &http.Client{Timeout: 15 * time.Second}
+	siteClient = &http.Client{Timeout: 30 * time.Second}
+)
 
 // ---------------------------------------------------------------------------
 // Signing and submission (same construction as cmd/transfer)
@@ -144,19 +196,22 @@ func newSigner(keyFile string, chainID uint64, rpcURL string, confirmTimeout tim
 	if strings.HasPrefix(line, "dilithium3:") {
 		line = strings.TrimPrefix(line, "dilithium3:")
 	}
-	privHex := strings.SplitN(line, ":", 2)[0]
+	// The private key is always the leading half of the blob; the public
+	// half (re-derivable below) may follow a ':' or a '+' separator
+	// (dev_export_keys writes one, the node's key extractor the other), or
+	// be absent entirely. Take exactly the private-key hex prefix so all
+	// three layouts parse identically.
+	privHexLen := crypto.Dilithium3PrivateKeySize * 2 // 8000 hex chars
+	if len(line) < privHexLen {
+		return nil, fmt.Errorf("key file too short: %d hex chars, want at least %d", len(line), privHexLen)
+	}
+	privHex := line[:privHexLen]
 	privBytes, err := hex.DecodeString(privHex)
 	if err != nil {
 		return nil, fmt.Errorf("decode private key: %w", err)
 	}
-	// F-10: wipe the decoded key material once the parsed key owns a copy.
+	// Wipe the decoded key material once the parsed key owns a copy.
 	defer func() { _ = crypto.ZeroBytesSecure(privBytes) }()
-	// Accept qaud/dev_export_keys style priv+pub concatenated keyfiles: when
-	// the blob is exactly privSize+pubSize long, the public half is redundant
-	// (re-derived from the private key below) and dropped.
-	if len(privBytes) == crypto.Dilithium3PrivateKeySize+crypto.Dilithium3PublicKeySize {
-		privBytes = privBytes[:crypto.Dilithium3PrivateKeySize]
-	}
 	privKey, err := crypto.PrivateKeyFromBytes(privBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
@@ -201,7 +256,7 @@ func (s *signer) fetchNonce() (uint64, error) {
 	}
 	// "pending" includes accepted-but-unmined transactions, so a resync after
 	// an ambiguous submit does not hand out a nonce that is already in flight.
-	if err := rpcJSON(s.rpcURL, "eth_getTransactionCount",
+	if err := rpcJSON(rpcClient, s.rpcURL, "eth_getTransactionCount",
 		[]any{s.fromHex, "pending"}, &res); err != nil {
 		return 0, err
 	}
@@ -216,9 +271,9 @@ func (s *signer) fetchNonce() (uint64, error) {
 }
 
 // resyncNonce refreshes the local cursor from the chain after a failure that
-// may have consumed the commit nonce (R2-09). Otherwise the next commit reuses
-// a consumed nonce and every following payment in the batch fails. When the
-// RPC is unreachable, advance past the commit nonce as a best effort.
+// may have consumed the commit nonce. Otherwise the next commit reuses a
+// consumed nonce and every following payment in the batch fails. When the RPC
+// is unreachable, advance past the commit nonce as a best effort.
 func (s *signer) resyncNonce() {
 	if nonce, err := s.fetchNonce(); err == nil {
 		if nonce > s.nextNonce {
@@ -236,7 +291,7 @@ func (s *signer) fetchBalance() (*big.Int, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := rpcJSON(s.rpcURL, "eth_getBalance",
+	if err := rpcJSON(rpcClient, s.rpcURL, "eth_getBalance",
 		[]any{s.fromHex, "latest"}, &res); err != nil {
 		return nil, err
 	}
@@ -250,28 +305,47 @@ func (s *signer) fetchBalance() (*big.Int, error) {
 	return bal, nil
 }
 
-// sendTransfer pays one registration using the chain's commit-reveal
-// (front-running protection) flow, which is mandatory for transfers at or
-// above the txpool threshold (10 QAU — any payout qualifies):
+// checkChainID fails pre-flight when the node serves a different chain — a
+// mis-pointed RPC would otherwise replay the whole batch against the wrong
+// network.
+func (s *signer) checkChainID() error {
+	var res struct {
+		Result string `json:"result"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := rpcJSON(rpcClient, s.rpcURL, "eth_chainId", []any{}, &res); err != nil {
+		return fmt.Errorf("chain pre-flight: %w", err)
+	}
+	if res.Error.Message != "" {
+		return fmt.Errorf("chain pre-flight RPC error: %s", res.Error.Message)
+	}
+	got, err := strconv.ParseUint(strings.TrimPrefix(res.Result, "0x"), 16, 64)
+	if err != nil {
+		return fmt.Errorf("chain pre-flight: parse %q: %w", res.Result, err)
+	}
+	if got != s.chainID {
+		return fmt.Errorf("chain pre-flight: node reports chain id %d, expected %d", got, s.chainID)
+	}
+	return nil
+}
+
+// buildPair constructs the unsigned commit-reveal pair. The commit-reveal
+// flow is mandatory for transfers at or above the txpool threshold (10 QAU —
+// any payout qualifies):
 //
 //	① commit tx  (TxTypeCommit, nonce N, To=zero, Data=SHA3(to‖value‖salt))
 //	② wait for the commit to be included, then for MinRevealBlocks to pass
 //	③ reveal tx  (TxTypeTransfer, nonce N+1, Data=32-byte salt)
-//
-// Returns the REVEAL tx hash (the tx that moves the funds) once the node
-// accepts it; the caller confirms the receipt before writing it back.
-func (s *signer) sendTransfer(to types.Address, amountQau *big.Int) (string, error) {
-	amountWei := new(big.Int).Mul(amountQau, s.qauDecimals)
-
+func (s *signer) buildPair(to types.Address, amountWei *big.Int) (commit, reveal *encoding.Transaction, err error) {
 	salt := make([]byte, txpool.CRV2SaltLen)
-	if _, err := rand.Read(salt); err != nil {
-		return "", fmt.Errorf("generate reveal salt: %w", err)
+	if _, err = rand.Read(salt); err != nil {
+		return nil, nil, fmt.Errorf("generate reveal salt: %w", err)
 	}
-
 	commitHash := txpool.ComputeCommitHash(to, amountWei, salt)
 	zeroAddr := types.Address{}
-
-	commitTx := &encoding.Transaction{
+	commit = &encoding.Transaction{
 		Version:  1,
 		Type:     encoding.TxTypeCommit,
 		Nonce:    s.nextNonce,
@@ -283,29 +357,7 @@ func (s *signer) sendTransfer(to types.Address, amountQau *big.Int) (string, err
 		Data:     commitHash[:],
 		ChainID:  s.chainID,
 	}
-	if err := s.signTx(commitTx); err != nil {
-		return "", fmt.Errorf("sign commit: %w", err)
-	}
-	commitAccepted, err := s.sendRaw(commitTx)
-	if err != nil {
-		return "", fmt.Errorf("send commit: %w", err)
-	}
-
-	ok, commitBlock := s.waitForReceipt(commitAccepted.Hash().String(), s.confirmTimeout)
-	if !ok {
-		// The commit was accepted, so its nonce is consumed even though the
-		// receipt is unknown; resync before the next payment.
-		s.resyncNonce()
-		return "", fmt.Errorf("commit tx %s not confirmed in time", commitAccepted.Hash().String())
-	}
-
-	// MinRevealBlocks is 1 on this network: the reveal must land at least
-	// one block after the commit's inclusion block.
-	if err := s.waitBlock(commitBlock+1, s.confirmTimeout); err != nil {
-		return "", fmt.Errorf("waiting reveal window: %w", err)
-	}
-
-	revealTx := &encoding.Transaction{
+	reveal = &encoding.Transaction{
 		Version:  1,
 		Type:     encoding.TxTypeTransfer,
 		Nonce:    s.nextNonce + 1,
@@ -317,20 +369,7 @@ func (s *signer) sendTransfer(to types.Address, amountQau *big.Int) (string, err
 		Data:     salt,
 		ChainID:  s.chainID,
 	}
-	if err := s.signTx(revealTx); err != nil {
-		s.resyncNonce()
-		return "", fmt.Errorf("sign reveal: %w", err)
-	}
-	if _, err := s.sendRaw(revealTx); err != nil {
-		// The commit nonce is consumed; the reveal may or may not have been
-		// accepted. Resync from the chain so the batch can continue.
-		s.resyncNonce()
-		return "", fmt.Errorf("send reveal: %w", err)
-	}
-
-	txHash := revealTx.Hash().String()
-	s.nextNonce += 2
-	return txHash, nil
+	return commit, reveal, nil
 }
 
 // signTx signs a transaction with the payout Dilithium3 key.
@@ -360,7 +399,7 @@ func (s *signer) sendRaw(tx *encoding.Transaction) (*encoding.Transaction, error
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := rpcJSON(s.rpcURL, "eth_sendRawTransaction",
+	if err := rpcJSON(rpcClient, s.rpcURL, "eth_sendRawTransaction",
 		[]any{"0x" + hex.EncodeToString(txBytes)}, &res); err != nil {
 		return nil, err
 	}
@@ -380,7 +419,7 @@ func (s *signer) waitBlock(h uint64, timeout time.Duration) error {
 		var res struct {
 			Result string `json:"result"`
 		}
-		if err := rpcJSON(s.rpcURL, "eth_blockNumber", []any{}, &res); err == nil && strings.HasPrefix(res.Result, "0x") {
+		if err := rpcJSON(rpcClient, s.rpcURL, "eth_blockNumber", []any{}, &res); err == nil && strings.HasPrefix(res.Result, "0x") {
 			if n, err := strconv.ParseUint(res.Result[2:], 16, 64); err == nil && n >= h {
 				return nil
 			}
@@ -399,7 +438,7 @@ func (s *signer) waitForReceipt(txHash string, timeout time.Duration) (bool, uin
 		var res struct {
 			Result json.RawMessage `json:"result"`
 		}
-		if err := rpcJSON(s.rpcURL, "eth_getTransactionReceipt",
+		if err := rpcJSON(rpcClient, s.rpcURL, "eth_getTransactionReceipt",
 			[]any{txHash}, &res); err == nil {
 			var receipt struct {
 				Status      string `json:"status"`
@@ -420,6 +459,26 @@ func (s *signer) waitForReceipt(txHash string, timeout time.Duration) (bool, uin
 	return false, 0
 }
 
+// receiptStatus checks the receipt ONCE (no polling): used by the reconciler
+// to decide what to do with a row whose transaction was recorded but whose
+// fate was not. ok=false means no receipt is available yet.
+func (s *signer) receiptStatus(txHash string) (ok bool, succeeded bool) {
+	var res struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := rpcJSON(rpcClient, s.rpcURL, "eth_getTransactionReceipt",
+		[]any{txHash}, &res); err != nil {
+		return false, false
+	}
+	var receipt struct {
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(res.Result, &receipt) != nil || receipt.Status == "" {
+		return false, false
+	}
+	return true, receipt.Status == "0x1"
+}
+
 // ---------------------------------------------------------------------------
 // Website admin API client
 // ---------------------------------------------------------------------------
@@ -432,44 +491,54 @@ type pendingItem struct {
 }
 
 func siteRequest(siteURL, path, adminKey, method string, body any, out any) error {
+	code, err := siteRequestStatus(siteURL, path, adminKey, method, body, out)
+	if err == nil && code >= 300 {
+		return fmt.Errorf("site HTTP %d", code)
+	}
+	return err
+}
+
+// siteRequestStatus performs the call and reports the HTTP status so callers
+// can branch on "not reservable" (409) without parsing the body.
+func siteRequestStatus(siteURL, path, adminKey, method string, body any, out any) (int, error) {
 	url := strings.TrimSuffix(siteURL, "/") + path
 	var reader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		reader = bytes.NewReader(buf)
 	}
 	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if adminKey != "" {
 		req.Header.Set("X-Admin-Key", adminKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := siteClient.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return resp.StatusCode, err
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+			return resp.StatusCode, fmt.Errorf("decode response: %w", err)
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
-func rpcJSON(url, method string, params []any, out any) error {
+func rpcJSON(client *http.Client, url, method string, params []any, out any) error {
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
@@ -480,12 +549,76 @@ func rpcJSON(url, method string, params []any, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(buf)) // #nosec G107 -- URL comes from operator flags, not request input
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf)) // #nosec G107 -- URL comes from operator flags, not request input
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
+}
+
+// ---------------------------------------------------------------------------
+// Single-instance lock
+// ---------------------------------------------------------------------------
+
+// acquireLock creates an exclusive lock file so two runs never pay the same
+// batch concurrently. A lock older than 2h is treated as an abandoned
+// crashed run and taken over.
+func acquireLock(path string) (func(), error) {
+	if path == "" {
+		return func() {}, nil
+	}
+	const staleAfter = 2 * time.Hour
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("create lock file: %w", err)
+		}
+		if st, statErr := os.Stat(path); statErr == nil && time.Since(st.ModTime()) > staleAfter {
+			// Abandoned by a crashed run: take over and continue.
+			_ = os.Remove(path)
+			f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			if err != nil {
+				return nil, fmt.Errorf("take over stale lock: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("another airdrop run holds %s (delete the file if that run is dead)", path)
+		}
+	}
+	_, _ = fmt.Fprintf(f, "pid %d at %s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	_ = f.Close()
+	return func() { _ = os.Remove(path) }, nil
+}
+
+// ---------------------------------------------------------------------------
+// Website mode: fetch pending + reserve
+// ---------------------------------------------------------------------------
+
+// pendingPull fetches the payable queue. A nil row with a nil error means the
+// registration could not be claimed — another distributor owns it.
+func pendingPull(cfg config) ([]payoutItem, error) {
+	var pending struct {
+		Success       bool          `json:"success"`
+		Count         int           `json:"count"`
+		Registrations []pendingItem `json:"registrations"`
+	}
+	if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/pending?limit="+
+		fmt.Sprint(cfg.limit), cfg.adminKey, "GET", nil, &pending); err != nil {
+		return nil, fmt.Errorf("fetch pending registrations: %w", err)
+	}
+	if !pending.Success {
+		return nil, errors.New("website returned a failure status")
+	}
+	items := make([]payoutItem, 0, len(pending.Registrations))
+	for _, r := range pending.Registrations {
+		items = append(items, payoutItem{
+			Label:   fmt.Sprintf("#%d", r.ID),
+			Address: r.WalletAddress,
+			Amount:  r.Amount,
+			SiteID:  r.ID,
+		})
+	}
+	return items, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +632,7 @@ type payoutItem struct {
 	Label   string
 	Address string
 	Amount  int
-	SiteID  int // >0 only in website mode: enables the txHash write-back
+	SiteID  int // >0 only in website mode: enables the protocol write-back
 }
 
 // readBatchCSV parses a payout CSV: one payment per line,
@@ -550,14 +683,192 @@ func readBatchCSV(path string) ([]payoutItem, error) {
 	return items, nil
 }
 
+// outcome classifies one payment for the batch summary.
+type outcome int
+
+const (
+	outPaid    outcome = iota
+	outSkipped         // already claimed by another distributor
+	outFailed          // released back to the queue with a note
+	outUnknown         // state on the chain is uncertain; the reconciler resolves it
+)
+
+// payItem runs the full reserve → commit → intent → reveal → paid protocol
+// for one website registration. Batch items (SiteID==0) skip the website
+// calls and run the commit-reveal flow directly.
+func payItem(s *signer, cfg config, it payoutItem) outcome {
+	if it.SiteID > 0 {
+		// Reserve BEFORE any chain interaction: the conditional UPDATE on the
+		// website is the single-payment guarantee. A 409 means another
+		// distributor holds the row — skip it, never pay it.
+		var reg struct {
+			Success      bool `json:"success"`
+			Registration struct {
+				ID            int    `json:"id"`
+				WalletAddress string `json:"walletAddress"`
+				Amount        int    `json:"amount"`
+			} `json:"registration"`
+		}
+		code, err := siteRequestStatus(cfg.siteURL, "/api/airdrop/admin/reserve",
+			cfg.adminKey, "POST", map[string]any{"id": it.SiteID}, &reg)
+		if err != nil {
+			if code == 409 {
+				fmt.Printf("  - %s already claimed — skipped\n", it.Label)
+				return outSkipped
+			}
+			fmt.Printf("  x %s reserve failed: %v\n", it.Label, err)
+			// Reserve transport failure: the row was not claimed, so a plain
+			// note (no release needed) keeps the audit trail honest.
+			failItem(cfg, it.SiteID, "reserve failed: "+err.Error())
+			return outFailed
+		}
+		// Use the authoritative address/amount the website returned at claim
+		// time rather than the pre-reserve snapshot.
+		if reg.Registration.WalletAddress != "" {
+			it.Address = reg.Registration.WalletAddress
+		}
+		if reg.Registration.Amount > 0 {
+			it.Amount = reg.Registration.Amount
+		}
+	}
+
+	to, err := types.ParseAddressWithFallback(it.Address)
+	if err != nil {
+		fmt.Printf("  x %s invalid address %s: %v\n", it.Label, it.Address, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "invalid address: "+err.Error())
+		}
+		return outFailed
+	}
+	amountWei := new(big.Int).Mul(big.NewInt(int64(it.Amount)), s.qauDecimals)
+
+	commit, reveal, err := s.buildPair(to, amountWei)
+	if err != nil {
+		fmt.Printf("  x %s build pair: %v\n", it.Label, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "build pair: "+err.Error())
+		}
+		return outFailed
+	}
+
+	if err := s.signTx(commit); err != nil {
+		s.resyncNonce()
+		fmt.Printf("  x %s sign commit: %v\n", it.Label, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "sign commit: "+err.Error())
+		}
+		return outFailed
+	}
+	if _, err := s.sendRaw(commit); err != nil {
+		// The commit may still have been accepted — resync so the next
+		// payment does not reuse a consumed nonce.
+		s.resyncNonce()
+		fmt.Printf("  x %s send commit: %v\n", it.Label, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "send commit: "+err.Error())
+		}
+		return outFailed
+	}
+	commitHash := commit.Hash().String()
+	ok, commitBlock := s.waitForReceipt(commitHash, s.confirmTimeout)
+	if !ok {
+		s.resyncNonce()
+		fmt.Printf("  x %s commit tx %s not confirmed in time\n", it.Label, commitHash)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "commit not confirmed, tx "+commitHash)
+		}
+		return outFailed
+	}
+
+	// MinRevealBlocks is 1 on this network: the reveal must land at least
+	// one block after the commit's inclusion block.
+	if err := s.waitBlock(commitBlock+1, s.confirmTimeout); err != nil {
+		// The commit nonce is consumed but the reveal was never broadcast;
+		// resync so the next payment does not reuse it.
+		s.resyncNonce()
+		fmt.Printf("  x %s reveal window: %v\n", it.Label, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "reveal window: "+err.Error())
+		}
+		return outFailed
+	}
+
+	if err := s.signTx(reveal); err != nil {
+		s.resyncNonce()
+		fmt.Printf("  x %s sign reveal: %v\n", it.Label, err)
+		if it.SiteID > 0 {
+			failItem(cfg, it.SiteID, "sign reveal: "+err.Error())
+		}
+		return outFailed
+	}
+	revealHash := reveal.Hash().String()
+
+	if it.SiteID > 0 {
+		// Record the intent BEFORE broadcasting the reveal: a crash in
+		// between leaves a row whose transaction hash can be checked against
+		// the chain instead of an unmarked payment.
+		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record", cfg.adminKey,
+			"POST", map[string]any{"id": it.SiteID, "phase": "intent",
+				"txHash": "0x" + revealHash, "nonce": reveal.Nonce}, nil); err != nil {
+			fmt.Printf("  x %s record intent: %v (reveal not broadcast)\n", it.Label, err)
+			failItem(cfg, it.SiteID, "record intent: "+err.Error())
+			s.resyncNonce()
+			return outFailed
+		}
+	}
+
+	if _, err := s.sendRaw(reveal); err != nil {
+		// The node may have accepted the reveal even though the submit errored;
+		// the intent is already recorded with the reveal hash, so the
+		// reconciler — not this run — gets the final say. Do NOT release:
+		// releasing could re-queue an address whose reveal is already on chain.
+		s.resyncNonce()
+		fmt.Printf("  ! %s broadcast reveal: %v — left in-flight for reconciliation (tx %s)\n",
+			it.Label, err, revealHash)
+		return outUnknown
+	}
+
+	fmt.Printf("  -> %s submitted %s, waiting for confirmation...\n", it.Label, revealHash)
+	confirmed, _ := s.waitForReceipt(revealHash, cfg.confirmTimeout)
+	if !confirmed {
+		// The receipt was not observed in time. The reveal hash is on record
+		// (intent), so the reconciler settles it — do not release, the funds
+		// may still move. The reveal nonce is likely consumed, so refresh.
+		s.resyncNonce()
+		fmt.Printf("  ! %s receipt timeout (tx %s) — left in-flight for reconciliation\n", it.Label, revealHash)
+		return outUnknown
+	}
+
+	if it.SiteID > 0 {
+		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
+			cfg.adminKey, "POST", map[string]any{"id": it.SiteID, "phase": "paid",
+				"txHash": "0x" + revealHash}, nil); err != nil {
+			// On chain but the write-back failed: the row stays in the
+			// broadcast state and the reconciler marks it paid next run. The
+			// reveal nonce was consumed, so refresh the cursor.
+			s.resyncNonce()
+			fmt.Printf("  ! %s paid on chain but write-back failed (tx %s): %v\n", it.Label, revealHash, err)
+			return outUnknown
+		}
+	}
+	s.nextNonce += 2
+	fmt.Printf("  v %s done: %d QAU -> %s (tx %s)\n", it.Label, it.Amount, it.Address, revealHash)
+	return outPaid
+}
+
+// failItem writes a single failure back to the website (the failed phase
+// releases the reservation with a backoff and keeps the reason for audit).
+func failItem(cfg config, id int, note string) {
+	_ = siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
+		cfg.adminKey, "POST", map[string]any{"id": id, "phase": "failed", "note": note}, nil)
+}
+
 func main() {
 	cfg := loadConfig()
 
 	var items []payoutItem
 
 	if cfg.batchFile != "" {
-		// Batch mode (tier-B tranches and any offline-approved payouts):
-		// same signer, same commit-reveal send path; no website interaction.
 		batch, err := readBatchCSV(cfg.batchFile)
 		if err != nil {
 			fatal("bad batch file: %v", err)
@@ -566,33 +877,19 @@ func main() {
 		fmt.Printf("batch: %d payment(s) from %s\n", len(items), cfg.batchFile)
 	}
 
-	// 1. Pull the pending list (website mode only; batch mode filled items above).
-	var pending struct {
-		Success       bool          `json:"success"`
-		Count         int           `json:"count"`
-		Registrations []pendingItem `json:"registrations"`
-	}
 	if cfg.batchFile == "" {
-		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/pending?limit="+
-			fmt.Sprint(cfg.limit), cfg.adminKey, "GET", nil, &pending); err != nil {
-			fatal("failed to fetch pending registrations: %v", err)
+		// Website mode only: fetch the queue, then settle whatever a previous
+		// run left in flight before paying anything new.
+		var err error
+		items, err = pendingPull(cfg)
+		if err != nil {
+			fatal("%v", err)
 		}
-		if !pending.Success {
-			fatal("website returned a failure status")
-		}
-		if len(pending.Registrations) == 0 {
-			fmt.Println("no pending registrations.")
-			return
-		}
-		for _, r := range pending.Registrations {
-			items = append(items, payoutItem{
-				Label:   fmt.Sprintf("#%d", r.ID),
-				Address: r.WalletAddress,
-				Amount:  r.Amount,
-				SiteID:  r.ID,
-			})
-		}
-		fmt.Printf("pending: %d registration(s)\n", len(items))
+	}
+
+	if len(items) == 0 {
+		fmt.Println("no pending registrations.")
+		return
 	}
 
 	total := new(big.Int)
@@ -603,14 +900,26 @@ func main() {
 	fmt.Printf("total: %s QAU\n", total.String())
 
 	if cfg.dryRun {
-		fmt.Println("(dry-run — nothing sent)")
+		fmt.Println("(dry-run — nothing sent, nothing reserved)")
 		return
 	}
 
-	// 2. Initialize the signer (validates key/nonce/balance).
+	unlock, err := acquireLock(cfg.lockFile)
+	if err != nil {
+		fatal("%v", err)
+	}
+	defer unlock()
+
+	// Initialize the signer (validates key/nonce/balance) and pre-flight.
 	s, err := newSigner(cfg.keyFile, cfg.chainID, cfg.rpcURL, cfg.confirmTimeout)
 	if err != nil {
 		fatal("failed to initialize signer: %v", err)
+	}
+	if cfg.expectAddress != "" && !strings.EqualFold(cfg.expectAddress, s.fromHex) {
+		fatal("payout address mismatch: key derives %s, expected %s", s.fromHex, cfg.expectAddress)
+	}
+	if err := s.checkChainID(); err != nil {
+		fatal("%v", err)
 	}
 
 	// Balance pre-check: total payout (wei) must fit within 95% of the
@@ -626,61 +935,30 @@ func main() {
 			need.String(), bal.String())
 	}
 
+	// Website mode: settle stuck rows from crashed runs before paying new
+	// ones, so a row that actually confirmed gets marked paid exactly once.
+	if cfg.batchFile == "" && cfg.adminKey != "" {
+		reconcileStuck(s, cfg)
+	}
+
 	// 3. Pay out one item at a time.
-	var sentOK, sentFail int
-	var failures []map[string]any
+	var nPaid, nSkipped, nFailed, nUnknown int
 	for _, it := range items {
-		to, err := types.ParseAddressWithFallback(it.Address)
-		if err != nil {
-			fmt.Printf("  x %s invalid address %s: %v\n", it.Label, it.Address, err)
-			failures = append(failures, map[string]any{"id": it.SiteID, "note": "invalid address: " + err.Error()})
-			sentFail++
-			continue
-		}
-
-		txHash, err := s.sendTransfer(to, big.NewInt(int64(it.Amount)))
-		if err != nil {
-			fmt.Printf("  x %s send failed: %v\n", it.Label, err)
-			failures = append(failures, map[string]any{"id": it.SiteID, "note": "send failed: " + err.Error()})
-			sentFail++
-			continue
-		}
-		fmt.Printf("  -> %s submitted %s, waiting for confirmation...\n", it.Label, txHash)
-
-		ok, _ := s.waitForReceipt(txHash, cfg.confirmTimeout)
-		if !ok {
-			fmt.Printf("  x %s receipt timeout (tx %s state unknown - resolve manually)\n", it.Label, txHash)
-			failures = append(failures, map[string]any{"id": it.SiteID, "note": "receipt timeout, tx " + txHash})
-			sentFail++
-			continue
-		}
-
-		// 4. Website mode: write the txHash back. Batch mode has no website
-		// record — the reconciler archives (label, address, amount, txHash)
-		// from this run's output instead. The site validates the EVM-style
-		// 0x-prefixed form, while tx.Hash().String() returns bare 64-hex.
-		if it.SiteID > 0 {
-			if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
-				cfg.adminKey, "POST", map[string]any{"id": it.SiteID, "txHash": "0x" + txHash}, nil); err != nil {
-				fmt.Printf("  ! %s on chain but write-back failed (tx %s): %v - record manually\n", it.Label, txHash, err)
-				sentFail++
-				continue
-			}
-		}
-		fmt.Printf("  v %s done: %d QAU -> %s (tx %s)\n", it.Label, it.Amount, it.Address, txHash)
-		sentOK++
-	}
-
-	// 5. Batch write-back of failure reasons (website mode only).
-	if len(failures) > 0 && cfg.batchFile == "" {
-		if err := siteRequest(cfg.siteURL, "/api/airdrop/admin/record",
-			cfg.adminKey, "POST", map[string]any{"failures": failures}, nil); err != nil {
-			fmt.Printf("! failed to write back failure reasons: %v\n", err)
+		switch payItem(s, cfg, it) {
+		case outPaid:
+			nPaid++
+		case outSkipped:
+			nSkipped++
+		case outFailed:
+			nFailed++
+		case outUnknown:
+			nUnknown++
 		}
 	}
 
-	fmt.Printf("\ndone: %d sent / %d failed / %d total\n", sentOK, sentFail, len(items))
-	if sentFail > 0 {
+	fmt.Printf("\ndone: %d paid / %d skipped / %d failed / %d in-flight / %d total\n",
+		nPaid, nSkipped, nFailed, nUnknown, len(items))
+	if nFailed > 0 {
 		os.Exit(1)
 	}
 }
