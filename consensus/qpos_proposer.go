@@ -455,16 +455,58 @@ func (q *QPOS) GetProposerForSlot(slot uint64) (*Validator, error) {
 // node reproduces identical proposer rewards from the census without re-deriving
 // from node-local VRF-accumulator/shuffle state.
 func (q *QPOS) GetProposerIndexForSlot(slot uint64) int {
+	// QR-20 FIX (R134 randomness audit): getProposerIndexForSlotUnlocked's
+	// weighted branch calls buildWeightedEpochTableLocked, which WRITES
+	// q.weightedCumCache (create + prune) on cache miss. This caller holds
+	// only RLock (unlike ProcessEpochRewards' full Lock), so a cache miss
+	// under RLock was a concurrent map read/write fatal — the same class of
+	// crash GetProposerForSlot already guards against with its lock-upgrade
+	// dance. Fast path (cache hit or non-weighted regime) stays on RLock;
+	// a miss upgrades to the write lock, records the cold-start flag, and
+	// re-enters under RLock for the read-only eligibility scan.
 	q.mu.RLock()
-	defer q.mu.RUnlock()
 	if q.validators == nil {
+		q.mu.RUnlock()
 		return -1
 	}
-	return q.getProposerIndexForSlotUnlocked(slot, q.validators)
+	if q.weightedProposerEnabled(SlotToEpoch(slot)) && q.weightedCumCache[SlotToEpoch(slot)] == nil {
+		epoch := SlotToEpoch(slot)
+		q.mu.RUnlock()
+		q.mu.Lock()
+		if q.validators == nil {
+			q.mu.Unlock()
+			return -1
+		}
+		table := q.buildWeightedEpochTableLocked(epoch)
+		if _, cold := q.epochSeedLocked(epoch); cold && table != nil {
+			// Mirror GetProposerForSlot: a degraded (cold) seed must mark the
+			// epoch so the R45 protection can observe it — previously this
+			// caller lost the flag on both the miss and the hit path.
+			q.coldStartEpochs[epoch] = struct{}{}
+		}
+		q.mu.Unlock()
+		q.mu.RLock()
+		if q.validators == nil {
+			q.mu.RUnlock()
+			return -1
+		}
+		idx := q.getProposerIndexForSlotUnlocked(slot, q.validators)
+		q.mu.RUnlock()
+		return idx
+	}
+	idx := q.getProposerIndexForSlotUnlocked(slot, q.validators)
+	q.mu.RUnlock()
+	return idx
 }
 
 // getProposerIndexForSlotUnlocked computes the proposer index for a slot
-// WITHOUT acquiring q.mu. Caller MUST hold q.mu (at least RLock).
+// WITHOUT acquiring q.mu. Caller MUST hold q.mu.
+//
+// QR-20 (R134): the weighted branch writes q.weightedCumCache on cache MISS,
+// so a caller holding only RLock must guarantee the table is already cached
+// (GetProposerIndexForSlot upgrades to the write lock on a miss before
+// calling here). Callers holding the full Lock (ProcessEpochRewards) are
+// always safe.
 //
 // CONS- (2026-07-19) FIX: Previously ProcessEpochRewards built the
 // ProposerRewards map but never populated it, so validators received zero

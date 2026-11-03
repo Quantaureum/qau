@@ -229,8 +229,15 @@ func unmarshalLog(data []byte) (*StoredLog, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%w: Address: %v", ErrMalformedMessage, err)
 			}
-			if len(b) != 32 {
-				return nil, fmt.Errorf("%w: Address length %d != 32", ErrMalformedMessage, len(b))
+			// LOG ADDRESS FIX (2026-11-03, found by the vrf-billing e2e):
+			// StoredLog.Address is types.Address (20 bytes) and marshalLog
+			// writes exactly those 20 bytes. This check demanded 32, so EVERY
+			// persisted receipt with a non-empty Logs array failed to decode —
+			// GetReceipt returned an error, the RPC layer silently fell back
+			// to the log-less inferred receipt, and eth_getLogs was
+			// permanently empty. Accept the address size the encoder writes.
+			if len(b) != types.AddressLength {
+				return nil, fmt.Errorf("%w: Address length %d != %d", ErrMalformedMessage, len(b), types.AddressLength)
 			}
 			copy(log.Address[:], b)
 

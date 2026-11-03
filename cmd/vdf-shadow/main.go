@@ -74,23 +74,34 @@ func fetchHeight(rpc string) (uint64, error) {
 }
 
 func fetchBlockHash(rpc string, height uint64) ([32]byte, error) {
+	out, _, err := fetchBlockAt(rpc, toHexQty(height))
+	return out, err
+}
+
+// fetchBlockAt returns the hash and the HEADER EPOCH of the block selected by
+// an eth_getBlockByNumber tag ("latest" or a height). QR-29: the header epoch
+// is the slot-domain truth (rpc/format.go BlockResponse.Epoch); heights only
+// advance per produced block, so callers must never derive the epoch from a
+// height by arithmetic.
+func fetchBlockAt(rpc, tag string) ([32]byte, uint64, error) {
 	var out [32]byte
-	res, err := rpcPost(rpc, "eth_getBlockByNumber", []interface{}{toHexQty(height), false})
+	res, err := rpcPost(rpc, "eth_getBlockByNumber", []interface{}{tag, false})
 	if err != nil {
-		return out, err
+		return out, 0, err
 	}
 	var r struct {
-		Hash string `json:"hash"`
+		Hash  string `json:"hash"`
+		Epoch uint64 `json:"epoch"`
 	}
 	if err := json.Unmarshal(res, &r); err != nil {
-		return out, err
+		return out, 0, err
 	}
 	b, err := hex.DecodeString(trim0x(r.Hash))
 	if err != nil || len(b) != 32 {
-		return out, fmt.Errorf("unexpected block hash %q (raw=%s)", r.Hash, string(res))
+		return out, 0, fmt.Errorf("unexpected block hash %q (raw=%s)", r.Hash, string(res))
 	}
 	copy(out[:], b)
-	return out, nil
+	return out, r.Epoch, nil
 }
 
 func toHexQty(n uint64) string { return "0x" + strconv.FormatUint(n, 16) }
@@ -174,36 +185,58 @@ func runCalibrate(rpc string, crsSeed [32]byte, workers int) {
 }
 
 // runFollow evaluates the configured T once per detected epoch change.
+//
+// QR-29: epoch arithmetic now stays in its own domain. Epochs are SLOT-domain
+// quantities (32 slots each, wall-clock driven) while heights advance per
+// produced block; the previous `height / epochLen` conflation undercounted
+// the epoch (and glued epochs together) whenever a slot was skipped. The
+// current epoch is therefore read from the head block's header `epoch` field,
+// and each row records BOTH the epoch being evaluated and the header epoch of
+// the probed input block, so a slot/height mismatch can never silently
+// mislabel the calibration data. The per-epoch INPUT remains a height-proxied
+// boundary hash: block e*epochLen is epoch e's boundary block only when no
+// slot before it was skipped. That proxy is acceptable here because this tool
+// is calibration-only — the VDF cost is input-independent (see the file
+// header); production seed derivation consumes the on-chain accumulator in
+// consensus, not this tool.
 func runFollow(rpc string, crsSeed [32]byte, tSteps, epochLen, poll, workers int) {
 	q := vdf.QBC
 	fmt.Println("[vdf-shadow] follow mode: evaluating the VDF for every new epoch")
 	lastEpoch := int64(-1)
 	for {
-		height, err := fetchHeight(rpc)
+		// QR-29: current epoch from the head block header (slot domain).
+		_, headEpoch, err := fetchBlockAt(rpc, "latest")
 		if err != nil {
 			time.Sleep(time.Duration(poll) * time.Second)
 			continue
 		}
-		epoch := int64(height / uint64(epochLen))
+		epoch := int64(headEpoch)
 		if lastEpoch == -1 {
 			lastEpoch = epoch
 		}
 		if epoch > lastEpoch {
 			for e := lastEpoch + 1; e <= epoch; e++ {
-				bh, err := fetchBlockHash(rpc, uint64(e)*uint64(epochLen))
+				// QR-29: probe the boundary slot's height (a heuristic
+				// shortcut, exact only with zero skipped slots) but label the
+				// row with the header epoch the probed block actually
+				// carries, so divergence between the two domains is visible
+				// in the output instead of being silently absorbed.
+				bh, blockEpoch, err := fetchBlockAt(rpc, toHexQty(uint64(e)*uint64(epochLen)))
 				if err != nil {
 					continue
 				}
 				start := time.Now()
-				image, whash, err := runEval(bh, uint64(e), tSteps, q, workers, crsSeed)
+				image, whash, err := runEval(bh, blockEpoch, tSteps, q, workers, crsSeed)
 				wall := time.Since(start)
 				if err != nil {
-					fmt.Printf("{\"epoch\":%d,\"error\":\"%v\"}\n", e, err)
+					fmt.Printf("{\"epoch\":%d,\"blockEpoch\":%d,\"error\":\"%v\"}\n", e, blockEpoch, err)
 					continue
 				}
 				seed := consensus.EpochSeed(image)
 				row, _ := json.Marshal(map[string]interface{}{
 					"epoch":        e,
+					"blockEpoch":   blockEpoch,
+					"inputDomain":  "boundary-height-proxy",
 					"T":            tSteps,
 					"wall_ms":      wall.Milliseconds(),
 					"seed_hex":     hexEncode(seed[:]),

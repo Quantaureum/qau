@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"sort"
 
+	logging "github.com/quantaureum/qau/log"
 	"github.com/quantaureum/qau/types"
 	"golang.org/x/crypto/sha3"
 )
@@ -229,6 +230,23 @@ func (q *QPOS) epochSeedLocked(epoch uint64) (types.Hash, bool) {
 			// the same bytes, so the merge cannot fork (see vdf_seed.go).
 			if vdfSeed, ok := q.vdfSeedFor(srcEpoch, vrfAcc); ok {
 				seedData = append(seedData, vdfSeed[:]...)
+			} else {
+				// QR-21: FALLBACK — the hardened seed is unavailable for this
+				// (epoch, accumulator) and the shuffle proceeds WITHOUT the
+				// VDF component. This is a KNOWN per-node divergence fork
+				// vector, self-acknowledged for the same design in
+				// beacon_vdf.go (ErrVDFTimeout comment): the failure is
+				// wall-clock/error dependent, so a node that fails while its
+				// peers succeed derives a different seed for the same epoch.
+				// Full fail-closed handling (refuse to elect from an
+				// unhardened seed, which requires consensus-stop semantics)
+				// is a follow-up; the fallback behavior itself is unchanged
+				// here to avoid forking the running devnet. The seed for an
+				// epoch is normally built once and cached, so in practice
+				// this warning fires about once per affected epoch (repeat
+				// fires only on cache rebuilds while the failure persists).
+				logging.Warn("VDF seed unavailable for accumulator epoch — proposer shuffle falling back to the unhardened seed; known divergence risk (QR-21)",
+					map[string]any{"srcEpoch": srcEpoch})
 			}
 		} else {
 			coldStart = true

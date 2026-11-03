@@ -1012,7 +1012,14 @@ func (vm *VotingManager) isBlacklisted(addr types.Address, height uint64) bool {
 		return false
 	}
 
-	// Use height as slot for deterministic block time (height == slot in this chain).
+	// QR-43: treating the height as a slot here is a LATENT domain error —
+	// the "height == slot" assumption in the old comment no longer holds.
+	// Slots advance per wall-clock tick (GetSlotStartTime counts from genesis
+	// time) while heights advance per produced block, so on any chain with
+	// skipped slots height < slot and the block-time estimate below drifts
+	// into the future. Kept as-is (the blacklist check is a coarse heuristic,
+	// not a consensus value); a correct fix must convert height → slot via
+	// the canonical header at that height, not by identity.
 	blockTime := GetSlotStartTime(height).Unix()
 	return check(idx, blockTime)
 }
@@ -1022,6 +1029,17 @@ func (vm *VotingManager) syncFinalityFromQPOS(justifiedEpoch, finalizedEpoch uin
 	defer vm.mu.Unlock()
 
 	if finalizedEpoch > 0 && finalizedRoot != (types.Hash{}) {
+		// TODO(QR-43): LATENT KEY-DOMAIN ERROR — this writes a SLOT-domain
+		// value (the last slot of the finalized epoch) into vm.finalized,
+		// whose key domain is HEIGHT (see Finalize/IsFinalized/
+		// GetFinalizedHash, all height-addressed). Slots and heights diverge
+		// on any chain with skipped slots, so the entry is unfindable through
+		// the height API — and no production reader exists (Finalize itself
+		// is documented below as having no production caller). Left in place
+		// rather than disabled so the test-only consumers keep working; the
+		// correct wiring needs the finalized epoch's boundary BLOCK HEIGHT
+		// (header with Header.Epoch == finalizedEpoch), which the consensus
+		// package cannot derive from (epoch, root) alone.
 		height := EpochStartSlot(finalizedEpoch) + SlotsPerEpoch - 1
 		vm.finalized[height] = finalizedRoot
 	}

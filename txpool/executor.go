@@ -506,9 +506,9 @@ func (e *TxExecutor) Execute(tx *encoding.Transaction, state StateDB, blockCtx *
 	case encoding.TxTypeTransfer:
 		gasUsed, execErr = e.executeTransfer(tx, state)
 	case encoding.TxTypeContract:
-		gasUsed, execErr = e.executeContractCall(tx, state, blockCtx, effectiveGasPrice)
+		gasUsed, execErr = e.executeContractCall(tx, state, blockCtx, effectiveGasPrice, receipt)
 	case encoding.TxTypeCreate:
-		gasUsed, execErr = e.executeContractCreate(tx, state, blockCtx, effectiveGasPrice)
+		gasUsed, execErr = e.executeContractCreate(tx, state, blockCtx, effectiveGasPrice, receipt)
 	case encoding.TxTypePrivacy:
 		gasUsed, execErr = e.executePrivacyTransfer(tx, state)
 	case encoding.TxTypeMultiSig:
@@ -525,11 +525,11 @@ func (e *TxExecutor) Execute(tx *encoding.Transaction, state StateDB, blockCtx *
 		// recipient never paid — receipts/indexers lied) and charged
 		// intrinsic gas twice.
 		if tx.To == nil {
-			gasUsed, execErr = e.executeContractCreate(tx, state, blockCtx, effectiveGasPrice)
+			gasUsed, execErr = e.executeContractCreate(tx, state, blockCtx, effectiveGasPrice, receipt)
 		} else {
 			// executeContractCall falls back to a plain transfer when the
 			// target has no code, covering both calls and transfers.
-			gasUsed, execErr = e.executeContractCall(tx, state, blockCtx, effectiveGasPrice)
+			gasUsed, execErr = e.executeContractCall(tx, state, blockCtx, effectiveGasPrice, receipt)
 		}
 	case encoding.TxTypeCommit:
 		// CRV2: a commitment tx performs no state change beyond gas+nonce
@@ -941,7 +941,39 @@ func (e *TxExecutor) executeMultiSigTransferLegacy(tx *encoding.Transaction, sta
 
 	return 0, nil
 }
-func (e *TxExecutor) executeContractCall(tx *encoding.Transaction, state StateDB, blockCtx *BlockContext, effectiveGasPrice *big.Int) (uint64, error) {
+
+// LOG PROPAGATION FIX (2026-11-03, found by the vrf-billing e2e): the QVM
+// collects LOG0-4 events into ExecutionResult.Logs, but the txpool layer
+// discarded them — receipt.Logs was never assigned anywhere, so persisted
+// receipts had empty logs and eth_getLogs was silently empty for the whole
+// product. Contract-call/create paths now forward the VM logs into the
+// receipt (converted qvm.Log → txpool.Log), which block_producer persists
+// into StoredReceipt.Logs and eth_getLogs serves.
+
+// qvmLogsToReceiptLogs converts QVM event logs into the txpool receipt log
+// shape (which mirrors encoding.StoredLog field-for-field).
+func qvmLogsToReceiptLogs(in []*qvm.Log) []*Log {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*Log, 0, len(in))
+	for _, lg := range in {
+		if lg == nil {
+			continue
+		}
+		l := &Log{Address: types.Address(lg.Address), Data: lg.Data}
+		if len(lg.Topics) > 0 {
+			l.Topics = make([]types.Hash, len(lg.Topics))
+			for i, t := range lg.Topics {
+				l.Topics[i] = types.Hash(t)
+			}
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+func (e *TxExecutor) executeContractCall(tx *encoding.Transaction, state StateDB, blockCtx *BlockContext, effectiveGasPrice *big.Int, receipt *Receipt) (uint64, error) {
 	// I22-010 FIX: effectiveGasPrice can be nil if both tx.GasPrice and
 	// blockCtx.BaseFee are nil. Default to 0 to prevent nil pointer panic
 	// when it is passed to the QVM as GasPrice.
@@ -1006,11 +1038,14 @@ func (e *TxExecutor) executeContractCall(tx *encoding.Transaction, state StateDB
 		return result.GasUsed, result.Err
 	}
 
+	// LOG PROPAGATION FIX: forward the VM's event logs into the receipt.
+	receipt.Logs = qvmLogsToReceiptLogs(result.Logs)
+
 	return result.GasUsed, nil
 }
 
 // executeContractCreate creates a new contract.
-func (e *TxExecutor) executeContractCreate(tx *encoding.Transaction, state StateDB, blockCtx *BlockContext, effectiveGasPrice *big.Int) (uint64, error) {
+func (e *TxExecutor) executeContractCreate(tx *encoding.Transaction, state StateDB, blockCtx *BlockContext, effectiveGasPrice *big.Int, receipt *Receipt) (uint64, error) {
 	if len(tx.Data) == 0 {
 		return 0, errors.New("contract creation requires init code")
 	}
@@ -1064,6 +1099,9 @@ func (e *TxExecutor) executeContractCreate(tx *encoding.Transaction, state State
 	if result.Err != nil {
 		return result.GasUsed, result.Err
 	}
+
+	// LOG PROPAGATION FIX: constructor-emitted events reach the receipt too.
+	receipt.Logs = qvmLogsToReceiptLogs(result.Logs)
 
 	// Log the contract address for debugging
 	_ = contractAddr

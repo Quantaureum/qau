@@ -271,6 +271,19 @@ type ThreeChambersCoordinator struct {
 	reshareEpoch         uint64
 	reshareInFlight      bool
 	reshareFailed        bool
+
+	// QR-28: stalled-chain exemption probe for SelectExecutiveForEpoch.
+	// When set, probe(epoch) reports whether the node's canonical chain
+	// holds NO block in the given epoch. The accumulator of an epoch is
+	// carried by that epoch's LAST block, so "no block in epoch E" proves
+	// acc[E] cannot exist on any node — the same evidence the proposer
+	// path's stalledChainExemption uses (node/block_producer.go). The node
+	// wiring MUST implement the probe with the same safety conditions as
+	// that path (node at network head, at least one peer, then walk the
+	// canonical chain — see node/cold_start_stalled_chain.go). Nil probe =
+	// exemption never fires: the cold-start guard stays fail-closed, the
+	// pre-QR-28 behavior.
+	stalledChainHasNoBlock func(epoch uint64) bool
 }
 
 // DistributedDKGRunner produces a group public key via real P2P distributed
@@ -310,6 +323,21 @@ func NewThreeChambersCoordinator(qpos *QPOS) *ThreeChambersCoordinator {
 		reviewSize:     TargetCommitteeSize,
 		epochExecutive: make(map[uint64][]int),
 	}
+}
+
+// SetStalledChainProbe wires the QR-28 stalled-chain exemption probe:
+// probe(epoch) must report whether the node's canonical chain holds NO block
+// in the given epoch, evaluated ONLY when the node is at network head with at
+// least one peer (the same conditions as the proposer path's
+// stalledChainExemption in node/block_producer.go — see
+// node/cold_start_stalled_chain.go for the canonical walk). Call ONCE at
+// node startup, before the first epoch transition, while no selection is
+// running. Without a probe the SelectExecutiveForEpoch cold-start guard
+// stays fail-closed (pre-QR-28 behavior).
+func (tpc *ThreeChambersCoordinator) SetStalledChainProbe(probe func(epoch uint64) bool) {
+	tpc.mu.Lock()
+	defer tpc.mu.Unlock()
+	tpc.stalledChainHasNoBlock = probe
 }
 
 // executiveSizeForValidatorCount returns the optimal number of executive
@@ -849,9 +877,34 @@ func (tpc *ThreeChambersCoordinator) SelectExecutiveForEpoch(epoch uint64, valid
 	// accumulator is fail-closed.
 	if epoch >= 2 && tpc.qpos.GetEpochVRFAccumulator(epoch-2) == (types.Hash{}) {
 		if !tpc.qpos.ChainStartsAfterEpoch(epoch - 2) {
-			tpfLog.Warnf("SelectExecutiveForEpoch: refusing to select Executive for epoch %d — VRF accumulator for epoch %d not yet loaded (cold-start); will retry at the next epoch boundary (R88-F)",
-				epoch, epoch-2)
-			return nil, ErrExecutiveScheduleNotReady
+			// QR-28: stalled-chain exemption — mirror of the proposer path's
+			// stalledChainExemption (node/block_producer.go). The accumulator
+			// of epoch E-2 is carried by that epoch's LAST block, so when the
+			// canonical chain holds no block in E-2 the accumulator cannot
+			// exist on ANY node: every node selects with the zero hash and
+			// the selection is identical everywhere, exactly like the
+			// high-genesis exemption below. Without this exemption a network
+			// that stalled for two-plus epochs can never re-select its
+			// Executive chamber: the fail-closed refusal below waits for an
+			// accumulator that no future block will ever carry.
+			if tpc.stalledChainHasNoBlock != nil && tpc.stalledChainHasNoBlock(epoch-2) {
+				// Stalled-chain exemption: acc[epoch-2] can never exist on
+				// this chain; fall through and select with the zero hash
+				// (identical on every node at the same head).
+			} else {
+				// QR-42: honest wording — this is NOT always a transient
+				// "will retry". If epoch E-2 produced no block, its
+				// accumulator is PERMANENTLY missing (no later block ever
+				// carries it), so this epoch's accumulator never arrives and
+				// the selection stays on this fail-closed refusal until a
+				// LATER epoch provides a valid accumulator. Only for an
+				// epoch that simply has not been imported/finalized yet does
+				// the next epoch-boundary block clear the guard (via
+				// SetEpochVRFAccumulator).
+				tpfLog.Warnf("SelectExecutiveForEpoch: refusing to select Executive for epoch %d — VRF accumulator for epoch %d not loaded (cold-start). If epoch %d had no block its accumulator is permanently missing and this epoch keeps the fail-closed refusal; otherwise the selection retries once the accumulator is assigned at an epoch boundary (R88-F, QR-42)",
+					epoch, epoch-2, epoch-2)
+				return nil, ErrExecutiveScheduleNotReady
+			}
 		}
 		// High-genesis exemption: acc[epoch-2] can never exist on this chain;
 		// fall through and select with the zero hash (identical on every node).

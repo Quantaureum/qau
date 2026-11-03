@@ -66,12 +66,17 @@ func vdfSeedConfigFromEnv() *VDFSeedConfig {
 		TimeSteps:       16384, // stage-2 calibration (35 s per evaluation)
 	}
 	// CRSSeed is chain-pinned: the caller (node/block_producer.go) sets it
-	// from node config (VDFSeedCRSSeedHex), which defaults to deriving from
-	// the genesis hash (identical across nodes, no extra config needed).
-	// Env-based CRS override is intentionally absent: env-based divergence
-	// is a fork vector.
+	// from node config (VDFSeedCRSSeedHex). QR-25: an empty config leaves the
+	// CRS seed at the implicit all-zero value — flagged with a startup WARN
+	// at the wiring site (the "derive from genesis hash" fallback mentioned
+	// by older comments was never implemented). Env-based CRS override is
+	// intentionally absent: env-based divergence is a fork vector.
 	if ts := os.Getenv("QAU_VDF_SEED_TIMESTEPS"); ts != "" {
 		if v, err := strconv.Atoi(ts); err == nil && v >= 1 {
+			// QR-25: an env-based T override diverges from every node that
+			// does not set it (different T = different seed = fork). Allowed
+			// only as a devnet calibration knob; warn loudly at startup.
+			logging.Warn("QAU_VDF_SEED_TIMESTEPS override is devnet calibration only — cross-node divergence risk on production (QR-25)", map[string]any{"timesteps": v})
 			cfg.TimeSteps = v
 		}
 	}
@@ -127,11 +132,24 @@ type vdfSeedKey struct {
 // consensus reads for one evaluation (~35 s at the calibrated T) — this
 // only happens on restart/replay or a late async precompute, never in
 // steady state.
-func (q *QPOS) vdfSeedFor(srcEpoch uint64, acc types.Hash) (types.Hash, bool) {
+//
+// QR-21: the whole body is guarded by a recover. This runs under q.mu
+// (RLock) on the consensus-critical seed path; a panic inside the VDF
+// evaluation (or cache handling) must degrade to "no hardened seed" — the
+// exact fallback the computation-failure path already uses, and a per-node
+// divergence risk acknowledged in r102_weighted_proposer.go / beacon_vdf.go —
+// instead of crashing the node while holding a consensus lock.
+func (q *QPOS) vdfSeedFor(srcEpoch uint64, acc types.Hash) (seed types.Hash, ok bool) {
 	cfg := q.vdfSeedCfg
 	if cfg == nil || srcEpoch+2 < cfg.ActivationEpoch {
 		return types.Hash{}, false
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			logging.Error("VDF seed computation panicked (degrading to the no-hardening fallback; QR-21)", map[string]any{"srcEpoch": srcEpoch, "panic": r})
+			seed, ok = types.Hash{}, false
+		}
+	}()
 	key := vdfSeedKey{srcEpoch: srcEpoch, acc: acc}
 	q.vdfSeedMu.Lock()
 	if cached, ok := q.vdfSeedCache[key]; ok {
