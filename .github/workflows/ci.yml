@@ -107,6 +107,12 @@ jobs:
         # The race pass for node/... stays a periodic local obligation on
         # multi-core machines (see tasks/lessons), and the other packages
         # below keep their -race coverage.
+        # R68 (2026-11-03): re-measured the full ./node/ suite at 1388s (23m)
+        # on a loaded local box, while the DKG add-seam test alone is 53s.
+        # Keep this budget at >= 30m: the suite is CPU-bound and hosted
+        # runners are much slower, so any shorter value turns healthy runs
+        # red and the failure looks like a crash in whatever test happened
+        # to be running when the alarm fired. Do not lower it.
         run: go test ./node/... -timeout 45m
       - name: Lint
         # R42-CI-RACE-10 (2026-08-20): golangci-lint v1.x (built with go1.23)
