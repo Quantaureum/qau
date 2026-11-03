@@ -410,3 +410,15 @@ docker-compose.override.yml
 
 # ----- p2p proof-of-work replay cache (runtime state, machine-specific nodeId/nonce)
 /p2p/pow_cache.json
+
+# ----- Real allocation/key material filenames (R69): these files hold real
+# mainnet allocation tables, validator keys, or SSH credentials. They live only
+# in .local-only/ or operator key directories and must never be committed, even
+# if accidentally copied to the repo root.
+/预分配.txt
+/验证者密钥.txt
+/*_privkey_only.txt
+/V*_deploy.key
+/服务器.txt
+/服务器2.txt
+/账户[0-9].txt
