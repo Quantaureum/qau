@@ -13,7 +13,7 @@
 //	      --validator YAU...
 //
 // All subcommands print the signed tx hex; with --rpc they POST it via
-// qau_sendRawTransaction. Default does NOT broadcast (air-gap friendly).
+// eth_sendRawTransaction. Default does NOT broadcast (air-gap friendly).
 package main
 
 import (
@@ -59,7 +59,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: vkctl <rotate|bind-master|revoke> [flags]
 
 Builds and signs TxTypeValidatorKey ops (R131). Default output is the signed
-raw transaction hex (no broadcast). Add --rpc to send via qau_sendRawTransaction.`)
+raw transaction hex (no broadcast). Add --rpc to send via eth_sendRawTransaction.`)
 }
 
 type commonFlags struct {
@@ -170,12 +170,12 @@ func buildSignAndMaybeSend(cf *commonFlags, signerKeyPath string, data []byte) {
 	fmt.Println(string(raw))
 
 	if *cf.rpc == "" {
-		fmt.Fprintln(os.Stderr, "not broadcast (no --rpc). POST this JSON to qau_sendRawTransaction to submit.")
+		fmt.Fprintln(os.Stderr, "not broadcast (no --rpc). POST this JSON to eth_sendRawTransaction to submit.")
 		return
 	}
-	// Send as hex of JSON for qau_sendRawTransaction (go-ethereum style 0x blob).
+	// Send as hex of JSON for eth_sendRawTransaction (go-ethereum style 0x blob).
 	rawHex := "0x" + hex.EncodeToString(raw)
-	res, err := rpcCall(*cf.rpc, "qau_sendRawTransaction", []any{rawHex})
+	res, err := rpcCall(*cf.rpc, "eth_sendRawTransaction", []any{rawHex})
 	must(err)
 	fmt.Fprintf(os.Stderr, "broadcast result: %s\n", string(res))
 }
@@ -203,7 +203,7 @@ func mustSignTx(tx *encoding.Transaction, priv *crypto.PrivateKey) ([]byte, erro
 }
 
 func fetchNonce(rpcURL string, addr types.Address) uint64 {
-	res, err := rpcCall(rpcURL, "qau_getTransactionCount", []any{addr.String(), "latest"})
+	res, err := rpcCall(rpcURL, "eth_getTransactionCount", []any{addr.String(), "latest"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: nonce fetch failed (%v), using 0\n", err)
 		return 0

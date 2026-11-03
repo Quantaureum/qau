@@ -199,8 +199,14 @@ jobs:
 
           # One node at a time, and only continue while the chain stays healthy:
           # the node must come back and report a block height that advances.
+          # Logs use neutral labels (node-1, node-2, ...) so real host
+          # addresses from $DEPLOY_HOSTS never appear in CI output (GitHub only
+          # masks full secret values, not individual IP substrings).
+          idx=0
           for HOST in $DEPLOY_HOSTS; do
-            echo "::group::Deploying to $HOST"
+            idx=$((idx + 1))
+            label="node-$idx"
+            echo "::group::Deploying to $label"
             before=$(ssh $ssh_opts "qau-deploy@$HOST" \
               "curl -s -m 5 -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
                  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}'" || true)
@@ -217,13 +223,13 @@ jobs:
                 "curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health" || true)
               if [ "$status" = "200" ]; then
                 healthy=1
-                echo "$HOST healthy after $((attempt * 15))s"
+                echo "$label healthy after $((attempt * 15))s"
                 break
               fi
               echo "attempt $attempt: health=$status"
             done
             if [ "$healthy" != "1" ]; then
-              echo "::error::$HOST did not become healthy; stopping the rollout so the"
+              echo "::error::$label did not become healthy; stopping the rollout so the"
               echo "::error::remaining validators keep running the previous binary"
               exit 1
             fi
