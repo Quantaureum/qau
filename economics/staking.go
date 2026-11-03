@@ -270,7 +270,7 @@ type StakingConfig struct {
 // DefaultStakingConfig returns the default staking configuration
 func DefaultStakingConfig() *StakingConfig {
 	return &StakingConfig{
-		// Minimum stake: 32 QAU (32g gold ≈$2,720)
+		// Minimum stake: 32 QAU
 		MinStakeAmount: new(big.Int).Mul(big.NewInt(32), big.NewInt(1e18)),
 		// Maximum stake: 20,000,000 QAU (20 million)
 		MaxStakeAmount: new(big.Int).Mul(big.NewInt(20000000), big.NewInt(1e18)),

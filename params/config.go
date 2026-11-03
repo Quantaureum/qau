@@ -49,8 +49,8 @@ const (
 
 // Staking parameters
 const (
-	MinValidatorStake = 32 // Minimum stake to become validator (QAU) - 32g gold ≈ $2,720
-	MinDelegatorStake = 1  // Minimum stake for delegation (QAU) - 1g gold ≈ $85
+	MinValidatorStake = 32 // Minimum stake to become validator (QAU)
+	MinDelegatorStake = 1  // Minimum stake for delegation (QAU)
 	UnbondingPeriod   = 21 // Unbonding period in days
 	SlashingPenalty   = 10 // Slashing penalty percentage
 )
