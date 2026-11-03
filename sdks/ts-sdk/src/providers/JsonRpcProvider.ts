@@ -18,6 +18,7 @@ import type {
   ProviderEvent,
   JsonRpcRequest,
   JsonRpcResponse,
+  RandomnessRecord,
 } from '../types';
 import {
   NetworkError,
@@ -672,6 +673,31 @@ export class JsonRpcProvider implements Provider {
 
     const rawLogs = await this.send<RawLog[]>('eth_getLogs', [filterObject]);
     return rawLogs.map((log) => this.parseLog(log));
+  }
+
+  /**
+   * Get the verifiable randomness of a specific epoch.
+   *
+   * Calls `qau_randomnessGet`. The returned record is the per-epoch VRF
+   * accumulator from the epoch boundary block header — publicly verifiable
+   * against block data (see docs/RANDOMNESS-API.md in the node repository).
+   *
+   * @param epoch - The epoch to query. A sealed but not-yet-finalized epoch
+   *   is served with `finalized: false`; an epoch whose boundary block does
+   *   not exist yet on the node rejects with a JSON-RPC error.
+   */
+  async getEpochRandomness(epoch: number | string): Promise<RandomnessRecord> {
+    return this.send<RandomnessRecord>('qau_randomnessGet', [{ epoch }]);
+  }
+
+  /**
+   * Get the verifiable randomness of the highest finalized epoch.
+   *
+   * Calls `qau_randomnessLatest` (no parameters). Until the chain's first
+   * epoch finalization this rejects with a JSON-RPC error.
+   */
+  async getLatestRandomness(): Promise<RandomnessRecord> {
+    return this.send<RandomnessRecord>('qau_randomnessLatest', []);
   }
 
 
