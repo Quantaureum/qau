@@ -7,8 +7,8 @@ This list is derived from the handler registration call sites in the source tree
 the code rather than a hand-maintained list. If it ever disagrees with a registration
 call site, treat this document as the bug and regenerate it.
 
-- Methods registered: **221**
-- Methods requiring admin authorization: **48**
+- Methods registered: **227**
+- Methods requiring admin authorization: **52**
 
 Transport, request/response envelope, error codes and the concrete schemas for the
 core and light-client subsets: see [openapi.yaml](./openapi.yaml). Specialized
@@ -29,24 +29,28 @@ limits for expensive or key-handling methods; see `rpc/ratelimit.go`.
 
 | Namespace | Methods | Admin-gated |
 | --- | --- | --- |
-| `admin_` | 2 | 2 |
+| `admin_` | 6 | 6 |
 | `debug_` | 5 | 5 |
 | `eth_` | 41 | 3 |
 | `evm_` | 2 | 2 |
 | `net_` | 3 | 0 |
 | `personal_` | 7 | 7 |
-| `qau_` | 156 | 27 |
+| `qau_` | 158 | 27 |
 | `txpool_` | 3 | 2 |
 | `web3_` | 2 | 0 |
 
 ## Method reference
 
-### `admin_` (2 methods)
+### `admin_` (6 methods)
 
 | Method | Admin | Registered in |
 | --- | --- | --- |
+| `admin_extendAPIKey` | yes | rpc/admin_key_api.go |
+| `admin_generateAPIKey` | yes | rpc/admin_key_api.go |
+| `admin_listAPIKeys` | yes | rpc/admin_key_api.go |
 | `admin_nodeInfo` | yes | rpc/api.go |
 | `admin_peers` | yes | rpc/api.go |
+| `admin_revokeAPIKey` | yes | rpc/admin_key_api.go |
 
 ### `debug_` (5 methods)
 
@@ -240,6 +244,8 @@ limits for expensive or key-handling methods; see `rpc/ratelimit.go`.
 | `qau_quantumGetKeyRotationStatus` |  | rpc/quantum_api.go |
 | `qau_quantumGetMPCStatus` |  | rpc/quantum_api.go |
 | `qau_quantumVerifyZKP` |  | rpc/quantum_api.go |
+| `qau_randomnessGet` |  | rpc/randomness_api.go |
+| `qau_randomnessLatest` |  | rpc/randomness_api.go |
 | `qau_registerMultisigWallet` | yes | rpc/multisig_api.go |
 | `qau_removeLiquidity` |  | rpc/defi_api.go |
 | `qau_repay` |  | rpc/defi_api.go |

@@ -920,11 +920,37 @@ func (bp *BlockProducer) initValidatorSet() {
 		if cfg.TimeSteps == 0 {
 			cfg.TimeSteps = 16384 // stage-2 calibration (35 s per evaluation)
 		}
-		if err := qpos.EnableVDFSeed(cfg); err != nil {
-			bpLog.Warn("VDF seed hardening rejected: %v", err)
+		// QR-25: the CRS seed must actually reach VDFSeedConfig. Before this
+		// wiring the config field (vdfSeedCRSSeedHex) was never decoded, so
+		// the derivation silently ran on the implicit all-zero CRS regardless
+		// of what the operator pinned. An explicitly configured seed must be
+		// exactly 32 bytes; a malformed value disables the hardened seed
+		// entirely (fail closed — a node deriving seeds from a different CRS
+		// than its peers forks at the activation epoch).
+		crsOK := true
+		if crsHex := strings.TrimSpace(bp.node.config.VDFSeedCRSSeedHex); crsHex != "" {
+			crsRaw, derr := hex.DecodeString(strings.TrimPrefix(crsHex, "0x"))
+			if derr != nil || len(crsRaw) != 32 {
+				bpLog.Error("VDF seed CRS seed must be 32 bytes of hex (vdfSeedCRSSeedHex=%q, err=%v) — VDF seed hardening DISABLED on this node; fix the config before the activation epoch (QR-25)",
+					bp.node.config.VDFSeedCRSSeedHex, derr)
+				crsOK = false
+			} else {
+				copy(cfg.CRSSeed[:], crsRaw)
+			}
 		} else {
-			bpLog.Info("VDF seed hardening configured: activationEpoch=%d T=%d",
-				cfg.ActivationEpoch, cfg.TimeSteps)
+			// QR-25: no CRS configured — the derivation proceeds on the
+			// implicit all-zero CRS (current de-facto default). Every node
+			// that leaves this empty agrees, but the value should be pinned
+			// explicitly (same 32 bytes everywhere) before production.
+			bpLog.Warn("VDF seed hardening active with the implicit all-zero CRS seed (vdfSeedCRSSeedHex empty) — pin the same 32-byte CRS seed on every node before production (QR-25)")
+		}
+		if crsOK {
+			if err := qpos.EnableVDFSeed(cfg); err != nil {
+				bpLog.Warn("VDF seed hardening rejected: %v", err)
+			} else {
+				bpLog.Info("VDF seed hardening configured: activationEpoch=%d T=%d crsSeed=%x...",
+					cfg.ActivationEpoch, cfg.TimeSteps, cfg.CRSSeed[:4])
+			}
 		}
 	}
 

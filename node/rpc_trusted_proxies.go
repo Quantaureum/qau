@@ -3,7 +3,9 @@ package node
 
 import (
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"strings"
 
 	"github.com/quantaureum/qau/rpc"
@@ -105,10 +107,24 @@ func validateTrustedProxyEntry(entry string) error {
 // booting a node: rpc.NewAuthManager(nil) silently falls back to
 // DefaultAuthConfig, which carries no proxy policy at all, so a regression here
 // is invisible from the outside.
-func newRPCAuthConfig(trustedProxies []string) *rpc.AuthConfig {
-	cfg := rpc.DefaultAuthConfig()
-	cfg.TrustedProxies = trustedProxies
-	return cfg
+func newRPCAuthConfig(cfg *Config, trustedProxies []string) *rpc.AuthConfig {
+	authCfg := rpc.DefaultAuthConfig()
+	authCfg.TrustedProxies = trustedProxies
+	// Provision the HMAC signing secret (EnableHMAC is on by default per the
+	// Q-B-008 audit decision). Env override wins over the config field so the
+	// secret can be injected without touching the config file on disk.
+	secret := cfg.RPCHMACSecret
+	if env := os.Getenv("QAU_RPC_HMAC_SECRET"); env != "" {
+		secret = env
+	}
+	if secret != "" {
+		authCfg.SetHMACSecret([]byte(secret))
+	} else if authCfg.Enabled {
+		log.Printf("[RPC][SECURITY] rpcAuthEnabled with no HMAC secret configured " +
+			"(set rpcHmacSecret or QAU_RPC_HMAC_SECRET): every authenticated " +
+			"non-public RPC call will fail until the secret is provisioned")
+	}
+	return authCfg
 }
 
 // newRPCRateLimitConfig returns the rate-limit configuration for this node:

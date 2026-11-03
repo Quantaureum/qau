@@ -851,6 +851,14 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 				if h, ok := t["hash"].(string); ok {
 					txHash = h
 				}
+			case *TransactionResponse:
+				// GETLOGS TX-HASH FIX (2026-11-03, found by the vrf-billing
+				// e2e): blockReaderAdapter.GetBlockByHeight serves
+				// FormatBlock(blk, true) — full tx objects — so production
+				// elements are *TransactionResponse. Only the string and
+				// map cases were handled here, so every production block
+				// yielded txHash=="" and eth_getLogs returned empty forever.
+				txHash = t.Hash
 			}
 
 			if txHash == "" {
@@ -904,12 +912,22 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 					}
 				}
 
-				// Extract topics
-				topicsRaw, _ := logMap["topics"].([]any)
-				topics := make([]string, 0, len(topicsRaw))
-				for _, t := range topicsRaw {
-					if s, ok := t.(string); ok {
-						topics = append(topics, s)
+				// Extract topics.
+				// GETLOGS TOPICS FIX (2026-11-03, found by the vrf-billing
+				// e2e): receiptFromStored stores topics as []string; the old
+				// []any-only assertion failed for every production receipt,
+				// silently stripping topics from served logs — topic filters
+				// (the entire eth_getLogs use case) then matched nothing.
+				// Accept both element shapes.
+				var topics []string
+				switch tv := logMap["topics"].(type) {
+				case []string:
+					topics = append(topics, tv...)
+				case []any:
+					for _, t := range tv {
+						if s, ok := t.(string); ok {
+							topics = append(topics, s)
+						}
 					}
 				}
 

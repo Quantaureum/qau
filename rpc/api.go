@@ -1127,25 +1127,49 @@ func (api *API) GetBlockByNumber(ctx context.Context, params json.RawMessage) (a
 	// "finalized" — highest block in the finalized epoch (irreversible).
 	// "safe"      — highest block in the justified epoch (one step before finalized).
 	// Falls back to "latest" when QPOS status is unavailable.
+	//
+	// EPOCH→HEIGHT FIX (2026-11-03, found by the vrf-billing e2e): the old
+	// mapping computed the boundary as epoch*slotsPerEpoch+(slotsPerEpoch-1),
+	// which assumes one block per slot. Empty slots skip block production, so
+	// heights lag slots and the computed height may not exist (observed:
+	// "finalized" returned "block not found" with the chain mid-epoch). The
+	// boundary is instead located by binary search over the exposed per-block
+	// Epoch field.
+	//
+	// QR-23/QR-05 (R2 audit): findLastBlockOfEpoch now returns the last block
+	// at or before the target epoch, so a gap epoch (no block carries it)
+	// resolves to the preceding already-finalized block instead of silently
+	// falling back to "latest" — a fallback whose height can sit beyond
+	// genuine finality (QR-23 billing watermark) and that misreported gap
+	// epochs (QR-05).
 	switch heightStr {
-	case "finalized":
+	case "finalized", "safe":
+		tag := heightStr
 		if api.chainInfo != nil {
 			status := api.chainInfo.GetQPOSStatus()
-			if fe, ok := status["finalizedEpoch"].(uint64); ok && fe > 0 {
-				// Conservative: use last slot of finalized epoch (slotsPerEpoch slots/epoch)
-				heightStr = formatHexUint64(fe*slotsPerEpoch + (slotsPerEpoch - 1))
+			var targetEpoch uint64
+			if tag == "finalized" {
+				targetEpoch = statusEpochValue(status, "finalizedEpoch")
 			} else {
-				heightStr = "latest"
+				targetEpoch = statusEpochValue(status, "justifiedEpoch")
 			}
-		} else {
-			heightStr = "latest"
-		}
-	case "safe":
-		if api.chainInfo != nil {
-			status := api.chainInfo.GetQPOSStatus()
-			if je, ok := status["justifiedEpoch"].(uint64); ok && je > 0 {
-				heightStr = formatHexUint64(je*slotsPerEpoch + (slotsPerEpoch - 1))
+			if targetEpoch > 0 && api.blockReader != nil {
+				if h, found := api.findLastBlockOfEpoch(targetEpoch); found {
+					heightStr = formatHexUint64(h)
+				} else {
+					// QR-23/QR-05: with <= semantics found=false means only
+					// "no block could be located at all" (empty chain, or a
+					// defensive header read failure mid-search) — never a gap
+					// epoch. On an empty chain "latest" resolves to the same
+					// not-found error, so this is a no-better defensive
+					// fallback, not a finality downgrade.
+					heightStr = "latest"
+				}
 			} else {
+				// targetEpoch==0: QPOS has not yet finalized/justified any
+				// epoch (pre-first-checkpoint bootstrap). There is no
+				// finalized block to name, so "latest" remains the documented
+				// fallback from audit-fix R7-L3.
 				heightStr = "latest"
 			}
 		} else {
@@ -1554,6 +1578,111 @@ func (api *API) GetTransactionReceipt(ctx context.Context, params json.RawMessag
 	}
 
 	return receipt, nil
+}
+
+// statusEpochValue reads an epoch counter out of the GetQPOSStatus map.
+//
+// Unknown-4 (R2 audit): GetQPOSStatus returns a typed map[string]any, so the
+// counters are uint64 in-process (node/adapters.go) — but if the map ever
+// round-trips through encoding/json (a proxy cache, admin tooling, a future
+// refactor), the integers decode as float64/json.Number and a bare .(uint64)
+// assertion silently yields 0. The "finalized"/"safe" tags would then
+// permanently fall back to "latest", overstating finality (QR-23). Accept the
+// three numeric representations instead of asserting one.
+func statusEpochValue(status map[string]any, key string) uint64 {
+	switch v := status[key].(type) {
+	case uint64:
+		return v
+	case float64:
+		if v < 0 {
+			return 0
+		}
+		return uint64(v)
+	case json.Number:
+		u, err := strconv.ParseUint(v.String(), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return u
+	}
+	return 0
+}
+
+// findLastBlockOfEpoch locates the last canonical block at or before the
+// given epoch — the largest height h whose Header.Epoch <= epoch — by binary
+// search over block heights (Header.Epoch is monotonic non-decreasing).
+//
+// QR-23/QR-05 (R2 audit): the search previously required an exact
+// Header.Epoch == epoch match and returned found=false for gap epochs (an
+// epoch whose every slot was empty, so no block carries it — devnets skip
+// block production aggressively). Callers then fell back to "latest", whose
+// height can sit far beyond genuine finality (QR-23: a billing watermark
+// derived from the "finalized" tag would treat unfinalized blocks as
+// irreversible) or misreport the tag for a legitimately skipped epoch (QR-05).
+//
+// <= semantics are safe under FFG chain finality: finality is
+// checkpoint-chained — finalizedEpoch = N implies every checkpoint epoch < N
+// is already finalized — so any block with epoch(h) < target <= finalized
+// has only finalized ancestors and is itself irreversible. The returned block
+// is therefore always finalized whenever the caller's target epoch is a
+// finalized (or justified) checkpoint, gap or not.
+//
+// found=false now means only "no block could be located at all": blockReader
+// is nil, the chain is empty (GetLatestHeight()==0), or a header read failed
+// mid-search (defensive — canonical heights are expected to be readable).
+// Used by the "finalized"/"safe" block tags — see the EPOCH→HEIGHT FIX note
+// in GetBlockByNumber.
+func (api *API) findLastBlockOfEpoch(epoch uint64) (uint64, bool) {
+	if api.blockReader == nil {
+		return 0, false
+	}
+	latest := api.blockReader.GetLatestHeight()
+	if latest == 0 {
+		return 0, false
+	}
+	headerEpoch := func(h uint64) (uint64, bool) {
+		blk, err := api.blockReader.GetBlockByHeight(h)
+		if err != nil {
+			return 0, false
+		}
+		if resp, ok := blk.(*BlockResponse); ok {
+			return resp.Epoch, true
+		}
+		if m, ok := blk.(map[string]any); ok {
+			switch v := m["epoch"].(type) {
+			case uint64:
+				return v, true
+			case float64:
+				return uint64(v), true
+			case json.Number:
+				u, err := strconv.ParseUint(v.String(), 10, 64)
+				return u, err == nil
+			}
+		}
+		return 0, false
+	}
+	lo, hi := uint64(0), latest
+	for lo < hi {
+		// QR-08 (R2 audit): (lo+hi+1) overflows uint64 for heights near 2^64;
+		// lo+(hi-lo+1)/2 is the same midpoint without the overflow.
+		mid := lo + (hi-lo+1)/2
+		e, ok := headerEpoch(mid)
+		if !ok {
+			return 0, false
+		}
+		if e <= epoch {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	// lo is the last block of the highest epoch <= target. A failed header
+	// read at lo stays fail-closed rather than returning an unverifiable
+	// height.
+	if _, ok := headerEpoch(lo); !ok {
+		return 0, false
+	}
+	return lo, true
 }
 
 // Helper functions

@@ -131,7 +131,7 @@ func TestR90_ResolveRPCTrustedProxies_AcceptsSingleHostCIDR(t *testing.T) {
 
 func TestR90_NewRPCAuthConfig_CarriesProxiesAndKeepsDefaults(t *testing.T) {
 	proxies := []string{"127.0.0.1"}
-	cfg := newRPCAuthConfig(proxies)
+	cfg := newRPCAuthConfig(&Config{}, proxies)
 	if cfg == nil {
 		t.Fatal("nil auth config")
 	}
@@ -148,10 +148,23 @@ func TestR90_NewRPCAuthConfig_CarriesProxiesAndKeepsDefaults(t *testing.T) {
 		t.Fatal("public method allowlist must be preserved")
 	}
 
+	// No HMAC secret configured: the enclave stays unset (the auth manager
+	// then fails closed on signed requests until the operator provisions
+	// rpcHmacSecret / QAU_RPC_HMAC_SECRET — see newRPCAuthConfig).
+	if cfg.HMACSecretConfigured() {
+		t.Fatal("HMAC secret must not be silently fabricated")
+	}
+
+	// A configured secret must reach the enclave via SetHMACSecret.
+	withSecret := newRPCAuthConfig(&Config{RPCHMACSecret: "test-secret"}, nil)
+	if !withSecret.HMACSecretConfigured() {
+		t.Fatal("configured HMAC secret did not reach the auth config")
+	}
+
 	// Nil policy (no proxy in front) must stay nil rather than become a
 	// zero-length non-nil slice: rpc.getClientIPWithTrust branches on len()==0,
 	// but a caller inspecting the config should see the same "trust nothing".
-	if got := newRPCAuthConfig(nil).TrustedProxies; len(got) != 0 {
+	if got := newRPCAuthConfig(&Config{}, nil).TrustedProxies; len(got) != 0 {
 		t.Fatalf("expected no trusted proxies, got %v", got)
 	}
 }

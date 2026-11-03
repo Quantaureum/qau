@@ -62,6 +62,14 @@ type Config struct {
 	// RPC
 	RPCEnabled     bool `json:"rpcEnabled"`
 	RPCAuthEnabled bool `json:"rpcAuthEnabled"`
+	// RPCHMACSecret is the node-wide HMAC secret for API-key request signing
+	// (auth.go verifies X-Signature over method||apiKeyHash||timestamp||nonce||
+	// bodyHash with EnableHMAC forced on by default). With no secret configured,
+	// every authenticated non-public RPC call fails ("HMAC secret not
+	// configured") — operators MUST set this (config field, or env
+	// QAU_RPC_HMAC_SECRET which takes precedence) whenever RPC auth is on.
+	// The secret is provisioned out-of-band to trusted callers only.
+	RPCHMACSecret string `json:"rpcHmacSecret,omitempty"`
 	// RPCForceDisableAuth disables RPC auth ONLY for loopback-only
 	// deployments. AUDIT (2026) H-01: if any listener (RPC/WS/GraphQL)
 	// is bound to a non-loopback address, the node ignores this flag and

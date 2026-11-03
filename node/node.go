@@ -3575,6 +3575,25 @@ func (n *Node) initRPC() (retErr error) {
 	shardAPI.RegisterHandlers(n.rpcServer)
 	nodeLog.Info("Shard API handlers registered")
 
+	// Register Randomness API handlers (per-epoch VRF accumulator, read-only).
+	// Always registered so the methods return a structured error instead of
+	// "method not found" when the source is not ready.
+	randomnessAPI := rpc.NewRandomnessAPI(&randomnessSourceAdapter{node: n})
+	// Per-method RPC metrics: n.nodeMetrics is created lazily by initMetrics,
+	// so the observer resolves it at call time and is a no-op until then.
+	randomnessAPI.SetMetricsObserver(func(method string, d time.Duration, failed bool) {
+		if n.nodeMetrics == nil {
+			return
+		}
+		n.nodeMetrics.RPCRequestsTotal.WithLabelValues(method).Inc()
+		n.nodeMetrics.RPCRequestDuration.WithLabelValues(method).Observe(d.Seconds())
+		if failed {
+			n.nodeMetrics.RPCErrorsTotal.WithLabelValues(method).Inc()
+		}
+	})
+	randomnessAPI.RegisterHandlers(n.rpcServer)
+	nodeLog.Info("Randomness API handlers registered")
+
 	// audit-fix R5-H1: wire AuthManager and RateLimiter into RPC server pipeline
 	// SECURITY: Authentication must be enabled in production when RPC is network-accessible.
 	// Even if rpcAuthEnabled=false in config, we force it on for non-localhost RPC.
@@ -3657,7 +3676,7 @@ func (n *Node) initRPC() (retErr error) {
 			len(n.config.RateLimitExemptIPs), strings.Join(n.config.RateLimitExemptIPs, ","))
 	}
 	newAuthMgr := func() *rpc.AuthManager {
-		return rpc.NewAuthManager(newRPCAuthConfig(trustedProxies))
+		return rpc.NewAuthManager(newRPCAuthConfig(n.config, trustedProxies))
 	}
 	newRateLimiter := func() *rpc.RateLimiter {
 		return rpc.NewRateLimiter(newRPCRateLimitConfig(n.config, trustedProxies))
@@ -3704,6 +3723,14 @@ func (n *Node) initRPC() (retErr error) {
 	n.rateLimiter = rateLimiter
 	n.rpcServer.SetAuthManager(n.authManager)
 	// R6-security: ChainID validation is handled in the RPC request pipeline via chainInfo.NetworkID()
+
+	// API-key persistence + runtime key management (admin-gated RPC).
+	// Keys live in <dataDir>/apikeys.json so issued keys survive restarts.
+	n.wireAPIKeyPersistence()
+	if n.authManager != nil {
+		rpc.NewAdminKeyAPI(n.authManager).RegisterHandlers(n.rpcServer)
+		nodeLog.Info("Admin key management RPC registered")
+	}
 
 	// Start RPC server in background
 	n.wg.Add(1)
@@ -3787,9 +3814,109 @@ func (n *Node) initRPC() (retErr error) {
 			}
 		}()
 		nodeLog.Info("WebSocket server starting on %s", n.config.WSAddr)
+
+		// newRandomness event source: push each newly finalized epoch's
+		// randomness to WS subscribers. Polled (not hooking consensus
+		// callbacks) so it works identically on sealer and pure-sync nodes
+		// and never holds a consensus lock while broadcasting.
+		n.wg.Add(1)
+		go n.randomnessFinalityPollLoop(n.wsServer)
 	}
 
 	return nil
+}
+
+// randomnessFinalityPollInterval is how often the node checks QPOS finality
+// to push newRandomness events. Well below the epoch duration (~6.4 min), so
+// push latency is negligible against the finality cadence.
+const randomnessFinalityPollInterval = 5 * time.Second
+
+// randomnessFinalityPollLoop polls QPOS finality and notifies the WebSocket
+// server's newRandomness subscribers whenever the finalized epoch advances.
+// It terminates with the node context and is wg-tracked (Node.Stop waits).
+//
+// QR-03 (R2 audit): the per-epoch cursor advances only across epochs that
+// were actually processed — a gap epoch (no block carries it) is skipped
+// permanently via the errEpochNotSealed sentinel, while a transient error
+// leaves the cursor at the failed epoch so the next tick retries it instead
+// of silently dropping its event.
+func (n *Node) randomnessFinalityPollLoop(wsServer *rpc.WebSocketServer) {
+	defer n.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			nodeLog.Error("randomnessFinalityPollLoop: top-level panic recovered (loop terminated): %v", r)
+		}
+	}()
+
+	lastEpoch := uint64(0)
+	started := false
+	ticker := time.NewTicker(randomnessFinalityPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		func() {
+			// Per-tick recover (same policy as nodeMetricsUpdateLoop): a nil
+			// block producer during startup/shutdown must not kill the loop.
+			defer func() {
+				if r := recover(); r != nil {
+					nodeLog.Error("randomnessFinalityPollLoop: tick panic recovered: %v", r)
+				}
+			}()
+			if n.blockProducer == nil || n.blockProducer.QPOS() == nil {
+				return
+			}
+			fe := n.blockProducer.QPOS().GetFinalizedEpoch()
+			// The "epoch 0 is not finalized" policy mirrors
+			// qau_randomnessLatest (see randomness_api.go).
+			if fe == 0 || (started && fe <= lastEpoch) {
+				return
+			}
+			// On the first observation, do not replay history: only epochs
+			// that finalize after this node started are pushed.
+			if !started {
+				started = true
+				lastEpoch = fe
+				return
+			}
+			// QR-03 (R2 audit): track actual progress instead of blindly
+			// advancing lastEpoch to fe. errEpochNotSealed means no block
+			// carries the epoch — permanent, so no event will ever exist for
+			// it and the cursor advances past it. Any other error is
+			// transient (storage/decode): the cursor stays at the failed
+			// epoch and the next tick retries it and everything after,
+			// instead of silently dropping those events.
+			processed := lastEpoch
+			for e := lastEpoch + 1; e <= fe; e++ {
+				rec, err := (&randomnessSourceAdapter{node: n}).EpochRandomness(e)
+				if err != nil {
+					if errors.Is(err, errEpochNotSealed) {
+						// No block carries this epoch: skip it permanently.
+						nodeLog.Warn("randomnessFinalityPollLoop: epoch %d carries no randomness event: %v", e, err)
+						processed = e
+						continue
+					}
+					// Transient failure: leave the cursor at e-1 and retry on
+					// the next tick.
+					nodeLog.Warn("randomnessFinalityPollLoop: epoch %d randomness unavailable, will retry: %v", e, err)
+					break
+				}
+				wsServer.NotifyEpochRandomness(rec.Epoch, formatRandomnessHex(rec.Accumulator), formatRandomnessHex(rec.BlockHash), rec.BoundaryBlock)
+				processed = e
+			}
+			lastEpoch = processed
+		}()
+	}
+}
+
+// formatRandomnessHex renders a hash as 0x-prefixed lowercase hex, matching
+// the qau_randomness* wire format.
+func formatRandomnessHex(h types.Hash) string {
+	return "0x" + hex.EncodeToString(h[:])
 }
 
 // bridgeSyncCommitteeToLightClient bridges the sync committee from QPOS to the
@@ -4550,7 +4677,7 @@ func (n *Node) initP3Features() error {
 			nodeLog.Warn("QRNG initialization failed: %v", err)
 		} else {
 			n.qrng = q
-			nodeLog.Info("QRNG initialized for consensus randomness")
+			nodeLog.Info("QRNG entropy pool initialized (admin RPC only; consensus randomness derives from the on-chain VRF accumulator)")
 		}
 	}
 

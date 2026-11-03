@@ -1236,6 +1236,121 @@ func (a *chainInfoAdapter) GetQPOSStatus() map[string]any {
 	return result
 }
 
+// randomnessSourceAdapter implements rpc.RandomnessSource over the node's
+// block store and QPOS finality state.
+//
+// Semantics: every block header carries the evolving VRF accumulator
+// (encoding.Header.VRFAccumulator, validated on import via
+// consensus.ComputeNextVRFAccumulator). The accumulator in the boundary
+// (last) block of epoch E is the complete accumulator for E — the same value
+// QPOS records via SetEpochVRFAccumulator(Header.Epoch, Header.VRFAccumulator)
+// on production and import. Reading from canonical block headers (rather than
+// the in-memory qpos map, which is pruned) serves any historical epoch and
+// stays consistent with what every other node can independently recompute.
+// The epoch→height mapping is by Header.Epoch binary search (epochs advance
+// per slot while heights advance per produced block — see EpochRandomness).
+type randomnessSourceAdapter struct {
+	node *Node
+}
+
+// errEpochNotSealed is the sentinel wrapped by
+// randomnessSourceAdapter.EpochRandomness when no canonical block carries the
+// requested epoch — either every slot of the epoch was empty (devnets skip
+// block production aggressively) or the epoch is still in the future.
+//
+// QR-03 (R2 audit): the finality poller (randomnessFinalityPollLoop in
+// node.go) must distinguish this permanent condition from transient storage
+// errors. A no-block epoch will never produce a randomness event, so the
+// poller advances past it; any other error is transient and the epoch is
+// retried on the next tick instead of silently losing its event.
+var errEpochNotSealed = errors.New("epoch not sealed")
+
+// LatestFinalizedEpoch implements rpc.RandomnessSource.
+func (a *randomnessSourceAdapter) LatestFinalizedEpoch() (uint64, bool) {
+	if a.node == nil || a.node.blockProducer == nil || a.node.blockProducer.QPOS() == nil {
+		return 0, false
+	}
+	fe := a.node.blockProducer.QPOS().GetFinalizedEpoch()
+	if fe == 0 {
+		// Mirrors the eth_getBlockByNumber "finalized" tag policy
+		// (rpc/api.go): epoch 0 is not treated as a finalized epoch.
+		return 0, false
+	}
+	return fe, true
+}
+
+// EpochRandomness implements rpc.RandomnessSource.
+//
+// EPOCH→HEIGHT MAPPING FIX (2026-11-03, found by the vrf-billing e2e): epochs
+// advance per SLOT (12s each) while block heights advance per PRODUCED block
+// — empty slots skip block production, so heights lag slots and the boundary
+// block of epoch E is NOT at height E*SlotsPerEpoch+31 (on the devnet, slot
+// 281 coexisted with height 97). The authoritative boundary is instead "the
+// last canonical block whose Header.Epoch == E" — located by binary search
+// over heights (Header.Epoch is monotonic non-decreasing), costing
+// O(log(height)) block reads, amortized to zero by the RPC-layer LRU cache.
+func (a *randomnessSourceAdapter) EpochRandomness(epoch uint64) (rpc.RandomnessRecord, error) {
+	if a.node == nil || a.node.blockStore == nil {
+		return rpc.RandomnessRecord{}, errors.New("randomness source unavailable: block store not ready")
+	}
+	latest, err := a.node.blockStore.GetLatestHeight()
+	if err != nil || latest == 0 {
+		return rpc.RandomnessRecord{}, fmt.Errorf("epoch %d randomness not available: chain has no blocks yet", epoch)
+	}
+
+	headerEpoch := func(h uint64) (uint64, error) {
+		blk, err := a.node.blockStore.GetBlockByHeight(h)
+		if err != nil || blk == nil || blk.Header == nil {
+			return 0, fmt.Errorf("block %d unavailable", h)
+		}
+		return blk.Header.Epoch, nil
+	}
+
+	// Binary search for the largest height whose Header.Epoch <= epoch.
+	lo, hi := uint64(0), latest
+	for lo < hi {
+		// QR-08 (R2 audit): (lo+hi+1) overflows uint64 for heights near 2^64;
+		// lo+(hi-lo+1)/2 is the same midpoint without the overflow.
+		mid := lo + (hi-lo+1)/2
+		e, err := headerEpoch(mid)
+		if err != nil {
+			return rpc.RandomnessRecord{}, fmt.Errorf("epoch %d randomness not available: %v", epoch, err)
+		}
+		if e <= epoch {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	boundaryEpoch, err := headerEpoch(lo)
+	if err != nil {
+		return rpc.RandomnessRecord{}, fmt.Errorf("epoch %d randomness not available: %v", epoch, err)
+	}
+	if boundaryEpoch != epoch {
+		// lo is the last block of an epoch < epoch: no block carries the
+		// requested epoch — either it is still in the future, or every one
+		// of its slots was empty (devnets skip block production aggressively,
+		// so an epoch can pass without a single block).
+		//
+		// QR-03 (R2 audit): this is a PERMANENT condition (a no-block epoch
+		// will never carry randomness), so it is wrapped in the
+		// errEpochNotSealed sentinel — the finality poller (node.go) advances
+		// past it, while any other error is transient and retried.
+		return rpc.RandomnessRecord{}, fmt.Errorf("%w: epoch %d randomness not available (no block carries it; last sealed epoch with blocks: %d)", errEpochNotSealed, epoch, boundaryEpoch)
+	}
+
+	blk, err := a.node.blockStore.GetBlockByHeight(lo)
+	if err != nil || blk == nil || blk.Header == nil {
+		return rpc.RandomnessRecord{}, fmt.Errorf("epoch %d randomness not available (boundary block %d unreadable)", epoch, lo)
+	}
+	return rpc.RandomnessRecord{
+		Epoch:         epoch,
+		Accumulator:   blk.Header.VRFAccumulator,
+		BoundaryBlock: lo,
+		BlockHash:     block.ComputeBlockHash(blk.Header),
+	}, nil
+}
+
 // stakingManagerAdapter adapts economics.StakingManager to rpc.StakingManager
 type stakingManagerAdapter struct {
 	sm *economics.StakingManager

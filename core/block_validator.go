@@ -261,9 +261,15 @@ type BlockValidator struct {
 	// and not in devMode, ValidateBlock fails closed (rejects all blocks).
 	electionVerifier ProposerElectionVerifier
 	// vrfEnforced gates the VRF proof/value existence check and cryptographic
-	// verification. SECURITY (audit 2026-06-26, P1-01): VRF generation is now
-	// implemented in the block producer. Set to true in production via
-	// SetVRFEnforced(true) during node initialization.
+	// verification. HONEST STATUS (audit QR-40, R2 loop): this flag has ZERO
+	// callers in the whole repo — nothing ever calls SetVRFEnforced(true), so
+	// the VRF proof check below is DEAD CODE on every network and proposer
+	// VRF-proof enforcement is NOT active. Enabling it is a planned
+	// epoch-gated, network-wide coordinated upgrade (all validators must
+	// enable it at the same epoch or blocks from unhardened proposers split
+	// the chain); until that lands, unbiasability rests on the honest-majority
+	// assumption, not on this check. The older "enforced in production"
+	// comments were aspirational, not factual.
 	vrfEnforced bool
 	// vrfSeed is the seed for VRF verification. When set and vrfEnforced
 	// is true, ValidateBlock calls ValidateVRFProof to cryptographically
@@ -742,9 +748,12 @@ func (v *BlockValidator) SyncProposerVerificationFailCount() uint64 {
 }
 
 // SetVRFEnforced enables or disables VRF proof/value existence checks and
-// cryptographic verification. SECURITY (audit 2026-06-26, P1-01): VRF
-// generation is now implemented in the block producer. This should be set
-// to true for production (mainnet/testnet) via node initialization.
+// cryptographic verification. HONEST STATUS (audit QR-40): despite what
+// older comments claimed, this has never been wired — the repo contains ZERO
+// callers, so the check is inactive on every network. Enabling it for real
+// requires an epoch-gated, network-wide coordinated activation (a per-node
+// unilateral toggle forks the chain at the boundary). Do not call this
+// outside such a coordinated upgrade.
 func (v *BlockValidator) SetVRFEnforced(enforced bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -1227,20 +1236,21 @@ func (v *BlockValidator) ValidateBlock(block *encoding.Block, parent *encoding.B
 		})
 		// Note: Full genesis hash validation happens at consensus layer via consensus.ValidateGenesisBlockHash()
 	} else {
-		// audit-fix HIGH: Validate VRF proof existence for non-genesis blocks.
+		// audit-fix HIGH: Validate VRF proof existence and cryptography.
 		// VRF (Verifiable Random Function) proves the proposer was legitimately
 		// selected. Without this check, an attacker could construct blocks with
 		// empty VRF proofs and bypass the proposer selection mechanism.
 		//
-		// audit-fix Round3 C-2: VRF generation is not yet implemented in
-		// block_producer.go. Gate the existence check on vrfEnforced to avoid
-		// rejecting all blocks. Enable via SetVRFEnforced(true) once VRF
-		// generation is wired into block production.
+		// audit-fix Round3 C-2: gate the existence check on vrfEnforced to
+		// avoid rejecting all blocks before the flag is wired.
 		//
-		// SECURITY (audit 2026-06-26, P1-01): VRF is now enforced in production.
-		// The VRF seed is derived from the parent block hash, ensuring each block
-		// has a unique, unpredictable seed. This prevents proposers from biasing
-		// the VRF output by grinding on multiple seeds.
+		// HONEST STATUS (audit QR-40): the older "VRF is now enforced in
+		// production" claim was FALSE — vrfEnforced has zero callers repo-wide,
+		// so this entire block is dead code today and proposer VRF-proof
+		// enforcement is NOT active. Activation is a planned epoch-gated,
+		// network-wide coordinated upgrade. Also note: the branch below has NO
+		// genesis exemption — when enabled it applies to EVERY block (the old
+		// "non-genesis" comment and error wording did not match the code).
 		v.mu.RLock()
 		vrfEnforced := v.vrfEnforced
 		configuredSeed := v.vrfSeed

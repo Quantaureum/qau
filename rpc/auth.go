@@ -161,11 +161,19 @@ type AuthConfig struct {
 
 // SetHMACSecret securely stores the HMAC secret in a memguard-protected Enclave.
 // Call this before creating the AuthManager to enable HMAC signature verification.
-// SECURITY FIX Q-B-008: The raw secret bytes are copied into protected memory
-// and immediately wiped from the caller's slice. Enclave does not expose Destroy()
+// SECURITY FIX Q-B-008: The raw secret bytes are copied into protected memory and
+// immediately wiped from the caller's slice. Enclave does not expose Destroy()
 // so repeated calls overwrite the reference; the sealed data is protected until GC.
 func (c *AuthConfig) SetHMACSecret(secret []byte) {
 	c.hmacSecretEnclave = memguard.NewEnclave(secret)
+}
+
+// HMACSecretConfigured reports whether an HMAC signing secret has been
+// provisioned. With EnableHMAC on (the default) and no secret configured,
+// every authenticated non-public RPC call fails — operators use this to
+// verify the secret wiring at startup.
+func (c *AuthConfig) HMACSecretConfigured() bool {
+	return c.hmacSecretEnclave != nil
 }
 
 // DefaultAuthConfig returns default authentication configuration
@@ -408,6 +416,15 @@ func DefaultAuthConfig() *AuthConfig {
 			"qau_rollupGetStatus",
 			"qau_rollupGetBatch",
 			"qau_rollupGetStateRoot", // FIX: missed in the earlier pass; added here
+			// Per-epoch verifiable randomness (randomness_api.go).
+			// Read-only repackaging of the VRF accumulator already recorded on
+			// every epoch boundary block header — the same data any client can
+			// read via eth_getBlockByNumber. Unlike qau_qrngGetRandom (AUDIT
+			// API-02 above) there is no node-local entropy surface here: the
+			// served value is public chain data, so serving it can neither
+			// drain node entropy nor correlate with it.
+			"qau_randomnessLatest",
+			"qau_randomnessGet",
 		},
 		APIKeyHeader: "X-API-Key",
 		// audit-fix C-4: CRITICAL - HMAC validation must be ENABLED by default for security
@@ -427,6 +444,12 @@ type apiKeyRateEntry struct {
 type AuthManager struct {
 	mu     sync.RWMutex
 	config *AuthConfig
+	// persistHook, when set, is invoked after every API-key mutation
+	// (generate/add/revoke/extend) so the owner can persist the registry.
+	// It is called OUTSIDE am.mu: hooks typically re-read the snapshot via
+	// SnapshotAPIKeys (which takes the read lock). Assign once at startup
+	// via SetPersistenceHook, before keys are loaded, to avoid races.
+	persistHook func()
 	// audit-fix M-4: per-key rate limiting state (separate lock from config)
 	rateMu       sync.Mutex
 	rateLimiters map[string]*apiKeyRateEntry
@@ -719,6 +742,7 @@ func (am *AuthManager) GenerateAPIKey(name string, permissions []string, expires
 	am.mu.Lock()
 	am.config.APIKeys[keyH] = sanitizedForStorage(info)
 	am.mu.Unlock()
+	am.notifyKeyRegistryChanged()
 
 	return info, nil
 }
@@ -728,12 +752,13 @@ func (am *AuthManager) GenerateAPIKey(name string, permissions []string, expires
 // caller's struct is not retained or mutated.
 func (am *AuthManager) AddAPIKey(info *APIKeyInfo) {
 	am.mu.Lock()
-	defer am.mu.Unlock()
 	// audit-fix M-1: store by hash
 	if info.KeyHash == "" {
 		info.KeyHash = hashAPIKey(info.Key)
 	}
 	am.config.APIKeys[info.KeyHash] = sanitizedForStorage(info)
+	am.mu.Unlock()
+	am.notifyKeyRegistryChanged()
 }
 
 // RemoveAPIKey removes an API key
@@ -742,11 +767,135 @@ func (am *AuthManager) RemoveAPIKey(key string) {
 	am.mu.Lock()
 	delete(am.config.APIKeys, keyH)
 	am.mu.Unlock()
+	am.notifyKeyRegistryChanged()
 
 	// audit-fix M-3: clean up rate limiter entry to prevent memory leak
 	am.rateMu.Lock()
 	delete(am.rateLimiters, keyH)
 	am.rateMu.Unlock()
+}
+
+// RemoveAPIKeyByHash revokes the key identified by its SHA-256 hash. Admin
+// RPC callers never hold the plaintext, so revocation is hash-addressed.
+// Reports whether the key existed.
+func (am *AuthManager) RemoveAPIKeyByHash(keyHash string) bool {
+	am.mu.Lock()
+	_, existed := am.config.APIKeys[keyHash]
+	delete(am.config.APIKeys, keyHash)
+	am.mu.Unlock()
+	if !existed {
+		return false
+	}
+	am.notifyKeyRegistryChanged()
+
+	// Same rate-limiter cleanup as RemoveAPIKey (audit-fix M-3).
+	am.rateMu.Lock()
+	delete(am.rateLimiters, keyHash)
+	am.rateMu.Unlock()
+	return true
+}
+
+// ExtendAPIKey extends the expiry of the key identified by keyHash by days.
+// A key without an expiry gets one (now + days); an expired key is revived
+// from now. Zero means never expires is preserved for days<=0 — rejected.
+// Returns the new expiry time.
+func (am *AuthManager) ExtendAPIKey(keyHash string, days int) (time.Time, error) {
+	if days <= 0 {
+		return time.Time{}, errors.New("api key: days must be positive")
+	}
+	am.mu.Lock()
+	info, ok := am.config.APIKeys[keyHash]
+	if !ok {
+		am.mu.Unlock()
+		return time.Time{}, ErrInvalidAPIKey
+	}
+	base := time.Now()
+	if info.ExpiresAt.After(base) {
+		base = info.ExpiresAt
+	}
+	info.ExpiresAt = base.Add(time.Duration(days) * 24 * time.Hour)
+	newExpiry := info.ExpiresAt
+	am.mu.Unlock()
+	am.notifyKeyRegistryChanged()
+	return newExpiry, nil
+}
+
+// SetAPIKeyRateLimit sets the per-key rate limit (requests per minute) of
+// the key identified by keyHash on its STORED copy. QR-41: both billing docs
+// promise "paid keys buy higher rate limits", but GenerateAPIKey never set
+// RateLimit (0 = per-key throttling disabled), so the promise was unreachable.
+// This is the runtime path that makes it real: admin_generateAPIKey calls it
+// right after minting the key, and operators can re-tier an existing key with
+// it later. A limit <= 0 clears the limit (0 means unthrottled — the same
+// convention as APIKeyInfo.RateLimit). Unknown keyHash returns
+// ErrInvalidAPIKey. am.mu protects the stored entry; the persistence hook
+// fires (outside the lock) so the change survives node restarts.
+func (am *AuthManager) SetAPIKeyRateLimit(keyHash string, limit int) error {
+	if limit < 0 {
+		limit = 0
+	}
+	am.mu.Lock()
+	info, ok := am.config.APIKeys[keyHash]
+	if !ok {
+		am.mu.Unlock()
+		return ErrInvalidAPIKey
+	}
+	info.RateLimit = limit
+	am.mu.Unlock()
+	am.notifyKeyRegistryChanged()
+	return nil
+}
+
+// APIKeySnapshot is a plaintext-free copy of an API key entry for listing
+// and persistence. The plaintext key never appears here by construction —
+// GenerateAPIKey returns it exactly once and only the hash is retained.
+type APIKeySnapshot struct {
+	KeyHash     string    `json:"keyHash"`
+	Name        string    `json:"name"`
+	Permissions []string  `json:"permissions,omitempty"`
+	IPWhitelist []string  `json:"ipWhitelist,omitempty"`
+	RateLimit   int       `json:"rateLimit,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	UsageCount  uint64    `json:"usageCount"`
+}
+
+// SnapshotAPIKeys returns plaintext-free copies of all registered keys.
+func (am *AuthManager) SnapshotAPIKeys() []APIKeySnapshot {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	out := make([]APIKeySnapshot, 0, len(am.config.APIKeys))
+	for _, info := range am.config.APIKeys {
+		snap := APIKeySnapshot{
+			KeyHash:     info.KeyHash,
+			Name:        info.Name,
+			Permissions: append([]string(nil), info.Permissions...),
+			IPWhitelist: append([]string(nil), info.IPWhitelist...),
+			RateLimit:   info.RateLimit,
+			CreatedAt:   info.CreatedAt,
+			ExpiresAt:   info.ExpiresAt,
+			UsageCount:  info.UsageCount.Load(),
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+// SetPersistenceHook registers the post-mutation persistence callback.
+// Call once at startup before loading persisted keys.
+func (am *AuthManager) SetPersistenceHook(fn func()) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.persistHook = fn
+}
+
+// notifyKeyRegistryChanged invokes the persistence hook after a mutation.
+// Must be called WITHOUT am.mu held (the hook re-acquires the read lock via
+// SnapshotAPIKeys).
+func (am *AuthManager) notifyKeyRegistryChanged() {
+	if am.persistHook != nil {
+		am.persistHook()
+	}
 }
 
 // IsPublicMethod reports whether the given method is in the configured public

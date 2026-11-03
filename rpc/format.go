@@ -24,7 +24,17 @@ type BlockResponse struct {
 	GasLimit         string `json:"gasLimit"`
 	GasUsed          string `json:"gasUsed"`
 	BaseFeePerGas    string `json:"baseFeePerGas,omitempty"`
-	Transactions     []any  `json:"transactions"`
+	// VRFAccumulator is the evolving VRF accumulator carried on the block
+	// header (consensus.ComputeNextVRFAccumulator). Exposed so clients can
+	// independently cross-check the value served by qau_randomnessGet /
+	// qau_randomnessLatest against public block data.
+	VRFAccumulator string `json:"vrfAccumulator"`
+	// Epoch is the consensus epoch (slot/32) the block was produced in.
+	// Exposed because epochs advance per slot while heights advance per
+	// produced block — clients (and the finalized/safe block tags) must
+	// locate epoch boundaries by Header.Epoch, not by height arithmetic.
+	Epoch        uint64 `json:"epoch"`
+	Transactions []any  `json:"transactions"`
 }
 
 // TransactionResponse is the formatted transaction response for RPC
@@ -68,6 +78,8 @@ func FormatBlock(blk *encoding.Block, fullTx bool) *BlockResponse {
 		Miner:            formatAddressHex(blk.Header.ProposerAddr),
 		GasLimit:         formatHex(blk.Header.GasLimit),
 		GasUsed:          formatHex(blk.Header.GasUsed),
+		VRFAccumulator:   formatHashHex(blk.Header.VRFAccumulator),
+		Epoch:            blk.Header.Epoch,
 		Transactions:     make([]any, 0),
 	}
 

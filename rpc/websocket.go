@@ -98,6 +98,11 @@ const (
 	SubTypeNewHeads = "newHeads"
 	SubTypeLogs     = "logs"
 	SubTypePending  = "newPendingTransactions"
+	// SubTypeRandomness pushes one event per newly finalized epoch carrying
+	// that epoch's verifiable randomness (see NotifyEpochRandomness). Unlike
+	// the three types above, whose Notify* producers are not wired yet, this
+	// type has a live event source: the node's finality poller.
+	SubTypeRandomness = "newRandomness"
 )
 
 // R14-LOW (P2P-LOW-02): Minimum interval between drop-warning log emissions.
@@ -350,9 +355,10 @@ type WebSocketServer struct {
 	lastDropLogTime atomic.Int64
 
 	// Event channels
-	newHeadsCh chan any
-	logsCh     chan any
-	pendingCh  chan any
+	newHeadsCh   chan any
+	logsCh       chan any
+	pendingCh    chan any
+	randomnessCh chan any
 
 	// Configuration
 	pingInterval   time.Duration
@@ -443,6 +449,7 @@ func NewWebSocketServer(rpcServer *Server) *WebSocketServer {
 		newHeadsCh:          make(chan any, 100),
 		logsCh:              make(chan any, 1000),
 		pendingCh:           make(chan any, 1000),
+		randomnessCh:        make(chan any, 100),
 		pingInterval:        30 * time.Second,
 		ctx:                 ctx,
 		cancel:              cancel,
@@ -1768,7 +1775,7 @@ func (ws *WebSocketServer) handleSubscribe(conn *WSConn, req *Request) *Response
 	}
 
 	switch subType {
-	case SubTypeNewHeads, SubTypeLogs, SubTypePending:
+	case SubTypeNewHeads, SubTypeLogs, SubTypePending, SubTypeRandomness:
 	default:
 		return &Response{JSONRPC: JSONRPCVersion, Error: NewError(ErrCodeInvalidParams, "invalid subscription type"), ID: req.ID}
 	}
@@ -1908,6 +1915,8 @@ func (ws *WebSocketServer) broadcastEvents() {
 			ws.broadcastToSubscribers(SubTypeLogs, log)
 		case tx := <-ws.pendingCh:
 			ws.broadcastToSubscribers(SubTypePending, tx)
+		case randomness := <-ws.randomnessCh:
+			ws.broadcastToSubscribers(SubTypeRandomness, randomness)
 		}
 	}
 }
@@ -2165,6 +2174,35 @@ func (ws *WebSocketServer) NotifyPendingTx(tx any) {
 		ws.droppedEvents.Add(1)
 		metrics.Global().AddWSDroppedEvent()
 		ws.logDroppedEvent("pendingCh")
+	}
+}
+
+// NotifyEpochRandomness notifies newRandomness subscribers of one newly
+// finalized epoch's verifiable randomness. The payload is the wire map
+// documented in docs/RANDOMNESS-API.md ("WebSocket subscription"): epoch
+// (decimal), randomness / blockHash (0x hex), boundaryBlock (0x hex height),
+// finalized (always true here — only finalized epochs are pushed) and source
+// (always "vrf-accumulator", matching the qau_randomness* responses —
+// QR-44, R2 audit: the field was missing from this payload only).
+//
+// Delivery is at-most-once: the per-subscriber queue is bounded and events
+// dropped under backpressure are not replayed. Reliable consumers should
+// poll qau_randomnessGet as a fallback (see the docs section).
+func (ws *WebSocketServer) NotifyEpochRandomness(epoch uint64, randomness, blockHash string, boundaryBlock uint64) {
+	payload := map[string]any{
+		"epoch":         epoch,
+		"randomness":    randomness,
+		"boundaryBlock": formatHex(boundaryBlock),
+		"blockHash":     blockHash,
+		"finalized":     true,
+		"source":        "vrf-accumulator",
+	}
+	select {
+	case ws.randomnessCh <- payload:
+	default:
+		ws.droppedEvents.Add(1)
+		metrics.Global().AddWSDroppedEvent()
+		ws.logDroppedEvent("randomnessCh")
 	}
 }
 
