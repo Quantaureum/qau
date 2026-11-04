@@ -1,8 +1,8 @@
 # DA (Data Availability) Subsystem Architecture
 
 > Document ID: P4-1 · Module: 04 DA aggregation (DA Aggregation)
-> Applicable version: Quantaureum L1 mainnet (ChainID 1668)
-> Status: production-ready (disabled by default, fail-closed)
+> Applicable version: Quantaureum L1 protocol (mainnet config 1668 / testnet 1669)
+> Status: design document; the project is in testnet phase. Production readiness is not claimed (ROADMAP.md).
 
 ---
 

@@ -1,6 +1,8 @@
 # Quantaureum Validator Onboarding Guide
 
-> **Version**: v1.0 | **Updated**: 2026-06-08 | **Network**: Mainnet ChainID 1668 / Testnet ChainID 1669
+> **Version**: v1.0 | **Updated**: 2026-06-08 | **Network**: Testnet ChainID 1669 (current phase) / Mainnet config 1668 / Devnet 1333
+>
+> **Status note (D-34):** Commands and endpoints below describe the built-in presets that exist in code. The project is currently in testnet phase; mainnet parameters (1668) are configured in code and launch status will be announced officially.
 
 ---
 

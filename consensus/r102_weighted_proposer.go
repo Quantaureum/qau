@@ -245,6 +245,23 @@ func (q *QPOS) epochSeedLocked(epoch uint64) (types.Hash, bool) {
 				// epoch is normally built once and cached, so in practice
 				// this warning fires about once per affected epoch (repeat
 				// fires only on cache rebuilds while the failure persists).
+				// QR-21 harden: at/after the coordinated activation epoch,
+				// pin this epoch as "stand down" instead of letting a single
+				// node keep electing from the unhardened seed. The seed bytes
+				// are deliberately left unchanged: if any path misses the
+				// stop pin, all failing nodes still derive the same legacy
+				// seed, so this branch cannot introduce a new fork vector.
+				// Election entry points consult VDFSeedStopped and fail
+				// closed (see consensus_hardening.go).
+				// Only a genuine evaluation failure may stand the node down.
+				// vdfSeedFor also reports ok=false when the VDF feature is
+				// simply not configured for this epoch yet; pinning those
+				// epochs would permanently halt every unconfigured network.
+				if q.HardeningActive(epoch) && q.vdfSeedActiveFor(epoch) {
+					q.MarkVDFSeedStopped(epoch)
+					logging.Error("VDF seed unavailable after consensus hardening activation — standing down from proposer election for this epoch (QR-21)",
+						map[string]any{"srcEpoch": srcEpoch, "shuffleEpoch": epoch})
+				}
 				logging.Warn("VDF seed unavailable for accumulator epoch — proposer shuffle falling back to the unhardened seed; known divergence risk (QR-21)",
 					map[string]any{"srcEpoch": srcEpoch})
 			}

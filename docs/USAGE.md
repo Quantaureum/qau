@@ -113,11 +113,11 @@ qau-cli blockchain --help
 ## JSON-RPC
 
 The node exposes Ethereum-compatible JSON-RPC methods. The examples use a
-local node; replace the URL with `https://rpc.quantaureum.com` to use the
-verified public mainnet endpoint. Verify any remote endpoint with
-`eth_chainId` before submitting transactions. Mainnet must return `0x684`;
-the testnet endpoint `https://testnet-rpc.quantaureum.com` must return
-`0x685`.
+local node. If you use any remote endpoint, verify it with `eth_chainId`
+before submitting transactions: the configured mainnet ChainID must return
+`0x684`, the testnet `0x685`, and the devnet `0x535`. The project is
+currently in testnet phase (1669); mainnet parameters (1668) are configured
+in code and launch status will be announced officially.
 
 For example:
 

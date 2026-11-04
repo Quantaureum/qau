@@ -341,13 +341,14 @@ wallet/tss/*.py
 # ----- Logos are kept in docs/logos/ for branding, but exclude large assets -----
 # docs/logos/*.png are kept (small branding assets)
 
-# ----- SDK sources are tracked in-tree; ignore only build artifacts/caches -----
-# The blanket `/sdks/` rule was removed: 198 SDK source files were already
-# tracked since the initial release, so the rule only hid new sources from
-# `git add` (requiring `git add -f`) without untracking anything.
-# Generic rules above already cover node_modules/, dist/ and __pycache__/.
-/sdks/rust-sdk/target/
-/sdks/python-sdk/.pytest_cache/
+# ----- SDKs are in separate repositories (not part of the node repo) -----
+# Go SDK:    github.com/quantaureum/go-sdk
+# JS/TS SDK: github.com/quantaureum/sdk-js
+# Rust SDK:  github.com/quantaureum/sdk-rs
+# C++ SDK:   github.com/quantaureum/sdk-cpp
+# Java SDK:  github.com/quantaureum/sdk-java
+# Python SDK: github.com/quantaureum/sdk-py
+/sdks/
 
 # ----- Root-level compiled binaries (build artifacts, not source) -----
 /sign_call
@@ -414,11 +415,10 @@ docker-compose.override.yml
 # ----- Real allocation/key material filenames (R69): these files hold real
 # mainnet allocation tables, validator keys, or SSH credentials. They live only
 # in .local-only/ or operator key directories and must never be committed, even
-# if accidentally copied to the repo root.
-/预分配.txt
-/验证者密钥.txt
+# if accidentally copied to the repo root. No tracked file at the repository
+# root uses a .txt extension, so a single ASCII pattern covers every operator
+# filename (localized names included) without publishing internal names here.
+# If a root-level .txt ever needs to ship, add an explicit !-exception below.
+/*.txt
 /*_privkey_only.txt
 /V*_deploy.key
-/服务器.txt
-/服务器2.txt
-/账户[0-9].txt

@@ -271,6 +271,12 @@ type BlockValidator struct {
 	// assumption, not on this check. The older "enforced in production"
 	// comments were aspirational, not factual.
 	vrfEnforced bool
+	// vrfEnforcedEpoch is the coordinated activation epoch for VRF proof
+	// enforcement (audit QR-40). 0 = inactive. Unlike the boolean toggle,
+	// this gate applies per block epoch: blocks below the activation epoch
+	// (genesis, historical imports, replay, fastboot) keep the legacy path,
+	// so switching the network on never invalidates existing chain history.
+	vrfEnforcedEpoch uint64
 	// vrfSeed is the seed for VRF verification. When set and vrfEnforced
 	// is true, ValidateBlock calls ValidateVRFProof to cryptographically
 	// verify the VRF proof (not just check existence). audit-fix H-8.
@@ -748,16 +754,40 @@ func (v *BlockValidator) SyncProposerVerificationFailCount() uint64 {
 }
 
 // SetVRFEnforced enables or disables VRF proof/value existence checks and
-// cryptographic verification. HONEST STATUS (audit QR-40): despite what
-// older comments claimed, this has never been wired — the repo contains ZERO
-// callers, so the check is inactive on every network. Enabling it for real
-// requires an epoch-gated, network-wide coordinated activation (a per-node
-// unilateral toggle forks the chain at the boundary). Do not call this
-// outside such a coordinated upgrade.
+// cryptographic verification. HONEST STATUS (audit QR-40): this manual
+// toggle has ZERO production callers. The supported activation path is the
+// epoch-gated, network-wide SetVRFEnforcedEpoch below, which stays inactive
+// (0) until a coordinated upgrade. A per-node unilateral toggle forks the
+// chain at the boundary; do not call this outside such an upgrade.
 func (v *BlockValidator) SetVRFEnforced(enforced bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.vrfEnforced = enforced
+}
+
+// vrfEnforcementActive reports whether VRF proof verification applies to a
+// block of blockEpoch. The boolean toggle is the legacy manual switch; the
+// activation epoch is the coordinated QR-40 cutover. Keeping the decision in
+// a pure function makes the historical-block exemption directly testable.
+func vrfEnforcementActive(blockEpoch uint64, forced bool, activationEpoch uint64) bool {
+	return forced || (activationEpoch > 0 && blockEpoch >= activationEpoch)
+}
+
+// SetVRFEnforcedEpoch wires the QR-40 epoch-gated, network-wide VRF proof
+// enforcement. epoch == 0 keeps the check inactive on every block. The value
+// MUST be identical on every node: a divergent activation epoch changes the
+// accepted block set at that boundary and forks the chain.
+func (v *BlockValidator) SetVRFEnforcedEpoch(epoch uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.vrfEnforcedEpoch = epoch
+}
+
+// VRFEnforcedEpoch returns the configured activation epoch (0 = inactive).
+func (v *BlockValidator) VRFEnforcedEpoch() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.vrfEnforcedEpoch
 }
 
 // SetVRFSeed sets the VRF seed used for cryptographic VRF proof verification.
@@ -1244,18 +1274,26 @@ func (v *BlockValidator) ValidateBlock(block *encoding.Block, parent *encoding.B
 		// audit-fix Round3 C-2: gate the existence check on vrfEnforced to
 		// avoid rejecting all blocks before the flag is wired.
 		//
-		// HONEST STATUS (audit QR-40): the older "VRF is now enforced in
-		// production" claim was FALSE — vrfEnforced has zero callers repo-wide,
-		// so this entire block is dead code today and proposer VRF-proof
-		// enforcement is NOT active. Activation is a planned epoch-gated,
-		// network-wide coordinated upgrade. Also note: the branch below has NO
-		// genesis exemption — when enabled it applies to EVERY block (the old
-		// "non-genesis" comment and error wording did not match the code).
+		// HONEST STATUS (audit QR-40): enforcement is INACTIVE by default.
+		// The supported activation is the epoch-gated, network-wide
+		// SetVRFEnforcedEpoch (0 = off): from the activation epoch onward
+		// every block must carry a valid VRF proof, while all earlier blocks
+		// (genesis, import, replay) keep the legacy path. A divergent
+		// activation epoch across nodes forks the chain. The old
+		// "non-genesis" error wording below is legacy text; the real gate
+		// is the block's epoch, as computed by vrfEnforcementActive.
 		v.mu.RLock()
 		vrfEnforced := v.vrfEnforced
+		hardeningEpoch := v.vrfEnforcedEpoch
 		configuredSeed := v.vrfSeed
 		v.mu.RUnlock()
-		if vrfEnforced {
+		// QR-40: epoch-gated activation. The gate is keyed on the BLOCK's
+		// epoch, not on height and not on a "non-genesis" string: every
+		// historical block (genesis, import, replay, fastboot) stays on the
+		// legacy path while blocks from the activation epoch onward require
+		// a valid VRF proof. This is the coordinated cutover the audit asked
+		// for; 0 keeps the pre-audit behavior byte-identically.
+		if vrfEnforcementActive(block.Header.Epoch, vrfEnforced, hardeningEpoch) {
 			if len(block.Header.VRFProof) == 0 {
 				return nil, nil, fmt.Errorf("%w: VRF proof missing for non-genesis block at height %d",
 					ErrInvalidVRFProof, block.Header.Height)

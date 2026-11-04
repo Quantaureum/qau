@@ -2828,14 +2828,18 @@ func (api *API) GetStakingPools(ctx context.Context, params json.RawMessage) (an
 	// GetUserStakes uses big.Int integer arithmetic (amount * apy * blocks / year / 100).
 	// For production, consider returning these as scaled integer strings (e.g.
 	// basis points: 500 = 5.00%) to avoid float64 precision loss in JSON clients.
+	// Illustrative stub pool catalogue (decision D-34). StakingAPY is disabled
+	// (apy = 0.0) and reward_rate is a placeholder, not a published yield.
+	// The first term is aligned with the protocol unbonding period (21 days);
+	// these entries are display stubs, not consensus staking state.
 	pools := []map[string]any{
 		{
-			"pool_id":          "STAKE-QAU-30",
+			"pool_id":          "STAKE-QAU-21",
 			"token":            "QAU",
 			"reward_token":     "QAU",
 			"total_staked":     totalStaked.String(),
 			"reward_rate":      0.05,
-			"duration_days":    30,
+			"duration_days":    21,
 			"min_stake_amount": config.MinStakeAmount.String(),
 			"apy":              0.0, //  StakingAPY disabled (consensus rewards only)
 			"validators":       validatorCount,
@@ -2961,13 +2965,16 @@ func (api *API) GetUserStakes(ctx context.Context, params json.RawMessage) (any,
 	rewards.Div(rewards, new(big.Int).SetUint64(blocksPerYear))
 	rewards.Div(rewards, big.NewInt(100))
 
-	// Lock period: 30 days = 30 * 7200 = 216000 blocks
-	lockPeriodBlocks := uint64(30 * 7200)
+	// Unstake lock follows the staking manager configured unbonding period
+	// (21 days / 151,200 blocks at 12s: params/config.go, economics/staking.go).
+	// The earlier hard-coded 30-day / 216,000-block value contradicted the
+	// actual UnlockHeight set by economics.StakingManager (decision D-34).
+	lockPeriodBlocks := api.stakingManager.GetConfig().UnbondingPeriod
 	unlockBlock := stake.StakeHeight + lockPeriodBlocks
 
 	stakes := []map[string]any{
 		{
-			"pool_id":     "STAKE-QAU-30",
+			"pool_id":     "STAKE-QAU-21",
 			"amount":      stake.Amount.String(),
 			"rewards":     rewards.String(),
 			"start_time":  stake.StakeHeight,
@@ -3156,9 +3163,9 @@ func (api *API) GetStakingContracts(ctx context.Context, params json.RawMessage)
 			"rewards": "Send a transaction to this address to claim pending rewards.",
 		},
 		"lockPeriod": map[string]any{
-			"blocks":      216000,
-			"days":        30,
-			"description": "Unstaked tokens are locked for 30 days before withdrawal.",
+			"blocks":      151200,
+			"days":        21,
+			"description": "Unstaked tokens are locked for 21 days before withdrawal (params.UnbondingPeriod); the exact unlock height is returned by qau_getUnstakeStatus.",
 		},
 	}, nil
 }

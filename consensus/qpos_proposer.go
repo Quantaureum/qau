@@ -200,7 +200,15 @@ func (q *QPOS) computeShuffleIndex(seed types.Hash, position, bound uint64) int 
 // VerifyProposer path consult this and refuse to act on slots in the
 // disputed epoch until SetEpochVRFAccumulator clears the cold-start flag
 // and the shuffle cache is invalidated, forcing a recomputation.
-func (q *QPOS) IsProposerScheduleReadyForEpoch(epoch uint64) bool {
+func (q *QPOS) IsProposerScheduleReadyForEpoch(epoch uint64) (ready bool) {
+	// QR-21: a failed hardened VDF seed stands the node down for the whole
+	// epoch. The result is overridden on every return path (including the
+	// fast paths) so a partially cached shuffle cannot leak through.
+	defer func() {
+		if q.VDFSeedStopped(epoch) {
+			ready = false
+		}
+	}()
 	if epoch < 2 {
 		return true
 	}
@@ -257,7 +265,16 @@ func (q *QPOS) ChainStartsAfterEpoch(epoch uint64) bool {
 	return q.firstBlockEpoch.Load() > epoch
 }
 
-func (q *QPOS) GetProposerForSlot(slot uint64) (*Validator, error) {
+func (q *QPOS) GetProposerForSlot(slot uint64) (result *Validator, retErr error) {
+	// QR-21: fail closed for an epoch whose hardened VDF seed is unavailable.
+	// The defer covers the first call too — epochSeedLocked pins the epoch
+	// during this very call, so an entry-point-only check would miss it.
+	defer func() {
+		if q.VDFSeedStopped(SlotToEpoch(slot)) {
+			result = nil
+			retErr = ErrVDFSeedUnavailable
+		}
+	}()
 	// P3-7 FIX: Use RLock for the read-heavy portion (validator set snapshot +
 	// cache lookup). The common cache-hit path now allows concurrent proposer
 	// lookups instead of serializing them behind a write lock. Only the rare
@@ -454,7 +471,14 @@ func (q *QPOS) GetProposerForSlot(slot uint64) (*Validator, error) {
 // (the Ethereum-aligned analog of block.proposer_index). Once embedded, every
 // node reproduces identical proposer rewards from the census without re-deriving
 // from node-local VRF-accumulator/shuffle state.
-func (q *QPOS) GetProposerIndexForSlot(slot uint64) int {
+func (q *QPOS) GetProposerIndexForSlot(slot uint64) (result int) {
+	// QR-21: see GetProposerForSlot. -1 is this function's existing
+	// "no proposer" sentinel, so the stand-down needs no new error path.
+	defer func() {
+		if q.VDFSeedStopped(SlotToEpoch(slot)) {
+			result = -1
+		}
+	}()
 	// QR-20 FIX (R134 randomness audit): getProposerIndexForSlotUnlocked's
 	// weighted branch calls buildWeightedEpochTableLocked, which WRITES
 	// q.weightedCumCache (create + prune) on cache miss. This caller holds

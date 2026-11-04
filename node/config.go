@@ -184,6 +184,15 @@ type Config struct {
 	// proposer election, which is cross-verified; a divergent value forks
 	// the chain at the activation epoch. See consensus/vdf_seed.go.
 	VDFSeedActivationEpoch uint64 `json:"vdfSeedActivationEpoch,omitempty"`
+	// ConsensusHardeningActivationEpoch is the first epoch at which the
+	// coordinated audit QR-22/42/40/28/21 hardening semantics apply:
+	// pure-function DA committee seed, strict proposer verification on an
+	// empty epoch, epoch-gated VRF proof enforcement, stalled-chain probe
+	// wiring, and VDF-failure election stand-down. 0 / unset = every path
+	// keeps its legacy behavior. MUST be identical on every node of the
+	// network — a divergent value changes the accepted block set at the
+	// activation epoch and forks the chain. See consensus_hardening.go.
+	ConsensusHardeningActivationEpoch uint64 `json:"consensusHardeningActivationEpoch,omitempty"`
 	// VDFSeedTimeSteps is the VDF sequential length T. 0 = the calibrated
 	// default (16,384). Governance pins this before activation; changing it
 	// after activation is a protocol change (same upgrade path).

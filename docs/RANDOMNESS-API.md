@@ -19,11 +19,16 @@ Its guarantees are:
   output into the accumulator, and the accumulator's self-consistency
   (`ComputeNextVRFAccumulator` over the parent) is re-verified on every block
   import. Honest caveat (audit QR-40): enforcing that each proposer's
-  contribution carries a valid VRF proof (`vrfEnforced` in
-  `core/block_validator.go`) is **not yet enabled network-wide** — it is an
-  epoch-gated activation planned as a coordinated upgrade. Until then,
-  grind-resistance of the accumulator rests on the honest-majority assumption
-  rather than on cryptographic proposer-proof enforcement.
+  contribution carries a valid VRF proof is **not enabled by default**. The
+  code provides an epoch-gated cutover (`consensusHardeningActivationEpoch`
+  in the node config, wired through `core.BlockValidator.SetVRFEnforcedEpoch`):
+  from that epoch onward every block must carry a valid VRF proof, while all
+  earlier blocks (genesis, historical imports, replay) keep the legacy path.
+  The value is unset (0) today and MUST be identical on every node when
+  activated — a divergent value splits the chain at the activation boundary.
+  Until activation, grind-resistance of the accumulator rests on the
+  honest-majority assumption rather than on cryptographic proposer-proof
+  enforcement.
 - **Finality-bound**: once the epoch is finalized, its accumulator is
   irreversible.
 - **Publicly verifiable**: the accumulator is plain block-header data. Any

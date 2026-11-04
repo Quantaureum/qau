@@ -462,6 +462,11 @@ type QPOS struct {
 	vdfSeedCache map[vdfSeedKey]types.Hash // (srcEpoch, acc) -> hardened seed
 	vdfSeedBusy  map[vdfSeedKey]struct{}   // async precompute dedup
 
+	// Coordinated consensus-hardening batch (audit QR-22/42/40/28/21).
+	// Zero value = all hardening off, byte-identical legacy behavior.
+	// See consensus_hardening.go for the gate and its dedicated lock.
+	hardening consensusHardeningState
+
 	// R58-VRF-PERSIST (2026-08-18): optional callback invoked (under q.mu)
 	// whenever SetEpochVRFAccumulator commits an authoritative per-epoch
 	// accumulator. node.go registers it to write the value to the block

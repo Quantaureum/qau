@@ -81,7 +81,7 @@ This document provides developers with an architecture overview and contribution
 
 1. **Fully original**: independent of the Ethereum codebase, with full intellectual property rights
 2. **Quantum-safe**: uses the Dilithium3 post-quantum signature algorithm
-3. **High performance**: targeting 10,000+ TPS with 3-second finality
+3. **No published performance claims**: 12-second slots; no chain TPS, latency or availability figures are published
 4. **Modular**: clear module boundaries for easy testing and maintenance
 
 ### Technology Stack

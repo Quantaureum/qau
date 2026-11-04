@@ -2314,6 +2314,9 @@ func (n *Node) initConsensus() error {
 	}
 	n.checkpointManager = consensus.NewCheckpointManager(cpConfig, n.validatorManager)
 	n.blockValidator = core.NewBlockValidator(n.chainID, n.config.MaxGasLimit)
+	// QR-40: epoch-gated VRF proof enforcement. 0 keeps the historical
+	// behavior; a non-zero value must be identical on every node.
+	n.blockValidator.SetVRFEnforcedEpoch(n.config.ConsensusHardeningActivationEpoch)
 
 	n.blockValidator.SetValidatorLookup(n.validatorManager)
 	n.blockValidator.SetKeyVersionValidator(&defaultKeyVersionValidator{})
@@ -2877,7 +2880,7 @@ func (n *Node) initDanksharding() error {
 			// in the DA committee shuffle seed. See selectDACommitteeSeed
 			// (da_r5_03_seed.go) for the full three-tier rationale and
 			// unit tests.
-			return selectDACommitteeSeed(qpos, epoch)
+			return selectDACommitteeSeedGated(qpos, epoch)
 		},
 	)
 	// Apply runtime config (enabled flag + committee size override).

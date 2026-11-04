@@ -467,7 +467,7 @@ Regression tests pin all three: `TestFeeMarketFloorBelowTarget` (50k tx/day must
 | D5 | proposer share | 8/64 = 12.5% | one full share per slot (incumbent, 84.2%) | attestations drive finality and should not be undervalued 5.54x against target ||
 | D6 | baseFee | 100% burned | partial treasury share | a treasury is a big governance attack surface; burn is the cleanest holder consideration ||
 | D7 | priorityFee | fully to the proposer | 80/20 split to attesters (v1.0) | the 87.5% issuance weight already pays attesters; Ethereum does not split ||
-| D8 | on-chain treasury / DAO treasury | not built | 10% of issuance to a treasury | genesis ecosystem 2M + development 2M + validator incentives 4M already cover it ||
+| D8 | on-chain treasury / community treasury | not built | 10% of issuance to a treasury | genesis ecosystem 2M + development 2M + validator incentives 4M already cover it ||
 | D9 | switch method | epoch gate + 5/6 multisig announcement | immediate switch | finality was just fixed; stability first, keep rollback ||
 | D10 | ecosystem funding | entirely from genesis-allocated amounts | borrowing against future issuance | no inflation advances ||
 

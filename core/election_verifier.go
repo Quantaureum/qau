@@ -18,6 +18,16 @@ import (
 // ProposerAddr, do not fail the block" — see R45-PoA-FIX.
 var ErrProposerScheduleNotReady = errors.New("proposer schedule not ready: VRF accumulator for epoch-2 not yet populated (cold-start)")
 
+// strictVerificationOnMissingAccumulator reports whether QR-42 may keep
+// verifying the proposer instead of trusting the canonical ProposerAddr when
+// acc[epoch-2] is missing. Both conditions are required: the coordinated
+// hardening epoch must be active, and the canonical chain must prove the
+// epoch produced no block (so the fallback shuffle is a network-wide
+// consensus value rather than a node-local state gap).
+func strictVerificationOnMissingAccumulator(hardeningActive, chainHasNoBlockInSourceEpoch bool) bool {
+	return hardeningActive && chainHasNoBlockInSourceEpoch
+}
+
 // QPOSElectionVerifier is a production-grade implementation of
 // ProposerElectionVerifier that delegates proposer verification to the QPOS
 // consensus engine.
@@ -259,7 +269,19 @@ func (v *QPOSElectionVerifier) VerifyProposer(proposer types.Address, slot, epoc
 
 	if epoch >= 2 {
 		if v.qpos.GetEpochVRFAccumulator(epoch-2) == (types.Hash{}) {
-			return ErrProposerScheduleNotReady
+			// QR-42: under the coordinated hardening epoch, a PERMANENTLY
+			// missing accumulator (the canonical chain produced no block in
+			// epoch-2) must not degrade verification to signature-only. The
+			// fallback shuffle is a pure function of the epoch, so every node
+			// at the same head derives the same expected proposer; fall
+			// through and compare it below. Without chain evidence the
+			// accumulator may merely be not imported yet, so keep the legacy
+			// "trust canonical" behavior to avoid stalling sync.
+			if !strictVerificationOnMissingAccumulator(
+				v.qpos.HardeningActive(epoch),
+				v.qpos.ChainHasNoBlockInEpoch(epoch-2)) {
+				return ErrProposerScheduleNotReady
+			}
 		}
 	}
 	// R45-PoA-FIX FOLLOW-UP (2026-08-13): epoch < 2 must PROCEED to real

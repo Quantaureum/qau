@@ -2,11 +2,11 @@
 
 ## Core Positioning
 
-QAU is the **native utility token** of the Quantaureum quantum-safe blockchain. It is used to pay for network security services, participate in consensus through staking, and engage in protocol governance.
+QAU is the **native utility token** of the Quantaureum quantum-safe blockchain. It is used to pay for network transaction fees (gas) and to secure consensus through staking. Holding QAU does not grant governance voting rights; see GOVERNANCE.md.
 
-**On the name "Quantaureum":** Derived from Ancient Greek, meaning "quantum gold." The name reflects our design philosophy - creating a digital asset with gold-like scarcity and cryptographic unforgeability. Where gold derives its value from physical scarcity in nature, QAU derives its scarcity from post-quantum cryptographic guarantees and protocol-governed issuance. This is a narrative parallel, not a legal peg.
+**On the name "Quantaureum":** Derived from Ancient Greek, meaning "quantum gold". This is a naming metaphor only. QAU is not pegged to gold or to any fiat currency or commodity; there are no gold reserves, vaults, insurance arrangements, physical redemption rights or reserve audits. Scarcity comes solely from the protocol's issuance rules, not from any asset backing.
 
-**QAU is not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity.** Its value is derived from network usage demand and the security services it enables.
+**QAU is not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity.** Its role is limited to paying gas and securing consensus; this document makes no value or price claim.
 
 ## 1. Token Basics
 
@@ -24,7 +24,7 @@ QAU is the **native utility token** of the Quantaureum quantum-safe blockchain. 
 
 ## 2. Token Utility
 
-QAU serves exactly three purposes within the Quantaureum network:
+QAU serves exactly two purposes within the Quantaureum network:
 
 ### 2.1 Network Transaction Fees (Gas)
 
@@ -38,10 +38,10 @@ QAU serves exactly three purposes within the Quantaureum network:
 - Delegators can delegate QAU to validators and share rewards
 - Staking rewards are issued exclusively by protocol, not by any individual or entity
 
-### 2.3 Protocol Governance
+### 2.3 What QAU Does Not Do
 
-- QAU holders participate in network governance voting
-- Includes protocol upgrades, parameter adjustments, and community decisions
+- Holding QAU does not grant governance voting rights; there is no token-holder vote, council, DAO or foundation
+- Protocol changes follow maintainer-led review and require a written design; see GOVERNANCE.md
 
 ## 3. Token Allocation
 
@@ -63,7 +63,7 @@ QAU serves exactly three purposes within the Quantaureum network:
 
 - All locked tokens managed via smart contracts, verifiable on-chain
 - Team, Development Fund, and Foundation Reserve include 1-year cliff, linear monthly release thereafter
-- Foundation reserve releases require community governance approval
+- Allocation labels such as "Foundation Reserve" are on-chain account labels only; they do not establish a legal foundation, a council, a DAO or token-holder governance. Releases follow maintainer-led review (GOVERNANCE.md)
 
 ## 4. Staking Economics
 
@@ -96,7 +96,7 @@ QAU serves exactly three purposes within the Quantaureum network:
   cost is small: 15,275 QAU/year is 0.076% of supply, and it decays
   automatically as stake grows
 - No supply cap; no manual minting; no admin-adjustable rate
-- Reproduce any row with `go run ./cmd/econsim table -preset live`
+- Every row is produced by `go run ./cmd/econsim table -preset live`, i.e. an economic-model simulation, not an on-chain measurement, not a yield promise and not investment advice
 
 ### 4.3 Slashing
 
@@ -110,7 +110,7 @@ QAU serves exactly three purposes within the Quantaureum network:
 
 - Minimum delegation: 1 QAU (no minimum, encourages broad participation)
 - Delegation fee: 0-15% of rewards, set by validator
-- 7-day unbonding period
+- 21-day unbonding period (`params/config.go:54` with a `params_test.go` assertion; 151,200 blocks at 12s in `economics/staking.go:280`)
 - Delegators share slashing risk proportionally
 
 ## 5. Economic Security
@@ -132,7 +132,7 @@ QAU serves exactly three purposes within the Quantaureum network:
 ### 5.2 Supply Dynamics
 
 - No fixed supply cap (similar to Ethereum)
-- No manual minting capability (no gold-backed or admin minting mechanism)
+- No manual minting capability (no asset-backed or admin minting mechanism)
 - Total supply grows only through protocol-governed staking rewards
 - Fee burning provides deflationary counterbalance
 
@@ -140,16 +140,14 @@ QAU serves exactly three purposes within the Quantaureum network:
 
 ### 6.1 Governance Model
 
-Quantaureum uses community-driven governance through the QIP (Quantaureum Improvement Proposal) process:
+Quantaureum uses maintainer-led review. Repository administrators control access, merge permissions and releases. Contributors propose changes through issues and pull requests; reviewers evaluate correctness, tests, compatibility and maintainability. Changes to protocol rules, cryptography, wire formats, storage compatibility or public APIs need a written design before implementation.
 
-1. Community Discussion -> 2. QIP Draft -> 3. Technical Review -> 4. Testnet Implementation -> 5. Community Vote -> 6. Mainnet Activation
+### 6.2 No Foundation or Token-Holder Governance
 
-### 6.2 Foundation Role
-
-- The Foundation is the legal entity responsible for protocol maintenance and compliance
-- Treasury funds managed by the Foundation under community oversight
-- Parameter changes require QIP process
-- Foundation gradually transfers governance authority to community DAO
+- This project does not establish a foundation, an elected council, a DAO, or token-holder governance
+- Holding QAU does not grant permissions or voting rights; contribution counts do not grant permissions automatically
+- "Foundation Reserve" in the genesis allocation table is an on-chain account label only, not a legal entity
+- A merge is not authorization for a network upgrade or a production deployment (see GOVERNANCE.md)
 
 ## 7. Comparative Positioning
 

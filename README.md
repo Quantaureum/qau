@@ -1,10 +1,12 @@
 # Quantaureum Node
 
-Quantaureum is a quantum-resistant, EVM-compatible Proof-of-Stake (PoS) Layer 1 blockchain.
+Quantaureum is a quantum-safe Layer 1 blockchain built from scratch in Go. This is an independent developer's technical exploration project, currently in **testnet phase** (chain ID 1669); mainnet parameters (1668) are configured in code and launch status will be announced officially.
 
-- **Consensus**: QPOS (Proof-of-Stake, validators lock stake; block rewards auto-compound)
-- **EVM**: full integration (current `go-ethereum` slice)
-- **Post-quantum**: validator identities, consensus signatures, and staking use post-quantum primitives (Dilithium3 / Falcon-512).
+- **Consensus**: QPOS (Proof-of-Stake, validators lock stake; block rewards auto-compound) with QTD / GM-QTD committee-signed finality
+- **Contract path**: QASM / QVM is the only verified contract path. Solidity deployments are explicitly rejected and the EVM compatibility layer is disabled; see `docs/EVM-COMPATIBILITY.md`
+- **Post-quantum**: validator identities, consensus signatures and staking use Dilithium3 / ML-DSA-65 (NIST FIPS 204) and Kyber768 / ML-KEM-768 (NIST FIPS 203). ECDSA is disabled and there is no classical fallback.
+
+QAU is not pegged to any fiat currency or commodity; there are no gold reserves, vaults, insurance arrangements, physical redemption rights or reserve audits. Governance is maintainer-led review (`GOVERNANCE.md`): no foundation, council, DAO or token-holder voting.
 
 ## Experimental — not live
 

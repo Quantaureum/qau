@@ -224,7 +224,7 @@ HD wallet path: `m/44'/1668'/0'/0/{index}`
 
 ## Contributing
 
-Pull requests and code improvements are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full process. Contributors — merged PRs, valid security reports, and significant community contributions — may receive QAU rewards from the on-chain **Foundation Reserve / Ecosystem Fund** (see the bounty table in [SECURITY.md](SECURITY.md)).
+Pull requests and code improvements are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full process. Valid security reports may be eligible for rewards from the fixed, capped 25,000 QAU bounty pool described in [SECURITY.md](SECURITY.md). "Foundation Reserve" is an on-chain allocation label only, not a legal entity; no reward schedule is activated by this README (see GOVERNANCE.md).
 
 ## Security
 

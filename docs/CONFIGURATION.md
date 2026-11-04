@@ -28,6 +28,29 @@ qauctl --config /etc/quantaureum/config.json config validate
 qauctl --config /etc/quantaureum/config.json config show
 ```
 
+## Coordinated Consensus Hardening (disabled by default)
+
+`consensusHardeningActivationEpoch` (unsigned integer, default `0`) is a single
+network-wide, epoch-gated cutover for the audit QR-22 / QR-42 / QR-40 / QR-28 /
+QR-21 follow-ups. From that epoch onward the node applies:
+
+- a pure, chain-derived DA committee seed instead of the node-local finality
+  and RANDAO tiers;
+- strict proposer-identity verification for the epoch following a zero-block
+  epoch, gated on canonical-chain evidence;
+- mandatory VRF proof verification on every block (earlier blocks, including
+  genesis, historical imports and replay, keep the legacy path);
+- the stalled-chain exemption probe for Executive chamber selection;
+- an election stand-down instead of a per-node VDF-seed fallback when a
+  configured VDF seed evaluation fails.
+
+`0` / unset keeps every legacy behavior byte-identical. **This value MUST be
+identical on every validator**: it changes the accepted block set at the
+activation epoch, so a divergent value forks the chain. Activation is a
+coordinated upgrade — all nodes on the same binary and the same value, with a
+rehearsed cutover. Leaving it unset is the supported default until then. The
+node logs the effective activation epoch at startup.
+
 ## Configuration Precedence
 
 1. Built-in defaults
@@ -156,10 +179,11 @@ Bootstrap records should use the authenticated form:
 ```
 
 The records above use documentation-space placeholders (TEST-NET-3 addresses and
-example node IDs). The live mainnet bootnode list is operational data and lives
-with the operator runbooks, never in this repository.
+example node IDs). No live mainnet bootnode list is published in this repository;
+the project is in testnet phase and any endpoint must be verified with
+`eth_chainId` before use.
 
-A config example with the same shape (these are the built-in mainnet records); an explicit `bootstrapPeers` setting or
+A config example with the same shape (these are the built-in mainnet configuration records); an explicit `bootstrapPeers` setting or
 `--bootnodes` flag replaces them. A plain `host:port` entry is an
 unauthenticated legacy address. It does not verify which node answers and
 should not be used for a public canonical list.

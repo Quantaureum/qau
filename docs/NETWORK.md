@@ -1,5 +1,7 @@
 # Network Guide
 
+> **Status note (D-34, 2026-11-04):** This document describes the built-in network presets that exist in code. The project is currently in **testnet phase (chain ID 1669)**; the mainnet preset (1668) is configured in code and its launch status will be announced officially. The endpoints below are a configuration reference, not a claim that a public mainnet is live.
+
 The `qaud` client contains the public identity and genesis configuration for
 the named Quantaureum networks. No runtime genesis JSON file is required for
 mainnet or testnet.
@@ -16,7 +18,7 @@ The hexadecimal JSON-RPC form of the chain ID is `0x684` for mainnet and
 
 ## Public RPC
 
-The verified public mainnet JSON-RPC endpoint is:
+The configured JSON-RPC endpoint for the mainnet preset is:
 
 ```text
 https://rpc.quantaureum.com
@@ -30,12 +32,12 @@ curl -sS https://rpc.quantaureum.com \
   -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
 ```
 
-The mainnet endpoint must return `"result":"0x684"`. A public RPC endpoint is
+A mainnet-preset endpoint must return `"result":"0x684"`. A public RPC endpoint is
 convenient for read-only queries and transaction submission, but operators and
 applications that require independent verification should run their own node
 and verify its genesis hash and peer connectivity as described below.
 
-The verified public testnet JSON-RPC endpoint is:
+The configured JSON-RPC endpoint for the testnet preset is:
 
 ```text
 https://testnet-rpc.quantaureum.com
@@ -101,7 +103,7 @@ lowercase, and `0x` prefixes are not used by the expected value.
 
 ## Bootnodes
 
-The mainnet preset contains the following authenticated canonical bootstrap
+The mainnet preset contains the following authenticated built-in bootstrap
 records. When `--network mainnet` is selected and no bootstrap peers are
 configured, `qaud` uses these records automatically:
 
@@ -119,7 +121,7 @@ configured, `qaud` uses these records automatically:
 }
 ```
 
-The testnet preset contains the following authenticated canonical bootstrap
+The testnet preset contains the following authenticated built-in bootstrap
 record. When `--network testnet` is selected and no bootstrap peers are
 configured, `qaud` uses this record automatically:
 

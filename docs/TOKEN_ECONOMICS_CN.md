@@ -1,57 +1,58 @@
+<!-- Historical localized path retained for existing documentation links.
+     This repository ships English-only text (R10-06); the canonical document
+     is TOKEN_ECONOMICS.md. This file mirrors it and must stay in sync. -->
+
 # QAU Token Economics
 
 ## Core Positioning
 
-QAU is the **Native Utility Token** of the Quantaureum quantum-secure blockchain, used to pay network security fees, stake for consensus participation, and for protocol governance.
+QAU is the **native utility token** of the Quantaureum quantum-safe blockchain. It is used to pay for network transaction fees (gas) and to secure consensus through staking. Holding QAU does not grant governance voting rights; see GOVERNANCE.md.
 
-**About the meaning of "Quantum Gold":** Quantaureum derives from ancient Greek and means "quantum gold." The name represents our design philosophy - creating in the digital age a value carrier that is as scarce, secure, and non-counterfeitable as gold. Gold is a naturally scarce asset; QAU is a cryptographically-backed scarce digital asset. This is a narrative resonance, not a legal anchor.
+**On the name "Quantaureum":** Derived from Ancient Greek, meaning "quantum gold". This is a naming metaphor only. QAU is not pegged to gold or to any fiat currency or commodity; there are no gold reserves, vaults, insurance arrangements, physical redemption rights or reserve audits. Scarcity comes solely from the protocol's issuance rules, not from any asset backing.
 
-QAU is not a payment currency, not a stablecoin, and not pegged to any fiat currency or commodity. Its value derives from network usage demand and security services.
+**QAU is not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity.** Its role is limited to paying gas and securing consensus; this document makes no value or price claim.
 
-
-## 1. Token Basic Information
+## 1. Token Basics
 
 | Parameter | Value |
-|------|-----|
+|-----------|-------|
 | Token Name | Quantaureum |
 | Token Symbol | QAU |
 | Token Type | Native Utility Token |
-| Genesis Supply | 20,000,000 QAU |
-| Subsequent Issuance | Issued only through the staking reward protocol (no manual minting) |
+| Initial Supply | 20,000,000 QAU |
+| Ongoing Issuance | Protocol-governed staking rewards only (no manual minting) |
 | Decimals | 18 |
-| Blockchain | Quantaureum native blockchain |
-| Consensus Mechanism | Quantum Proof of Stake (QPOS) |
-| Cryptography | Dilithium3 + Kyber-768 post-quantum cryptography suite |
+| Blockchain | Quantaureum Native Blockchain |
+| Consensus | Quantum Proof of Stake (QPOS) |
+| Cryptography | Dilithium3 + Kyber-768 post-quantum |
 
+## 2. Token Utility
 
-## 2. Token Use Cases
-
-QAU's sole purpose is to run and maintain the Quantaureum network:
+QAU serves exactly two purposes within the Quantaureum network:
 
 ### 2.1 Network Transaction Fees (Gas)
 
-- All on-chain operations (transfers, contract calls, deployments) require paying QAU as Gas fees
-- Uses the EIP-1559 fee model: base fee burned + priority fee to validators
-- Base fee burning produces a deflationary effect
+- All on-chain operations (transfers, contract calls, deployments) require QAU as gas
+- EIP-1559 fee model: base fee burned + priority fee to validators
+- Base fee burning creates deflationary pressure
 
 ### 2.2 Staking for Consensus Participation
 
-- Validators stake QAU to participate in QPOS consensus and receive protocol-issued staking rewards
+- Validators stake QAU to participate in QPOS consensus
 - Delegators can delegate QAU to validators and share rewards
-- Staking rewards come from automatic protocol issuance, not from any individual or entity
+- Staking rewards are issued exclusively by protocol, not by any individual or entity
 
-### 2.3 Protocol Governance
+### 2.3 What QAU Does Not Do
 
-- QAU holders participate in network governance voting
-- Includes community decisions such as protocol upgrades and parameter adjustments
-
+- Holding QAU does not grant governance voting rights; there is no token-holder vote, council, DAO or foundation
+- Protocol changes follow maintainer-led review and require a written design; see GOVERNANCE.md
 
 ## 3. Token Allocation
 
 ### 3.1 Genesis Allocation (20,000,000 QAU)
 
 | Category | Amount | Share | Vesting |
-|------|------|------|----------|
+|----------|--------|-------|---------|
 | Community Contribution | 4,961,600 QAU | 24.81% | Free circulation |
 | Team | 4,000,000 QAU | 20% | 4-year linear, 1-year cliff |
 | Staking Incentive Pool | 4,000,000 QAU | 20% | 5-year linear |
@@ -64,29 +65,29 @@ QAU's sole purpose is to run and maintain the Quantaureum network:
 
 ### 3.2 Release Rules
 
-- All locked tokens are managed through smart contracts and are verifiable on-chain
-- Team, Development Fund, and Foundation Reserve include a 1-year cliff period, followed by monthly linear release
-- Each release from the Foundation Reserve requires community vote approval
-
+- All locked tokens managed via smart contracts, verifiable on-chain
+- Team, Development Fund, and Foundation Reserve include 1-year cliff, linear monthly release thereafter
+- Allocation labels such as "Foundation Reserve" are on-chain account labels only; they do not establish a legal foundation, a council, a DAO or token-holder governance. Releases follow maintainer-led review (GOVERNANCE.md)
 
 ## 4. Staking Economics
 
 ### 4.1 Validator Requirements
 
 | Parameter | Value |
-|------|-----|
+|-----------|-------|
 | Minimum Stake | 32 QAU |
-| Key Type | Dilithium3 (mandatory, quantum-secure) |
+| Key Type | Dilithium3 (mandatory, quantum-safe) |
 
 ### 4.2 Staking Rewards
 
-- Issued automatically by the protocol, not human-controlled
+- Issued by the protocol automatically, not controlled by any entity
 - Formula (Ethereum Altair-aligned): each validator's per-epoch base reward is
   `stake x 31 / sqrt(total_staked)`, computed in gwei. Attesters receive 87.5%
   of issuance; the block proposer pool receives 12.5%
-- **Yield is a function of total stake, not of a participation ratio.** APY
-  falls as `1/sqrt(total_staked)`, so early stakers are not locked into a
-  permanently high rate and no manual adjustment or governance vote is involved
+- **Yield is a function of total stake, not of a participation ratio.** Because
+  issuance scales with `sqrt(total_staked)` while yield divides by stake, APY
+  falls as `1/sqrt(total_staked)` — early stakers are not locked into a
+  permanently high rate, and no manual adjustment or governance vote is involved
 
 | Total staked (QAU) | Validators | Annual issuance (QAU) | Staking APY |
 |---|---|---|---|
@@ -99,23 +100,22 @@ QAU's sole purpose is to run and maintain the Quantaureum network:
   cost is small: 15,275 QAU/year is 0.076% of supply, and it decays
   automatically as stake grows
 - No supply cap; no manual minting; no admin-adjustable rate
-- Reproduce any row with `go run ./cmd/econsim table -preset live`
+- Every row is produced by `go run ./cmd/econsim table -preset live`, i.e. an economic-model simulation, not an on-chain measurement, not a yield promise and not investment advice
 
-### 4.3 Slashing Mechanism
+### 4.3 Slashing
 
-| Violation Type | Penalty |
-|----------|------|
-| Double signing | 100% slashed + removed from the validator set |
-| Persistent offline | Gradual penalty proportional to offline time |
-| Malicious behavior | 10-100% depending on severity |
+| Violation | Penalty |
+|-----------|---------|
+| Double signing | 100% slash + removal from validator set |
+| Extended downtime | Progressive penalty proportional to offline duration |
+| Malicious behavior | 10-100% based on severity |
 
-### 4.4 Delegation Mechanism
+### 4.4 Delegation
 
-- Minimum delegation of 1 QAU, no need to become a validator to participate
-- Delegation fee is set by the validator (0-15%)
-- 7-day unbonding period
-- Delegators bear slashing risk proportionally
-
+- Minimum delegation: 1 QAU (no minimum, encourages broad participation)
+- Delegation fee: 0-15% of rewards, set by validator
+- 21-day unbonding period (`params/config.go:54` with a `params_test.go` assertion; 151,200 blocks at 12s in `economics/staking.go:280`)
+- Delegators share slashing risk proportionally
 
 ## 5. Economic Security
 
@@ -123,8 +123,8 @@ QAU's sole purpose is to run and maintain the Quantaureum network:
 
 - EIP-1559 base fee is burned (removed from supply, credited to no account);
   the priority fee goes to the block proposer
-- Net issuance = staking reward issuance - base fee burn
-- Net deflation achieved under sustained high network usage
+- Net issuance = staking rewards - base fee burned
+- Net deflation occurs under sustained high network usage
 
 > **Current scope of burning.** Base-fee burning applies to EIP-1559
 > dynamic-fee transactions. Legacy transaction types currently pay their entire
@@ -135,40 +135,35 @@ QAU's sole purpose is to run and maintain the Quantaureum network:
 
 ### 5.2 Supply Dynamics
 
-- No fixed total supply cap (similar to Ethereum)
-- No manual minting capability (no gold-backed minting mechanism)
-- Total supply grows only automatically through the staking reward protocol
-- The burn mechanism provides a deflationary balance
-
+- No fixed supply cap (similar to Ethereum)
+- No manual minting capability (no asset-backed or admin minting mechanism)
+- Total supply grows only through protocol-governed staking rewards
+- Fee burning provides deflationary counterbalance
 
 ## 6. Governance
 
 ### 6.1 Governance Model
 
-Quantaureum adopts community-driven governance, making decisions through the QIP (Quantaureum Improvement Proposal) process:
+Quantaureum uses maintainer-led review. Repository administrators control access, merge permissions and releases. Contributors propose changes through issues and pull requests; reviewers evaluate correctness, tests, compatibility and maintainability. Changes to protocol rules, cryptography, wire formats, storage compatibility or public APIs need a written design before implementation.
 
-1. Community discussion -> 2. QIP draft -> 3. Technical review -> 4. Testnet implementation -> 5. Community vote -> 6. Mainnet activation
+### 6.2 No Foundation or Token-Holder Governance
 
-### 6.2 Foundation Role
+- This project does not establish a foundation, an elected council, a DAO, or token-holder governance
+- Holding QAU does not grant permissions or voting rights; contribution counts do not grant permissions automatically
+- "Foundation Reserve" in the genesis allocation table is an on-chain account label only, not a legal entity
+- A merge is not authorization for a network upgrade or a production deployment (see GOVERNANCE.md)
 
-- The Foundation is a legal entity responsible for the day-to-day maintenance and compliance of the protocol
-- Treasury funds are managed by the Foundation, and usage requires community oversight
-- Key parameter changes must go through the QIP process
-- The Foundation gradually transfers governance rights to the community DAO
-
-
-## 7. Comparison with Other Tokens
+## 7. Comparative Positioning
 
 | Feature | Bitcoin | Ethereum | QAU |
-|------|---------|----------|-----|
-| Type | Store of value | Smart contract platform fuel | **Quantum-secure network fuel** |
-| Signature algorithm | ECDSA | ECDSA | **Dilithium3 (post-quantum)** |
-| Key exchange | None | ECIES | **Kyber-768 (post-quantum)** |
+|---------|---------|----------|-----|
+| Type | Store of value | Smart contract platform fuel | **Quantum-safe network fuel** |
+| Signature | ECDSA | ECDSA | **Dilithium3 (post-quantum)** |
+| Key Exchange | None | ECIES | **Kyber-768 (post-quantum)** |
 | Consensus | PoW | PoS | QPOS |
-| Issuance method | Mining | Staking | Staking (automatic protocol) |
-| Quantum resistance | None | None | Yes (native support) |
-
+| Issuance | Mining | Staking | Staking (protocol-governed) |
+| Quantum Resistance | None | None | Yes (native) |
 
 ## 8. Disclaimer
 
-QAU is a utility token of the Quantaureum network, used to pay for network service fees and participate in consensus security. QAU is not a security, not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity. This document does not constitute investment advice or an offer. Please consult local laws and regulations before participating in the network.
+QAU is the utility token of the Quantaureum network, used to pay for network services and participate in consensus security. QAU is not a security, not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity. This document does not constitute investment advice or a solicitation. Consult local laws and regulations before participating in the network.

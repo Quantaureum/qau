@@ -255,7 +255,7 @@ The `txHash` returned by `qau_stake` **only means the transaction entered the no
   - a hop indicator in the swap UI
   - a pool-selector control
   - pool contract addresses no longer fixed — fetched at runtime from `factory.getPair(tokenA, tokenB)`
-- **R126+ (governance)**: QSwap parameters change via DAO proposals — wallets do not implement governance; they only link proposals to a browser
+- **R126+ (governance)**: parameter changes follow maintainer-led review with a written design (GOVERNANCE.md); there is no DAO or token-holder vote, and wallets do not implement governance
 
 ---
 

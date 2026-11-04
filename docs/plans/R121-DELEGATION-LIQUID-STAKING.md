@@ -1,5 +1,7 @@
 # R121 — Delegation & Liquid Staking mainnet rollout plan
 
+> **Status note (D-34, 2026-11-04):** This is a historical planning draft; the figures below describe a *proposed* design, not shipped behaviour. The current authoritative unbonding parameter is **21 days / 151,200 blocks at 12s** (`params/config.go:54`, `params_test.go`, `economics/staking.go:280`); governance is maintainer-led review (`GOVERNANCE.md`), not a DAO or token-holder vote. Do not quote the 7-day figure below as current protocol behaviour.
+
 | Field | Content ||
 ---|---||
 | **Status** | 📋 Planning (R120 stable and running; work not started) ||
@@ -27,7 +29,7 @@
 | Whitepaper | Reality | Gap ||
 ---|---||---|
 | "delegate staking from 1 QAU" | no qau_stake / qau_delegate user-facing RPC | 🔴 Critical ||
-| "7-day unbonding" | no user-facing unbonding queue | 🔴 Critical ||
+| "7-day unbonding" (historical draft, superseded; current = 21 days) | no user-facing unbonding queue | 🔴 Critical ||
 | "delegators share validator rewards pro rata" | LiquidStakingManager framework exists but pool active=false | 🔴 Critical ||
 | "pools can switch validators" | no pool->validator binding logic | 🟡 ||
 | "liquid staking receipt token" | the LiquidQ contract is undeveloped | 🟡 ||
@@ -230,7 +232,7 @@ Incentives (initial intent; final amounts confirmed via a governance proposal):
 ---|---||---|
 | EM-2 epoch rewards stably running on mainnet | ✅ live | none ||
 | the 6000 QAU stake of allocation accounts is a genesis value | ✅ | none ||
-| Governance/QIP process | ⏸️ planned | soft dependency; R121 can launch without governance ||
+| Governance/QIP process (historical draft; governance is maintainer-led review, no DAO or token vote) | ⏸️ planned | soft dependency; R121 can launch without governance ||
 | Treasury multisig | 📋 not started | blocks delegator rewards; interim plan: "protocol-native rewards" ||
 | validator registry RPC | ✅ exists in qpos | none ||
 

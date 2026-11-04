@@ -4,13 +4,13 @@
 
 ## Abstract
 
-Quantaureum is a quantum-safe Layer-1 blockchain infrastructure designed to withstand attacks from both classical and quantum adversaries. The name derives from Ancient Greek, meaning "quantum gold" — a reflection of our design philosophy: creating a digital asset with gold-like scarcity and unforgeability, backed not by physical reserves but by post-quantum cryptographic guarantees.
+Quantaureum is a quantum-safe Layer-1 blockchain infrastructure designed to withstand attacks from both classical and quantum adversaries. The name derives from Ancient Greek, meaning "quantum gold". That is a naming metaphor only: QAU is not pegged to gold or to any fiat currency or commodity, and there are no gold reserves, vaults, insurance arrangements, physical redemption rights or reserve audits. Scarcity is a property of the protocol's issuance rules, not of any asset backing.
 
 Built from the ground up with NIST-standardized post-quantum cryptography — Dilithium3 (ML-DSA-65) for signatures and Kyber-768 (ML-KEM-768) for key exchange — Quantaureum provides a secure foundation for decentralized applications in the post-quantum era.
 
-The mainnet is live (chain ID 1668), alongside a browser extension wallet (Chrome/Edge/Firefox), a mobile wallet (Android), an official website with explorer, and six-language SDKs.
+This is an independent developer's technical exploration project, currently in testnet phase (chain ID 1669). Mainnet parameters (chain ID 1668) are configured in code; launch status will be announced officially. The repository also contains a browser extension wallet, an Android mobile wallet, a website with explorer, and SDKs.
 
-The native utility token, QAU, serves as network fuel for transaction processing, consensus participation, and protocol governance. It is not a payment currency, stablecoin, or commodity-pegged asset.
+The native utility token, QAU, pays for transaction processing (gas) and secures the network through staking and consensus participation. It is not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity. Holding QAU does not confer governance voting rights; see GOVERNANCE.md.
 
 ## 1. Introduction
 
@@ -87,11 +87,11 @@ Quantum Proof of Stake (QPOS) is modeled after the Gasper consensus protocol (Ca
 | Committee size (large-scale) | 128 per epoch |
 | Attestation signature | Dilithium3 |
 
-Blocks reach the chain within a 12-second slot; irreversibility is provided by Casper FFG finality across two consecutive epochs. Checkpoint subjectivity protection prevents shallow-history fabrication for newly syncing nodes.
+Blocks reach the chain within a 12-second slot. The base checkpoint path is Casper FFG finality across two consecutive epochs; when the QTD / GM-QTD committee-signed finality path is active it supersedes the checkpoint path. Both paths are implemented in `consensus/` (`block.go`, `checkpoint.go`). Checkpoint subjectivity protection prevents shallow-history fabrication for newly syncing nodes.
 
 ### 3.2 Validator Selection
 
-Validators are selected via Verifiable Random Function (VRF) to ensure fair and unpredictable assignment. At 200,000 simulated validators, committee assignment completes in ~234 ms per epoch and proposer selection in ~2.9 ms per call, with no duplicate committee members or proposers (verified over full epochs).
+Validators are selected via Verifiable Random Function (VRF) to ensure fair and unpredictable assignment. Committee assignment and proposer selection have been exercised at 200,000 validators in simulation to check for duplicate members; these are simulation results, not measurements from a deployed network.
 
 ### 3.3 Slashing
 
@@ -127,7 +127,7 @@ Transactions follow a commit-reveal pattern that prevents validators from exploi
 
 ## 5. Scalability Modules
 
-The protocol codebase implements the following scaling layers; mainnet activation is staged progressively via governance:
+The following scaling layers are design and roadmap items in this repository, not shipped feature claims. Their completion status and staged activation are tracked in ROADMAP.md:
 
 - **Data availability:** erasure coding, data-availability sampling (DAS), and FRI commitments
 - **Sharding:** multi-shard architecture with cross-shard messaging
@@ -157,18 +157,18 @@ The P2P networking layer uses:
 
 ### 6.3 Scale Validation
 
-The networking stack has been validated at 200,000-node scale in simulation: DHT node discovery at 530K inserts/sec, connection pools for 200K peers in ~53 MB of memory, and rate limiting at ~12K peers/sec (42/42 tests passing).
+The networking stack has been exercised at 200,000-node scale in simulation for DHT discovery, connection pools and rate limiting. These are simulation results, not measurements from a deployed network; no chain throughput, latency or availability figure is published.
 
 ## 7. Products & Ecosystem
 
 | Product | Status |
 |---------|--------|
-| **Blockchain node** (`qaud`/`qauctl`, Go 1.26+) | Mainnet live (chain ID 1668), testnet & devnet |
+| **Blockchain node** (`qaud`/`qauctl`, Go 1.26+) | Testnet phase (1669); mainnet config 1668; devnet 1333 |
 | **Browser extension wallet** v1.0.1 | Chrome, Edge, Firefox |
 | **Mobile wallet** v1.0 | Android (React Native, Dilithium3 keystore, BIP-39/BIP-44-style HD) |
 | **Official website & explorer** | www.quantaureum.com — explorer, staking, developer docs |
 | **SDKs** | Go, Rust, C++, Java, Python, JavaScript/TypeScript — unified API |
-| **RPC / GraphQL** | JSON-RPC 2.0 (HTTPS + WS) at rpc.quantaureum.com |
+| **RPC / GraphQL** | JSON-RPC 2.0 (HTTPS + WS); verify `eth_chainId` before use (1668 / 1669 / 1333) |
 
 Wallets support multi-network switching (mainnet/testnet/devnet), Commit-Reveal anti-MEV transaction flow, and real-time transaction status tracking.
 
@@ -178,10 +178,11 @@ QAU is the **native utility token** of the Quantaureum network. It is not a paym
 
 ### 8.1 Utility
 
-QAU serves three purposes:
+QAU serves two purposes:
 1. **Network fuel (gas):** All on-chain operations require QAU
-2. **Consensus participation:** Validators stake QAU to secure the network
-3. **Protocol governance:** QAU holders vote on network proposals
+2. **Consensus participation:** Validators stake QAU to secure the network; delegators may delegate from 1 QAU
+
+Holding QAU does not grant governance voting rights. Changes to protocol rules follow maintainer-led review and require a written design; see GOVERNANCE.md.
 
 ### 8.2 Genesis Allocation (20,000,000 QAU)
 
@@ -197,7 +198,7 @@ QAU serves three purposes:
 | Genesis Validators | 38,400 QAU | 0.19% | 6 × 6,000 QAU staked in consensus, 6 × 400 QAU account balance |
 | **Total** | **20,000,000 QAU** | **100%** | |
 
-All locked allocations are managed via smart contracts with on-chain verification. No manual minting capability exists beyond protocol-governed staking rewards.
+All locked allocations are managed via smart contracts with on-chain verification. No manual minting capability exists beyond protocol-governed staking rewards. "Foundation Reserve" and "Ecosystem Fund" are on-chain allocation labels only; they do not establish a legal foundation, a council, a DAO, or token-holder governance. Governance follows maintainer-led review (GOVERNANCE.md).
 
 ### 8.3 Staking & Issuance
 
@@ -212,11 +213,11 @@ All locked allocations are managed via smart contracts with on-chain verificatio
 | 3,996,000 | 666 | 160,935 | 4.03% |
 | 19,998,000 | 3,333 | 360,023 | 1.80% |
 
-No supply cap; no manual minting; no admin-adjustable rate. See [QAU Token Economics](TOKEN_ECONOMICS.md) for full details.
+No supply cap; no manual minting; no admin-adjustable rate. The table above is produced by `go run ./cmd/econsim table -preset live`; it is an economic-model simulation, not an on-chain measurement, not a yield promise and not investment advice. See [QAU Token Economics](TOKEN_ECONOMICS.md) for full details.
 
 ## 9. Performance
 
-Micro-benchmarks (serialization + validation, Xeon E5-2680 v3, Go 1.26+) show 384K–909K TPS raw throughput, scaling to ~2.2x at 8 workers. These figures **exclude Dilithium3 signature verification** (~3,300 verifications/sec/core); end-to-end throughput under full PQC load is the subject of ongoing distributed benchmarks. 200,000-node network simulation results are reported in §6.3 and in the benchmark reports.
+The only published throughput figures come from a transaction serialization micro-benchmark (serialization + validation, Xeon E5-2680 v3, Go 1.26+): 384K–909K operations/sec, scaling to ~2.2x at 8 workers. These are **not chain TPS**. They exclude Dilithium3 signature verification, consensus, networking and state execution. No end-to-end chain throughput, latency or availability figure is published; distributed benchmarking under full PQC load remains an open item (ROADMAP.md).
 
 Honest framing matters: the cost of quantum safety is larger signatures and slower verification. Quantaureum's position is that this trade-off is worth making today rather than migrating under duress tomorrow, and the protocol is engineered (batch verification, Block-STM, committee sampling) to absorb it.
 
@@ -240,22 +241,15 @@ These may only be temporarily enabled for emergency migration scenarios.
 
 ### 10.3 Audit
 
-30 rounds of deep security auditing (plus 5 preliminary rounds) were conducted across the core chain and wallet extension, covering 43 packages. Result: **54 findings, all fixed** — 14 Critical, 12 High, 16 Medium, 12 Low. All 43 packages compile and pass tests with a 100% pass rate.
+No completed third-party audit, FIPS certification, security compliance certification or zero-vulnerability claim is made. Implementing the NIST FIPS 203 / FIPS 204 standard algorithms is not the same as holding a product certification. Source code alone does not establish production readiness (ROADMAP.md); known risks and experimental interfaces are listed in SECURITY.md.
 
-See [SECURITY.md](../SECURITY.md) for the vulnerability-reporting policy and bounty program; audit summary details are held in the internal audit archive.
+See [SECURITY.md](../SECURITY.md) for the private vulnerability-reporting channel and the capped 25,000 QAU bounty pool.
 
 ## 11. Governance
 
-Quantaureum uses community-driven governance through the QIP (Quantaureum Improvement Proposal) process, modeled after Ethereum's EIP process:
+Quantaureum uses maintainer-led review, not token-holder governance. Repository administrators control access, merge permissions and releases. Changes to protocol rules, cryptography, wire formats, storage compatibility or public APIs need a written design recording the problem, alternatives, security assumptions, migration impact and acceptance evidence before implementation. A merge is not authorization for a network upgrade or a production deployment.
 
-1. Community discussion
-2. Formal QIP draft with technical specifications
-3. Core developer technical review
-4. Testnet implementation and testing
-5. Community vote
-6. Mainnet activation
-
-A Foundation serves as the legal entity responsible for protocol maintenance and compliance, with a mandate to gradually transfer governance authority to community DAO.
+This document does not establish a foundation, an elected council, a DAO, or token-holder voting. Holding QAU does not grant permissions. See [GOVERNANCE.md](../GOVERNANCE.md).
 
 ## 12. Roadmap
 
@@ -266,11 +260,11 @@ A Foundation serves as the legal entity responsible for protocol maintenance and
 - QVM + QASM smart-contract engine, Block-STM parallel execution
 - Commit-Reveal anti-MEV transaction flow
 - Batch signature verification, key rotation and management
-- P2P networking with post-quantum transport; 200K-node scale validation
-- 30-round security audit (54 findings fixed, zero Critical/High remaining)
-- **Mainnet live since September 2026 (chain ID 1668)** at rpc.quantaureum.com
+- P2P networking with post-quantum transport; 200K-node scale validation in simulation
+- Known risks and experimental interfaces documented in SECURITY.md
+- **Testnet phase (chain ID 1669); mainnet parameters (1668) configured in code, launch status to be announced officially**
 - Browser extension wallet (Chrome/Edge/Firefox) + Android mobile wallet
-- Six-language SDKs; website with explorer
+- SDKs and a website with explorer
 
 ### In Progress
 - Cross-platform performance benchmarking (Dilithium3/ML-DSA across hardware)
@@ -279,11 +273,10 @@ A Foundation serves as the legal entity responsible for protocol maintenance and
 - Contributor documentation and onboarding
 
 ### Planned
-- Data availability, sharding, and rollup module mainnet activation (staged via governance)
-- Cross-chain bridge deployments and DeFi ecosystem
-- Enterprise BaaS offering
-- Foundation establishment, legal structuring, and community governance transition
+- Data availability, sharding and rollup module completion (design/roadmap items, not shipped features)
+- Cross-chain bridge work and light-client proofs
+- Independent review of cryptography and consensus (ROADMAP.md)
 
 ## 13. Disclaimer
 
-This whitepaper describes the technical architecture and design of the Quantaureum protocol. QAU is a utility token used to pay for network services and participate in consensus. QAU is not a security, not a payment currency, and not a stablecoin. This document does not constitute investment advice, a solicitation, or an offer to sell securities. Participation in the Quantaureum network is subject to applicable laws and regulations in your jurisdiction.
+This whitepaper describes the technical architecture and design of the Quantaureum protocol, an independent developer's technical exploration project currently in testnet phase. QAU is a utility token used to pay for network services and participate in consensus security. QAU is not a security, not a payment currency, not a stablecoin, and is not pegged to any fiat currency or commodity; there is no gold or other reserve backing. This document does not constitute investment advice, a solicitation, an offer to sell securities, or any price or return expectation. Participation in the Quantaureum network is subject to applicable laws and regulations in your jurisdiction.

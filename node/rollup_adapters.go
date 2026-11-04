@@ -144,5 +144,5 @@ func (a *qposSequencerAdapter) GetEpochSeed(epoch uint64) types.Hash {
 	if a.qpos == nil {
 		return types.Hash{}
 	}
-	return selectDACommitteeSeed(a.qpos, epoch)
+	return selectDACommitteeSeedGated(a.qpos, epoch)
 }

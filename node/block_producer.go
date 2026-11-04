@@ -781,6 +781,17 @@ func (bp *BlockProducer) initValidatorSet() {
 		bpLog.Info("ThreeChambersFlow initialized for block lifecycle tracking")
 	}
 
+	// QR-22/42/40/28/21: install the coordinated consensus-hardening gate
+	// and the canonical-chain probe once, before the first epoch transition.
+	// Activation epoch 0 keeps every legacy path byte-identical.
+	bp.node.wireConsensusHardening(qpos, coordinator)
+	hardeningEpoch := uint64(0)
+	if bp.node != nil && bp.node.config != nil {
+		hardeningEpoch = bp.node.config.ConsensusHardeningActivationEpoch
+	}
+	bpLog.Info("Consensus hardening activation epoch=%d (0 = legacy semantics; QR-22/42/40/28/21)",
+		hardeningEpoch)
+
 	// Wire up SlashingManager for double-signing/downtime detection.
 	// NewSlashingManager internally uses DefaultSlashingParams().
 	if bp.node.validatorManager != nil {
