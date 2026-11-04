@@ -130,7 +130,10 @@ func TestStateRoundtrip(t *testing.T) {
 		t.Errorf("LastProcessedBlock = %d, want 42", s.LastProcessedBlock)
 	}
 	// Missing file = zero state, not an error.
-	s2, err := loadState(filepath.Join(path, "does-not-exist", "x.json"))
+	// Build the missing path under a nonexistent directory, not under the
+	// state file itself: through a file component Linux yields ENOTDIR
+	// (not matched by os.IsNotExist) while Windows yields ENOENT.
+	s2, err := loadState(filepath.Join(t.TempDir(), "does-not-exist", "x.json"))
 	if err != nil {
 		t.Errorf("missing state file must not error, got %v", err)
 	}

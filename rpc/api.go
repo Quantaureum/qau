@@ -2828,7 +2828,7 @@ func (api *API) GetStakingPools(ctx context.Context, params json.RawMessage) (an
 	// GetUserStakes uses big.Int integer arithmetic (amount * apy * blocks / year / 100).
 	// For production, consider returning these as scaled integer strings (e.g.
 	// basis points: 500 = 5.00%) to avoid float64 precision loss in JSON clients.
-	// Illustrative stub pool catalogue (decision D-34). StakingAPY is disabled
+	// Illustrative stub pool catalog (decision D-34). StakingAPY is disabled
 	// (apy = 0.0) and reward_rate is a placeholder, not a published yield.
 	// The first term is aligned with the protocol unbonding period (21 days);
 	// these entries are display stubs, not consensus staking state.
