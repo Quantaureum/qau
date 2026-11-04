@@ -1218,8 +1218,23 @@ func (a *chainInfoAdapter) GetQPOSStatus() map[string]any {
 	// Get advanced QPOS status if available
 	if a.node.blockProducer.QPOSAdvanced() != nil {
 		advanced := a.node.blockProducer.QPOSAdvanced()
+		// F-5 (2026-11-04): the advanced.forkChoice sub-object is VESTIGIAL and must
+		// not be read as live finality. Its only growth path is
+		// QPOSAdvanced.ProcessSlot (qpos_advanced.go:1632), which has NO production
+		// caller, so the fork-choice tree never advances past genesis and every
+		// field is a stale placeholder (finalizedEpoch:0, voteCount:0,
+		// blockCount:1). This misled operators into believing the chain had no
+		// finality. Authoritative finality is the top-level "finality" block
+		// (qpos.GetFinalityStatus / GetFinalizedEpoch). Annotate the sub-object so
+		// the stale zeros are self-explanatory; the "note"/"enabled" keys are
+		// additive and ignored by JSON consumers that don't know them.
+		fcStatus := advanced.GetForkChoice().GetForkChoiceStatus()
+		fcStatus["enabled"] = false
+		fcStatus["note"] = "vestigial: advanced fork-choice tree has no production driver " +
+			"(ProcessSlot is never called); fields are stale placeholders, NOT live " +
+			"finality. Use the top-level 'finality' block for authoritative finality."
 		result["advanced"] = map[string]any{
-			"forkChoice":           advanced.GetForkChoice().GetForkChoiceStatus(),
+			"forkChoice":           fcStatus,
 			"inactivityLeakActive": advanced.GetInactivityLeakManager().IsLeakActive(),
 			"pendingWithdrawals":   len(advanced.GetWithdrawalManager().GetPendingWithdrawals()),
 		}
