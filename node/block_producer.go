@@ -656,7 +656,7 @@ func (bp *BlockProducer) initValidatorSet() {
 	// Fallback to default validators if genesis has none (dev/bootstrap)
 	if len(validators) == 0 {
 		if bp.node != nil && bp.node.config != nil && bp.node.config.DevMode {
-			// DEV-ONLY: deterministic dev validator set whose private keys are
+			// DEVNET ONLY: deterministic dev validator set whose private keys are
 			// reproducible from fixed seeds (like Ethereum's well-known dev
 			// accounts). This lets every dev node (and dev tooling / tests)
 			// derive the same validator addresses AND sign for them — the

@@ -60,6 +60,9 @@ func InitDevAccounts(dataDir string, count int) ([]*DevAccount, map[types.Addres
 		// different stateRoots, breaking consensus on testnet.
 		// The seed is derived from a fixed domain separator + account index,
 		// NOT from the dataDir (which differs per node).
+		// DEVNET ONLY: the seed below is fixed and public by design (same
+		// convention as Ethereum's well-known dev accounts); it must never
+		// be used outside dev mode.
 		seed := make([]byte, 32)
 		copy(seed[:], []byte("QUANTAUREUM-DEV-ACCOUNT-SEED")) // 27 bytes + 5 zero pad
 		binary.BigEndian.PutUint64(seed[24:], uint64(i))      // append index at bytes 24-31
