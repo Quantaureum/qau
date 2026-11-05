@@ -7705,11 +7705,17 @@ func (n *Node) wireElectionVerifier() {
 			n.blockValidator.SetElectionVerifier(verifier)
 			n.blockValidator.SetDevMode(false)
 			n.proposerElectionVerifier = verifier // R88-E: producer stand-down signal
-			// SECURITY WARNING (audit S-3): VRF verification is not enforced because
-			// VRF generation is not yet implemented in the block producer. Without VRF,
-			// proposer selection is deterministic and can be predicted by adversaries
-			// for targeted DoS attacks. This must be addressed in a future release.
-			nodeLog.Warn("VRF verification NOT enforced — proposer selection is predictable (known limitation, audit S-3)")
+			// SECURITY WARNING (audit S-3): VRF proof enforcement is epoch-gated
+			// (QR-40). Before the coordinated hardening activation epoch, VRF
+			// verification is not enforced and proposer selection is
+			// deterministic — predictable by adversaries for targeted DoS
+			// attacks. At/after the activation epoch the block validator
+			// rejects blocks whose VRF proof or value is missing or invalid.
+			if activation := n.config.ConsensusHardeningActivationEpoch; activation > 0 {
+				nodeLog.Info("VRF proof enforcement activates at epoch %d (QR-40); before that proposer selection remains predictable (audit S-3)", activation)
+			} else {
+				nodeLog.Warn("VRF verification NOT enforced — proposer selection is predictable (known limitation, audit S-3)")
+			}
 		}
 	}
 }
