@@ -1513,6 +1513,19 @@ func (q *QPOS) reanchorSlotRoots(roots map[uint64]types.Hash, vrfAccUpdates map[
 				// deterministic value rather than a stale one.
 				q.epochVRFAccumulator[e] = v
 			}
+			// QR-21: a reorg that rewrites epoch e's accumulator invalidates any
+			// VDF stand-down pin that was derived from the old accumulator (the
+			// seed for shuffle epoch e+2 mixes acc[e]). Release the pin for e
+			// itself and for the dependent epochs, mirroring the e+1/e+2 cache
+			// invalidation policy of SetAllEpochVRFAccumulators, so a node can
+			// resume electing/verifying on the post-reorg chain without a
+			// restart. Safe under q.mu by design (consensus_hardening.go owns a
+			// dedicated mutex precisely for calls from q.mu holders).
+			for e := range vrfAccUpdates {
+				q.ClearVDFSeedStopped(e)
+				q.ClearVDFSeedStopped(e + 1)
+				q.ClearVDFSeedStopped(e + 2)
+			}
 		}
 		// CONS-FIX: After a reorg the epoch VRF accumulator may differ on
 		// the new canonical chain (AccumulateVRFOutput recomputes it from the
