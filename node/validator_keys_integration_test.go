@@ -19,6 +19,8 @@ import (
 
 // buildDevFundTx (unused helper, kept for manual dev flows): generates from deterministic dev account 0
 // (seed "QUANTAUREUM-DEV-ACCOUNT-SEED"||0) to `to`, with value 1 QAU.
+// DEVNET ONLY: the seed is fixed and public by design (same convention as
+// node/dev_accounts.go); never use outside dev mode.
 func buildDevFundTx(t *testing.T, to types.Address, chainID uint64) *encoding.Transaction {
 	t.Helper()
 	seed := make([]byte, 32)
