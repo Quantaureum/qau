@@ -110,3 +110,75 @@ func TestReanchorSlotRoots_KeepsVDFSeedStopsWhenNoAccumulatorChanged(t *testing.
 		}
 	}
 }
+
+// TestSetEpochVRFAccumulator_ReleasesDependentVDFSeedStops verifies that the
+// per-block accumulator write (header replay, calibration) releases the
+// stand-down pins on the dependent epochs under the same e+1/e+2 policy as
+// its own cache invalidation.
+func TestSetEpochVRFAccumulator_ReleasesDependentVDFSeedStops(t *testing.T) {
+	vs, _ := NewValidatorSet(generateValidators(10))
+	qpos, _ := NewQPOS(vs)
+
+	for _, e := range []uint64{5, 6, 9} {
+		qpos.MarkVDFSeedStopped(e)
+	}
+
+	qpos.SetEpochVRFAccumulator(4, types.Hash{0x42})
+
+	for _, e := range []uint64{5, 6} {
+		if qpos.VDFSeedStopped(e) {
+			t.Errorf("VDF stand-down pin for dependent epoch %d survived an accumulator rewrite of epoch 4", e)
+		}
+	}
+	if !qpos.VDFSeedStopped(9) {
+		t.Error("stand-down pin for unrelated epoch 9 must survive")
+	}
+}
+
+// TestSetAllEpochVRFAccumulators_ReleasesDependentVDFSeedStops verifies the
+// bulk store-load write path releases dependent pins under the same policy.
+func TestSetAllEpochVRFAccumulators_ReleasesDependentVDFSeedStops(t *testing.T) {
+	vs, _ := NewValidatorSet(generateValidators(10))
+	qpos, _ := NewQPOS(vs)
+
+	for _, e := range []uint64{5, 6, 9} {
+		qpos.MarkVDFSeedStopped(e)
+	}
+
+	qpos.SetAllEpochVRFAccumulators(map[uint64]types.Hash{
+		4: {0x42},
+	})
+
+	for _, e := range []uint64{5, 6} {
+		if qpos.VDFSeedStopped(e) {
+			t.Errorf("VDF stand-down pin for dependent epoch %d survived a bulk accumulator restore of epoch 4", e)
+		}
+	}
+	if !qpos.VDFSeedStopped(9) {
+		t.Error("stand-down pin for unrelated epoch 9 must survive")
+	}
+}
+
+// TestClearEpochVRFAccumulatorsFrom_ReleasesDependentVDFSeedStops verifies
+// that a fork-rollback accumulator wipe releases the pins that depended on
+// the removed state; persistent VDF failures re-pin on the next election.
+func TestClearEpochVRFAccumulatorsFrom_ReleasesDependentVDFSeedStops(t *testing.T) {
+	vs, _ := NewValidatorSet(generateValidators(10))
+	qpos, _ := NewQPOS(vs)
+
+	qpos.AccumulateVRFOutput(4, types.Hash{0x11})
+	for _, e := range []uint64{5, 6, 9} {
+		qpos.MarkVDFSeedStopped(e)
+	}
+
+	qpos.ClearEpochVRFAccumulatorsFrom(4)
+
+	for _, e := range []uint64{5, 6} {
+		if qpos.VDFSeedStopped(e) {
+			t.Errorf("VDF stand-down pin for dependent epoch %d survived a rollback accumulator wipe from epoch 4", e)
+		}
+	}
+	if !qpos.VDFSeedStopped(9) {
+		t.Error("stand-down pin for unrelated epoch 9 must survive")
+	}
+}

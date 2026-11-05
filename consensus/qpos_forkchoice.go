@@ -814,6 +814,15 @@ func (q *QPOS) SetEpochVRFAccumulator(epoch uint64, accOnChain types.Hash) {
 	delete(q.coldStartEpochs, epoch+1)
 	delete(q.coldStartEpochs, epoch+2)
 
+	// QR-21: the seed for election epoch+2 mixes acc[epoch], so a stand-down
+	// pin on epoch+1/epoch+2 derived from the previous accumulator value is
+	// stale once the accumulator is rewritten. Release those pins under the
+	// same dependent-epoch policy as the cache invalidation above; a
+	// persistent VDF failure re-pins on the next election (failures are not
+	// cached), so releasing is always safe.
+	q.ClearVDFSeedStopped(epoch + 1)
+	q.ClearVDFSeedStopped(epoch + 2)
+
 	// CONS-R40-P1-01 FIX (2026-08-04): PROPOSER DIVERGENCE BUG.
 	// Never prune an epoch that could still be needed by any future election
 	// (the farthest future is epoch+2, which needs the current epoch). The
@@ -871,6 +880,12 @@ func (q *QPOS) ClearEpochVRFAccumulatorsFrom(fromEpoch uint64) {
 			// accumulator (same policy as SetEpochVRFAccumulator).
 			delete(q.shuffleCache, e+1)
 			delete(q.shuffleCache, e+2)
+			// QR-21: release stand-down pins derived from the removed
+			// accumulator state (same dependent-epoch policy as the cache
+			// invalidation above); persistent VDF failures re-pin on the
+			// next election.
+			q.ClearVDFSeedStopped(e + 1)
+			q.ClearVDFSeedStopped(e + 2)
 		}
 	}
 }
@@ -928,6 +943,12 @@ func (q *QPOS) SetAllEpochVRFAccumulators(accs map[uint64]types.Hash) {
 		delete(q.shuffleCache, e+2)
 		delete(q.coldStartEpochs, e+1)
 		delete(q.coldStartEpochs, e+2)
+		// QR-21: release stand-down pins derived from the pre-store
+		// accumulator state (same dependent-epoch policy as the cache
+		// invalidation above); persistent VDF failures re-pin on the next
+		// election.
+		q.ClearVDFSeedStopped(e + 1)
+		q.ClearVDFSeedStopped(e + 2)
 	}
 }
 
