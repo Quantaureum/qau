@@ -674,6 +674,12 @@ func NewNode(cfg *Config) (*Node, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// M4-F4: pin the epoch-reward index ordering for this process. The switch
+	// is process-wide because both the producing path (block_producer) and the
+	// verifying path (syncer) must translate census indices identically. A
+	// value of 0 keeps the legacy live-order translation.
+	SetEpochRewardsCanonicalOrderActivation(cfg.EpochRewardsCanonicalOrderActivationEpoch)
+
 	// Initialize shutdown handler
 	shutdownTimeout := time.Duration(cfg.ShutdownTimeout) * time.Second
 	if shutdownTimeout == 0 {
@@ -4091,6 +4097,18 @@ func (n *Node) initSyncer() error {
 		}
 		n.recordStateRootMismatch(height)
 	})
+	// M4-F5: an unusable state index (Verkle tree update failed) means no
+	// valid root can be derived — stop producing instead of retrying.
+	n.syncer.SetOnStateFatal(func(detail string) {
+		n.markStateTrustBroken(detail)
+	})
+	// M4-F6: a single height that exhausted its bounded retry budget is
+	// unrecoverable in-process; stop producing and let an operator rebuild.
+	n.syncer.SetOnStateRootRetryExhausted(func(height uint64, attempts int) {
+		n.markStateTrustBroken(fmt.Sprintf("M4-F6: state-root mismatch retry limit reached at height %d after %d attempts", height, attempts))
+	})
+	// M4-F6: apply the operator-configured retry budget (0 keeps the default).
+	n.syncer.SetStateRootRetryLimit(n.config.StateRootMismatchRetryLimit)
 	n.syncer.SetOnForkRollback(func(forkHeight uint64) {
 		n.syncBufMu.Lock()
 		// During cascade: only evict blocks at or above forkHeight.
@@ -8695,6 +8713,20 @@ func (n *Node) blockInsertLoop() {
 						// mismatched parent hash) instead of retrying it in a loop.
 						// ForkDetected handler already called requestBlocksFromBestPeer.
 						nodeLog.Warn("blockInsertLoop: dropping block %d due to fork detection (pbDur=%v)", height, time.Since(pbStart))
+					} else if errors.Is(err, ErrStateRootRetryExhausted) {
+						// M4-F6: the same height exhausted its retry budget. The
+						// syncer refuses further attempts, so this entry is only
+						// reached by in-flight duplicates; warn sparingly.
+						if height%20 == 0 {
+							nodeLog.Warn("blockInsertLoop: M4-F6 retry budget exhausted at height %d — block dropped, retries stopped (pbDur=%v)",
+								height, time.Since(pbStart))
+						}
+					} else if errors.Is(err, ErrStateRollbackAfterApply) {
+						// M4-F1: rollback after a failed apply did not complete;
+						// store and state may disagree. State trust is broken by
+						// the syncer hook, so this is a loud operator signal.
+						nodeLog.Error("blockInsertLoop: M4-F1 state rollback FAILED for block %d: %v (pbDur=%v)",
+							height, err, time.Since(pbStart))
 					} else if !errors.Is(err, ErrStateRootMismatch) {
 						nodeLog.Warn("blockInsertLoop: ProcessBlock failed for block %d: %v (pbDur=%v)", height, err, time.Since(pbStart))
 					}

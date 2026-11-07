@@ -193,6 +193,20 @@ type Config struct {
 	// network — a divergent value changes the accepted block set at the
 	// activation epoch and forks the chain. See consensus_hardening.go.
 	ConsensusHardeningActivationEpoch uint64 `json:"consensusHardeningActivationEpoch,omitempty"`
+	// EpochRewardsCanonicalOrderActivationEpoch is the first epoch whose
+	// epoch-reward census indices are translated through the address-sorted
+	// validator set instead of the live insertion-order set (M4-F4). 0 / unset
+	// = disabled: the legacy live-order translation runs byte-for-byte as
+	// before. MUST be identical on every node — the translation decides which
+	// address receives rewards[idx], so a divergent value forks the chain at
+	// the activation epoch. See node/epoch_reward_order.go.
+	EpochRewardsCanonicalOrderActivationEpoch uint64 `json:"epochRewardsCanonicalOrderActivationEpoch,omitempty"`
+	// StateRootMismatchRetryLimit bounds how many consecutive state-root
+	// mismatches a single block height may accumulate before the syncer stops
+	// retrying that height (M4-F6). 0 / unset = the built-in default of 8.
+	// This is a local liveness knob only: it never changes block validity or
+	// the state root, so it does not need to be identical across nodes.
+	StateRootMismatchRetryLimit int `json:"stateRootMismatchRetryLimit,omitempty"`
 	// VDFSeedTimeSteps is the VDF sequential length T. 0 = the calibrated
 	// default (16,384). Governance pins this before activation; changing it
 	// after activation is a protocol change (same upgrade path).

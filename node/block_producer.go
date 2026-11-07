@@ -3125,6 +3125,11 @@ func (bp *BlockProducer) buildBlock(
 		slotInEpoch := slot % consensus.SlotsPerEpoch
 		if slotInEpoch == 0 && slot > 0 {
 			prevEpoch := consensus.SlotToEpoch(slot) - 1
+			// M4-F2: the proposer must reproduce the same idempotency rule as
+			// validators. If this epoch was already paid on durable state (e.g.
+			// a retried build), skip the credits but STILL embed the census below
+			// so the header remains path-independent.
+			rewardsAlreadyApplied := stateDB.EpochRewardApplied(prevEpoch)
 			bp.mu.Lock()
 			epochCensusBytes = append([]byte(nil), bp.epochCensus[prevEpoch]...)
 			bp.mu.Unlock()
@@ -3146,10 +3151,10 @@ func (bp *BlockProducer) buildBlock(
 						prevEpoch, err)
 				}
 			}
-			if rewards != nil && rewards.TotalRewards.Sign() > 0 {
+			if rewards != nil && rewards.TotalRewards.Sign() > 0 && !rewardsAlreadyApplied {
 				validators := bp.qpos.GetValidatorSet()
 				if validators != nil {
-					vList := validators.Validators()
+					vList := epochRewardTargets(validators.Validators(), prevEpoch)
 					if r87Diag() {
 						addrs := make([]string, 0, len(vList))
 						for i, v := range vList {
@@ -3209,6 +3214,7 @@ func (bp *BlockProducer) buildBlock(
 				// FIXED: Moved bpLog.Info INSIDE the `if rewards != nil && ...` block.
 				// Previously it was outside, causing nil pointer dereference when
 				// GetEpochRewards returned nil (e.g., for epochs with no rewards).
+				stateDB.MarkEpochRewardPending(prevEpoch, newHeight)
 				bpLog.Info("Epoch %d rewards applied: total=%s qau-wei, penalties=%s qau-wei",
 					prevEpoch, rewards.TotalRewards.String(), rewards.TotalPenalties.String())
 			}

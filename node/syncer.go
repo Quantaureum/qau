@@ -37,7 +37,25 @@ var (
 	ErrParentNotFound        = errors.New("parent block not found")
 	ErrForkDetected          = errors.New("fork detected: parent hash mismatch")
 	ErrStateRootMismatch     = errors.New("state root mismatch")
+
+	// M4-F1: a strict state-root mismatch must undo the just-applied block.
+	// This error means the rollback itself failed, so the store and the state
+	// may now disagree — the caller must treat it as a hard state-trust break.
+	ErrStateRollbackAfterApply = errors.New("state rollback after failed apply failed")
+
+	// M4-F6: the same height has exceeded the bounded retry budget. Further
+	// attempts are refused instead of accumulating mismatches forever.
+	ErrStateRootRetryExhausted = errors.New("state root retry limit exhausted for height")
 )
+
+// M4-F6: bounded same-height retry budget. A retry re-executes the same
+// canonical block after the previous attempt was rolled back; repeating it
+// forever only amplifies one bad block into an unbounded mismatch counter.
+// maxStateRootRetriesPerHeight is the built-in M4-F6 retry budget for a
+// single height. Operators can override it per node through
+// stateRootMismatchRetryLimit; the override is local-only and does not
+// change block validity.
+const maxStateRootRetriesPerHeight = 8
 
 // SyncStatus represents the current sync status
 type SyncStatus struct {
@@ -233,8 +251,22 @@ type Syncer struct {
 	// check so the node can track how long it has been diverging. Injected by
 	// node.go; nil in unit tests.
 	onStateRootResult func(height uint64, matched bool)
-	onGenesisReplace  func(newGenesis *encoding.Block)
-	onStateDBVerified func(height uint64)
+	// M4-F5: invoked when the state index (Verkle tree) is unusable. The
+	// node treats this as a hard state-trust break and stops producing.
+	onStateFatal func(detail string)
+	// M4-F6: invoked once when a single height exhausts its retry budget.
+	onStateRootRetryExhausted func(height uint64, attempts int)
+	onGenesisReplace          func(newGenesis *encoding.Block)
+	onStateDBVerified         func(height uint64)
+
+	// M4-F6: bounded same-height retry tracking (guarded by s.mu).
+	stateRootRetryHeight    uint64
+	stateRootRetryCount     int
+	stateRootRetryExhausted bool
+	stateRootRetrySkipWarns int
+	// M4-F6: operator override for the per-height retry budget; 0 keeps the
+	// built-in default (maxStateRootRetriesPerHeight).
+	stateRootRetryLimit int
 
 	// Checkpoint manager for fork recovery
 	checkpointManager *consensus.CheckpointManager
@@ -939,6 +971,14 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 
 	blockHash := block.ComputeBlockHash(blk.Header)
 
+	// M4-F6: refuse further attempts for a height whose retry budget is
+	// exhausted. This must run before the "already in store" fast path below,
+	// which would otherwise advance currentHeight for a block whose state was
+	// never applied.
+	if s.IsStateRootRetryExhausted(blk.Header.Height) {
+		return fmt.Errorf("block %d: %w", blk.Header.Height, ErrStateRootRetryExhausted)
+	}
+
 	if exists, _ := s.blockStore.HasBlock(blockHash); exists {
 		s.mu.Lock()
 		if blk.Header.Height == s.currentHeight+1 {
@@ -1449,6 +1489,26 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 		// for a hash it already has.
 		s.updateCommitRevealState(blk)
 	} else if err := s.applyBlock(blk); err != nil {
+		// M4-F1: a strict state-root mismatch means execution completed but
+		// the recomputed root does not match the header. The block was already
+		// persisted by PutBlockWithIndex and the state was already committed
+		// by applyBlockInternal, so the only way to keep "store and state both
+		// did not advance" is to undo both here, outside the execution frame.
+		if errors.Is(err, ErrStateRootMismatch) {
+			if rbErr := s.rollbackFailedApply(blk); rbErr != nil {
+				s.reportStateFatal(rbErr.Error())
+				syncLog.Error("M4-F1: state rollback after failed apply DID NOT complete for block %d: %v — "+
+					"store and state may now disagree; state trust is broken", blk.Header.Height, rbErr)
+				return fmt.Errorf("block %d: %w: %v", blk.Header.Height, ErrStateRollbackAfterApply, rbErr)
+			}
+			if s.noteStateRootRetry(blk.Header.Height) {
+				return fmt.Errorf("block %d: %w", blk.Header.Height, ErrStateRootRetryExhausted)
+			}
+		} else if errors.Is(err, state.ErrStateIndexUnavailable) {
+			// M4-F5: the Verkle index is unusable; retrying the same height
+			// cannot produce a valid root.
+			s.reportStateFatal(err.Error())
+		}
 		// CRITICAL FIX (r68h): Do NOT delete the block when applyBlock fails.
 		// The block has already passed ValidateBlock and PutBlockWithIndex — it is
 		// a structurally valid block in the canonical chain. Deleting it creates
@@ -1456,6 +1516,12 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 		// full chain reset). State can always be rebuilt from the block store;
 		// deleted blocks cannot be recovered. Log the error and return it so the
 		// caller knows the state transition failed, but the block stays stored.
+		//
+		// M4-F1 NOTE: the paragraph above is retained for non-mismatch errors.
+		// A state-root mismatch is different: retrying on top of state that is
+		// already past this height can never converge, so that path above
+		// explicitly rolls the state back and removes only the block this call
+		// inserted.
 		syncLog.Error("ProcessBlock: applyBlock failed for block %d (block KEPT in store, state may need resync): %v",
 			blk.Header.Height, err)
 		return err
@@ -1484,6 +1550,10 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 			}
 		}
 	}
+
+	// M4-F6: a successful apply proves this height converges; clear the
+	// per-height retry budget so a later independent failure starts fresh.
+	s.resetStateRootRetry()
 
 	lockStart2 := time.Now()
 	s.mu.Lock()
@@ -1555,6 +1625,52 @@ func canonicalStoreHoldsBlock(bs *block.BlockStore, height uint64, blockHash typ
 	return storedHash == blockHash
 }
 
+// M4-F1: rollbackFailedApply undoes a block whose execution completed but
+// whose recomputed state root did not match the header. Before this fix the
+// block stayed in the canonical store and the committed state stayed at that
+// height while the apply returned an error, so every retry re-executed the
+// same block on top of an already-diverged state (the M4 amplification chain).
+//
+// Order matters: roll the state back first, then delete the block. If the
+// rollback fails the block is deliberately kept, because deleting it would
+// leave the store below a state that is still ahead — the caller then hard-
+// breaks state trust.
+func (s *Syncer) rollbackFailedApply(blk *encoding.Block) error {
+	if blk == nil || blk.Header == nil || blk.Header.Height == 0 {
+		return nil
+	}
+	height := blk.Header.Height
+	blockHash := block.ComputeBlockHash(blk.Header)
+
+	// Only undo the block this call actually stored. If the canonical store
+	// already holds a different block at this height (fork conflict), this is
+	// not our mutation to revert.
+	if !canonicalStoreHoldsBlock(s.blockStore, height, blockHash) {
+		return nil
+	}
+
+	if err := s.stateDB.RollbackToHeight(height); err != nil {
+		return fmt.Errorf("%w: height=%d: %v", ErrStateRollbackAfterApply, height, err)
+	}
+
+	if err := s.blockStore.DeleteBlockAtHeight(height); err != nil {
+		return fmt.Errorf("%w: height=%d: block delete failed after state rollback: %v",
+			ErrStateRollbackAfterApply, height, err)
+	}
+
+	s.mu.Lock()
+	delete(s.unvalidatedBlocks, blockHash)
+	s.mu.Unlock()
+	if s.blockStore != nil {
+		if err := s.blockStore.ClearBlockUnvalidated(blockHash); err != nil {
+			syncLog.Warn("M4-F1: failed to clear unvalidated marker for rolled-back block %d: %v", height, err)
+		}
+	}
+	syncLog.Warn("M4-F1: rolled back state and removed block %d (hash=%x) after state-root mismatch — store and state both stayed at height %d",
+		height, blockHash[:8], height-1)
+	return nil
+}
+
 // SetStrictStateRoot enables or disables strict state-root validation.
 // When enabled, a state-root mismatch causes applyBlock to return an error
 // (rejecting the block) instead of only logging a warning.
@@ -1577,6 +1693,115 @@ func (s *Syncer) SetStrictStateRoot(enabled bool) {
 // state-root comparison during block application.
 func (s *Syncer) SetOnStateRootResult(fn func(height uint64, matched bool)) {
 	s.onStateRootResult = fn
+}
+
+// M4-F5: SetOnStateFatal installs the hook invoked when the state index
+// (Verkle tree) becomes unusable. The node hard-breaks state trust so block
+// production stops instead of continuing on a state whose root cannot be
+// derived.
+func (s *Syncer) SetOnStateFatal(fn func(detail string)) {
+	s.mu.Lock()
+	s.onStateFatal = fn
+	s.mu.Unlock()
+}
+
+// M4-F6: SetOnStateRootRetryExhausted installs the hook invoked once when a
+// single height exceeds maxStateRootRetriesPerHeight.
+func (s *Syncer) SetOnStateRootRetryExhausted(fn func(height uint64, attempts int)) {
+	s.mu.Lock()
+	s.onStateRootRetryExhausted = fn
+	s.mu.Unlock()
+}
+
+// SetStateRootRetryLimit overrides the M4-F6 per-height retry budget. A
+// non-positive value restores the built-in default (8). The value is read at
+// note time, so it can be set once at node startup.
+func (s *Syncer) SetStateRootRetryLimit(limit int) {
+	s.mu.Lock()
+	if limit <= 0 {
+		s.stateRootRetryLimit = 0
+	} else {
+		s.stateRootRetryLimit = limit
+	}
+	s.mu.Unlock()
+}
+
+// StateRootRetryLimit returns the effective per-height retry budget.
+func (s *Syncer) StateRootRetryLimit() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.stateRootRetryLimit <= 0 {
+		return maxStateRootRetriesPerHeight
+	}
+	return s.stateRootRetryLimit
+}
+
+// reportStateFatal forwards a hard state-index failure to the node.
+func (s *Syncer) reportStateFatal(detail string) {
+	s.mu.RLock()
+	fn := s.onStateFatal
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(detail)
+	}
+}
+
+// M4-F6: noteStateRootRetry records one failed apply at height. It returns
+// true exactly when the bounded retry budget for that height is exhausted
+// (the caller then stops retrying). A different height or a successful apply
+// resets the counter.
+func (s *Syncer) noteStateRootRetry(height uint64) bool {
+	s.mu.Lock()
+	if s.stateRootRetryHeight != height {
+		s.stateRootRetryHeight = height
+		s.stateRootRetryCount = 0
+		s.stateRootRetryExhausted = false
+	}
+	s.stateRootRetryCount++
+	limit := s.stateRootRetryLimit
+	if limit <= 0 {
+		limit = maxStateRootRetriesPerHeight
+	}
+	if s.stateRootRetryCount < limit {
+		s.mu.Unlock()
+		return false
+	}
+	if s.stateRootRetryExhausted {
+		s.mu.Unlock()
+		return false
+	}
+	s.stateRootRetryExhausted = true
+	attempts := s.stateRootRetryCount
+	fn := s.onStateRootRetryExhausted
+	s.mu.Unlock()
+	// M4-F6: explicit degradation — stop re-executing this height and stop
+	// producing until an operator rebuilds/resyncs. The node keeps following.
+	syncLog.Error("M4-F6: state-root mismatch retry limit reached at height %d after %d attempts — "+
+		"stopping retries for this height; local state cannot reproduce the canonical root. "+
+		"Operator action required: rebuild state / re-sync from a snapshot.", height, attempts)
+	if fn != nil {
+		fn(height, attempts)
+	}
+	return true
+}
+
+// resetStateRootRetry clears the per-height retry counter after a successful
+// apply (or when a different height makes progress).
+func (s *Syncer) resetStateRootRetry() {
+	s.mu.Lock()
+	s.stateRootRetryHeight = 0
+	s.stateRootRetryCount = 0
+	s.stateRootRetryExhausted = false
+	s.mu.Unlock()
+}
+
+// IsStateRootRetryExhausted reports whether the retry budget for height was
+// already exhausted, so ProcessBlock can refuse further attempts without
+// touching state.
+func (s *Syncer) IsStateRootRetryExhausted(height uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stateRootRetryExhausted && s.stateRootRetryHeight == height
 }
 
 // reportStateRoot forwards a state-root comparison outcome to the node.
@@ -1643,6 +1868,16 @@ func ApplyEpochRewards(qpos *consensus.QPOS, stateDB *state.StateDB, blk *encodi
 	}
 	prevEpoch := consensus.SlotToEpoch(slot) - 1
 
+	// M4-F2: idempotency gate. The marker is written in the same batch as the
+	// rewarded balances, so "already applied" means the credit is durable.
+	// Re-executing an already-committed boundary block (retry, replay, or a
+	// partially rolled-back apply) must not credit the same epoch twice.
+	if stateDB.EpochRewardApplied(prevEpoch) {
+		syncLog.Info("M4-F2: epoch %d rewards already applied — skipping duplicate application for block %d slot %d",
+			prevEpoch, blk.Header.Height, slot)
+		return
+	}
+
 	// CNS-EPH-001: Recompute rewards deterministically from the on-chain census
 	// embedded in this epoch-boundary block's header, so ALL nodes derive the
 	// SAME rewards as the proposer (path-independent). This is the root-cause
@@ -1678,7 +1913,7 @@ func ApplyEpochRewards(qpos *consensus.QPOS, stateDB *state.StateDB, blk *encodi
 	if validators == nil {
 		return
 	}
-	vList := validators.Validators()
+	vList := epochRewardTargets(validators.Validators(), prevEpoch)
 	if r87Diag() {
 		addrs := make([]string, 0, len(vList))
 		for i, v := range vList {
@@ -1727,6 +1962,7 @@ func ApplyEpochRewards(qpos *consensus.QPOS, stateDB *state.StateDB, blk *encodi
 			stateDB.SetBalance(addr, newBal)
 		}
 	}
+	stateDB.MarkEpochRewardPending(prevEpoch, blk.Header.Height)
 	syncLog.Info("applyEpochRewards: block %d slot %d prevEpoch %d rewards=%s penalties=%s",
 		blk.Header.Height, slot, prevEpoch, rewards.TotalRewards.String(), rewards.TotalPenalties.String())
 }
@@ -2431,7 +2667,21 @@ func (s *Syncer) checkSync() {
 				s.stallRetryCount = 0
 				s.lastSyncProgress = time.Now()
 				// Re-request blocks from currentHeight+1
-				s.requestBlocksByHeightUnlocked(s.currentHeight+1, s.highestKnown)
+				// M4-F6: never re-request a height whose retry budget is
+				// exhausted. Re-requesting it would replay the same bad block
+				// forever (the 6,746-mismatch storm). s.mu is held here, so the
+				// fields are read directly.
+				nextHeight := s.currentHeight + 1
+				if s.stateRootRetryExhausted && s.stateRootRetryHeight == nextHeight {
+					s.stateRootRetrySkipWarns++
+					if s.stateRootRetrySkipWarns%20 == 1 {
+						syncLog.Warn("M4-F6: not re-requesting height %d — state-root mismatch retry budget exhausted; node stays degraded until an operator rebuilds/re-syncs (skips=%d)",
+							nextHeight, s.stateRootRetrySkipWarns)
+					}
+				} else {
+					s.stateRootRetrySkipWarns = 0
+					s.requestBlocksByHeightUnlocked(nextHeight, s.highestKnown)
+				}
 			} else {
 				syncLog.Warn("checkSync: sync stalled for %v (retry %d/%d, syncedCount=%d, highestKnown=%d > currentHeight=%d), retrying from peers (totalStall=%d/%d)",
 					time.Since(s.lastSyncProgress), s.stallRetryCount, s.maxStallRetries,

@@ -25,6 +25,19 @@ var (
 	ErrAccountNotFound = errors.New("account not found")
 	ErrStorageNotFound = errors.New("storage not found")
 	ErrInvalidState    = errors.New("invalid state")
+
+	// M4-F3: RollbackToHeight must fail closed when the in-memory
+	// before-image history is gone (e.g. after a restart) but the durable
+	// committed height still sits at or above the requested fork height.
+	// Returning nil in that situation reported a successful rollback while
+	// the state actually remained on the post-fork chain.
+	ErrRollbackHistoryUnavailable = errors.New("rollback history unavailable: in-memory beforeImages lost (restart) while state is committed at or above the rollback target")
+
+	// M4-F5: the derived Verkle index could not be updated. The account data
+	// itself is durable (the account batch was written), but no valid state
+	// root can be derived, so Commit must fail closed instead of returning a
+	// root computed from a partially updated tree.
+	ErrStateIndexUnavailable = errors.New("state index (Verkle) unavailable: tree update failed; account data is durable but the state root is not derivable")
 )
 
 // L14-012: Maximum snapshot depth to prevent memory exhaustion from excessive
@@ -100,6 +113,12 @@ var (
 	// block production). See node/syncer.go computeRebuildBaseline for the
 	// consumer.
 	lastCommittedHeightKey = []byte("_last_committed_height_")
+	// M4-F2: per-epoch epoch-reward idempotency marker. Key is the prefix
+	// plus 8 big-endian epoch bytes; value is the 8-byte height of the
+	// boundary block that applied the rewards. Written into the SAME batch as
+	// the account changes, so "state durable" and "marker durable" are one
+	// transaction. This key lives in metadata and never enters the trie.
+	epochRewardAppliedPrefix = []byte("_epoch_reward_applied_")
 )
 
 // R8-01 (2026-10-21 eighth-round audit): durable commit anchor and writer gate.
@@ -167,7 +186,8 @@ func isDurabilityControlKey(key string) bool {
 	case string(commitPendingKey), string(lastCommittedHeightKey), string(lastCommittedRootKey):
 		return true
 	}
-	return false
+	return len(key) == len(epochRewardAppliedPrefix)+8 &&
+		key[:len(epochRewardAppliedPrefix)] == string(epochRewardAppliedPrefix)
 }
 
 // durableDisk is the control block ONE base database shares with every StateDB
@@ -727,6 +747,12 @@ type StateDB struct {
 	// batch as the account update, ensuring atomicity.
 	pendingCodeWrites map[types.Hash][]byte // codeHash -> code
 
+	// M4-F2: epoch-reward idempotency markers staged for the next Commit.
+	// epoch -> boundary block height. Flushed into the account batch so the
+	// marker and the rewarded balances become durable together.
+	// Guarded by s.mu.
+	pendingEpochRewardMarks map[uint64]uint64
+
 	// Cache with LRU eviction
 	// audit-fix: added LRU cache to prevent unbounded memory growth
 	accountCache    map[types.Address]*Account
@@ -893,9 +919,11 @@ func allocStateDB(database ...db.Database) *StateDB {
 		dirtyStorage:  make(map[types.Address]map[types.Hash]types.Hash),
 		// R33 STATE-02 FIX: initialize pending code writes buffer
 		pendingCodeWrites: make(map[types.Hash][]byte),
-		accountCache:      make(map[types.Address]*Account),
-		cacheAccessTime:   make(map[types.Address]int64),
-		cacheMaxSize:      5000, // audit-fix: default 10,000 entries max
+		// M4-F2: epoch-reward idempotency markers staged for the next Commit.
+		pendingEpochRewardMarks: make(map[uint64]uint64),
+		accountCache:            make(map[types.Address]*Account),
+		cacheAccessTime:         make(map[types.Address]int64),
+		cacheMaxSize:            5000, // audit-fix: default 10,000 entries max
 		// R6-DB-1 FIX: pass dbInstance for persistent Verkle tree storage
 		stateTrie:        trie.NewVerkleTree(256, dbInstance),
 		stateSnapshots:   make(map[uint64]types.Hash),
@@ -989,6 +1017,103 @@ func (s *StateDB) CommitPendingMarkerCloggedCount() uint64 {
 		return 0
 	}
 	return s.commitPendingMarkerCloggedCount.Load()
+}
+
+// epochRewardAppliedKey builds the metadata key for one epoch's reward marker.
+func epochRewardAppliedKey(epoch uint64) []byte {
+	key := make([]byte, 0, len(epochRewardAppliedPrefix)+8)
+	key = append(key, epochRewardAppliedPrefix...)
+	var enc [8]byte
+	binary.BigEndian.PutUint64(enc[:], epoch)
+	return append(key, enc[:]...)
+}
+
+// EpochRewardApplied reports whether epoch rewards were already applied to
+// durable state, either by a successful Commit or by a mark staged for the
+// next Commit on this instance.
+//
+// M4-F2: this is the idempotency gate for ApplyEpochRewards. Without it a
+// retried boundary block (for example after a failed apply was rolled back
+// only partially, or a replay path re-executes an already-committed block)
+// credited the same epoch twice and produced a divergent state root.
+func (s *StateDB) EpochRewardApplied(epoch uint64) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	_, pending := s.pendingEpochRewardMarks[epoch]
+	s.mu.RUnlock()
+	if pending {
+		return true
+	}
+	if s.db == nil {
+		return false
+	}
+	value, err := s.db.Get(epochRewardAppliedKey(epoch))
+	return err == nil && len(value) == 8
+}
+
+// MarkEpochRewardPending stages an epoch-reward marker to be written with the
+// next Commit's account batch. M4-F2: the marker must land in the same
+// transaction as the balances it certifies, otherwise a crash could persist a
+// marker for rewards that never reached durable state (or vice versa).
+func (s *StateDB) MarkEpochRewardPending(epoch, blockHeight uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.pendingEpochRewardMarks == nil {
+		s.pendingEpochRewardMarks = make(map[uint64]uint64)
+	}
+	s.pendingEpochRewardMarks[epoch] = blockHeight
+	s.mu.Unlock()
+}
+
+// dropEpochRewardMarksFromLocked removes epoch-reward markers whose recorded
+// block height is at or above forkHeight. M4-F2: after a rollback those blocks
+// will be re-executed, so their epoch rewards must not be treated as already
+// paid. Caller must hold s.mu (RollbackToHeight does).
+func (s *StateDB) dropEpochRewardMarksFromLocked(forkHeight uint64) {
+	// Staged-but-not-yet-committed marks must be dropped too: a failed Commit
+	// leaves them in memory, and keeping them would make a retried boundary
+	// block skip rewards that were never persisted.
+	for epoch, height := range s.pendingEpochRewardMarks {
+		if height >= forkHeight {
+			delete(s.pendingEpochRewardMarks, epoch)
+		}
+	}
+	if s.db == nil {
+		return
+	}
+	iter := s.db.NewIterator(epochRewardAppliedPrefix, nil)
+	type doomedKey struct{ key []byte }
+	var doomed []doomedKey
+	for iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		value := append([]byte(nil), iter.Value()...)
+		if len(value) != 8 {
+			continue
+		}
+		if binary.BigEndian.Uint64(value) >= forkHeight {
+			doomed = append(doomed, doomedKey{key: key})
+		}
+	}
+	iter.Release()
+	if len(doomed) == 0 {
+		return
+	}
+	batch := s.db.NewBatch()
+	for _, d := range doomed {
+		if err := batch.Delete(d.key); err != nil {
+			log.Printf("[WARN] M4-F2: failed to stage epoch reward marker delete during rollback: %v", err)
+			return
+		}
+	}
+	if err := batch.Write(); err != nil {
+		log.Printf("[WARN] M4-F2: failed to write epoch reward marker deletes during rollback: %v — stale markers may skip rewards after re-execution", err)
+		return
+	}
+	log.Printf("[INFO] M4-F2: dropped %d epoch reward marker(s) at or above height %d during rollback", len(doomed), forkHeight)
 }
 
 // RecoverConsistency checks whether the previous Commit completed
@@ -2184,11 +2309,25 @@ func (s *StateDB) Commit(blockHeight ...uint64) (types.Hash, error) {
 		return types.Hash{}, fmt.Errorf("failed to write commit-pending marker: %w", err)
 	}
 
+	// M4-F2: stage epoch-reward idempotency markers into the SAME batch as the
+	// account changes. If batch.Write succeeds, the rewarded balances and the
+	// marker that certifies "this epoch was paid" become durable together.
+	for epoch, blockHeight := range s.pendingEpochRewardMarks {
+		var heightBytes [8]byte
+		binary.BigEndian.PutUint64(heightBytes[:], blockHeight)
+		if err := batch.Put(epochRewardAppliedKey(epoch), heightBytes[:]); err != nil {
+			return types.Hash{}, fmt.Errorf("M4-F2: failed to stage epoch reward marker for epoch %d: %w", epoch, err)
+		}
+	}
+
 	if err := batch.Write(); err != nil {
 		// SECURITY FIX: Return error instead of silently ignoring
 		// Prevents state from appearing committed when write actually failed
 		return types.Hash{}, err
 	}
+
+	// M4-F2: the markers are durable only after batch.Write() succeeded.
+	s.pendingEpochRewardMarks = make(map[uint64]uint64)
 
 	// R40-P2-02 (2026-08-03): batch.Write() succeeded → the account state
 	// is durable in BoltDB. NOW it is safe to update the in-memory cache.
@@ -2233,6 +2372,18 @@ func (s *StateDB) Commit(blockHeight ...uint64) (types.Hash, error) {
 			log.Printf("[ERROR] state_db: failed to flush Verkle tree batch (STORAGE-P0-01): %v — tree may be stale until rebuild", err)
 			verklePutFailed = true
 		}
+	}
+
+	// M4-F5: fail closed when the derived index is unusable. Previously the
+	// code fell through to rootLocked() and returned a root computed from a
+	// partially updated tree, while also persisting that root and the
+	// committed height — a wrong root that every subsequent block had to
+	// fail against. The account batch above is already durable, so this
+	// error explicitly means "accounts written, index not updated": do not
+	// clear commit-pending, do not persist the root or the height, and keep
+	// the dirty state for a rebuild/retry.
+	if verklePutFailed {
+		return types.Hash{}, fmt.Errorf("M4-F5: %w", ErrStateIndexUnavailable)
 	}
 
 	// AUDIT (2026) R4-DATA-03: Clear the commit-pending marker ONLY if
@@ -3162,7 +3313,20 @@ func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 		//     heights >= forkHeight may or may not exist; if none
 		//     exist, nothing to do (return nil).
 		if len(s.beforeImages) == 0 {
-			return nil // fresh node, nothing to roll back AND nothing pruned
+			// M4-F3: an empty beforeImages map has two very different
+			// meanings. On a genuinely fresh node (lastCommittedHeight == 0)
+			// there is nothing to roll back. After a restart the in-memory
+			// history is gone but lastCommittedHeight is restored from
+			// `_last_committed_height_`; if that height is at or above the
+			// requested fork height, the state is still on the post-fork
+			// chain and this function cannot undo it. Returning nil there
+			// reported success while the state silently stayed diverged
+			// (M4: fork rollback after restart became a no-op).
+			if forkHeight == 0 || s.lastCommittedHeight < forkHeight {
+				return nil
+			}
+			return fmt.Errorf("%w: RollbackToHeight(%d) refused: beforeImages empty (lost across restart) but lastCommittedHeight=%d is at or above the target; state cannot be rolled back in-process — re-sync or restore a snapshot",
+				ErrRollbackHistoryUnavailable, forkHeight, s.lastCommittedHeight)
 		}
 		minRetained := uint64(0)
 		first := true
@@ -3506,6 +3670,10 @@ func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 	} else {
 		s.lastCommittedHeight = 0
 	}
+
+	// M4-F2: the rolled-back blocks will be re-executed on the new canonical
+	// chain, so their epoch-reward markers must be dropped as well.
+	s.dropEpochRewardMarksFromLocked(forkHeight)
 
 	// R87-M4-RESTART (2026-08-29): persist the rolled-back height — a crash
 	// between here and the next CommitWithBlock would otherwise restart with

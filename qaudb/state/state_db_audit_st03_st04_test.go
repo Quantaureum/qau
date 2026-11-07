@@ -151,12 +151,14 @@ func TestST04_VerkleFailureKeepsDirtyState(t *testing.T) {
 	addr := types.Address{0x57}
 
 	// Stage a mutation and Commit. The account batch must succeed; the
-	// Verkle flush must fail (injected). Per the existing contract Commit
-	// still returns a nil error (the authoritative state is in the DB and
-	// the commit-pending marker triggers a rebuild on restart).
+	// Verkle flush must fail (injected). M4-F5 changed the contract: Commit
+	// must now fail closed (ErrStateIndexUnavailable) instead of returning
+	// and persisting a root derived from the partially updated tree.
 	sdb.SetNonce(addr, 42)
-	if _, err := sdb.Commit(); err != nil {
-		t.Fatalf("Commit returned error on Verkle failure (contract: nil error, stale tree): %v", err)
+	if _, err := sdb.Commit(); err == nil {
+		t.Fatal("M4-F5: Commit returned nil on a Verkle failure; it must fail closed instead of persisting a partial-tree root")
+	} else if !errors.Is(err, ErrStateIndexUnavailable) {
+		t.Fatalf("M4-F5: expected ErrStateIndexUnavailable, got %v", err)
 	}
 
 	// ST-04 core assertion: the dirty state SURVIVES the failed Verkle
