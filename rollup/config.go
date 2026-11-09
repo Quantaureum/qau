@@ -70,6 +70,15 @@ type RollupConfig struct {
 	// use DefaultSequencerTimeout. Only effective when a SequencerElector
 	// is configured (SetSequencerElector called).
 	SequencerTimeout uint64
+	// MinVRFEpochActivation is the first epoch at which a zero-hash VRF
+	// epoch seed REFUSES sequencer election (P3-RL-05): at/above this epoch
+	// GetCurrentSequencer/GetNextSequencer return ErrVRFSeedNotAvailable
+	// instead of the predictable keccak256(epoch) % n bootstrap fallback.
+	// 0 (default) = inactive, election stays byte-identical to the legacy
+	// behavior. Activation changes sequencer election, so it MUST be
+	// identical on every node of the rollup network; the epoch itself is a
+	// governance decision — this field carries it, it does not pick a value.
+	MinVRFEpochActivation uint64
 	// RLLP- (2026-07-16): L2 bridge address that users send withdrawal
 	// transactions to (tx.To == BridgeAddress && tx.Value > 0). When set,
 	// processBatchLocked BURNS the withdrawal value from L2 supply (deducts

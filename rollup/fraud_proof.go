@@ -331,19 +331,32 @@ func (fp *FraudProver) verifyStateTransitionFraud(proof *FraudProof) error {
 	if proof.PostStateRoot != batch.PostStateRoot {
 		return ErrFraudProofInvalid
 	}
-	// Verify InvalidTx belongs to the batch.
-	txFound := false
+	// Identify the offending transaction by CONTENT HASH, not by pointer
+	// identity (run-4 node/rollup-fraudproof-pointer-identity, ported from
+	// node 8245a07). A proof that arrives over RPC carries a freshly decoded
+	// *RollupTransaction, so it can never share a pointer with the batch's
+	// stored objects — the old `btx == proof.InvalidTx` check rejected every
+	// honest challenge, i.e. the fraud-proof path was unusable. The hash is
+	// computed from the SAME field encoding the batch manager uses to bind a
+	// tx to its batch, and it is recomputed here from proof.InvalidTx's
+	// fields rather than trusting a challenger-supplied Hash: altering ANY
+	// hashed field (From, To, Value, Data, Nonce, GasPrice, GasLimit,
+	// ChainID) yields a different hash and the proof is still rejected. On a
+	// match we re-simulate with the BATCH's own object, so challenger-
+	// supplied copies are never executed.
+	submittedHash := ComputeTxContentHash(proof.InvalidTx)
+	var batchTx *RollupTransaction
 	for _, btx := range batch.Transactions {
-		if btx == proof.InvalidTx {
-			txFound = true
+		if ComputeTxContentHash(btx) == submittedHash {
+			batchTx = btx
 			break
 		}
 	}
-	if !txFound {
+	if batchTx == nil {
 		return ErrFraudProofInvalid
 	}
 
-	expectedRoot, _, err := fp.stateManager.SimulateBatch(proof.PreStateRoot, []*RollupTransaction{proof.InvalidTx})
+	expectedRoot, _, err := fp.stateManager.SimulateBatch(proof.PreStateRoot, []*RollupTransaction{batchTx})
 	if err != nil {
 		return ErrFraudProofInvalid
 	}
@@ -463,15 +476,25 @@ func (fp *FraudProver) GetFraudProof(batchIndex uint64) (*FraudProof, bool) {
 			toCopy = &types.Address{}
 			copy(toCopy[:], proof.InvalidTx.To[:])
 		}
+		var valueCopy *big.Int
+		if proof.InvalidTx.Value != nil {
+			valueCopy = new(big.Int).Set(proof.InvalidTx.Value)
+		}
+		// The copy must hash identically to the stored tx: identity is now the
+		// CONTENT hash (see verifyStateTransitionFraud), so every field that
+		// encodeTxForHash covers has to be preserved here — including ChainID.
 		copied.InvalidTx = &RollupTransaction{
-			Nonce:    proof.InvalidTx.Nonce,
-			GasPrice: proof.InvalidTx.GasPrice,
-			GasLimit: proof.InvalidTx.GasLimit,
-			To:       toCopy,
-			Value:    new(big.Int).Set(proof.InvalidTx.Value),
-			Data:     append([]byte(nil), proof.InvalidTx.Data...),
-			From:     proof.InvalidTx.From,
-			Hash:     proof.InvalidTx.Hash,
+			Nonce:     proof.InvalidTx.Nonce,
+			GasPrice:  proof.InvalidTx.GasPrice,
+			GasLimit:  proof.InvalidTx.GasLimit,
+			To:        toCopy,
+			Value:     valueCopy,
+			Data:      append([]byte(nil), proof.InvalidTx.Data...),
+			From:      proof.InvalidTx.From,
+			ChainID:   proof.InvalidTx.ChainID,
+			PublicKey: append([]byte(nil), proof.InvalidTx.PublicKey...),
+			Signature: append([]byte(nil), proof.InvalidTx.Signature...),
+			Hash:      proof.InvalidTx.Hash,
 		}
 	}
 	return copied, true

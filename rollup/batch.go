@@ -550,6 +550,30 @@ func (bm *BatchManager) computeBatchHash(batch *Batch) types.Hash {
 }
 
 func (bm *BatchManager) encodeTxForHash(tx *RollupTransaction) []byte {
+	return encodeTxForHash(tx)
+}
+
+// ComputeTxContentHash returns sha256(encodeTxForHash(tx)) — the content hash
+// the batch manager stores in tx.Hash at AddTransaction.
+//
+// It is exported so fraud-proof verification can locate a transaction inside a
+// batch by content instead of by pointer: proofs decoded at the RPC boundary
+// are distinct objects and can never be pointer-identical to stored batch
+// entries. The encoding covers exactly the fields that identify the
+// transaction (From, To, Value, Data, Nonce, GasPrice, GasLimit, ChainID);
+// PublicKey/Signature are envelope data and deliberately excluded, matching
+// AddTransaction.
+func ComputeTxContentHash(tx *RollupTransaction) types.Hash {
+	if tx == nil {
+		return types.Hash{}
+	}
+	return sha256.Sum256(encodeTxForHash(tx))
+}
+
+// encodeTxForHash serialises the transaction fields bound into its content
+// hash. Package-level (receiver-free) so the fraud-proof path can recompute it
+// without a *BatchManager.
+func encodeTxForHash(tx *RollupTransaction) []byte {
 	var valueBytes []byte
 	if tx.Value != nil {
 		valueBytes = tx.Value.Bytes()
