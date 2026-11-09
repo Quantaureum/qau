@@ -81,6 +81,10 @@ type PersonalAPI struct {
 	chainInfo ChainInfo
 	// allow-insecure-unlock: bypasses TLS requirement (Ethereum-compatible)
 	allowInsecureUnlock bool
+	// networkID is the network the node runs under. It is used for the
+	// network-aware production backstop so that a mainnet node refuses
+	// allow-insecure-unlock even when QAU_PRODUCTION was not set.
+	networkID uint64
 }
 
 // isProductionEnv returns true if NODE_ENV is set to production
@@ -132,6 +136,16 @@ func (api *PersonalAPI) SetDevMode(enabled bool) {
 	api.devMode = enabled
 }
 
+// SetNetworkID records the network ID this node is configured for. Production
+// guards (allow-insecure-unlock) use it as a fail-closed backstop when the
+// QAU_PRODUCTION environment variable is missing (params.IsProduction).
+// Ported from node 8245a07 (run-3 production-env-gate-not-backstopped).
+func (api *PersonalAPI) SetNetworkID(networkID uint64) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	api.networkID = networkID
+}
+
 // SetAllowInsecureUnlock bypasses TLS requirement for personal_* methods.
 // Ethereum-compatible: equivalent to geth's --allow-insecure-unlock flag.
 // WARNING: This exposes private key material over plaintext HTTP. Use only
@@ -140,14 +154,17 @@ func (api *PersonalAPI) SetDevMode(enabled bool) {
 // FIX: Block allow-insecure-unlock in production environments.
 // Previously, SetAllowInsecureUnlock could be called at any time, including
 // in production, which would expose passwords and private keys over plaintext
-// HTTP. Now we check QAU_PRODUCTION=1 and refuse to enable the bypass,
-// logging a security warning instead.
+// HTTP. The guard is now network-aware: a mainnet-configured node counts as
+// production even if QAU_PRODUCTION=1 was forgotten (params.IsProduction).
 func (api *PersonalAPI) SetAllowInsecureUnlock(allowed bool) {
 	if allowed {
+		api.mu.RLock()
+		networkID := api.networkID
+		api.mu.RUnlock()
 		// M-5: Refuse to enable insecure unlock in production
-		if params.IsProductionEnv() {
-			log.Printf("[SECURITY] SetAllowInsecureUnlock(true) rejected: QAU_PRODUCTION=1 is set. " +
-				"personal_* methods require TLS in production.")
+		if params.IsProduction(networkID) {
+			log.Printf("[SECURITY] SetAllowInsecureUnlock(true) rejected: production mode is active " +
+				"(QAU_PRODUCTION=1 or mainnet network ID). personal_* methods require TLS in production.")
 			return
 		}
 		log.Printf("[SECURITY] --allow-insecure-unlock enabled: personal_* methods available over plaintext HTTP")

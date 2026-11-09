@@ -3095,6 +3095,10 @@ func (n *Node) initRPC() (retErr error) {
 	// Register Personal API handlers for account management first
 	keystoreDir := filepath.Join(n.config.DataDir, "keystore")
 	personalAPI := rpc.NewPersonalAPI(keystoreDir, &txPoolAdapter{n.txPool, n}, &stateReaderAdapter{n}, &chainInfoAdapter{n})
+	// run-3 production-env-gate-not-backstopped (node 8245a07 port): the
+	// network ID arms the personal_* production backstop so a mainnet node
+	// refuses allow-insecure-unlock even if QAU_PRODUCTION was forgotten.
+	personalAPI.SetNetworkID(n.config.NetworkID)
 	personalAPI.RegisterHandlers(n.rpcServer)
 	nodeLog.Info("Personal API handlers registered")
 

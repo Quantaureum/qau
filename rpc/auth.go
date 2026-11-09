@@ -1948,46 +1948,62 @@ func getClientIPWithTrust(r *http.Request, trustedProxies []string) string {
 	// bad entry rather than crashing the server.
 	safeProxies := filterUnsafeProxies(trustedProxies)
 
-	// Check if the direct connection is from a trusted proxy
-	isTrustedProxy := false
+	// AUDIT node/rpc-xff-leftmost-identity FIX (ported from node 8245a07):
+	// the X-Forwarded-For chain is parsed from the RIGHT. Proxies append to
+	// the header, so the leftmost entry is whatever the client sent and is
+	// attacker-controlled: a client can rotate it per request to obtain fresh
+	// per-IP rate-limit buckets and, behind a trusted proxy, to satisfy an
+	// admin IP whitelist it is not actually on. The rightmost untrusted valid
+	// IP is the address observed by the closest trusted hop. Entries that are
+	// themselves trusted proxies (host or CIDR) are skipped.
+
+	// Only trust forwarding headers if the direct connection is a trusted proxy.
+	if !isTrustedProxyIP(remoteIP, safeProxies) {
+		return remoteIP
+	}
+
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		entry := strings.TrimSpace(parts[i])
+		// Validate it's a valid IP; malformed entries are attacker noise.
+		if net.ParseIP(entry) == nil {
+			continue
+		}
+		// Skip hops that are themselves trusted proxies and keep walking left.
+		if isTrustedProxyIP(entry, safeProxies) {
+			continue
+		}
+		return entry
+	}
+
+	// X-Real-IP is a single-valued header; accept it only when it is a valid IP.
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(xri) != nil {
+		return xri
+	}
+
+	return remoteIP
+}
+
+// isTrustedProxyIP reports whether ipStr matches an explicit trusted-proxy
+// entry (exact host or CIDR). safeProxies must already be filtered by
+// filterUnsafeProxies.
+func isTrustedProxyIP(ipStr string, safeProxies []string) bool {
 	for _, trusted := range safeProxies {
 		if strings.Contains(trusted, "/") {
 			// CIDR notation
 			_, network, err := net.ParseCIDR(trusted)
-			if err == nil {
-				ip := net.ParseIP(remoteIP)
-				if ip != nil && network.Contains(ip) {
-					isTrustedProxy = true
-					break
-				}
+			if err != nil {
+				continue
 			}
-		} else if remoteIP == trusted {
-			isTrustedProxy = true
-			break
+			ip := net.ParseIP(ipStr)
+			if ip != nil && network.Contains(ip) {
+				return true
+			}
+		} else if ipStr == trusted {
+			return true
 		}
 	}
-
-	// Only trust X-Forwarded-For if connection is from trusted proxy
-	if isTrustedProxy {
-		xff := r.Header.Get("X-Forwarded-For")
-		if xff != "" {
-			// Take the first (client) IP in the list
-			parts := strings.Split(xff, ",")
-			clientIP := strings.TrimSpace(parts[0])
-			// Validate it's a valid IP
-			if net.ParseIP(clientIP) != nil {
-				return clientIP
-			}
-		}
-
-		// Check X-Real-IP as fallback
-		xri := r.Header.Get("X-Real-IP")
-		if xri != "" && net.ParseIP(xri) != nil {
-			return xri
-		}
-	}
-
-	return remoteIP
+	return false
 }
 
 // filterUnsafeProxies returns the subset of `proxies` that are NOT

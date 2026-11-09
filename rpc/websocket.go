@@ -1727,7 +1727,13 @@ func (ws *WebSocketServer) handleRequestInternal(conn *WSConn, req *Request, ski
 	// and let personal_* password-bearing methods run over plaintext ws://.
 	// Build a synthetic http.Request that reflects whether the underlying socket
 	// is TLS (wss://), so requireTLS can enforce WSS on the WS transport.
-	ctx := context.WithValue(context.Background(), contextKeyClientIP{}, conn.conn.RemoteAddr().String())
+	// AUDIT node/rpc-ws-lockout-port-key FIX (ported from node 8245a07): store
+	// the PORT-FREE peer host in the auth context. authenticateFromContext
+	// rebuilds RemoteAddr with net.JoinHostPort(clientIP, "0"); storing
+	// "IP:port" made that "IP:port:0", which SplitHostPort rejects, so the
+	// whole string (unique per connection) became the brute-force lockout key
+	// and a client could reset its failure counter simply by reconnecting.
+	ctx := context.WithValue(context.Background(), contextKeyClientIP{}, wsClientIP(conn.conn.RemoteAddr().String()))
 	// R41-RP-001 FIX: Copy conn.header into the synthetic request so that
 	// admin re-authentication (ValidateAdminRequest) can read HMAC/API-Key
 	// headers. Without this, all admin methods fail with "authentication required".
@@ -1760,6 +1766,16 @@ func isTLSDial(conn net.Conn) bool {
 	}
 	_, ok := conn.(handshakeConn)
 	return ok
+}
+
+// wsClientIP returns the peer host without its port, so WebSocket auth
+// bookkeeping (brute-force lockout, rate-limit identity) is stable across
+// reconnects from the same client.
+func wsClientIP(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // handleSubscribe handles a subscription request

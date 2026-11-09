@@ -91,6 +91,37 @@ func TestR90_ClientIP_OverBroadProxyEntryIsIgnored(t *testing.T) {
 	}
 }
 
+// AUDIT node/rpc-xff-leftmost-identity FIX (ported from node 8245a07): behind a
+// trusted proxy the leftmost X-Forwarded-For entry is client-supplied (proxies
+// append), so it must not become the rate-limit / admin-whitelist identity.
+// Rotating it must not produce fresh buckets.
+func TestR90_ClientIP_LeftmostXFFSpoofIgnored(t *testing.T) {
+	trusted := []string{"127.0.0.1"}
+	a := getClientIPWithTrust(r90ProxiedRequest("127.0.0.1", "1.2.3.4, 203.0.113.10"), trusted)
+	b := getClientIPWithTrust(r90ProxiedRequest("127.0.0.1", "9.9.9.9, 203.0.113.10"), trusted)
+	if a != "203.0.113.10" || b != "203.0.113.10" {
+		t.Fatalf("leftmost spoof leaked into identity: got %q and %q, want 203.0.113.10", a, b)
+	}
+}
+
+// Trusted proxy hops inside the X-Forwarded-For chain are skipped.
+func TestR90_ClientIP_SkipsTrustedXFFHops(t *testing.T) {
+	trusted := []string{"127.0.0.1", "10.0.0.5/32"}
+	got := getClientIPWithTrust(r90ProxiedRequest("127.0.0.1", "203.0.113.10, 10.0.0.5"), trusted)
+	if got != "203.0.113.10" {
+		t.Fatalf("got %q, want 203.0.113.10 (trusted hop 10.0.0.5 skipped)", got)
+	}
+}
+
+// Malformed forwarding values never become the attribution identity.
+func TestR90_ClientIP_MalformedHeadersFallBackToPeer(t *testing.T) {
+	r := r90ProxiedRequest("127.0.0.1", "garbage")
+	r.Header.Set("X-Real-IP", "not-an-ip")
+	if got := getClientIPWithTrust(r, []string{"127.0.0.1"}); got != "127.0.0.1" {
+		t.Fatalf("malformed headers used as identity: got %q, want direct peer 127.0.0.1", got)
+	}
+}
+
 // TestR90_RateLimit_SharesBucketWithoutTrustedProxies drives the real limiter to
 // show the operational consequence end-to-end: with the proxy untrusted, one
 // client's traffic throttles a different client.
