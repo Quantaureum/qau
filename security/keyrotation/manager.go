@@ -273,9 +273,17 @@ func (krm *KeyRotationManager) CompleteRotation(proof *RotationProof) error {
 	}
 
 	// Activate the pending key
+	retiredKey := krm.currentKey
 	krm.currentKey = krm.pendingKey
 	krm.pendingKey = nil
 	krm.rotationInProgress = false
+
+	// AUDIT N-21 (step 1, ported from node 8245a07): a retired key must not
+	// remain usable. Zeroize the private half right after the swap; later
+	// Sign calls on it fail with crypto.ErrInvalidPrivateKey.
+	if retiredKey != nil && retiredKey.Private != nil {
+		retiredKey.Private.Zeroize()
+	}
 
 	return nil
 }

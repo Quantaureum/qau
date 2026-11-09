@@ -166,9 +166,11 @@ func (km *KeyManager) ActivateKey(keyPair *crypto.KeyPair, meta *KeyMetadata) er
 	}
 
 	// Retire old key if exists
+	var oldKey *crypto.KeyPair
 	if km.nodeKeyMeta != nil {
 		km.nodeKeyMeta.State = KeyStateRetired
 		km.nodeKeyMeta.RetiredAt = time.Now().UTC()
+		oldKey = km.nodeKey
 	}
 
 	// Activate new key
@@ -178,6 +180,12 @@ func (km *KeyManager) ActivateKey(keyPair *crypto.KeyPair, meta *KeyMetadata) er
 
 	km.nodeKey = keyPair
 	km.nodeKeyMeta = meta
+
+	// AUDIT N-21 (step 1, ported from node 8245a07): a retired key must not
+	// stay usable or resident in memory. Zeroize its private material right
+	// after the switch; from then on PrivateKey.Sign fails with
+	// ErrInvalidPrivateKey.
+	destroyKeyPair(oldKey)
 
 	return nil
 }
@@ -250,12 +258,19 @@ func (km *KeyManager) CompleteRotation() error {
 	km.pendingMeta.ExpiresAt = time.Now().UTC().Add(km.config.MaxKeyAge)
 
 	oldMeta := km.nodeKeyMeta
+	oldKey := km.nodeKey
 	km.nodeKey = km.pendingKey
 	km.nodeKeyMeta = km.pendingMeta
 
 	km.pendingKey = nil
 	km.pendingMeta = nil
 	km.rotating = false
+
+	// AUDIT N-21 (step 1, ported from node 8245a07): zeroize the retired key
+	// immediately. The metadata stays available as history, but the private
+	// material is gone and any further Sign call on it fails with
+	// ErrInvalidPrivateKey.
+	destroyKeyPair(oldKey)
 
 	// Call rotation callback
 	if km.onRotation != nil {

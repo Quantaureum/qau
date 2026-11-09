@@ -2,13 +2,28 @@
 package keyrotation
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/quantaureum/qau/crypto"
 	logging "github.com/quantaureum/qau/log"
 )
 
 var autoTriggerLog = logging.Global().WithModule("keyrotation/auto")
+
+// AUDIT N-21 (step 2, ported from node 8245a07): automatic rotation must never
+// complete a rotation that replaces an existing key without a verifiable
+// RotationProof. When no proof provider is configured the trigger refuses to
+// rotate (fail-closed) instead of silently bypassing the authorization check.
+var ErrAutoRotationRequiresProof = errors.New("automatic key rotation requires a verifiable RotationProof; refusing to rotate")
+
+// RotationProofProvider produces the authorization proof for a rotation.
+// It is an explicit operator-supplied dependency: the automatic trigger must
+// never invent its own authorization. The returned proof is always verified
+// against the actual old/new keys before it is accepted.
+type RotationProofProvider func(oldKey, newKey *crypto.KeyPair, timestamp int64) (*RotationProof, error)
 
 type AutoTriggerConfig struct {
 	CheckInterval time.Duration
@@ -36,9 +51,11 @@ type AutoTrigger struct {
 	config     *AutoTriggerConfig
 	keyManager *KeyManager
 	notifier   KeyVersionNotifier
-	stopCh     chan struct{}
-	stopped    bool
-	mu         sync.Mutex
+	// proofProvider is nil by default: rotation then stops (fail-closed).
+	proofProvider RotationProofProvider
+	stopCh        chan struct{}
+	stopped       bool
+	mu            sync.Mutex
 }
 
 func NewAutoTrigger(config *AutoTriggerConfig, notifier KeyVersionNotifier) (*AutoTrigger, error) {
@@ -105,9 +122,9 @@ func (at *AutoTrigger) loop() {
 	}
 }
 
-func (at *AutoTrigger) checkAndRotate() {
+func (at *AutoTrigger) checkAndRotate() error {
 	if !at.keyManager.IsRotationNeeded() {
-		return
+		return nil
 	}
 
 	autoTriggerLog.Infof("Key rotation needed, initiating automatic rotation")
@@ -121,12 +138,18 @@ func (at *AutoTrigger) checkAndRotate() {
 	newKeyPair, newMeta, err := at.keyManager.InitiateRotation()
 	if err != nil {
 		autoTriggerLog.Errorf("Failed to initiate key rotation: %v", err)
-		return
+		return err
 	}
 
-	if err := at.keyManager.CompleteRotation(); err != nil {
-		autoTriggerLog.Errorf("Failed to complete key rotation: %v", err)
-		return
+	// AUDIT N-21 (step 2, ported from node 8245a07): prove the rotation before
+	// replacing the active key. A refusal cancels the pending key (zeroizing
+	// it) and keeps the old key.
+	if err := at.completeWithVerifiedProof(oldKey, newKeyPair); err != nil {
+		if cancelErr := at.keyManager.CancelRotation(); cancelErr != nil {
+			autoTriggerLog.Errorf("Failed to cancel refused rotation: %v", cancelErr)
+		}
+		autoTriggerLog.Errorf("Automatic key rotation refused, active key kept (version %d): %v", oldVersion, err)
+		return err
 	}
 
 	autoTriggerLog.Infof("Key rotation completed: version %d -> %d", oldVersion, newMeta.Version)
@@ -135,7 +158,54 @@ func (at *AutoTrigger) checkAndRotate() {
 		at.notifier.OnKeyRotated(oldVersion, newMeta.Version, newKeyPair.Public.Bytes())
 	}
 
-	_ = oldKey
+	return nil
+}
+
+// completeWithVerifiedProof authorizes and completes a pending rotation.
+// First-time provisioning (no active key yet) has nothing to authorize; every
+// rotation that replaces an existing key requires a proof that (a) is signed
+// by the outgoing private key and (b) binds exactly the outgoing and incoming
+// public keys.
+func (at *AutoTrigger) completeWithVerifiedProof(oldKey, newKey *crypto.KeyPair) error {
+	if oldKey == nil || oldKey.Public == nil {
+		// Provisioning path: no existing identity is being replaced.
+		return at.keyManager.CompleteRotation()
+	}
+	if newKey == nil || newKey.Public == nil {
+		return ErrNoPendingKey
+	}
+
+	at.mu.Lock()
+	provider := at.proofProvider
+	at.mu.Unlock()
+
+	if provider == nil {
+		return ErrAutoRotationRequiresProof
+	}
+
+	proof, err := provider(oldKey, newKey, time.Now().UTC().Unix())
+	if err != nil {
+		return fmt.Errorf("rotation proof provider failed: %w", err)
+	}
+	if proof == nil {
+		return ErrAutoRotationRequiresProof
+	}
+
+	// Verify: signature by the old key, timestamp freshness, and exact binding
+	// of the proof to the outgoing and incoming public keys.
+	if err := NewProofVerifier().VerifyWithExpectedKeys(proof, oldKey.Public, newKey.Public); err != nil {
+		return fmt.Errorf("rotation proof rejected: %w", err)
+	}
+
+	return at.keyManager.CompleteRotation()
+}
+
+// SetRotationProofProvider installs the authorization proof provider. Without
+// one, automatic rotation of an existing key fails closed.
+func (at *AutoTrigger) SetRotationProofProvider(provider RotationProofProvider) {
+	at.mu.Lock()
+	defer at.mu.Unlock()
+	at.proofProvider = provider
 }
 
 func (at *AutoTrigger) GetKeyManager() *KeyManager {
@@ -143,6 +213,5 @@ func (at *AutoTrigger) GetKeyManager() *KeyManager {
 }
 
 func (at *AutoTrigger) RotateNow() error {
-	at.checkAndRotate()
-	return nil
+	return at.checkAndRotate()
 }
