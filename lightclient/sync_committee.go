@@ -18,9 +18,25 @@ var (
 	ErrSyncCommitteeSigMismatch   = errors.New("sync committee signature count mismatch with bitfield")
 )
 
-const (
-	MinSyncCommitteeParticipation = 2.0 / 3.0 // At least 2/3 of committee must sign
-)
+// MinSyncCommitteeSignatures returns the minimum number of sync committee
+// members that must sign a header: ceil(2n/3).
+//
+// R5-SYNC-THRESHOLD FIX (2026-11-08): the previous formula
+// int(float64(n) * 2 / 3) truncated toward zero whenever 2n/3 is not an
+// integer — a 4-member committee required only 2 signatures (50%), a 7-member
+// committee 4 (57%) — so a minority could get a header accepted by light
+// clients, breaking the 2/3 safety floor. Integer arithmetic keeps the
+// ceiling exact for every committee size and is the single source of truth
+// for the participation check. (The reported n=6 -> 3 value does not
+// reproduce: 2n/3 is exact for multiples of 3, where the old code already
+// required 4.)
+func MinSyncCommitteeSignatures(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	// ceil(2n/3) == floor((2n + 2)/3) for positive integers.
+	return (2*n + 2) / 3
+}
 
 // SyncCommitteeInfo holds the sync committee data needed by light clients.
 type SyncCommitteeInfo struct {
@@ -119,11 +135,8 @@ func (v *SyncCommitteeVerifier) VerifyBlockHeader(header *encoding.BlockHeader) 
 		return ErrInsufficientSyncSignatures
 	}
 
-	// Check minimum participation (2/3)
-	minRequired := int(float64(committeeSize) * MinSyncCommitteeParticipation)
-	if minRequired < 1 {
-		minRequired = 1
-	}
+	// Check minimum participation (ceil(2n/3)); committeeSize > 0 here.
+	minRequired := MinSyncCommitteeSignatures(committeeSize)
 	if participantCount < minRequired {
 		return fmt.Errorf("%w: got %d, need at least %d of %d",
 			ErrInsufficientSyncSignatures, participantCount, minRequired, committeeSize)
