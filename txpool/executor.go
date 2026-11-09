@@ -276,19 +276,61 @@ func (e *TxExecutor) PrivacyManager() *privacy.PrivacyManager {
 	return e.privacyMgr
 }
 
+// SECURITY (audit M-11, ported from node 8245a07): the qzkp prover binds its
+// Schnorr commitment to the InputEcCommitments it supplies, while the real
+// transaction Pedersen commitments (TxCommit = a*G + b*H) are only compared
+// byte-for-byte. Those two points are NOT equal by construction, so a
+// verifier wired today would validate proofs that are unbound to the
+// transaction being executed. Until the circuit itself is fixed, wiring is
+// hard-locked and the fail-closed default cannot be switched off.
+//
+// privacyProofBindingResolved is deliberately a constant: it cannot be
+// flipped at runtime, so no config or RPC path can bypass the guard. Flip it
+// only in the same change that lands the circuit-level binding fix.
+const privacyProofBindingResolved = false
+
+var (
+	// ErrPrivacyProofBindingUnresolved is returned when a caller tries to
+	// wire a PrivacyTxVerifier while the binding gap is unresolved.
+	ErrPrivacyProofBindingUnresolved = errors.New("txpool: privacy ZK proof binding gap unresolved (audit M-11): refusing to wire PrivacyTxVerifier")
+	// ErrPrivacyVerificationCannotBeDisabled is returned when a caller tries
+	// to disable the fail-closed privacy gate while the binding gap is
+	// unresolved.
+	ErrPrivacyVerificationCannotBeDisabled = errors.New("txpool: privacy proof verification cannot be disabled while the ZK proof binding gap is unresolved (audit M-11)")
+)
+
 // SetPrivacyTxVerifier configures the cryptographic verifier for encoded
 // privacy transactions. See PrivacyTxVerifier docs.
-func (e *TxExecutor) SetPrivacyTxVerifier(v PrivacyTxVerifier) {
+//
+// SECURITY (audit M-11): returns ErrPrivacyProofBindingUnresolved for any
+// non-nil verifier while privacyProofBindingResolved is false. A nil verifier
+// is always accepted (it only clears the hook).
+func (e *TxExecutor) SetPrivacyTxVerifier(v PrivacyTxVerifier) error {
+	if v == nil {
+		e.privacyTxVerifier = nil
+		return nil
+	}
+	if !privacyProofBindingResolved {
+		return ErrPrivacyProofBindingUnresolved
+	}
 	e.privacyTxVerifier = v
+	return nil
 }
 
 // SetRequirePrivacyVerification controls whether privacy transactions are
 // rejected when no verifier is configured. Default is true (fail-closed,
 // R2-HIGH-09) — privacy transactions without cryptographic verification are
-// rejected by default. Tests that need to exercise the privacy path without
-// a real verifier should call SetRequirePrivacyVerification(false).
-func (e *TxExecutor) SetRequirePrivacyVerification(require bool) {
+// rejected by default.
+//
+// SECURITY (audit M-11): disabling the gate is equivalent to re-opening the
+// unchecked privacy path, so it is refused while the binding gap is
+// unresolved. Re-enabling (require == true) is always accepted.
+func (e *TxExecutor) SetRequirePrivacyVerification(require bool) error {
+	if !require && !privacyProofBindingResolved {
+		return ErrPrivacyVerificationCannotBeDisabled
+	}
 	e.requirePrivacyVerification = require
+	return nil
 }
 
 // SetMultisigWalletLookup configures the wallet lookup for multisig signature

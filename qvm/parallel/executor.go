@@ -174,16 +174,52 @@ func NewParallelExecutor(config *Config) *ParallelExecutor {
 	}
 }
 
+// SECURITY (audit M-11, ported from node 8245a07): same binding gap as the
+// txpool executor — the qzkp prover's Schnorr commitment is bound to
+// prover-supplied InputEcCommitments, not to the transaction's real Pedersen
+// commitments. Wiring is hard-locked and the fail-closed default cannot be
+// switched off until the circuit fix lands. The constant cannot be changed at
+// runtime.
+const privacyProofBindingResolved = false
+
+var (
+	// ErrPrivacyProofBindingUnresolved is returned when a caller tries to
+	// wire a PrivacyTxVerifier while the binding gap is unresolved.
+	ErrPrivacyProofBindingUnresolved = errors.New("qvm/parallel: privacy ZK proof binding gap unresolved (audit M-11): refusing to wire PrivacyTxVerifier")
+	// ErrPrivacyVerificationCannotBeDisabled is returned when a caller tries
+	// to disable the fail-closed privacy gate while the binding gap is
+	// unresolved.
+	ErrPrivacyVerificationCannotBeDisabled = errors.New("qvm/parallel: privacy proof verification cannot be disabled while the ZK proof binding gap is unresolved (audit M-11)")
+)
+
 // SetPrivacyTxVerifier injects the ZK proof verifier for privacy
-// transactions. AUDIT ROUND-5 2026-08-17 .
-func (pe *ParallelExecutor) SetPrivacyTxVerifier(v PrivacyTxVerifier) {
+// transactions. AUDIT ROUND-5 2026-08-17.
+//
+// SECURITY (audit M-11): returns ErrPrivacyProofBindingUnresolved for any
+// non-nil verifier while privacyProofBindingResolved is false.
+func (pe *ParallelExecutor) SetPrivacyTxVerifier(v PrivacyTxVerifier) error {
+	if v == nil {
+		pe.privacyTxVerifier = nil
+		return nil
+	}
+	if !privacyProofBindingResolved {
+		return ErrPrivacyProofBindingUnresolved
+	}
 	pe.privacyTxVerifier = v
+	return nil
 }
 
 // SetRequirePrivacyVerification controls fail-closed behavior when no
-// privacy verifier is configured (default true). AUDIT ROUND-5 .
-func (pe *ParallelExecutor) SetRequirePrivacyVerification(require bool) {
+// privacy verifier is configured (default true). AUDIT ROUND-5.
+//
+// SECURITY (audit M-11): disabling the gate is refused while the binding gap
+// is unresolved.
+func (pe *ParallelExecutor) SetRequirePrivacyVerification(require bool) error {
+	if !require && !privacyProofBindingResolved {
+		return ErrPrivacyVerificationCannotBeDisabled
+	}
 	pe.requirePrivacyVerification = require
+	return nil
 }
 
 // SetMultisigTxVerifier injects the wallet-aware multisig verifier.
