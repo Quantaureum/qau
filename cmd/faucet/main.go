@@ -57,6 +57,15 @@ type FaucetService struct {
 	dailyResetDate time.Time // UTC date when dailyDispensed was last reset
 }
 
+// addrRateKey returns the canonical per-address rate-limit bucket key.
+// AUDIT run-3 qau.faucet/address-limit-case-variant-bypass FIX (ported from
+// node 8245a07): key on the parsed address in canonical lowercase hex form
+// instead of the raw request string, so case variants of the same address
+// cannot each claim a fresh slot.
+func addrRateKey(a types.Address) string {
+	return "addr:" + a.ToHexAddress()
+}
+
 func main() {
 	fs, err := NewFaucetService()
 	if err != nil {
@@ -170,6 +179,14 @@ func NewFaucetService() (*FaucetService, error) {
 // each successful claim. If the path is empty (not configured), rate
 // limits remain in-memory only (dev mode).
 func (fs *FaucetService) loadRateLimits() {
+	// AUDIT run-4 faucet-daily-cap-failopen FIX (ported from node 8245a07):
+	// the daily quota state lives in its own file and MUST be restored
+	// independently of the per-identity rate-limit map. Previously it was
+	// loaded only after the rate-limit JSON parsed successfully, so a corrupt
+	// or unreadable rate-limit file reset the day's dispensed total on
+	// restart ("unreadable == unused").
+	fs.loadDailyState()
+
 	if fs.persistPath == "" {
 		return
 	}
@@ -195,10 +212,94 @@ func (fs *FaucetService) loadRateLimits() {
 	log.Printf("Loaded %d rate limit entries from %s", len(fs.rateLimitMap), fs.persistPath)
 }
 
+// faucetDailyState is the persisted form of the global daily dispensation cap.
+// AUDIT run-3 qau.faucet/daily-cap-not-persisted FIX (ported from node
+// 8245a07): the cap was in-memory only, so a faucet restart reset it and let
+// an attacker drain another full day's quota.
+type faucetDailyState struct {
+	Dispensed int       `json:"dispensed"`
+	ResetDate time.Time `json:"reset_date"`
+}
+
+// dailyStatePath stays separate from the rate-limit map file so the existing
+// on-disk format remains loadable after an upgrade.
+func (fs *FaucetService) dailyStatePath() string {
+	return fs.persistPath + ".daily"
+}
+
+func (fs *FaucetService) loadDailyState() {
+	if fs.persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(fs.dailyStatePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Fresh install: no quota consumed today yet.
+			return
+		}
+		fs.markDailyStateUnavailable("read", err)
+		return
+	}
+	var st faucetDailyState
+	if err := json.Unmarshal(data, &st); err != nil {
+		fs.markDailyStateUnavailable("parse", err)
+		return
+	}
+	today := utcMidnight(time.Now())
+	if st.ResetDate.Equal(today) {
+		fs.dailyDispensed = st.Dispensed
+		fs.dailyResetDate = today
+		log.Printf("Restored daily dispensation: %d QAU used today", fs.dailyDispensed)
+		return
+	}
+	// Persisted state belongs to another day: start today at zero.
+	fs.dailyDispensed = 0
+	fs.dailyResetDate = today
+}
+
+// markDailyStateUnavailable applies the fail-closed policy when the persisted
+// quota cannot be trusted: today's quota is treated as fully consumed so the
+// faucet refuses to dispense until the state file is repaired. "Unreadable"
+// must never mean "unused".
+func (fs *FaucetService) markDailyStateUnavailable(op string, err error) {
+	log.Printf("ERROR: failed to %s daily dispensation file %s: %v; treating today's quota as EXHAUSTED (fail-closed, refusing to dispense)", op, fs.dailyStatePath(), err)
+	fs.dailyDispensed = maxDailyDispense
+	fs.dailyResetDate = utcMidnight(time.Now())
+}
+
+func utcMidnight(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func (fs *FaucetService) saveDailyState() {
+	if fs.persistPath == "" {
+		return
+	}
+	st := faucetDailyState{Dispensed: fs.dailyDispensed, ResetDate: fs.dailyResetDate}
+	data, err := json.Marshal(st)
+	if err != nil {
+		log.Printf("WARNING: failed to marshal daily dispensation: %v", err)
+		return
+	}
+	tmpPath := fs.dailyStatePath() + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		log.Printf("WARNING: failed to write daily dispensation file: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, fs.dailyStatePath()); err != nil {
+		log.Printf("WARNING: failed to rename daily dispensation file: %v", err)
+	}
+}
+
 func (fs *FaucetService) saveRateLimits() {
 	if fs.persistPath == "" {
 		return
 	}
+	// Snapshot the map and the daily counters under the same lock to keep the
+	// persisted view consistent with concurrent claim handlers.
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	data, err := json.Marshal(fs.rateLimitMap)
 	if err != nil {
 		log.Printf("WARNING: failed to marshal rate limits: %v", err)
@@ -213,6 +314,7 @@ func (fs *FaucetService) saveRateLimits() {
 	if err := os.Rename(tmpPath, fs.persistPath); err != nil {
 		log.Printf("WARNING: failed to rename rate limit file: %v", err)
 	}
+	fs.saveDailyState()
 }
 
 func loadKeyFile(path string) (string, error) {
@@ -326,7 +428,7 @@ func (fs *FaucetService) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	// to bypass rate limiting. Now we record the claim time BEFORE sending
 	// (reserving the rate limit slot), and roll back if the transaction fails.
 	clientIP := getClientIP(r)
-	addrKey := "addr:" + req.Address
+	addrKey := addrRateKey(targetAddr)
 	var claimedTime time.Time
 	fs.mu.Lock()
 	// AUDIT (2026) API-FIX: Check and enforce global daily cap.

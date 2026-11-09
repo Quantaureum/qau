@@ -12,7 +12,13 @@
 // plaintext format qauctl writes for operator import — see user_rules
 // "account key file" format: dilithium3:<privkey-hex>+<pubkey-hex>.
 //
-// Run from project root:  QAU_KEYSTORE_PASSWORD=<pwd> go run ./cmd/dev_export_keys
+// Run from project root:
+//
+//	QAU_KEYSTORE_PASSWORD=<pwd> QAU_ALLOW_PLAINTEXT_KEY_EXPORT=1 //	  QAU_NETWORK=devnet go run ./cmd/dev_export_keys
+//
+// The network must be declared explicitly: the mainnet gate is fail-closed and
+// treats an undeclared environment as chain 1668
+// (audit node/cmd-plaintext-key-export-gate).
 package main
 
 import (
@@ -21,13 +27,40 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/quantaureum/qau/cmd/internal/keyexportgate"
 	"github.com/quantaureum/qau/crypto"
 )
+
+// SECURITY (audit N-18, 2026-11-06): this tool writes plaintext private keys
+// in bulk, so it must never run on a production network and must never run
+// unless the operator explicitly acknowledges what it does. Previously the
+// only gate was a non-empty keystore password, which is also present in
+// production deployments — nothing stopped a mainnet operator from dumping
+// every validator key to disk.
+const plaintextExportOptInEnv = "QAU_ALLOW_PLAINTEXT_KEY_EXPORT"
+
+// requirePlaintextExportOptIn enforces the two export preconditions.
+func requirePlaintextExportOptIn() error {
+	if os.Getenv(plaintextExportOptInEnv) != "1" {
+		return fmt.Errorf("%s=1 is required: this tool writes PLAINTEXT private keys to disk", plaintextExportOptInEnv)
+	}
+	// AUDIT node/cmd-plaintext-key-export-gate FIX (ported from node 8245a07):
+	// the mainnet check is fail-closed and shared with cmd/keystore_to_plainkey.
+	// An environment with no declared network is chain 1668, not "not mainnet".
+	if keyexportgate.Mainnet() {
+		return fmt.Errorf("refusing to export plaintext keys for mainnet (QAU_NETWORK=mainnet or QAU_CHAIN_ID/QAU_NETWORK_ID=1668); declare QAU_NETWORK=devnet for local devnet use")
+	}
+	return nil
+}
 
 func main() {
 	password := os.Getenv("QAU_KEYSTORE_PASSWORD")
 	if password == "" {
 		fmt.Fprintln(os.Stderr, "QAU_KEYSTORE_PASSWORD env var required")
+		os.Exit(2)
+	}
+	if err := requirePlaintextExportOptIn(); err != nil {
+		fmt.Fprintf(os.Stderr, "SECURITY: %v\n", err)
 		os.Exit(2)
 	}
 

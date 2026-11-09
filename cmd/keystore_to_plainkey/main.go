@@ -46,6 +46,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/quantaureum/qau/cmd/internal/keyexportgate"
 	"github.com/quantaureum/qau/crypto"
 )
 
@@ -64,6 +65,35 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "    keystore_to_plainkey -o \"$XDG_RUNTIME_DIR/qau-plain.key\" /var/lib/quantaureum/validator.key")
 	fmt.Fprintln(os.Stderr, "  transfer_commit \"$XDG_RUNTIME_DIR/qau-plain.key\" 0xABCDEF 5 1668")
 	fmt.Fprintln(os.Stderr, "  shred -u \"$XDG_RUNTIME_DIR/qau-plain.key\"")
+}
+
+// SECURITY (audit N-18, 2026-11-06): a plaintext private key must never land
+// in a terminal scrollback or shell pipeline by default. Previously an
+// unset -o silently wrote the decrypted key to stdout. Either an explicit
+// output file (mode 0600) or an explicit opt-in is now required.
+const plaintextExportOptInEnv = "QAU_ALLOW_PLAINTEXT_KEY_EXPORT"
+
+// requireExplicitOutput gates plaintext key export.
+//
+// AUDIT node/cmd-plaintext-key-export-gate FIX (ported from node 8245a07):
+// on mainnet an explicit -o is no longer sufficient. The network check is
+// fail-closed (undeclared => chain 1668), so a single command on a production
+// host cannot decrypt the validator key to disk without an explicit
+// acknowledgement.
+func requireExplicitOutput(outPath string) error {
+	if keyexportgate.Mainnet() {
+		if os.Getenv(plaintextExportOptInEnv) == "1" {
+			return nil
+		}
+		return fmt.Errorf("refusing to export a plaintext private key on mainnet (an undeclared network defaults to chain 1668): set %s=1 to confirm", plaintextExportOptInEnv)
+	}
+	if outPath != "" {
+		return nil
+	}
+	if os.Getenv(plaintextExportOptInEnv) == "1" {
+		return nil
+	}
+	return fmt.Errorf("refusing to write a plaintext private key to stdout: pass -o <path> (written with mode 0600) or set %s=1 if redirection is intentional", plaintextExportOptInEnv)
 }
 
 func fatal(format string, args ...any) {
@@ -157,6 +187,9 @@ func main() {
 	if keystorePath == "" {
 		usage()
 		os.Exit(1)
+	}
+	if err := requireExplicitOutput(outPath); err != nil {
+		fatal("%v", err)
 	}
 
 	pwBytes := readPassword()
