@@ -230,3 +230,49 @@ func TestN22_ProvenNonOperatorStillBlockedByBridge(t *testing.T) {
 		t.Fatalf("expected the proven caller to reach the bridge layer once, got %d", len(ref.calls))
 	}
 }
+
+// SECURITY (audit memo on d327f6e): the deadline-embedded nonce must be
+// consumed at most once. Before the replay-guard wiring the freshness check
+// (ParseAuthNonceDeadline) only rejected EXPIRED nonces, so the very same
+// signed request could be replayed until its deadline expired.
+func TestN22_SameNonceReplayedRequestRejected(t *testing.T) {
+	refunder := &n22Refunder{}
+	api := n22API(refunder)
+
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	nonce := n22Nonce(time.Now().Add(5 * time.Minute))
+	params := n22Params(t, "lock-replay-1", kp, nonce, "", "")
+
+	ctx := context.Background()
+	if _, rpcErr := api.RefundFailedLock(ctx, params); rpcErr != nil {
+		t.Fatalf("first request must pass: %v", rpcErr)
+	}
+	if len(refunder.calls) != 1 {
+		t.Fatalf("first request must reach the refunder, got %d calls", len(refunder.calls))
+	}
+
+	// The exact same signed request (same lock, same nonce, same signature):
+	// the nonce is now consumed, so the replay must be rejected before the
+	// refunder is reached again.
+	if _, rpcErr := api.RefundFailedLock(ctx, params); rpcErr == nil {
+		t.Fatal("replayed request must be rejected")
+	}
+	if len(refunder.calls) != 1 {
+		t.Fatalf("replayed request must not reach the refunder, got %d calls", len(refunder.calls))
+	}
+
+	// A different lock with a FRESH nonce still works. The nonce string is
+	// "<unix-deadline>:<random>", so a different expiry minute guarantees a
+	// different nonce without sleeping.
+	freshNonce := n22Nonce(time.Now().Add(8 * time.Minute))
+	fresh := n22Params(t, "lock-replay-2", kp, freshNonce, "", "")
+	if _, rpcErr := api.RefundFailedLock(ctx, fresh); rpcErr != nil {
+		t.Fatalf("fresh-nonce request must pass: %v", rpcErr)
+	}
+	if len(refunder.calls) != 2 {
+		t.Fatalf("fresh-nonce request must reach the refunder, got %d calls", len(refunder.calls))
+	}
+}

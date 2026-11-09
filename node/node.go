@@ -3650,6 +3650,7 @@ func (n *Node) initRPC() (retErr error) {
 		// the admin-only qau_bridgeRefundFailedLock RPC is available for
 		// emergency manual refunds when the relayer cannot complete them.
 		bridgeAPI := rpc.NewBridgeAPI(n.bridge, n.bridgeConfig, n.assetLockManager)
+		bridgeAPI.SetAuthReplayStore(replayStore)
 		bridgeAPI.RegisterHandlers(n.rpcServer)
 		nodeLog.Info("Bridge API handlers registered")
 	}

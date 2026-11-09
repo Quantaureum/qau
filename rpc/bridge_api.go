@@ -32,6 +32,10 @@ type BridgeAPI struct {
 	bridge   bridge.Bridge
 	config   *bridge.BridgeConfig
 	refunder lockRefunder // nil when bridge asset lock is unavailable
+	// replay consumes the deadline-embedded nonce of a signed refund request
+	// at most once (namespace "bridge"). Without it the same signed request
+	// could be replayed until its deadline expires (audit memo on d327f6e).
+	replay *authReplayGuard
 }
 
 // NewBridgeAPI creates a BridgeAPI. The bridge and config arguments may be
@@ -39,7 +43,20 @@ type BridgeAPI struct {
 // safely. The refunder argument enables the admin-only
 // qau_bridgeRefundFailedLock method; pass nil to disable it.
 func NewBridgeAPI(b bridge.Bridge, cfg *bridge.BridgeConfig, refunder lockRefunder) *BridgeAPI {
-	return &BridgeAPI{bridge: b, config: cfg, refunder: refunder}
+	return &BridgeAPI{
+		bridge:   b,
+		config:   cfg,
+		refunder: refunder,
+		replay:   newAuthReplayGuard("bridge"),
+	}
+}
+
+// SetAuthReplayStore wires the persistent replay cache shared by all RPC APIs.
+func (api *BridgeAPI) SetAuthReplayStore(store *AuthReplayStore) {
+	if api.replay == nil {
+		api.replay = newAuthReplayGuard("bridge")
+	}
+	api.replay.setStore(store)
 }
 
 // RegisterHandlers registers all bridge API handlers on the given server.
@@ -221,10 +238,23 @@ func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessa
 	}
 
 	// SECURITY (audit N-22): the caller identity must be proven, not asserted.
-	if err := verifySignedRefundRequest(caller, req.LockID, req.Nonce, req.Signature, req.PublicKey); err != nil {
+	deadline, err := verifySignedRefundRequest(caller, req.LockID, req.Nonce, req.Signature, req.PublicKey)
+	if err != nil {
 		log.Printf("[SECURITY] qau_bridgeRefundFailedLock rejected lockId=%s claimedCaller=%s err=%v",
 			req.LockID, caller.ToHexAddress(), err)
 		return nil, &Error{Code: -32003, Message: "refund request is not authorized: " + err.Error()}
+	}
+
+	// SECURITY (audit memo on d327f6e): the deadline-embedded nonce must be
+	// CONSUMED, not merely freshness-checked — without a one-time reservation
+	// the same signed request can be replayed until its deadline expires.
+	// Mirrors the defi/staking pattern: reserve only after the signature
+	// checks out so unauthenticated traffic cannot drive persistent writes,
+	// and a concurrent duplicate still loses the race here.
+	if err := api.replay.reserve(caller, req.Nonce, deadline); err != nil {
+		log.Printf("[SECURITY] qau_bridgeRefundFailedLock replay-rejected lockId=%s caller=%s err=%v",
+			req.LockID, caller.ToHexAddress(), err)
+		return nil, &Error{Code: -32003, Message: "refund request nonce already used: " + err.Error()}
 	}
 
 	// Security audit log: record every refund attempt (success or failure).
@@ -253,40 +283,43 @@ func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessa
 // state-mutating pattern: Dilithium3 pubkey ↔ address binding plus a
 // signature over a domain-separated message that includes the lock ID and a
 // deadline-embedded nonce (replay/freshness protection).
-func verifySignedRefundRequest(caller types.Address, lockID, nonce, signature, pubKeyHex string) error {
+func verifySignedRefundRequest(caller types.Address, lockID, nonce, signature, pubKeyHex string) (time.Time, error) {
 	if signature == "" || pubKeyHex == "" || nonce == "" {
-		return fmt.Errorf("signature, publicKey and nonce are required: the caller address must be proven by a Dilithium3 signature (client-asserted caller is not accepted)")
+		return time.Time{}, fmt.Errorf("signature, publicKey and nonce are required: the caller address must be proven by a Dilithium3 signature (client-asserted caller is not accepted)")
 	}
 
 	// Expired / over-far deadlines are rejected before any cryptographic work.
-	if _, err := ParseAuthNonceDeadline(nonce, time.Now()); err != nil {
-		return err
+	// The parsed deadline is returned so the caller can reserve the nonce with
+	// the replay guard (audit memo on d327f6e).
+	deadline, err := ParseAuthNonceDeadline(nonce, time.Now())
+	if err != nil {
+		return time.Time{}, err
 	}
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
 	if err != nil {
-		return fmt.Errorf("invalid signature hex: %w", err)
+		return time.Time{}, fmt.Errorf("invalid signature hex: %w", err)
 	}
 	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
 	if err != nil {
-		return fmt.Errorf("invalid publicKey hex: %w", err)
+		return time.Time{}, fmt.Errorf("invalid publicKey hex: %w", err)
 	}
 
 	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
 	if err != nil {
-		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
+		return time.Time{}, fmt.Errorf("invalid Dilithium3 public key: %w", err)
 	}
 	if pubKey.Address() != caller {
-		return fmt.Errorf("public key does not match claimed caller address")
+		return time.Time{}, fmt.Errorf("public key does not match claimed caller address")
 	}
 
 	// Domain-separated so a signature collected for another RPC method (or
 	// another lock) cannot be replayed here.
 	message := []byte(fmt.Sprintf("QAU-qau_bridgeRefundFailedLock|%s|%s|%s", caller.ToHexAddress(), lockID, nonce))
 	if !crypto.Verify(pubKey, message, sigBytes) {
-		return fmt.Errorf("invalid caller signature")
+		return time.Time{}, fmt.Errorf("invalid caller signature")
 	}
-	return nil
+	return deadline, nil
 }
 
 // bridgeMessageToMap converts a BridgeMessage to a JSON-friendly map.
