@@ -77,7 +77,8 @@ type AssetLock struct {
 	RefundTxHash string
 	// BRIDGE-H06 (R30, 2026-07-27): BurnProof is required to refund a
 	// lock whose last good status was Minted (i.e., FailedReason contains
-	// "Minted"). Without a verified burn proof, refunding such a lock
+	// "Minted", or MintedAt/MintTxHash show a successful mint — see
+	// wasMinted). Without a verified burn proof, refunding such a lock
 	// would create a double-spend: the user keeps the wrapped asset on
 	// the target chain AND gets the original asset back on the source
 	// chain. Once attached, the proof is immutable — attempts to refund
@@ -1285,9 +1286,12 @@ func (alm *AssetLockManager) scanStaleLocks() {
 			oldStatus := lock.Status
 			lock.Status = LockStatusFailed
 			lock.FailedAt = now
+			// AUDIT N-17: the reason must carry the symbolic status name. A
+			// numeric rendering ("in status 2") is what let the BRIDGE-H06
+			// burn-proof gate be bypassed for timed-out Minted locks.
 			lock.FailedReason = fmt.Sprintf(
-				"timeout after %s in status %d (entered at %d, now %d)",
-				alm.lockTimeout, oldStatus, entryTime, now)
+				"timeout after %s in status %s (entered at %d, now %d)",
+				alm.lockTimeout, lockStatusName(oldStatus), entryTime, now)
 
 			delete(alm.locksByStatus[oldStatus], id)
 			if alm.locksByStatus[LockStatusFailed] == nil {
@@ -1394,16 +1398,20 @@ func (alm *AssetLockManager) refundFailedLockLegacy(ctx context.Context, lockID 
 	}
 
 	// BRIDGE-H06 (R30, 2026-07-27) FIX: A lock whose last good status was
-	// Minted (inferred from FailedReason containing "Minted") requires a
-	// verified BurnProof before the refund may proceed. Without a burn
-	// proof, refunding the source-chain lock would create a double-spend:
-	// the user keeps the wrapped asset on the target chain AND gets the
-	// original asset back on the source chain. The legacy/internal path
-	// (timeout watcher, HandlePendingMessageEviction) does NOT supply a
-	// burn proof, so it is fail-closed for Minted locks. Operators must
-	// use RefundFailedLockWithBurnProof to supply the on-chain burn
-	// evidence.
-	if containsMintedHint(lock.FailedReason) && lock.BurnProof == nil {
+	// Minted requires a verified BurnProof before the refund may proceed.
+	// Without a burn proof, refunding the source-chain lock would create a
+	// double-spend: the user keeps the wrapped asset on the target chain AND
+	// gets the original asset back on the source chain. The legacy/internal
+	// path (timeout watcher, HandlePendingMessageEviction) does NOT supply a
+	// burn proof, so it is fail-closed for Minted locks. Operators must use
+	// RefundFailedLockWithBurnProof to supply the on-chain burn evidence.
+	// AUDIT N-17 (2026-11-06): the mint evidence must be structural. The old
+	// condition relied solely on the human-readable FailedReason, so any
+	// failure path that rendered the status numerically (notably the timeout
+	// watcher) never matched "Minted" and silently unlocked the refund.
+	// MintedAt/MintTxHash are written only after a successful mint submission,
+	// so they are authoritative regardless of how the reason was formatted.
+	if (containsMintedHint(lock.FailedReason) || lock.wasMinted()) && lock.BurnProof == nil {
 		if alm.bridge != nil && alm.bridge.logger != nil {
 			alm.bridge.logger.Warn("refund rejected: lock was in Minted status and no burn proof was supplied (BRIDGE-H06)", map[string]any{
 				"lockID":       lock.ID,
@@ -1848,4 +1856,37 @@ func containsMintedHint(reason string) bool {
 		}
 	}
 	return false
+}
+
+// wasMinted reports whether the lock ever reached Minted status. AUDIT N-17
+// (2026-11-06): this is the structural counterpart of containsMintedHint —
+// MintedAt and MintTxHash are only set after a successful mint submission,
+// so they cannot be lost to a numeric rendering of the failed status.
+func (lock *AssetLock) wasMinted() bool {
+	return lock.MintedAt > 0 || lock.MintTxHash != ""
+}
+
+// lockStatusName returns the symbolic name of a lock status for diagnostics.
+// AUDIT N-17 (2026-11-06): failure records must carry the symbolic status so
+// the BRIDGE-H06 "last good status was Minted" check can never be bypassed
+// by a numeric rendering of the same status.
+func lockStatusName(s LockStatus) string {
+	switch s {
+	case LockStatusPending:
+		return "Pending"
+	case LockStatusLocked:
+		return "Locked"
+	case LockStatusMinted:
+		return "Minted"
+	case LockStatusBurned:
+		return "Burned"
+	case LockStatusUnlocked:
+		return "Unlocked"
+	case LockStatusFailed:
+		return "Failed"
+	case LockStatusRefunded:
+		return "Refunded"
+	default:
+		return fmt.Sprintf("Unknown(%d)", uint8(s))
+	}
 }
