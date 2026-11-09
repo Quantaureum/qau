@@ -83,6 +83,14 @@ type HandlerConfig struct {
 
 	AllowedPaths []string
 
+	// AUDIT run-3 qau.graphql/loopback-forwarded-ip-rate-limit-bypass FIX
+	// (ported from node 8245a07): TrustedProxies lists the direct peers (host
+	// or CIDR) whose X-Real-IP / X-Forwarded-For headers may be trusted for
+	// client-IP attribution. When empty, forwarding headers are ignored and
+	// the direct peer address is used, so a loopback caller cannot rotate
+	// spoofed headers to bypass the limiter.
+	TrustedProxies []string
+
 	RateLimitRequests int
 	RateLimitWindow   time.Duration
 
@@ -172,18 +180,74 @@ func (rl *rateLimiter) allow(key string) bool {
 	return entry.count <= rl.limit
 }
 
-// isLoopback checks if an IP address string is a loopback address
-// (127.0.0.0/8 for IPv4, ::1 for IPv6, or the literal "localhost").
-// This is used to determine whether forwarded IP headers can be trusted.
-func isLoopback(ip string) bool {
-	if ip == "localhost" {
-		return true
+// clientIPWithTrust resolves the client IP used for rate limiting. Forwarding
+// headers are honored only when the direct peer matches a configured
+// trusted-proxy entry (host or CIDR); otherwise the direct peer address is used.
+//
+// AUDIT node/graphql-clientip-spoof FIX (ported from node 8245a07): the
+// X-Forwarded-For chain is now evaluated from the RIGHT. A leftmost entry is
+// attacker-controlled whenever any hop in the chain appends instead of
+// overwrites: a client can send "X-Forwarded-For: <random>" and a well-behaved
+// proxy turns it into "<random>, <real-client>", so keying on the leftmost
+// entry hands the attacker unlimited fresh rate-limit buckets. Entries that
+// are themselves trusted proxies are skipped, and the first untrusted valid IP
+// walking right-to-left is the client. X-Real-IP is only accepted when it
+// parses as an IP.
+func clientIPWithTrust(r *http.Request, trustedProxies []string) string {
+	host := directPeerHost(r.RemoteAddr)
+	if len(trustedProxies) == 0 || !isTrustedProxy(host, trustedProxies) {
+		return host
 	}
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
+	chain := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(chain) - 1; i >= 0; i-- {
+		entry := strings.TrimSpace(chain[i])
+		if net.ParseIP(entry) == nil {
+			continue // malformed / attacker garbage
+		}
+		if isTrustedProxy(entry, trustedProxies) {
+			continue // proxy hop, keep walking left
+		}
+		return entry
 	}
-	return parsed.IsLoopback()
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(xrip) != nil {
+		return xrip
+	}
+	return host
+}
+
+// directPeerHost returns the host portion of an http.Request RemoteAddr,
+// tolerating values that are already bare IPs (no port).
+func directPeerHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
+// isTrustedProxy reports whether host matches an explicit trusted-proxy entry.
+// Over-broad CIDRs (/0) are ignored: they would trust forwarding headers from
+// any source and defeat the purpose of the whitelist.
+func isTrustedProxy(host string, trustedProxies []string) bool {
+	ip := net.ParseIP(host)
+	for _, trusted := range trustedProxies {
+		if strings.Contains(trusted, "/") {
+			_, network, err := net.ParseCIDR(trusted)
+			if err != nil || ip == nil {
+				continue
+			}
+			if ones, _ := network.Mask.Size(); ones == 0 {
+				continue
+			}
+			if network.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if host == trusted {
+			return true
+		}
+	}
+	return false
 }
 
 func initAPIKeys(primary string) map[string]time.Time {
@@ -323,27 +387,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	// SECURITY FIX (audit P2-03): Only trust X-Real-IP/X-Forwarded-For
-	// headers when the request originates from a loopback address (trusted
-	// reverse proxy). Previously, any client could spoof these headers with
-	// a different IP per request to bypass rate limiting entirely.
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	clientIP := host
-
-	if isLoopback(host) {
-		// Request comes from a trusted proxy on loopback; honor forwarded headers
-		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-			clientIP = xrip
-		} else if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if idx := strings.Index(xff, ","); idx != -1 {
-				clientIP = strings.TrimSpace(xff[:idx])
-			} else {
-				clientIP = strings.TrimSpace(xff)
-			}
-		}
-	}
-	// If not from loopback, clientIP remains the direct RemoteAddr host,
-	// ignoring any spoofed forwarding headers.
+	// AUDIT run-3 qau.graphql/loopback-forwarded-ip-rate-limit-bypass FIX
+	// (ported from node 8245a07): Client-IP attribution now requires an
+	// explicit trusted-proxy entry. The previous loopback-only check let any
+	// local process (and any deployment whose reverse proxy shares the
+	// loopback bind) rotate X-Real-IP / X-Forwarded-For per request and land
+	// in a fresh rate-limit bucket.
+	clientIP := clientIPWithTrust(r, h.config.TrustedProxies)
 
 	if h.rateLimit != nil && !h.rateLimit.allow(clientIP) {
 		h.writeError(w, http.StatusTooManyRequests, errors.New("rate limit exceeded"))
