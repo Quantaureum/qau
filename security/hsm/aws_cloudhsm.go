@@ -29,19 +29,14 @@ func NewAWSCloudHSM() *AWSCloudHSM {
 }
 
 func (a *AWSCloudHSM) Initialize(config *HSMConfig) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if config == nil {
-		return errors.New("AWS CloudHSM: config is nil")
-	}
-	if config.ConnectionString == "" {
-		return errors.New("AWS CloudHSM: cluster ID or HSM IP is required")
-	}
-
-	a.config = config
-	a.initialized = true
-	return nil
+	// run-13 B7 (fail-closed): this type is a complete software simulation
+	// (in-process plaintext key equivalents), NOT an AWS CloudHSM client. A
+	// validator operator configuring an HSM must never silently receive
+	// software-equivalent keys. Initialization is refused in every case;
+	// use SoftwareHSM explicitly when no hardware protection is intended.
+	// All other methods on this type consequently fail with
+	// ErrHSMNotInitialized and no KeyPair can ever be created here.
+	return errors.New("aws cloudhsm: software stub, not a real HSM; use the software backend explicitly")
 }
 
 func (a *AWSCloudHSM) Close() error {

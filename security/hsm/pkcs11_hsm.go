@@ -31,19 +31,14 @@ func NewPKCS11HSM() *PKCS11HSM {
 }
 
 func (p *PKCS11HSM) Initialize(config *HSMConfig) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if config == nil {
-		return errors.New("PKCS#11: config is nil")
-	}
-	if config.ConnectionString == "" {
-		return errors.New("PKCS#11: connection string (library path) is required")
-	}
-
-	p.config = config
-	p.initialized = true
-	return nil
+	// run-13 B7 (fail-closed): this type is a complete software simulation
+	// (in-process plaintext key equivalents), NOT a PKCS#11 HSM. A validator
+	// operator configuring an HSM must never silently receive
+	// software-equivalent keys. Initialization is refused in every case;
+	// use SoftwareHSM explicitly when no hardware protection is intended.
+	// All other methods on this type consequently fail with
+	// ErrHSMNotInitialized and no KeyPair can ever be created here.
+	return errors.New("pkcs11: software stub, not a real HSM; use the software backend explicitly")
 }
 
 func (p *PKCS11HSM) Close() error {

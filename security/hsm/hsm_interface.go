@@ -1,10 +1,12 @@
 // Quantaureum Node source, version 1.0.0.
 // Package hsm provides Hardware Security Module integration for secure key management.
 // This module abstracts HSM operations to support various HSM backends including:
-// - Software HSM (for development/testing)
-// - PKCS#11 compatible HSMs (Thales, Gemalto, etc.)
-// - Cloud HSMs (AWS CloudHSM, Azure Key Vault, GCP Cloud HSM)
-// - YubiHSM
+//   - Software HSM (for development/testing; no hardware protection — explicit)
+//   - PKCS#11 compatible HSMs (Thales, Gemalto, etc.) — NOT yet implemented;
+//     the placeholder type is a software stub and fails closed (run-13 B7)
+//   - Cloud HSMs (AWS CloudHSM, Azure Key Vault, GCP Cloud HSM) — NOT yet
+//     implemented; placeholders fail closed (run-13 B7)
+//   - YubiHSM
 package hsm
 
 import (
@@ -173,9 +175,16 @@ func NewHSMManager(config *HSMConfig) (*HSMManager, error) {
 	case "software":
 		provider = NewSoftwareHSM()
 	case "pkcs11":
-		provider = NewPKCS11HSM()
+		// run-13 B7 (fail-closed): the pkcs11 backend is currently a
+		// complete software simulation holding in-process plaintext key
+		// equivalents. Accepting the config would silently hand an operator
+		// who requested a real HSM a software key with no hardware
+		// protection. Refuse construction; use the "software" backend
+		// explicitly when no hardware protection is intended.
+		return nil, errors.New("pkcs11 backend is a software stub, not a real HSM; use the software backend explicitly for dev/test")
 	case "aws":
-		provider = NewAWSCloudHSM()
+		// run-13 B7 (fail-closed): same software-stub status as pkcs11.
+		return nil, errors.New("aws cloudhsm backend is a software stub, not a real HSM; use the software backend explicitly for dev/test")
 	case "azure":
 		return nil, errors.New("azure Key Vault backend not yet implemented")
 	case "gcp":
