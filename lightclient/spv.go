@@ -371,6 +371,36 @@ func VerifyStateProof(stateRoot types.Hash, proof *StateProof) bool {
 		return false
 	}
 
+	// run-4 L-1: the proof path is valid, but the envelope's Account fields
+	// come from attacker-controlled bytes and were never tied to the proven
+	// leaf. Without this binding a benign inclusion proof can be presented
+	// with any balance/nonce/storageRoot/codeHash.
+	if proof.AccountProof.IsExclusion {
+		if proof.Account != nil {
+			return false
+		}
+	} else if proof.Account != nil {
+		// A caller may verify proof material only (Account == nil) without
+		// claiming account fields; but when fields are claimed they must be the
+		// proven leaf.
+		if len(proof.AccountProof.Value) == 0 {
+			return false
+		}
+		proven, err := state.DecodeAccount(proof.AccountProof.Value)
+		if err != nil || proven == nil {
+			return false
+		}
+		if proven.Nonce != proof.Account.Nonce ||
+			proven.StorageRoot != proof.Account.StorageRoot ||
+			proven.CodeHash != proof.Account.CodeHash {
+			return false
+		}
+		if proven.Balance == nil || proof.Account.Balance == nil ||
+			proven.Balance.Cmp(proof.Account.Balance) != 0 {
+			return false
+		}
+	}
+
 	// R6-02: storage slots live in the SAME flat key space as accounts --
 	// StateDB.ProveStorage walks the state trie with
 	// storagePrefix ++ addr ++ 0xFF ++ slot -- so a storage proof is bound to
@@ -386,6 +416,12 @@ func VerifyStateProof(stateRoot types.Hash, proof *StateProof) bool {
 			return false
 		}
 		if !trie.VerifyProof(stateRoot, entry.Proof) {
+			return false
+		}
+		// run-4 L-1: StorageProofEntry.Value is envelope data; bind it to the
+		// value actually carried by the verified leaf.
+		if len(entry.Proof.Value) != len(entry.Value) ||
+			!bytes.Equal(entry.Proof.Value, entry.Value[:]) {
 			return false
 		}
 	}
