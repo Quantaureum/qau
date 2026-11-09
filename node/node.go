@@ -6965,6 +6965,9 @@ func (n *Node) startServices() error {
 			interval = 12 * time.Second // Default 12 second block time
 		}
 		n.blockProducer = NewBlockProducer(n, interval)
+		if err := n.blockProducer.ValidatorKeyLoadError(); err != nil {
+			return fmt.Errorf("refusing to start block production: %w", err)
+		}
 		if err := n.wireTSSDistributed(); err != nil {
 			return err
 		}
@@ -6983,6 +6986,9 @@ func (n *Node) startServices() error {
 		}
 		nodeLog.Info("Starting validator block producer with %v interval", interval)
 		n.blockProducer = NewBlockProducer(n, interval)
+		if err := n.blockProducer.ValidatorKeyLoadError(); err != nil {
+			return fmt.Errorf("refusing to start block production: %w", err)
+		}
 		if err := n.wireTSSDistributed(); err != nil {
 			return err
 		}

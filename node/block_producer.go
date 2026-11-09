@@ -76,6 +76,12 @@ type BlockProducer struct {
 	validatorSet       *consensus.ValidatorSet
 	validatorIdx       int // Index in validator set
 
+	// validatorKeyLoadErr records a fail-closed validator key load failure.
+	// Block production must not start with an identity that could not be
+	// authenticated (run-4 K-1: a truncated/unreadable key must never be
+	// silently replaced by a freshly generated key).
+	validatorKeyLoadErr error
+
 	// QPOS consensus engine
 	qpos *consensus.QPOS
 
@@ -269,7 +275,8 @@ func NewBlockProducer(node *Node, interval time.Duration) *BlockProducer {
 	// audit-fix H-2: load or generate validator key with persistence
 	keyPair, err := bp.loadOrGenerateValidatorKey()
 	if err != nil {
-		bpLog.Warn("Failed to load/generate validator key: %v", err)
+		bp.validatorKeyLoadErr = err
+		bpLog.Error("Failed to load validator key (block production will refuse to start): %v", err)
 	}
 	if keyPair != nil {
 		bp.validatorKey = keyPair.Private
@@ -308,8 +315,19 @@ func NewBlockProducer(node *Node, interval time.Duration) *BlockProducer {
 	return bp
 }
 
+// ValidatorKeyLoadError returns the fail-closed validator key load error, if any.
+// startServices refuses to start a producing validator when this is non-nil.
+func (bp *BlockProducer) ValidatorKeyLoadError() error {
+	return bp.validatorKeyLoadErr
+}
+
 // loadOrGenerateValidatorKey loads the validator key from disk, or generates
-// and persists a new one if the file doesn't exist.
+// and persists a new one when the file does not exist.
+//
+// Fail-closed policy (run-4 K-1): only os.IsNotExist may trigger generation.
+// An existing file that is empty (truncated by a failed write) or unreadable
+// must never be overwritten with a new identity, because that permanently
+// destroys the on-chain validator identity.
 // audit-fix H-2: ensures validator identity is preserved across restarts.
 // audit-fix H-1: supports encrypted key files; migrates plaintext keys to encrypted format.
 func (bp *BlockProducer) loadOrGenerateValidatorKey() (*crypto.KeyPair, error) {
@@ -320,9 +338,16 @@ func (bp *BlockProducer) loadOrGenerateValidatorKey() (*crypto.KeyPair, error) {
 		return crypto.GenerateKeyPair()
 	}
 
-	// Try to load existing key
+	// Try to load existing key. Only a genuinely missing file may fall through
+	// to generation; every other read outcome is fail-closed.
 	data, err := os.ReadFile(keyPath) // #nosec G304 -- keyPath from node config, not direct user input
-	if err == nil && len(data) > 0 {
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("refusing to generate a new validator identity: key file %s exists but cannot be read: %w", keyPath, err)
+	}
+	if err == nil {
+		if len(data) == 0 {
+			return nil, fmt.Errorf("refusing to generate a new validator identity: key file %s is empty (interrupted write?); restore the key from backup", keyPath)
+		}
 		privKey, migrated, err := bp.loadValidatorKey(data, keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load validator key from %s: %w", keyPath, err)
@@ -368,9 +393,17 @@ func (bp *BlockProducer) loadOrGenerateValidatorKey() (*crypto.KeyPair, error) {
 		return nil, fmt.Errorf("failed to create key directory: %w", err)
 	}
 	if err := bp.saveEncryptedValidatorKey(keyPair.Private, keyPath); err != nil {
+		// SECURITY (audit L-08): mainnet must never persist a freshly generated
+		// validator key in plaintext. The load path already refuses plaintext
+		// keys on mainnet; the generation path previously fell back to raw
+		// bytes whenever encryption was unavailable (e.g. no password), which
+		// silently planted a plaintext key on production disk.
+		if bp.node.config.NetworkID == MainnetNetworkID {
+			return nil, fmt.Errorf("SECURITY: mainnet refuses to generate a plaintext validator key at %s — configure a validator key password (ValidatorPasswordFile, QAU_VALIDATOR_KEY_PASSWORD or validatorKeyPassword) so the key can be encrypted (audit 2026-08-17 M-01/L-08)", keyPath)
+		}
 		// Fallback: save as raw bytes if encryption fails (e.g. no password configured)
 		bpLog.Warn("Saving validator key as plaintext (no password configured): %v", err)
-		if err := os.WriteFile(keyPath, keyPair.Private.Bytes(), 0600); err != nil {
+		if err := writeFileAtomic(keyPath, keyPair.Private.Bytes(), 0600); err != nil {
 			return nil, fmt.Errorf("failed to save validator key to %s: %w", keyPath, err)
 		}
 	}
@@ -512,7 +545,52 @@ func (bp *BlockProducer) saveEncryptedValidatorKey(privKey *crypto.PrivateKey, k
 		return fmt.Errorf("failed to marshal encrypted key file: %w", err)
 	}
 
-	return os.WriteFile(keyPath, jsonData, 0600) // #nosec G703 -- path traversal: input validated by caller
+	return writeFileAtomic(keyPath, jsonData, 0600)
+}
+
+// writeFileAtomic writes key material through a same-directory temporary file
+// followed by os.Rename, so an interrupted write can never leave a truncated
+// or empty key file at the live path (run-4 K-3). The previous os.WriteFile
+// used O_TRUNC, so a crash between truncate and write produced the zero-byte
+// file that the loader then treated as "missing" (run-4 K-1).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".keyfile-tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary key file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to set key file permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to write key file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to flush key file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close key file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to replace key file: %w", err)
+	}
+	tmpName = ""
+	if runtime.GOOS != "windows" {
+		if d, err := os.Open(dir); err == nil {
+			_ = d.Sync()
+			_ = d.Close()
+		}
+	}
+	return nil
 }
 
 // parseValidatorPrivateKeyFile parses a validator private key from file contents.
