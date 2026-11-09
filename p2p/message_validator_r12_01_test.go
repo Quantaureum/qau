@@ -106,6 +106,42 @@ func TestR12_01_IsDuplicate_BoundsMapWhenAllFresh(t *testing.T) {
 	}
 }
 
+// TestR12_01_IsDuplicate_NewestSurvivesEvenWhenSeedsSortAfterIt pins the
+// eviction invariant deterministically. All seeds are stamped in the future so
+// the just-inserted hash is unambiguously the oldest entry in sort order; the
+// pre-fix batch drop therefore removed it every time. The fix skips the hash
+// inserted by the current call, so it must survive AND still dedup a replay.
+func TestR12_01_IsDuplicate_NewestSurvivesEvenWhenSeedsSortAfterIt(t *testing.T) {
+	v := NewMessageValidator()
+	cap := 100
+	v.maxSeenMessages = cap
+
+	// Future stamps put every seed after "now" in the sort order.
+	seedSeen(v, cap, time.Hour)
+
+	newest := "flood-latest"
+	if v.IsDuplicate(newest) {
+		t.Fatal("fresh hash must not be flagged duplicate on first sight")
+	}
+
+	v.seenMessagesMu.Lock()
+	_, hasNewest := v.seenMessages[newest]
+	size := len(v.seenMessages)
+	v.seenMessagesMu.Unlock()
+
+	if !hasNewest {
+		t.Fatal("eviction dropped the hash inserted by the current call")
+	}
+	if size > cap {
+		t.Fatalf("seenMessages not bounded: size %d > cap %d", size, cap)
+	}
+	// The surviving entry must actually dedup within the window; otherwise the
+	// message it represents can be replayed immediately.
+	if !v.IsDuplicate(newest) {
+		t.Fatal("the surviving newest entry must still dedup a replay within the 30s window")
+	}
+}
+
 // TestR12_01_IsDuplicate_StillDedupsWithinWindow proves the change preserves the
 // replay-dedup behavior it exists for: a hash seen moments ago is flagged.
 func TestR12_01_IsDuplicate_StillDedupsWithinWindow(t *testing.T) {

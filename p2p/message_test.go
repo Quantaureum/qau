@@ -353,7 +353,7 @@ func TestCrc32Checksum(t *testing.T) {
 }
 
 func TestIsSyncMessage(t *testing.T) {
-	syncTypes := []uint8{MsgTypeBlock, MsgTypeBlockReq, MsgTypeBlockResp, MsgTypeStatus,
+	syncTypes := []uint8{MsgTypeBlock, MsgTypeBlockReq, MsgTypeBlockResp,
 		MsgTypeSnapStateReq, MsgTypeSnapStateResp, MsgTypeSnapRangeReq, MsgTypeSnapRangeResp}
 	for _, mt := range syncTypes {
 		if !isSyncMessage(mt) {

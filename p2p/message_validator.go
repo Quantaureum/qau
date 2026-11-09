@@ -764,8 +764,21 @@ func (v *MessageValidator) IsDuplicate(msgHash string) bool {
 			if evictCount < 1 {
 				evictCount = 1
 			}
-			for i := 0; i < evictCount && i < len(entries); i++ {
+			// AUDIT run-4 T-P2P-FLAKE-01 FIX (ported from node 8245a07):
+			// never evict the hash inserted by this call. It is the newest
+			// dedup entry, so dropping it would let that message replay inside
+			// its 30s window. The sort cannot be trusted to place it last: on
+			// coarse platform clocks (Windows ~15ms tick) the batch may share a
+			// single time.Now() value, and sort.Slice keeps map iteration order
+			// for ties — which previously evicted the just-inserted entry
+			// roughly 10% of the time.
+			evicted := 0
+			for i := 0; i < len(entries) && evicted < evictCount; i++ {
+				if entries[i].hash == msgHash {
+					continue
+				}
 				delete(v.seenMessages, entries[i].hash)
+				evicted++
 			}
 		}
 	}

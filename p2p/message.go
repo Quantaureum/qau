@@ -546,6 +546,14 @@ func DecodeReceiptResponse(data []byte) (*ReceiptResponse, error) {
 	if setCount > MaxReceiptRequestCount {
 		return nil, ErrMalformedMessage
 	}
+	// AUDIT run-3 qau.p2p/receipt-resp-prealloc-amplification FIX (ported from
+	// node 8245a07): bound the preallocation by the bytes actually present.
+	// Every declared set needs at least BlockHash(32) + RCount(4) on the wire,
+	// so a small frame that inflates setCount must be rejected before make()
+	// sizes the slice.
+	if uint64(setCount)*36 > uint64(len(data)-12) {
+		return nil, ErrMalformedMessage
+	}
 	offset := 12
 	resp.Sets = make([]ReceiptSet, 0, setCount)
 	for i := uint32(0); i < setCount; i++ {
@@ -558,6 +566,13 @@ func DecodeReceiptResponse(data []byte) (*ReceiptResponse, error) {
 		rCount := binary.BigEndian.Uint32(data[offset : offset+4])
 		offset += 4
 		if rCount > 100000 {
+			return nil, ErrMalformedMessage
+		}
+		// AUDIT run-3 qau.p2p/receipt-resp-prealloc-amplification FIX (ported
+		// from node 8245a07): each receipt consumes at least RLen(4) + one
+		// payload byte, so reject a count that cannot fit in the remaining
+		// bytes before preallocating.
+		if uint64(rCount)*5 > uint64(len(data)-offset) {
 			return nil, ErrMalformedMessage
 		}
 		set.Receipts = make([][]byte, 0, rCount)

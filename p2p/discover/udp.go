@@ -144,6 +144,17 @@ type UDPTransport struct {
 	// The value is the timestamp of the last completed PING/PONG exchange.
 	verifiedPeers map[string]time.Time
 
+	// AUDIT N-19 (ported from node 8245a07): dormant UDP discovery wire
+	// authentication (integrity tag, timestamp, nonce and source-address
+	// binding). wireAuthOn is derived from wireAuthActivation (0 = inactive)
+	// at construction. While it is false every encoded frame is byte-for-byte
+	// the legacy encoding.
+	wireAuthOn       bool
+	wireAuthKey      []byte
+	wireAuthKeyMu    sync.Mutex
+	wireAuthCookieMu sync.Mutex
+	wireAuthCookies  map[string]*wireAuthCookie
+
 	rateLimiterMu sync.Mutex
 
 	ctx    context.Context
@@ -174,6 +185,8 @@ func NewUDPTransport(ctx context.Context, localNode *enode.Node, table *Table, a
 		pending:   make(map[uint32]*pendingRequest),
 		ctx:       ctx,
 		cancel:    cancel,
+		// AUDIT N-19: dormant until the coordinated upgrade window activates it.
+		wireAuthOn: wireAuthActive(wireAuthActivation),
 	}
 
 	t.wg.Add(2)
@@ -352,13 +365,17 @@ func (t *UDPTransport) handlePing(from *net.UDPAddr, payload []byte) {
 
 	reqID := binary.BigEndian.Uint32(payload[:4])
 
-	pongPayload := make([]byte, 4+len(payload[4:]))
-	binary.BigEndian.PutUint32(pongPayload[:4], reqID)
-	copy(pongPayload[4:], payload[4:])
+	pongPacket := buildPongFrame(reqID, payload[4:])
 
-	pongPacket := make([]byte, 1+len(pongPayload))
-	pongPacket[0] = 2
-	copy(pongPacket[1:], pongPayload)
+	// AUDIT N-19 (ported from node 8245a07): when wire authentication is
+	// active the PONG carries the address cookie that the peer echoes on its
+	// FINDNODE frames. When the gate is inactive this is skipped and the
+	// frame stays legacy-identical.
+	if t.wireAuthOn {
+		if cookie := t.issueWireAuthCookie(from); cookie != nil {
+			pongPacket = append(pongPacket, cookie.encode()...)
+		}
+	}
 
 	// P2-DEADLINE FIX (R29, 2026-07-26): Check SetWriteDeadline error.
 	// A failure here indicates the socket is in a bad state (closed, FD
@@ -474,8 +491,14 @@ func (t *UDPTransport) handlePong(from *net.UDPAddr, payload []byte) {
 	}
 	t.pendingMu.Unlock()
 
+	// AUDIT N-19 (ported from node 8245a07): when wire authentication is
+	// active the echo may carry the address cookie, which is remembered for
+	// later FINDNODE frames. When the gate is inactive this returns the echo
+	// unchanged.
+	echo := t.capturePongCookie(from, payload[4:])
+
 	if exists && req.callback != nil {
-		safeCallback(req.callback, payload[4:], nil)
+		safeCallback(req.callback, echo, nil)
 	}
 
 	// SECURITY FIX H-4: Only update node activity if the pong corresponds
@@ -494,7 +517,7 @@ func (t *UDPTransport) handlePong(from *net.UDPAddr, payload []byte) {
 		// must be rejected. Without this check, an attacker who captures a
 		// PONG meant for node A could replay it to node B to falsely mark
 		// a remote node as "active" in B's routing table.
-		nodeID := t.extractNodeID(payload[4:])
+		nodeID := t.extractNodeID(echo)
 		if t.localNode != nil && !nodeID.IsEmpty() && nodeID != t.localNode.ID() {
 			udpLog.Warn("handlePong: PONG RecipientID mismatch — rejecting (possible replay)",
 				map[string]any{"from": from.String()})
@@ -537,6 +560,19 @@ func (t *UDPTransport) handleFindNode(from *net.UDPAddr, payload []byte) {
 		return
 	}
 
+	// AUDIT N-19 (ported from node 8245a07): when wire authentication is
+	// active a FINDNODE must carry a valid, fresh, source-address-bound
+	// cookie; otherwise it is dropped silently (no amplification and no
+	// error oracle). When the gate is inactive this returns the payload
+	// unchanged.
+	body, err := t.stripWireAuth(from, payload)
+	if err != nil {
+		return
+	}
+	if len(body) < 36 {
+		return
+	}
+
 	// SECURITY (audit P2P-08): Require endpoint proof before responding to
 	// FINDNODE. The requester must have recently sent us a PING (proving
 	// they can receive packets at their claimed source address). This
@@ -554,9 +590,9 @@ func (t *UDPTransport) handleFindNode(from *net.UDPAddr, payload []byte) {
 		return // silently drop rate-limited requests
 	}
 
-	reqID := binary.BigEndian.Uint32(payload[:4])
+	reqID := binary.BigEndian.Uint32(body[:4])
 	var target enode.ID
-	copy(target[:], payload[4:36])
+	copy(target[:], body[4:36])
 
 	var closest []*enode.Node
 	if t.table != nil {
@@ -828,11 +864,9 @@ func (t *UDPTransport) Ping(node *enode.Node) error {
 	binary.BigEndian.PutUint32(pingPayload[:4], reqID)
 	copy(pingPayload[4:], t.localNode.ID().Bytes())
 
-	packet := make([]byte, 1+len(pingPayload))
-	packet[0] = 1
-	copy(packet[1:], pingPayload)
-
 	addr := &net.UDPAddr{IP: node.IP(), Port: node.UDP()}
+
+	packet := t.buildRequestFrame(1, pingPayload, addr)
 
 	resultCh := make(chan error, 1)
 	t.registerPending(reqID, func(result any, err error) {
@@ -883,11 +917,9 @@ func (t *UDPTransport) FindNode(node *enode.Node, target enode.ID) ([]*enode.Nod
 	binary.BigEndian.PutUint32(findNodePayload[:4], reqID)
 	copy(findNodePayload[4:], target[:])
 
-	packet := make([]byte, 1+len(findNodePayload))
-	packet[0] = 3
-	copy(packet[1:], findNodePayload)
-
 	addr := &net.UDPAddr{IP: node.IP(), Port: node.UDP()}
+
+	packet := t.buildRequestFrame(3, findNodePayload, addr)
 
 	resultCh := make(chan []*enode.Node, 1)
 	errCh := make(chan error, 1)

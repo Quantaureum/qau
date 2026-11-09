@@ -3549,7 +3549,11 @@ func (h *Host) verifyPeerIdentity(conn net.Conn, peerID PeerID) error {
 func isSyncMessage(msgType uint8) bool {
 	switch msgType {
 	case MsgTypeBlock, MsgTypeBlockReq, MsgTypeBlockResp,
-		MsgTypeStatus,
+		// AUDIT run-3 H-02 FIX (ported from node 8245a07): status frames are no
+		// longer exempt from the normal per-peer/per-IP rate limits. They are
+		// broadcast every 15s, far below the 500 msg/sec cap, so legitimate
+		// traffic is unaffected while a peer can no longer flood
+		// unauthenticated status frames for free.
 		MsgTypeSnapStateReq, MsgTypeSnapStateResp,
 		MsgTypeSnapRangeReq, MsgTypeSnapRangeResp,
 		// ETHEREUM-PARITY SYNC (2026-08-13): extended sync protocol traffic
@@ -4468,10 +4472,14 @@ func (h *Host) handleBaseProtocol(msg *Message) error {
 						msg.From, status.ValidatorAddress[:4])
 				}
 			}
-		}
-		select {
-		case h.statusCh <- PeerMessage{From: msg.From, Payload: msg.Payload}:
-		default:
+			// AUDIT run-4 REG-01 FIX (ported from node 8245a07): forward every
+			// decodable status (including non-validator peers and frames that
+			// failed the mapping checks) so the syncer can still learn a peer's
+			// height. Mapping updates remain gated by `verified` above.
+			select {
+			case h.statusCh <- PeerMessage{From: msg.From, Payload: msg.Payload}:
+			default:
+			}
 		}
 	case MsgTypeBlockReq:
 		select {
