@@ -109,6 +109,7 @@ func newSampleAttestation(validatorIndex int) *encoding.DASAttestation {
 // attestation.Hash() MUST be accepted by the verifier. This is the happy path
 // that confirms the verifier is correctly wired to crypto.Verify.
 func TestP2_4_Verifier_AcceptsValidSignature(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 3)
 	lookup := func() []*ValidatorInfo { return validators }
 	// Use a disabled committee (testnet mode) so the membership check is
@@ -132,6 +133,7 @@ func TestP2_4_Verifier_AcceptsValidSignature(t *testing.T) {
 // rejection — Dilithium3 is EUF-CMA secure, so any mutation of a valid
 // signature should fail verification with overwhelming probability.
 func TestP2_4_Verifier_RejectsTamperedSignature(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -188,6 +190,7 @@ func TestP2_4_Verifier_RejectsForgedSignature(t *testing.T) {
 // from one validator and tries to submit it under a different validator's
 // index. Dilithium3's strong unforgeability prevents this.
 func TestP2_4_Verifier_RejectsWrongValidator(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 3)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -256,6 +259,7 @@ func TestP2_4_Verifier_RejectsOutOfRangeIndex(t *testing.T) {
 // should be accepted. Otherwise, an attacker could forge attestations that
 // bypass the membership check.
 func TestP2_4_Verifier_RejectsNilCommitteeMgr(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 
@@ -273,6 +277,7 @@ func TestP2_4_Verifier_RejectsNilCommitteeMgr(t *testing.T) {
 // This allows small networks (< 512 validators) to operate without a full
 // DA committee while still authenticating attestations cryptographically.
 func TestP2_4_Verifier_SkipsMembershipWhenDisabled(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -376,6 +381,7 @@ func TestP2_4_Verifier_AcceptsCommitteeMember(t *testing.T) {
 // matches the new Hash() and MUST be rejected. This is the "attestation
 // mutation" forgery — distinct from tampering with the signature itself.
 func TestP2_4_Verifier_RejectsTamperedAttestationBody(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -419,6 +425,7 @@ func TestP2_4_Verifier_RejectsTamperedAttestationBody(t *testing.T) {
 //
 // Run with `go test -race` to detect data races.
 func TestP2_4_Verifier_ParallelNoRace(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 8)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -551,6 +558,7 @@ func TestP2_4_Verifier_Dilithium3KeyAndSignatureSizes(t *testing.T) {
 // collector — the collector delegates to the verifier, which performs the
 // real Dilithium3 check.
 func TestP2_4_Verifier_SubmitAttestationWithRealVerifier(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 5)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -596,6 +604,7 @@ func TestP2_4_Verifier_SubmitAttestationWithRealVerifier(t *testing.T) {
 // slice with a nil entry at the requested index, the verifier MUST reject
 // (not panic). This guards against a misbehaving ValidatorLookupFunc.
 func TestP2_4_Verifier_NilValidatorInSet(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 3)
 	// Inject a nil at index 1.
 	validators[1] = nil
@@ -667,6 +676,7 @@ func TestP2_4_Verifier_WrongSignatureLength(t *testing.T) {
 // confirms the signature is bound to the slot via Hash(), preventing
 // replay across slots.
 func TestP2_4_Verifier_DeterministicAcrossSlots(t *testing.T) {
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(
@@ -797,6 +807,7 @@ func TestDA_R7_06_Verifier_RejectsDisabledCommitteeInProduction(t *testing.T) {
 		}
 	}()
 
+	declareDevnetForTest(t)
 	validators, keypairs := makeVerifierValidators(t, 2)
 	lookup := func() []*ValidatorInfo { return validators }
 	mgr := NewDACommitteeManager(

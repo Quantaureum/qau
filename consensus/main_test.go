@@ -4,7 +4,48 @@ package consensus
 import (
 	"os"
 	"testing"
+
+	"github.com/quantaureum/qau/params"
 )
+
+// declareNetworkForTest sets the attestation network identity for a test and
+// restores the package-wide test default (devnet) afterwards. Since the run-4
+// P1 port (node 8245a07) an UNSET network ID (0) counts as production, so
+// tests that mean to exercise non-production paths must identify themselves;
+// leaving 1668 behind would arm production-only consensus gates for every
+// later test in the binary.
+func declareNetworkForTest(t *testing.T, id uint64) {
+	t.Helper()
+	EnableTestHelpers()
+	ResetAttestationNetworkIDForTesting()
+	SetAttestationNetworkID(id)
+	t.Cleanup(func() {
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
+}
+
+// freezeMainnetForTest pins the attestation network identity to mainnet and
+// freezes it (the consensus-started state). The cleanup must RESET the freeze
+// first — SetAttestationNetworkID is a no-op after FreezeAttestationNetworkID,
+// so a frozen mainnet identity would otherwise leak into every later test and
+// arm production-only consensus gates.
+func freezeMainnetForTest(t *testing.T) {
+	t.Helper()
+	EnableTestHelpers()
+	ResetAttestationNetworkIDForTesting()
+	SetAttestationNetworkID(params.MainnetChainID)
+	FreezeAttestationNetworkID()
+	t.Cleanup(func() {
+		ResetAttestationNetworkIDForTesting()
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
+}
+
+// declareDevnetForTest is the common case: non-production consensus paths.
+func declareDevnetForTest(t *testing.T) {
+	t.Helper()
+	declareNetworkForTest(t, params.DevnetChainID)
+}
 
 // TestMain sets up the test environment for the consensus package.
 //

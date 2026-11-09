@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/quantaureum/qau/params"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -53,6 +54,13 @@ func TestQPOS_SetDAAvailabilityChecker(t *testing.T) {
 // TestQPOS_CheckDAAvailability_NoChecker verifies that CheckDAAvailability
 // returns nil (available) when no checker is configured. P1-4 (2026-07-14).
 func TestQPOS_CheckDAAvailability_NoChecker(t *testing.T) {
+	// run-4 P1 (node 8245a07 port): an unset network ID (0) is now production and
+	// REQUIRES a checker; declare devnet to document the devnet opt-in behavior.
+	EnableTestHelpers()
+	SetAttestationNetworkID(params.DevnetChainID)
+	t.Cleanup(func() {
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
 	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
@@ -151,6 +159,13 @@ func TestQPOS_CanPropose_NoDAChecker(t *testing.T) {
 // REFUSES to finalize when the DA availability check fails. P1-4 (2026-07-14).
 // This is the HARD check — blocks with unavailable DA must not be finalized.
 func TestThreeChambersFlow_FinalizeBlock_DARefused(t *testing.T) {
+	// run-4 P1 (node 8245a07 port): declare a non-mainnet network so the
+	// production-only consensus gates (DA / QTD canonical-root) stay opt-in.
+	EnableTestHelpers()
+	SetAttestationNetworkID(params.DevnetChainID)
+	t.Cleanup(func() {
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
 	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
 	// stake). The executive members {0,1,2} must reach that bar with their
 	// own signatures. Use a 4-validator set (total 4000, required 2667):
@@ -234,6 +249,13 @@ func TestThreeChambersFlow_FinalizeBlock_DARefused(t *testing.T) {
 // TestThreeChambersFlow_FinalizeBlock_DAAvailable verifies that FinalizeBlock
 // SUCCEEDS when the DA availability check passes. P1-4 (2026-07-14).
 func TestThreeChambersFlow_FinalizeBlock_DAAvailable(t *testing.T) {
+	// run-4 P1 (node 8245a07 port): non-mainnet network so production-only QTD
+	// gates stay opt-in.
+	EnableTestHelpers()
+	SetAttestationNetworkID(params.DevnetChainID)
+	t.Cleanup(func() {
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
 	// R47-QTD-QUORUM: same 4-validator topology as DARefused (see above).
 	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)
@@ -309,6 +331,13 @@ func TestThreeChambersFlow_FinalizeBlock_DAAvailable(t *testing.T) {
 // SUCCEEDS when no DA checker is configured (DA verification is opt-in).
 // P1-4 (2026-07-14).
 func TestThreeChambersFlow_FinalizeBlock_NoChecker(t *testing.T) {
+	// run-4 P1 (node 8245a07 port): an unset network ID (0) is production and
+	// requires a DA checker; declare devnet to exercise the opt-in (no checker) path.
+	EnableTestHelpers()
+	SetAttestationNetworkID(params.DevnetChainID)
+	t.Cleanup(func() {
+		SetAttestationNetworkID(params.DevnetChainID)
+	})
 	// R47-QTD-QUORUM: same 4-validator topology as DARefused (see above).
 	vs := createTestValidatorSet(t, 4)
 	qpos, err := NewQPOS(vs)

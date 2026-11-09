@@ -829,7 +829,7 @@ func (qfs *QTDFinalityState) SubmitPartialSeal(validatorIndex int, slot uint64, 
 		// crypto verification — it indicates either a misconfiguration
 		// (should be using Dilithium3 full sigs) or a potential attack
 		// attempt.
-		if params.IsProduction(GetAttestationNetworkID()) {
+		if params.IsProductionFailClosed(GetAttestationNetworkID()) {
 			qposAdvLogger.Errorf("R14-MED: TSS partial signature accepted without crypto verification in PRODUCTION mode (validator %d slot %d len=%d) — should use full Dilithium3 signatures (3293 bytes); aggregated sig will fail-closed if invalid",
 				validatorIndex, slot, len(signature))
 		} else {

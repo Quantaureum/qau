@@ -15,9 +15,7 @@ import (
 func TestQPOSSafety(t *testing.T) {
 	EnableTestHelpers()
 	defer ResetGenesisTimeForTesting()
-	ResetAttestationNetworkIDForTesting()
-	SetAttestationNetworkID(1668)
-	FreezeAttestationNetworkID()
+	freezeMainnetForTest(t)
 
 	t.Run("finality - finalized checkpoints cannot be reverted", func(t *testing.T) {
 		validators := createVerificationTestValidators(3)
@@ -294,9 +292,7 @@ func TestValidatorWeightIntegrity(t *testing.T) {
 func TestDoubleSignDetection(t *testing.T) {
 	EnableTestHelpers()
 	defer ResetGenesisTimeForTesting()
-	ResetAttestationNetworkIDForTesting()
-	SetAttestationNetworkID(1668)
-	FreezeAttestationNetworkID()
+	freezeMainnetForTest(t)
 
 	t.Run("same slot, different blockRoot is detected as double-signing", func(t *testing.T) {
 		validators := createVerificationTestValidators(3)

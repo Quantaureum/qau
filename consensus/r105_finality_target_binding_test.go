@@ -29,10 +29,7 @@ import (
 // advances one epoch per epoch with 6/6 validators voting.
 func TestR105_JustifyAdvancesWithBoundaryTargets(t *testing.T) {
 	q, keys := setupQPOSWithKeys(6)
-	SetAttestationNetworkID(1668)
-	// run-13 B6: production guards now read the attestation network ID, so a
-	// leaked mainnet ID would arm guards in unrelated tests. Always restore.
-	defer SetAttestationNetworkID(0)
+	declareNetworkForTest(t, 1668)
 	idxs := make([]int, 6)
 	for i, k := range keys {
 		idxs[i] = findValidatorIndex(q, k.Public.Address())

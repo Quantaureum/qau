@@ -85,7 +85,7 @@ func NewDAAttestationVerifier(
 			// run-13 B6: production determination includes the configured
 			// network ID (SetAttestationNetworkID), so the mainnet hard
 			// reject no longer depends on the env var alone.
-			if params.IsProduction(GetAttestationNetworkID()) {
+			if params.IsProductionFailClosed(GetAttestationNetworkID()) {
 				return fmt.Errorf("DA committee disabled in production mode; attestation membership check required")
 			}
 			return nil

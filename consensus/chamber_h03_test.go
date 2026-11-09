@@ -23,6 +23,7 @@ import (
 // exact Executive member list per epoch. CanSeal now requires the
 // validator to be in epochExecutive[epoch].
 func TestCHAMBER_H03_CanSeal_RejectsStaleEpochMembership(t *testing.T) {
+	declareDevnetForTest(t)
 	vs := createTestValidatorSet(t, 10)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
@@ -85,6 +86,7 @@ func TestCHAMBER_H03_CanSeal_RejectsStaleEpochMembership(t *testing.T) {
 // Executive is elected, CanSeal must fail-closed rather than allow
 // any validator to seal.
 func TestCHAMBER_H03_CanSeal_FailClosedOnUnassignedEpoch(t *testing.T) {
+	declareDevnetForTest(t)
 	vs := createTestValidatorSet(t, 10)
 	qpos, err := NewQPOS(vs)
 	if err != nil {
@@ -115,6 +117,7 @@ func TestCHAMBER_H03_CanSeal_FailClosedOnUnassignedEpoch(t *testing.T) {
 // distinguishes them. This is the core security guarantee of the
 // CHAMBER-H03 fix.
 func TestCHAMBER_H03_CanSeal_PerEpochIsolation(t *testing.T) {
+	declareDevnetForTest(t)
 	vs := createTestValidatorSet(t, 10)
 	qpos, err := NewQPOS(vs)
 	if err != nil {

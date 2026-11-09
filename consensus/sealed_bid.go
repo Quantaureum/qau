@@ -223,7 +223,7 @@ func (sbl *SealedBidLottery) updatePhaseLocked() {
 	// B6), log an error to alert operators that SetCurrentSlot has not been
 	// called. In dev/test mode, log a warning. The phase remains pinned — no
 	// automatic transition.
-	if params.IsProduction(GetAttestationNetworkID()) {
+	if params.IsProductionFailClosed(GetAttestationNetworkID()) {
 		log.Printf("ERROR: SealedBidLottery.updatePhaseLocked: currentSlot is 0 in production mode — phase transitions require SetCurrentSlot (slot=%d, phase=%s)", sbl.slot, sbl.phase)
 		return
 	}

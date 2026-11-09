@@ -596,7 +596,7 @@ func (tpc *ThreeChambersCoordinator) AssignExecutive(validatorIndices []int, epo
 	// run-13 B6: production determination includes the configured network ID
 	// (SetAttestationNetworkID), so the mainnet gate no longer depends on the
 	// env var alone.
-	if tpc.requireDistributedDKG || params.IsProduction(GetAttestationNetworkID()) {
+	if tpc.requireDistributedDKG || params.IsProductionFailClosed(GetAttestationNetworkID()) {
 		return ErrAssignExecutiveDisabledInProduction
 	}
 

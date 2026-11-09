@@ -66,8 +66,7 @@ func TestCONS_R13_M01_RejectsFutureEpochAttestation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
-	SetAttestationNetworkID(1668)
-	defer SetAttestationNetworkID(0)
+	declareNetworkForTest(t, 1668)
 
 	// Rewind genesis time so currentSlot = SlotsPerEpoch-1 (last slot of
 	// epoch 0). currentEpoch = 0.
@@ -138,8 +137,7 @@ func TestCONS_R13_M01_AllowsSameEpochFutureSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
-	SetAttestationNetworkID(1668)
-	defer SetAttestationNetworkID(0)
+	declareNetworkForTest(t, 1668)
 
 	// currentSlot = 5 (epoch 0).
 	rewind := int64(5) * int64(SlotDuration.Seconds())

@@ -47,10 +47,7 @@ func r9LRedo01SetupQPOS(t *testing.T, count int, targetEpoch uint64) *QPOS {
 	if err != nil {
 		t.Fatalf("NewQPOS failed: %v", err)
 	}
-	SetAttestationNetworkID(1668)
-	// run-13 B6: production guards now read the attestation network ID, so a
-	// leaked mainnet ID would arm guards in unrelated tests. Always restore.
-	t.Cleanup(func() { SetAttestationNetworkID(0) })
+	declareNetworkForTest(t, 1668)
 
 	// Rewind genesis time so currentEpoch == targetEpoch exactly.
 	// (now - genesisTime) = targetEpoch * EpochDuration + 1s margin so

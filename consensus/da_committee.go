@@ -699,7 +699,7 @@ func (c *DAAttestationCollector) BuildAggregateAttestation(slot uint64, commitme
 			// run-13 B6: production determination includes the configured
 			// network ID (SetAttestationNetworkID), so the mainnet reject no
 			// longer depends on the env var alone.
-			if params.IsProduction(GetAttestationNetworkID()) && len(att.BlobCommitments) == 0 {
+			if params.IsProductionFailClosed(GetAttestationNetworkID()) && len(att.BlobCommitments) == 0 {
 				daCommitteeLogger.Errorf(
 					"[da] DA- legacy attestation (empty BlobCommitments) rejected in production mode for slot %d validator %d — full commitment set required",
 					slot, att.ValidatorIndex,

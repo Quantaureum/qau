@@ -95,6 +95,32 @@ func TestJITAllowed_FailClosed(t *testing.T) {
 	}
 }
 
+// TestIsProductionFailClosed covers the consensus-layer variant: an unset
+// network ID (0 = unknown identity) must be treated as production, because the
+// consensus guards it gates must never be disarmed by a missing configuration.
+func TestIsProductionFailClosed(t *testing.T) {
+	cases := []struct {
+		name      string
+		env       map[string]string
+		networkID uint64
+		want      bool
+	}{
+		{"unknown network ID (0) fails closed", nil, 0, true},
+		{"mainnet", nil, MainnetChainID, true},
+		{"testnet without env", nil, TestnetChainID, false},
+		{"devnet without env", nil, DevnetChainID, false},
+		{"unknown ID but explicit env", map[string]string{"QAU_PRODUCTION": "1"}, 999999, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setenvs(t, tc.env)
+			if got := IsProductionFailClosed(tc.networkID); got != tc.want {
+				t.Fatalf("IsProductionFailClosed(%d) = %v, want %v", tc.networkID, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEnvOnlyVariants(t *testing.T) {
 	setenvs(t, nil)
 	if IsProductionEnv() {

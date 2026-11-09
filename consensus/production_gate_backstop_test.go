@@ -14,9 +14,10 @@ import (
 // Before the fix, every consensus production guard keyed solely on the
 // QAU_PRODUCTION env var (params.IsProductionEnv), so a mainnet node that
 // forgot to set the variable silently ran with dev-lenient guards. The fix
-// switches the guard source to params.IsProduction(GetAttestationNetworkID()),
+// switches the guard source to params.IsProductionFailClosed(GetAttestationNetworkID()),
 // which arms the guards whenever the node is configured for the mainnet
-// network ID (params.MainnetChainID == 1668), env var or not.
+// network ID (params.MainnetChainID == 1668), env var or not — and, since the
+// run-4 P1 port from node 8245a07, also when the network ID is unset (0).
 //
 // These tests pin the env var to unset via t.Setenv and toggle ONLY the
 // configured network ID, proving the backstop is independent of operator
@@ -72,10 +73,13 @@ func TestProductionGateBackstopCheckDAAvailability(t *testing.T) {
 		}
 	})
 
-	t.Run("unset network ID keeps legacy env-only behavior", func(t *testing.T) {
+	t.Run("unset network ID fails closed", func(t *testing.T) {
+		// run-4 P1 (node 8245a07 port): an unknown identity (0) counts as
+		// production so a misconfigured node can never run with the guard
+		// silently disarmed.
 		withNetworkID(t, 0)
-		if err := qpos.CheckDAAvailability(1); err != nil {
-			t.Fatalf("B6 REGRESSION: network ID 0 (not configured) must degrade to env-only check, got: %v", err)
+		if err := qpos.CheckDAAvailability(1); err == nil {
+			t.Fatal("REGRESSION: network ID 0 (not configured) must fail closed")
 		}
 	})
 

@@ -50,6 +50,25 @@ func IsProduction(networkID uint64) bool {
 	return networkID == MainnetChainID
 }
 
+// IsProductionFailClosed is the consensus-layer production check.
+//
+// It is IsProduction with one extra rule: an unset network ID (0, meaning the
+// node's network identity is unknown) is treated as PRODUCTION. Consensus
+// guards keyed on this value (DA hard-reject, DA committee membership,
+// executive-assignment bypass, legacy TSS partial acceptance) protect
+// mainnet-critical invariants, so an unconfigured node must never run with
+// them silently disarmed. Runtime startup already refuses to start a validator
+// with network ID 0 (consensus/validator.go), so this only bites tooling and
+// misconfigured nodes — exactly the cases where fail-closed is correct.
+//
+// Ported from node m4-stateroot-hardening 8245a07 (run-4 P1).
+func IsProductionFailClosed(networkID uint64) bool {
+	if networkID == 0 {
+		return true
+	}
+	return IsProduction(networkID)
+}
+
 // IsProductionEnv is the legacy env-only check, kept for call sites that have
 // no network identity available (pure library code, tests, tooling).
 // New call sites with access to the node's network ID MUST prefer

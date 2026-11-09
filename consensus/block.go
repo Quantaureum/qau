@@ -841,9 +841,11 @@ func (q *QPOS) CanPropose(validatorIndex int, slot uint64) bool {
 	// run-13 B6: production determination is no longer env-only. The node's
 	// network ID (wired from config via SetAttestationNetworkID) is checked
 	// against params.MainnetChainID, so a mainnet node keeps this guard armed
-	// even when the QAU_PRODUCTION env var is forgotten. When no network ID
-	// is configured (0), behavior degrades to the legacy env-only check.
-	isProduction := params.IsProduction(GetAttestationNetworkID())
+	// even when the QAU_PRODUCTION env var is forgotten. run-4 P1 (node
+	// 8245a07 port): an UNSET network ID (0 = unknown identity) also counts as
+	// production — an unconfigured node must never run with the guard silently
+	// disarmed (IsProductionFailClosed).
+	isProduction := params.IsProductionFailClosed(GetAttestationNetworkID())
 
 	if chambers == nil {
 		// DA: hard-reject in production, soft-check in non-production (liveness priority).
@@ -1029,7 +1031,7 @@ func (q *QPOS) CheckDAAvailability(slot uint64) error {
 	q.mu.RUnlock()
 	if checker == nil {
 		// R33 P2-21: Fail-closed in production to prevent DA review bypass.
-		if params.IsProduction(GetAttestationNetworkID()) {
+		if params.IsProductionFailClosed(GetAttestationNetworkID()) {
 			return fmt.Errorf("DA availability checker not configured (production mode requires DA verification)")
 		}
 		return nil
