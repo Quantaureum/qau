@@ -4,11 +4,14 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -155,6 +158,402 @@ func TestGetLogs_InvalidParams(t *testing.T) {
 	api := newTestAPI()
 	_, err := api.GetLogs(ctx(), json.RawMessage(`"invalid"`))
 	requireErr(t, nil, err)
+}
+
+// logScanMockReader serves formatted blocks and receipts so the log-filter
+// scan can be exercised end to end (the default mockBlockReader returns nil
+// for every read).
+type logScanMockReader struct {
+	latestHeight uint64
+	blocks       map[uint64]*BlockResponse
+	receipts     map[types.Hash]map[string]any
+}
+
+func (m *logScanMockReader) GetBlockByHash(hash types.Hash) (any, error) { return nil, nil }
+func (m *logScanMockReader) GetBlockByHeight(height uint64) (any, error) {
+	blk, ok := m.blocks[height]
+	if !ok {
+		return nil, fmt.Errorf("block %d not found", height)
+	}
+	return blk, nil
+}
+func (m *logScanMockReader) GetLatestHeight() uint64                     { return m.latestHeight }
+func (m *logScanMockReader) GetTransaction(hash types.Hash) (any, error) { return nil, nil }
+func (m *logScanMockReader) GetTransactionReceipt(hash types.Hash) (any, error) {
+	if r, ok := m.receipts[hash]; ok {
+		return r, nil
+	}
+	return nil, nil
+}
+func (m *logScanMockReader) GetBlockByHeightRange(from, to uint64) ([]any, error) { return nil, nil }
+func (m *logScanMockReader) GetGasLimit() uint64                                  { return 30_000_000 }
+
+// TestGetFilterChanges_LogFilter_ReturnsNewLogsAndAdvancesCursor is the
+// regression test for the silent-empty eth_getFilterChanges log path
+// (rpc/advanced.go getNewLogs). Before the fix every poll returned []Log{}.
+// It also pins the incremental cursor contract: a second poll with no new
+// blocks must return nothing (no duplicate delivery), and a later block must
+// be delivered exactly once.
+func TestGetFilterChanges_LogFilter_ReturnsNewLogsAndAdvancesCursor(t *testing.T) {
+	// The FilterManager is a package singleton that captures the first
+	// BlockReader it sees; rebind it to this test's reader.
+	StopGlobalFilterManager()
+	t.Cleanup(StopGlobalFilterManager)
+
+	contract := "0x1111111111111111111111111111111111111111"
+	otherAddr := "0x2222222222222222222222222222222222222222"
+	topic := "0x" + strings.Repeat("aa", 32)
+
+	tx6 := types.Hash{0x06}
+	tx7 := types.Hash{0x07}
+	tx8 := types.Hash{0x08}
+
+	reader := &logScanMockReader{
+		latestHeight: 5, // filter is created at height 5
+		blocks: map[uint64]*BlockResponse{
+			6: {Number: "0x6", Hash: "0xblock6", Transactions: []any{&TransactionResponse{Hash: "0x" + tx6.String()}}},
+			7: {Number: "0x7", Hash: "0xblock7", Transactions: []any{&TransactionResponse{Hash: "0x" + tx7.String()}}},
+		},
+		receipts: map[types.Hash]map[string]any{
+			tx6: {"logs": []any{map[string]any{
+				"address": contract, "data": "0x01", "topics": []any{topic}, "removed": false,
+			}}},
+			// Same topic from a different address: must NOT match the
+			// address-scoped filter.
+			tx7: {"logs": []any{map[string]any{
+				"address": otherAddr, "data": "0x02", "topics": []any{topic}, "removed": false,
+			}}},
+		},
+	}
+
+	api := NewAPI(newMockStateReader(), reader, newMockTxPool(), newMockChainInfo(), &mockAccountManager{})
+
+	params, _ := json.Marshal(map[string]any{
+		"fromBlock": "latest",
+		"address":   contract,
+		"topics":    []any{topic},
+	})
+	created, err := api.NewFilter(ctx(), params)
+	requireOK(t, created, err)
+	filterID := created.(string)
+	cleanupFilter(t, api, filterID)
+
+	// Head advances past the filter's creation height before the first poll.
+	reader.latestHeight = 7
+	pollParams, _ := json.Marshal([]string{filterID})
+
+	changes, rpcErr := api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	logs, ok := changes.([]Log)
+	if !ok {
+		t.Fatalf("expected []Log from eth_getFilterChanges, got %T", changes)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("expected exactly 1 matching log, got %d (%+v)", len(logs), logs)
+	}
+	if logs[0].BlockNumber != "0x6" || logs[0].TransactionHash != "0x"+tx6.String() {
+		t.Fatalf("unexpected log identity: %+v", logs[0])
+	}
+
+	// Second poll with no new blocks: nothing to deliver, cursor unchanged.
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	logs, ok = changes.([]Log)
+	if !ok {
+		t.Fatalf("expected []Log from eth_getFilterChanges, got %T", changes)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("expected no logs on an unchanged head, got %d (%+v)", len(logs), logs)
+	}
+
+	// New head block with a matching log is delivered exactly once.
+	reader.latestHeight = 8
+	reader.blocks[8] = &BlockResponse{
+		Number: "0x8", Hash: "0xblock8", Transactions: []any{&TransactionResponse{Hash: "0x" + tx8.String()}},
+	}
+	reader.receipts[tx8] = map[string]any{"logs": []any{map[string]any{
+		"address": contract, "data": "0x03", "topics": []any{topic}, "removed": false,
+	}}}
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	logs, ok = changes.([]Log)
+	if !ok {
+		t.Fatalf("expected []Log from eth_getFilterChanges, got %T", changes)
+	}
+	if len(logs) != 1 || logs[0].BlockNumber != "0x8" {
+		t.Fatalf("expected the block-8 log exactly once, got %d (%+v)", len(logs), logs)
+	}
+}
+
+// syntheticBlockReader synthesizes a block for any requested height, which
+// lets the batch-cap and retry semantics be tested without materializing a
+// 1000+ block fixture.
+type syntheticBlockReader struct {
+	latest uint64
+	failAt uint64 // 0 means "never fail"
+}
+
+func (m *syntheticBlockReader) GetBlockByHash(hash types.Hash) (any, error) { return nil, nil }
+func (m *syntheticBlockReader) GetBlockByHeight(height uint64) (any, error) {
+	if m.failAt != 0 && height == m.failAt {
+		return nil, fmt.Errorf("synthetic read failure at height %d", height)
+	}
+	return &BlockResponse{Number: formatHexUint64(height), Hash: fmt.Sprintf("0xblock%d", height)}, nil
+}
+func (m *syntheticBlockReader) GetLatestHeight() uint64                              { return m.latest }
+func (m *syntheticBlockReader) GetTransaction(hash types.Hash) (any, error)          { return nil, nil }
+func (m *syntheticBlockReader) GetTransactionReceipt(hash types.Hash) (any, error)   { return nil, nil }
+func (m *syntheticBlockReader) GetBlockByHeightRange(from, to uint64) ([]any, error) { return nil, nil }
+func (m *syntheticBlockReader) GetGasLimit() uint64                                  { return 30_000_000 }
+
+// blockFilterCursor returns the filter's current block cursor.
+func blockFilterCursor(t *testing.T, reader BlockReader, filterID string) uint64 {
+	t.Helper()
+	fm := getFilterManager(reader)
+	fm.mu.RLock()
+	filter := fm.filters[filterID]
+	fm.mu.RUnlock()
+	if filter == nil {
+		t.Fatalf("filter %s disappeared", filterID)
+	}
+	filter.pollMu.Lock()
+	defer filter.pollMu.Unlock()
+	return filter.lastBlock
+}
+
+// TestGetFilterChanges_BlockFilter_ReadFailureKeepsCursor pins the retry
+// contract: a block read failure must surface as an RPC error and must NOT
+// advance the cursor, or the unread blocks are lost forever.
+func TestGetFilterChanges_BlockFilter_ReadFailureKeepsCursor(t *testing.T) {
+	StopGlobalFilterManager()
+	t.Cleanup(StopGlobalFilterManager)
+
+	reader := &syntheticBlockReader{latest: 5}
+	api := NewAPI(newMockStateReader(), reader, newMockTxPool(), newMockChainInfo(), &mockAccountManager{})
+
+	created, err := api.NewBlockFilter(ctx(), nil)
+	requireOK(t, created, err)
+	filterID := created.(string)
+	cleanupFilter(t, api, filterID)
+	pollParams, _ := json.Marshal([]string{filterID})
+
+	reader.latest = 7
+	reader.failAt = 6
+	_, rpcErr := api.GetFilterChanges(ctx(), pollParams)
+	if rpcErr == nil {
+		t.Fatal("expected an RPC error when a block cannot be read, got success")
+	}
+	if got := blockFilterCursor(t, reader, filterID); got != 5 {
+		t.Fatalf("cursor must stay at 5 after a failed scan, got %d", got)
+	}
+
+	// The same window is retried once the read succeeds.
+	reader.failAt = 0
+	changes, rpcErr := api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok := changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	if len(hashes) != 2 || hashes[0] != "0xblock6" || hashes[1] != "0xblock7" {
+		t.Fatalf("expected blocks 6 and 7 after retry, got %v", hashes)
+	}
+}
+
+// TestGetFilterChanges_BlockFilter_BatchCapAdvancesWithoutSkipping pins the
+// batch semantics for stale filters: at most maxFilterBlockRange blocks per
+// poll, and the next poll continues exactly where the previous one stopped
+// (the old code jumped to head-minus-1024, dropping the gap).
+func TestGetFilterChanges_BlockFilter_BatchCapAdvancesWithoutSkipping(t *testing.T) {
+	StopGlobalFilterManager()
+	t.Cleanup(StopGlobalFilterManager)
+
+	reader := &syntheticBlockReader{latest: 0}
+	api := NewAPI(newMockStateReader(), reader, newMockTxPool(), newMockChainInfo(), &mockAccountManager{})
+
+	created, err := api.NewBlockFilter(ctx(), nil)
+	requireOK(t, created, err)
+	filterID := created.(string)
+	cleanupFilter(t, api, filterID)
+	pollParams, _ := json.Marshal([]string{filterID})
+
+	reader.latest = 5000
+	changes, rpcErr := api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok := changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	if len(hashes) != maxFilterBlockRange {
+		t.Fatalf("expected exactly %d hashes in one batch, got %d", maxFilterBlockRange, len(hashes))
+	}
+	if hashes[0] != "0xblock1" || hashes[len(hashes)-1] != fmt.Sprintf("0xblock%d", maxFilterBlockRange) {
+		t.Fatalf("first batch must cover blocks 1..%d, got %s..%s",
+			maxFilterBlockRange, hashes[0], hashes[len(hashes)-1])
+	}
+	if got := blockFilterCursor(t, reader, filterID); got != uint64(maxFilterBlockRange) {
+		t.Fatalf("cursor must stop at the last scanned block %d, got %d", maxFilterBlockRange, got)
+	}
+
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok = changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	if len(hashes) != maxFilterBlockRange {
+		t.Fatalf("expected a full second batch, got %d", len(hashes))
+	}
+	if hashes[0] != fmt.Sprintf("0xblock%d", maxFilterBlockRange+1) {
+		t.Fatalf("second batch must resume at block %d, got %s", maxFilterBlockRange+1, hashes[0])
+	}
+}
+
+// pendingPoolMock lets a test control what the pool reports as pending.
+// The embedded mockTxPool supplies the remaining TxPool methods.
+type pendingPoolMock struct {
+	mockTxPool
+	pending []any
+}
+
+func (m *pendingPoolMock) GetPendingTransactions() []any { return m.pending }
+
+func newFilterTestTx(nonce uint64) *encoding.Transaction {
+	return &encoding.Transaction{
+		Version:  1,
+		Type:     encoding.TxTypeTransfer,
+		Nonce:    nonce,
+		Value:    big.NewInt(0),
+		GasLimit: 21000,
+		GasPrice: big.NewInt(1),
+		ChainID:  1668,
+	}
+}
+
+// TestGetFilterChanges_PendingTxFilter_ProductionTypeIncremental is the
+// regression test for the pending-transaction filter returning nothing in
+// production. The production adapter returns []any of *encoding.Transaction,
+// while the old code only accepted map[string]any, so every poll was empty.
+// It also pins the incremental contract: each poll returns only hashes that
+// entered the pool since the previous poll, and evicted transactions are
+// dropped from the seen-set.
+func TestGetFilterChanges_PendingTxFilter_ProductionTypeIncremental(t *testing.T) {
+	StopGlobalFilterManager()
+	t.Cleanup(StopGlobalFilterManager)
+
+	tx1 := newFilterTestTx(1)
+	tx2 := newFilterTestTx(2)
+	tx3 := newFilterTestTx(3)
+
+	pool := &pendingPoolMock{pending: []any{tx1}}
+	api := NewAPI(newMockStateReader(), newMockBlockReader(), pool, newMockChainInfo(), &mockAccountManager{})
+
+	created, err := api.NewPendingTransactionFilter(ctx(), nil)
+	requireOK(t, created, err)
+	filterID := created.(string)
+	cleanupFilter(t, api, filterID)
+	pollParams, _ := json.Marshal([]string{filterID})
+
+	// A transaction that arrives after the filter was created must be
+	// reported (as a hash string) even though the element is a real
+	// *encoding.Transaction, not a map.
+	pool.pending = append(pool.pending, tx2)
+	changes, rpcErr := api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok := changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	want2 := "0x" + tx2.Hash().String()
+	if len(hashes) != 1 || hashes[0] != want2 {
+		t.Fatalf("expected only the new tx %s, got %v", want2, hashes)
+	}
+
+	// Polling again with no new arrivals must not replay the pool.
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok = changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	if len(hashes) != 0 {
+		t.Fatalf("expected no new hashes on an unchanged pool, got %v", hashes)
+	}
+
+	// A third arrival is reported exactly once.
+	pool.pending = append(pool.pending, tx3)
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok = changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	want3 := "0x" + tx3.Hash().String()
+	if len(hashes) != 1 || hashes[0] != want3 {
+		t.Fatalf("expected only the new tx %s, got %v", want3, hashes)
+	}
+
+	// An evicted transaction is forgotten; it is not reported again.
+	pool.pending = pool.pending[1:]
+	changes, rpcErr = api.GetFilterChanges(ctx(), pollParams)
+	requireOK(t, changes, rpcErr)
+	hashes, ok = changes.([]string)
+	if !ok {
+		t.Fatalf("expected []string from eth_getFilterChanges, got %T", changes)
+	}
+	if len(hashes) != 0 {
+		t.Fatalf("expected no hashes after eviction, got %v", hashes)
+	}
+}
+
+// TestFilterOwnership_PollAndReadChecksCaller pins the AUDIT FIX: filter read
+// paths (eth_getFilterChanges, eth_getFilterLogs) must enforce the same
+// ownership rule as eth_uninstallFilter. Before the fix, any client that knew
+// a filter ID could poll it and advance its cursor.
+func TestFilterOwnership_PollAndReadChecksCaller(t *testing.T) {
+	StopGlobalFilterManager()
+	t.Cleanup(StopGlobalFilterManager)
+
+	reader := &syntheticBlockReader{latest: 5}
+	api := NewAPI(newMockStateReader(), reader, newMockTxPool(), newMockChainInfo(), &mockAccountManager{})
+
+	ctxA := context.WithValue(ctx(), contextKeyClientIP{}, "10.0.0.1")
+	ctxB := context.WithValue(ctx(), contextKeyClientIP{}, "10.0.0.2")
+
+	blockID, err := api.NewBlockFilter(ctxA, nil)
+	requireOK(t, blockID, err)
+	blockPollParams, _ := json.Marshal([]string{blockID.(string)})
+
+	if _, rpcErr := api.GetFilterChanges(ctxA, blockPollParams); rpcErr != nil {
+		t.Fatalf("owner must be able to poll its filter: %v", rpcErr.Message)
+	}
+	_, rpcErr := api.GetFilterChanges(ctxB, blockPollParams)
+	if rpcErr == nil {
+		t.Fatal("another client was able to poll a filter it does not own")
+	}
+	if rpcErr.Code != ErrCodeNotFound {
+		t.Fatalf("expected %d for a non-owned filter, got %d", ErrCodeNotFound, rpcErr.Code)
+	}
+
+	logParams, _ := json.Marshal(map[string]any{"fromBlock": "latest"})
+	logID, err := api.NewFilter(ctxA, logParams)
+	requireOK(t, logID, err)
+	logReadParams, _ := json.Marshal([]string{logID.(string)})
+
+	if _, rpcErr := api.GetFilterLogs(ctxA, logReadParams); rpcErr != nil {
+		t.Fatalf("owner must be able to read its log filter: %v", rpcErr.Message)
+	}
+	if _, rpcErr := api.GetFilterLogs(ctxB, logReadParams); rpcErr == nil {
+		t.Fatal("another client was able to read a log filter it does not own")
+	}
+
+	// Uninstall keeps the same boundary.
+	if removed, _ := api.UninstallFilter(ctxB, logReadParams); removed == true {
+		t.Fatal("another client was able to uninstall a filter it does not own")
+	}
+	if removed, rpcErr := api.UninstallFilter(ctxA, logReadParams); rpcErr != nil || removed != true {
+		t.Fatalf("owner must be able to uninstall its filter, removed=%v err=%v", removed, rpcErr)
+	}
 }
 
 // ── PersonalAPI tests ──

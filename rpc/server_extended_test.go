@@ -91,6 +91,24 @@ func TestSanitizeError_HideData(t *testing.T) {
 	}
 }
 
+// TestSanitizeError_KeepsRevertData pins the AUDIT FIX: revert payloads are
+// public on-chain data, so they must survive production sanitization even
+// though other error data is stripped.
+func TestSanitizeError_KeepsRevertData(t *testing.T) {
+	srv := NewServer(nil)
+	srv.SetDevMode(false)
+	srv.SetExposeErrorData(false)
+
+	rpcErr := NewErrorWithData(ErrCodeExecutionReverted, "execution reverted", "0x08c3")
+	sanitized := srv.sanitizeError(rpcErr)
+	if sanitized.Code != ErrCodeExecutionReverted {
+		t.Fatalf("expected code %d, got %d", ErrCodeExecutionReverted, sanitized.Code)
+	}
+	if sanitized.Data != "0x08c3" {
+		t.Fatalf("expected revert data preserved, got %v", sanitized.Data)
+	}
+}
+
 // ── Admin method checks ──
 
 func TestIsAdminMethod_Registered(t *testing.T) {

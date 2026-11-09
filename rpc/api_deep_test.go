@@ -9,10 +9,39 @@ import (
 	"testing"
 
 	"github.com/quantaureum/qau/encoding"
+	"github.com/quantaureum/qau/qvm"
 	"github.com/quantaureum/qau/types"
 )
 
 // ── API methods with full parameter paths ──
+
+// TestCall_RevertDataPropagates pins the AUDIT FIX: eth_call used to report a
+// failed contract execution as the successful result "0x". It must now return
+// code 3 with the revert payload in Data.
+func TestCall_RevertDataPropagates(t *testing.T) {
+	api := newTestAPIFull()
+	addr := mustParseAddress(t, "0x1234567890123456789012345678901234567890")
+	api.stateReader.(*mockStateReader).codes[addr] = []byte{0x60, 0x00}
+
+	caller := api.contractCaller.(*mockContractCaller)
+	caller.returnData = []byte{0x08, 0xc3}
+	caller.resultErr = qvm.ErrExecutionReverted
+
+	params, _ := json.Marshal([]map[string]string{{
+		"to":   addr.ToHexAddress(),
+		"data": "0xabcdef",
+	}})
+	result, err := api.Call(ctx(), params)
+	if err == nil {
+		t.Fatalf("expected a revert error instead of success, got %v", result)
+	}
+	if err.Code != ErrCodeExecutionReverted {
+		t.Fatalf("expected revert code %d, got %d", ErrCodeExecutionReverted, err.Code)
+	}
+	if err.Data != "0x08c3" {
+		t.Fatalf("expected revert data 0x08c3, got %v", err.Data)
+	}
+}
 
 func TestGetBalance_WithParams(t *testing.T) {
 	api := newTestAPI()

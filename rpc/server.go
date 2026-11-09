@@ -87,6 +87,18 @@ const (
 	ErrCodeInvalidTx         = -32001
 	ErrCodeInsufficientFunds = -32002
 	ErrCodeUnauthorized      = -32003
+
+	// ErrCodeExecutionReverted is the JSON-RPC error code for a reverted
+	// execution; the revert payload is carried in Error.Data so callers can
+	// decode the reason (Ethereum semantics, as used by geth).
+	ErrCodeExecutionReverted = 3
+
+	// ErrCodeExecution is geth's generic -32000 server-error code for
+	// execution-level failures that are NOT reverts (out of gas, invalid
+	// opcode, node busy). It shares the numeric range with ErrCodeNotFound,
+	// which is already geth's -32000; unlike ErrCodeInternal the message is
+	// user-facing and is not sanitized.
+	ErrCodeExecution = -32000
 )
 
 // Request represents a JSON-RPC 2.0 request
@@ -504,6 +516,13 @@ func (s *Server) sanitizeError(rpcErr *Error) *Error {
 	// Operators must ensure devMode is NEVER enabled in production, as internal
 	// error Data may contain stack traces, file paths, or internal addresses.
 	if s.devMode && s.exposeErrorData {
+		return rpcErr
+	}
+	// A revert payload is produced by contract code the caller chose to call
+	// and is already public on chain, so it is not an internal detail. It must
+	// survive sanitization or eth_call/eth_estimateGas clients cannot decode
+	// why the execution failed.
+	if rpcErr.Code == ErrCodeExecutionReverted {
 		return rpcErr
 	}
 	msg := rpcErr.Message

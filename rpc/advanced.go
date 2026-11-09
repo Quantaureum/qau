@@ -7,6 +7,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quantaureum/qau/encoding"
+	"github.com/quantaureum/qau/qvm"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -80,6 +83,22 @@ type activeFilter struct {
 	logFilter  *LogFilter
 	lastBlock  uint64
 	clientID   string // AUDIT (2026) API-04: per-client ownership tracking
+
+	// pollMu serializes polling of this filter and protects lastBlock /
+	// lastPendingNonce-type cursors. Without it, two concurrent
+	// eth_getFilterChanges calls for the same filter could both read the
+	// same cursor, scan the same range, and advance it independently
+	// (data race + duplicated / skipped results). The manager's mu only
+	// guards the filters map, not per-filter mutable state.
+	pollMu sync.Mutex
+
+	// pendingSeen is the set of pending-transaction hashes already reported
+	// by this filter. eth_getFilterChanges must be incremental: returning the
+	// whole pool on every poll re-delivers transactions the caller has already
+	// handled. It is seeded from the pool contents at filter creation so the
+	// first poll only reports transactions that arrived afterwards.
+	pendingSeen map[string]struct{}
+
 	// pendingLogs, pendingTxs, pendingBlocks removed (unused — golangci-lint unused)
 }
 
@@ -164,10 +183,13 @@ func (fm *FilterManager) newFilterID() (string, error) {
 	return "0x" + hex.EncodeToString(b), nil
 }
 
-// addFilter creates a new filter owned by clientID.
+// addFilter creates a filter owned by clientID.
 // AUDIT (2026) API-04 FIX: Added per-client filter limit to prevent a
 // single client from exhausting the global filter pool.
-func (fm *FilterManager) addFilter(filterType string, logFilter *LogFilter, clientID string) (string, error) {
+// pendingBaseline carries the pending-tx hashes already in the pool when a
+// pending-transaction filter is created (nil for other filter types) so the
+// filter reports only later arrivals.
+func (fm *FilterManager) addFilter(filterType string, logFilter *LogFilter, clientID string, pendingBaseline []string) (string, error) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
@@ -199,22 +221,44 @@ func (fm *FilterManager) addFilter(filterType string, logFilter *LogFilter, clie
 		lastBlock = fm.blockReader.GetLatestHeight()
 	}
 
+	var pendingSeen map[string]struct{}
+	if filterType == FilterTypePendingTransaction {
+		pendingSeen = make(map[string]struct{}, len(pendingBaseline))
+		for _, h := range pendingBaseline {
+			pendingSeen[h] = struct{}{}
+		}
+	}
+
 	fm.filters[id] = &activeFilter{
-		id:         id,
-		filterType: filterType,
-		created:    time.Now(),
-		lastPolled: time.Now(),
-		logFilter:  logFilter,
-		lastBlock:  lastBlock,
-		clientID:   clientID,
+		id:          id,
+		filterType:  filterType,
+		created:     time.Now(),
+		lastPolled:  time.Now(),
+		logFilter:   logFilter,
+		lastBlock:   lastBlock,
+		clientID:    clientID,
+		pendingSeen: pendingSeen,
 	}
 	return id, nil
 }
 
-func (fm *FilterManager) getFilter(id string) *activeFilter {
+// getFilter returns the filter if it exists and is visible to clientID.
+// AUDIT (2026) FIX: read paths used to skip the ownership check that
+// removeFilter enforced, so any client that obtained a filter ID could poll
+// it and advance its cursor. Read access now follows the same rule as
+// uninstall: the creator sees the filter; filters created without a client
+// identity (legacy/unknown origin) stay readable for backward compatibility.
+func (fm *FilterManager) getFilter(id string, clientID string) *activeFilter {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
-	return fm.filters[id]
+	f, ok := fm.filters[id]
+	if !ok {
+		return nil
+	}
+	if f.clientID != "" && f.clientID != clientID {
+		return nil
+	}
+	return f
 }
 
 // removeFilter removes a filter, verifying that the caller (clientID) owns it.
@@ -391,8 +435,10 @@ func (api *API) Call(ctx context.Context, params json.RawMessage) (any, *Error) 
 	// user-controlled input on every eth_call, enabling log-flooding DoS and
 	// potential log-injection. Address validation happens in parseAddress below.
 	if toStr == "" {
-		// Contract creation - not supported in eth_call, return 0x
-		return "0x", nil
+		// This node cannot simulate contract deployment in eth_call. Returning
+		// "0x" would look like a successful call that returned no data.
+		return nil, NewError(ErrCodeExecution,
+			"eth_call for contract creation is not supported: deployment simulation is unavailable")
 	}
 
 	to, err := parseAddress(toStr)
@@ -466,19 +512,37 @@ func (api *API) Call(ctx context.Context, params json.RawMessage) (any, *Error) 
 
 		result, err := api.contractCaller.Call(req)
 		if err != nil {
-			return nil, NewError(ErrCodeInternal, fmt.Sprintf("contract call failed: %v", err))
+			return nil, NewError(ErrCodeExecution, fmt.Sprintf("contract call failed: %v", err))
+		}
+
+		if result == nil {
+			return nil, NewError(ErrCodeExecution, "contract call returned no result")
 		}
 
 		if result.Error != nil {
-			// Return 0x on error (Ethereum semantics)
-			return "0x", nil
+			// AUDIT FIX: a revert / execution failure must not be reported as a
+			// successful call with empty return data.
+			return nil, executionRPCError(result)
 		}
 
 		return formatHexBytes(result.ReturnData), nil
 	}
 
 	// Contract caller not available - return error
-	return nil, NewError(ErrCodeInternal, "contract call not supported: QVM not available")
+	return nil, NewError(ErrCodeExecution, "contract call not supported: QVM not available")
+}
+
+// executionRPCError converts a failed contract simulation into a JSON-RPC
+// error instead of reporting it as a successful call with empty return data.
+// Reverts keep their revert payload in Error.Data (code 3); every other
+// execution failure is reported as a user-facing -32000 execution error.
+func executionRPCError(result *ContractCallResult) *Error {
+	if errors.Is(result.Error, qvm.ErrExecutionReverted) {
+		return NewErrorWithData(ErrCodeExecutionReverted, "execution reverted",
+			formatHexBytes(result.ReturnData))
+	}
+	return NewError(ErrCodeExecution,
+		fmt.Sprintf("contract execution failed: %v", result.Error))
 }
 
 // clientIDFromContext extracts a client identifier from the request context.
@@ -511,7 +575,7 @@ func (api *API) NewFilter(ctx context.Context, params json.RawMessage) (any, *Er
 	}
 
 	fm := getFilterManager(api.blockReader)
-	filterID, err := fm.addFilter(FilterTypeLog, &args[0], clientIDFromContext(ctx))
+	filterID, err := fm.addFilter(FilterTypeLog, &args[0], clientIDFromContext(ctx), nil)
 	if err != nil {
 		return nil, NewError(ErrCodeInternal, err.Error())
 	}
@@ -522,7 +586,7 @@ func (api *API) NewFilter(ctx context.Context, params json.RawMessage) (any, *Er
 // NewBlockFilter creates a new block filter
 func (api *API) NewBlockFilter(ctx context.Context, params json.RawMessage) (any, *Error) {
 	fm := getFilterManager(api.blockReader)
-	filterID, err := fm.addFilter(FilterTypeBlock, nil, clientIDFromContext(ctx))
+	filterID, err := fm.addFilter(FilterTypeBlock, nil, clientIDFromContext(ctx), nil)
 	if err != nil {
 		return nil, NewError(ErrCodeInternal, err.Error())
 	}
@@ -531,8 +595,12 @@ func (api *API) NewBlockFilter(ctx context.Context, params json.RawMessage) (any
 
 // NewPendingTransactionFilter creates a new pending transaction filter
 func (api *API) NewPendingTransactionFilter(ctx context.Context, params json.RawMessage) (any, *Error) {
+	var baseline []string
+	if api.txPool != nil {
+		baseline = pendingTxHashes(api.txPool.GetPendingTransactions())
+	}
 	fm := getFilterManager(api.blockReader)
-	filterID, err := fm.addFilter(FilterTypePendingTransaction, nil, clientIDFromContext(ctx))
+	filterID, err := fm.addFilter(FilterTypePendingTransaction, nil, clientIDFromContext(ctx), baseline)
 	if err != nil {
 		return nil, NewError(ErrCodeInternal, fmt.Sprintf("failed to add filter: %v", err))
 	}
@@ -560,10 +628,13 @@ func (api *API) GetFilterChanges(ctx context.Context, params json.RawMessage) (a
 	fm := getFilterManager(api.blockReader)
 	// FIX: check filter existence and update lastPolled under a single
 	// Lock to prevent TOCTOU race with cleanup goroutine deleting the filter.
+	clientID := clientIDFromContext(ctx)
 	fm.mu.Lock()
 	filter, filterExists := fm.filters[args[0]]
-	if !filterExists {
+	if !filterExists || (filter.clientID != "" && filter.clientID != clientID) {
 		fm.mu.Unlock()
+		// Same answer for "does not exist" and "belongs to another client":
+		// a foreign client must not be able to probe which IDs are live.
 		return nil, NewError(ErrCodeNotFound, "filter not found")
 	}
 	filter.lastPolled = time.Now()
@@ -588,100 +659,208 @@ func (api *API) GetFilterChanges(ctx context.Context, params json.RawMessage) (a
 // via stale filters that haven't been polled for a long time.
 const maxFilterBlockRange = 1024
 
+// getNewBlockHashes returns the hashes of blocks after the filter's cursor and
+// advances the cursor to the last block actually scanned.
+//
+// AUDIT (2026) FIX:
+//   - Reading filter.lastBlock, scanning, and advancing it now happen under the
+//     per-filter pollMu (previously the cursor was read without any lock and
+//     written under the manager lock, so two concurrent polls raced).
+//   - The scan is capped at maxFilterBlockRange blocks PER POLL and the cursor
+//     advances only to the last scanned block. The old code jumped straight to
+//     head-minus-1024, permanently dropping everything in between.
+//   - A block read failure returns an error and leaves the cursor untouched,
+//     so the range is retried on the next poll instead of being skipped.
 func (api *API) getNewBlockHashes(filter *activeFilter) (any, *Error) {
 	if api.blockReader == nil {
-		return []string{}, nil
+		// No silent empty result: the node cannot serve this filter type.
+		return nil, NewError(ErrCodeInternal,
+			"block filters are not supported: block reader unavailable")
 	}
 
-	currentHeight := api.blockReader.GetLatestHeight()
-	if currentHeight <= filter.lastBlock {
-		return []string{}, nil
-	}
+	filter.pollMu.Lock()
+	defer filter.pollMu.Unlock()
 
-	// audit-fix R3-M1: cap scan range to prevent DoS from stale filters
+	latest := api.blockReader.GetLatestHeight()
+	if latest < filter.lastBlock {
+		// Chain rewound below the cursor (rollback / resync); resume at head.
+		filter.lastBlock = latest
+	}
 	fromHeight := filter.lastBlock + 1
-	if currentHeight-fromHeight >= maxFilterBlockRange {
-		fromHeight = currentHeight - maxFilterBlockRange + 1
+	if fromHeight > latest {
+		return []string{}, nil
 	}
 
-	hashes := make([]string, 0)
-	for h := fromHeight; h <= currentHeight; h++ {
+	toHeight := fromHeight + maxFilterBlockRange - 1
+	if toHeight > latest {
+		toHeight = latest
+	}
+
+	hashes := make([]string, 0, toHeight-fromHeight+1)
+	for h := fromHeight; h <= toHeight; h++ {
 		block, err := api.blockReader.GetBlockByHeight(h)
 		if err != nil {
-			continue
+			// Cursor intentionally not advanced; the batch is retried.
+			return nil, NewError(ErrCodeInternal,
+				fmt.Sprintf("failed to read block %d for block filter: %v", h, err))
 		}
-		// MEDIUFIX: Use *BlockResponse type assertion instead of
-		// map[string]any. The production BlockReader implementation
-		// (blockReaderAdapter.GetBlockByHeight) returns *BlockResponse via
-		// rpc.FormatBlock(), not a map. The previous map type assertion
-		// always failed, causing eth_getFilterChanges block filters to
-		// silently return empty results.
+		// Use *BlockResponse type assertion instead of map[string]any. The
+		// production BlockReader implementation returns *BlockResponse via
+		// rpc.FormatBlock(), not a map.
+		var hash string
 		if blockResp, ok := block.(*BlockResponse); ok {
-			if blockResp.Hash != "" {
-				hashes = append(hashes, blockResp.Hash)
-			}
+			hash = blockResp.Hash
 		} else if blockMap, ok := block.(map[string]any); ok {
 			// Fallback for test mocks that return map[string]any
-			if hash, ok := blockMap["hash"].(string); ok {
-				hashes = append(hashes, hash)
-			}
+			hash, _ = blockMap["hash"].(string)
 		}
+		if hash == "" {
+			// A block without a hash cannot be reported, and skipping it
+			// while advancing the cursor would lose it silently.
+			return nil, NewError(ErrCodeInternal,
+				fmt.Sprintf("block %d has no hash; refusing to skip it", h))
+		}
+		hashes = append(hashes, hash)
 	}
 
-	// R36-P3-17 FIX (2026-07-30): Acquire the FilterManager lock before
-	// writing filter.lastBlock. The filter pointer was fetched under the
-	// manager's Lock at GetFilterChanges line 562-569, but released before
-	// this function runs. Two concurrent GetFilterChanges calls for the
-	// same filterID would both read+write filter.lastBlock without
-	// synchronization — a data race the race detector would flag. The
-	// manager's mu protects the filters map AND (by convention) the
-	// per-filter mutable fields like lastBlock and lastPolled. Re-acquire
-	// the Lock here for the write.
-	fm := getFilterManager(api.blockReader)
-	fm.mu.Lock()
-	filter.lastBlock = currentHeight
-	fm.mu.Unlock()
+	filter.lastBlock = toHeight
 	return hashes, nil
 }
 
+// getNewPendingTxHashes returns the pending-transaction hashes that entered
+// the pool since the previous poll, and rebases the filter's seen-set.
+//
+// AUDIT (2026) API-04-adjacent FIX: the previous implementation only accepted
+// map[string]any elements, but the production adapter (txPoolAdapter
+// .GetPendingTransactions in node/adapters.go) returns *encoding.Transaction,
+// so every production poll yielded an empty array. It also returned the whole
+// pool on each poll instead of the increment. Both are addressed here:
+// pendingTxHashes understands the real element shape, and pendingSeen tracks
+// what has already been delivered.
 func (api *API) getNewPendingTxHashes(filter *activeFilter) (any, *Error) {
 	if api.txPool == nil {
-		return []string{}, nil
+		// No silent empty result: the node cannot serve this filter type.
+		return nil, NewError(ErrCodeInternal,
+			"pending transaction filters are not supported: tx pool unavailable")
 	}
 
-	// Get current pending transactions
-	pending := api.txPool.GetPendingTransactions()
-	hashes := make([]string, 0, len(pending))
-	for _, tx := range pending {
-		if txMap, ok := tx.(map[string]any); ok {
-			if hash, ok := txMap["hash"].(string); ok {
-				hashes = append(hashes, hash)
-			}
+	filter.pollMu.Lock()
+	defer filter.pollMu.Unlock()
+
+	hashes := pendingTxHashes(api.txPool.GetPendingTransactions())
+	newHashes := make([]string, 0, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		seen[h] = struct{}{}
+		if _, already := filter.pendingSeen[h]; !already {
+			newHashes = append(newHashes, h)
 		}
 	}
 
-	return hashes, nil
+	// Rebase to the current pool: hashes that left the pool must not be
+	// remembered forever, and a later re-entry is a new arrival worth reporting.
+	filter.pendingSeen = seen
+
+	return newHashes, nil
 }
 
+// pendingTxHashes extracts canonical lowercase 0x-prefixed hashes from the
+// elements returned by TxPool.GetPendingTransactions. Production returns
+// *encoding.Transaction; strings, types.Hash and map[string]any are accepted
+// for test doubles and legacy callers. Duplicates are dropped and elements
+// whose hash cannot be determined are skipped.
+func pendingTxHashes(pending []any) []string {
+	out := make([]string, 0, len(pending))
+	seen := make(map[string]struct{}, len(pending))
+	for _, tx := range pending {
+		var hash string
+		switch t := tx.(type) {
+		case *encoding.Transaction:
+			if t != nil {
+				if h := t.Hash(); h != (types.Hash{}) {
+					hash = "0x" + h.String()
+				}
+			}
+		case encoding.Transaction:
+			if h := t.Hash(); h != (types.Hash{}) {
+				hash = "0x" + h.String()
+			}
+		case types.Hash:
+			if t != (types.Hash{}) {
+				hash = "0x" + t.String()
+			}
+		case string:
+			hash = t
+		case map[string]any:
+			if h, ok := t["hash"].(string); ok {
+				hash = h
+			}
+		}
+		if hash == "" {
+			continue
+		}
+		key := strings.ToLower(hash)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+
+// getNewLogs returns the logs matching the filter that were produced in the
+// blocks after the last poll, and advances the filter's block cursor.
+//
+// AUDIT (2026) API-04-adjacent FIX (LOW-6): this used to always return an
+// empty slice, so clients polling eth_getFilterChanges silently missed every
+// event. Logs are now sourced from the same per-block receipt scan used by
+// eth_getLogs (getLogsRange): there is no separate log index, but the block
+// reader can serve every block and its receipts, which is enough to scan the
+// (lastBlock, head] window.
+//
+// The cursor is advanced ONLY after a successful scan, and only up to the last
+// block actually scanned (the batch is capped at maxFilterBlockRange so a stale
+// filter cannot force an unbounded scan in one poll). If a block cannot be
+// read the RPC returns an error and leaves the cursor untouched, so the same
+// window is retried on the next poll instead of being skipped forever.
 func (api *API) getNewLogs(filter *activeFilter) (any, *Error) {
-	// LOW-6 FIX: Document why this returns an empty slice.
-	// TODO(security/rpc-compat): eth_getFilterChanges for log filters should
-	// return only the logs generated SINCE the last poll. The current
-	// implementation always returns an empty slice, which means clients using
-	// polling-based log subscriptions will silently miss every event.
-	//
-	// A correct implementation requires:
-	//   1. A log store that indexes logs by block number (so we can query
-	//      "logs in blocks (filter.lastPollBlock, currentBlock]").
-	//   2. Storing lastPollBlock on the activeFilter and updating it after
-	//      each poll.
-	//   3. Applying filter.logFilter (address + topics) to the retrieved logs.
-	//
-	// Until the log store is available, callers must use eth_getLogs with an
-	// explicit block range, or subscribe to logs via websocket newHeads +
-	// eth_getLogs per block. Returning an empty slice (rather than an error)
-	// preserves backward compatibility with existing clients.
-	return []Log{}, nil
+	if api.blockReader == nil {
+		// No silent empty result: the node cannot serve this filter type.
+		return nil, NewError(ErrCodeInternal,
+			"log filters are not supported: block reader unavailable")
+	}
+	if filter.logFilter == nil {
+		return nil, NewError(ErrCodeInternal, "log filter has no criteria")
+	}
+
+	filter.pollMu.Lock()
+	defer filter.pollMu.Unlock()
+
+	latest := api.blockReader.GetLatestHeight()
+	if latest < filter.lastBlock {
+		// Chain was rewound below our cursor (rollback / resync). Move the
+		// cursor back so the next blocks are still reported.
+		filter.lastBlock = latest
+	}
+	fromHeight := filter.lastBlock + 1
+	if fromHeight > latest {
+		return []Log{}, nil
+	}
+
+	toHeight := fromHeight + maxFilterBlockRange - 1
+	if toHeight > latest {
+		toHeight = latest
+	}
+
+	logs, rpcErr := api.getLogsRange(fromHeight, toHeight, filter.logFilter)
+	if rpcErr != nil {
+		// Cursor intentionally not advanced; the batch is retried next poll.
+		return nil, rpcErr
+	}
+
+	filter.lastBlock = toHeight
+	return logs, nil
 }
 
 // GetFilterLogs returns all logs for a filter
@@ -692,7 +871,7 @@ func (api *API) GetFilterLogs(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	fm := getFilterManager(api.blockReader)
-	filter := fm.getFilter(args[0])
+	filter := fm.getFilter(args[0], clientIDFromContext(ctx))
 	if filter == nil {
 		return nil, NewError(ErrCodeNotFound, "filter not found")
 	}
@@ -770,6 +949,21 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 		return []Log{}, nil
 	}
 
+	logs, rpcErr := api.getLogsRange(fromBlock, toBlock, filter)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	return logs, nil
+}
+
+// getLogsRange scans blocks [fromBlock, toBlock] inclusive and returns the
+// logs matching filter (address + topics). Callers are responsible for
+// bounding the range before calling.
+//
+// A failure to read a block is returned as an error rather than skipped:
+// silently dropping a block would make an empty result indistinguishable from
+// "no events", which is the failure mode this scan exists to avoid.
+func (api *API) getLogsRange(fromBlock, toBlock uint64, filter *LogFilter) ([]Log, *Error) {
 	// Collect addresses to filter
 	addresses := make([]string, 0)
 	if filter.Address != nil {
@@ -815,7 +1009,8 @@ func (api *API) getLogs(filter *LogFilter) (any, *Error) {
 	for height := fromBlock; height <= toBlock; height++ {
 		block, err := api.blockReader.GetBlockByHeight(height)
 		if err != nil {
-			continue
+			return nil, NewError(ErrCodeInternal,
+				fmt.Sprintf("failed to read block %d while scanning logs: %v", height, err))
 		}
 
 		// R36-P2-RPC-02 FIX: Use *BlockResponse type assertion (production

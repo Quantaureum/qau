@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/quantaureum/qau/qvm"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -108,6 +109,7 @@ type mockContractCaller struct {
 	returnData []byte
 	gasUsed    uint64
 	callErr    error
+	resultErr  error
 }
 
 func newMockContractCaller() *mockContractCaller {
@@ -118,7 +120,7 @@ func (m *mockContractCaller) Call(req *ContractCallRequest) (*ContractCallResult
 	if m.callErr != nil {
 		return nil, m.callErr
 	}
-	return &ContractCallResult{ReturnData: m.returnData, GasUsed: m.gasUsed}, nil
+	return &ContractCallResult{ReturnData: m.returnData, GasUsed: m.gasUsed, Error: m.resultErr}, nil
 }
 
 // R6-01 (2026-10-21 sixth-round audit): the SnapshotManager seam was removed --
@@ -410,6 +412,9 @@ func TestGetTransactionReceipt_NoParams(t *testing.T) {
 
 // ── EstimateGas tests ──
 
+// TestEstimateGas_ContractCreation pins the AUDIT FIX: contract creation
+// cannot be simulated on this node, so eth_estimateGas refuses it instead of
+// returning a heuristic 32000-gas number that looks authoritative.
 func TestEstimateGas_ContractCreation(t *testing.T) {
 	api := newTestAPI()
 	addr := mustParseAddress(t, "0x1234567890123456789012345678901234567890")
@@ -418,11 +423,74 @@ func TestEstimateGas_ContractCreation(t *testing.T) {
 		"data": "0x60806040",
 	}})
 	result, err := api.EstimateGas(ctx(), params)
-	requireOK(t, result, err)
-	// Contract creation should add 32000 overhead
-	gasStr := result.(string)
-	if gasStr == "0x0" {
-		t.Error("expected non-zero gas for contract creation")
+	if err == nil {
+		t.Fatalf("expected an explicit error for contract-creation estimation, got %v", result)
+	}
+}
+
+// TestEstimateGas_SimulationFailurePropagates pins the AUDIT FIX: a failed
+// QVM simulation is returned as an RPC error, not papered over with the
+// heuristic gas number.
+func TestEstimateGas_SimulationFailurePropagates(t *testing.T) {
+	api := newTestAPIFull()
+	api.contractCaller.(*mockContractCaller).callErr = fmt.Errorf("node busy: state execution frame unavailable")
+	addr := mustParseAddress(t, "0x1234567890123456789012345678901234567890")
+	params, _ := json.Marshal([]map[string]string{{
+		"from": addr.ToHexAddress(),
+		"to":   addr.ToHexAddress(),
+	}})
+	result, err := api.EstimateGas(ctx(), params)
+	if err == nil {
+		t.Fatalf("expected estimation to fail when simulation fails, got %v", result)
+	}
+	if err.Code != ErrCodeExecution {
+		t.Fatalf("expected user-facing execution error code, got %d", err.Code)
+	}
+}
+
+// TestEstimateGas_RevertDataPropagates pins the AUDIT FIX: a reverted
+// simulation reports code 3 with the revert payload in Data.
+func TestEstimateGas_RevertDataPropagates(t *testing.T) {
+	api := newTestAPIFull()
+	revertPayload := []byte{0x08, 0xc3, 0x7a}
+	caller := api.contractCaller.(*mockContractCaller)
+	caller.gasUsed = 21000
+	caller.returnData = revertPayload
+	caller.resultErr = qvm.ErrExecutionReverted
+
+	addr := mustParseAddress(t, "0x1234567890123456789012345678901234567890")
+	params, _ := json.Marshal([]map[string]string{{
+		"from": addr.ToHexAddress(),
+		"to":   addr.ToHexAddress(),
+		"data": "0x08c37a00",
+	}})
+	_, err := api.EstimateGas(ctx(), params)
+	if err == nil {
+		t.Fatal("expected an error for a reverted simulation")
+	}
+	if err.Code != ErrCodeExecutionReverted {
+		t.Fatalf("expected revert code %d, got %d", ErrCodeExecutionReverted, err.Code)
+	}
+	if err.Data != "0x08c37a" {
+		t.Fatalf("expected revert data 0x08c37a, got %v", err.Data)
+	}
+}
+
+// TestEstimateGas_ContractCallWithoutSimulatorRefused pins the AUDIT FIX: with
+// no ContractCaller, a call to an address that holds code cannot be estimated
+// honestly, so it is refused instead of answered with 21000 gas.
+func TestEstimateGas_ContractCallWithoutSimulatorRefused(t *testing.T) {
+	api := newTestAPI() // no contract caller
+	addr := mustParseAddress(t, "0x1234567890123456789012345678901234567890")
+	api.stateReader.(*mockStateReader).codes[addr] = []byte{0x60, 0x00}
+
+	params, _ := json.Marshal([]map[string]string{{
+		"from": addr.ToHexAddress(),
+		"to":   addr.ToHexAddress(),
+	}})
+	result, err := api.EstimateGas(ctx(), params)
+	if err == nil {
+		t.Fatalf("expected estimation to fail for an unsimulatable contract call, got %v", result)
 	}
 }
 

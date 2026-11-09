@@ -1947,104 +1947,106 @@ func (api *API) EstimateGas(ctx context.Context, params json.RawMessage) (any, *
 		return nil, ErrInvalidParams
 	}
 
-	// FIX: Try actual QVM simulation if ContractCaller is available.
-	// This provides accurate gas estimation by executing the transaction in a
-	// read-only context and measuring actual gas consumed. Falls back to the
-	// heuristic estimation below if simulation is unavailable or fails.
-	if api.contractCaller != nil {
-		if toStr, ok := txObj.To.(string); ok && toStr != "" && toStr != "0x" && toStr != "0x0" {
-			to, addrErr := parseAddress(toStr)
-			if addrErr == nil {
-				// Parse call data
-				var data []byte
-				if txObj.Data != "" {
-					if parsedData, dErr := parseHexBytes(txObj.Data); dErr == nil {
-						data = parsedData
-					}
-				}
-				// Parse value
-				value := big.NewInt(0)
-				if txObj.Value != "" {
-					vStr := stripHexPrefix(txObj.Value)
-					if _, ok := value.SetString(vStr, 16); !ok {
-						value.SetString(vStr, 10)
-					}
-				}
-				// Parse from address (optional)
-				var from types.Address
-				if txObj.From != "" {
-					from, _ = parseAddress(txObj.From)
-				}
-				// Use a generous gas limit for the simulation
-				const simulationGas uint64 = 50_000_000
-				req := &ContractCallRequest{
-					From:  from,
-					To:    to,
-					Value: value,
-					Data:  data,
-					Gas:   simulationGas,
-				}
-				result, callErr := api.contractCaller.Call(req)
-				if callErr == nil && result != nil && result.Error == nil && result.GasUsed > 0 {
-					simGas := result.GasUsed
-					if simGas < 21000 {
-						simGas = 21000
-					}
-					// Apply 20% safety margin on top of simulated gas
-					simGas += simGas / 5
-					// Cap at block gas limit
-					if api.blockReader != nil && simGas > api.blockReader.GetGasLimit() {
-						simGas = api.blockReader.GetGasLimit()
-					}
-					return formatHexUint64(simGas), nil
-				}
-			}
-		}
+	// AUDIT FIX: gas estimation must never return a plausible-looking number
+	// for a transaction it could not simulate.
+	//
+	//   - Contract creation cannot be simulated on this node at all (the
+	//     ContractCaller has no deployment entry point), so it is refused
+	//     instead of answered with a fixed 32000-gas guess.
+	//   - Contract calls are simulated through ContractCaller. A simulation
+	//     failure / revert is propagated as an RPC error; there is no fallback
+	//     to the heuristic, which would report success for a doomed transaction.
+	//   - Only a transfer to an account without code falls through to the
+	//     protocol-defined cost below, where no execution happens at all.
+	toStr, _ := txObj.To.(string)
+	if toStr == "" || toStr == "0x" || toStr == "0x0" {
+		return nil, NewError(ErrCodeExecution,
+			"gas estimation for contract creation is not supported: deployment simulation is unavailable")
 	}
 
-	// --- Heuristic fallback (when ContractCaller is not available) ---
-	// TODO(): The heuristic below is an approximation, not an exact gas
-	// estimate. When ContractCaller is not available, this provides a rough
-	// estimate based on static analysis of the transaction payload. A proper
-	// implementation should use binary search over gas limits (similar to
-	// go-ethereum's EstimateGas) to find the minimum gas that allows the
-	// transaction to succeed. The current heuristic may over- or under-estimate
-	// gas for complex contract calls, which can cause transactions to fail or
-	// waste gas fees. The QVM simulation path above addresses this when
-	// ContractCaller is configured, but contract creation gas estimation
-	// (when 'to' is empty) still requires the heuristic.
+	to, addrErr := parseAddress(toStr)
+	if addrErr != nil {
+		return nil, NewError(ErrCodeInvalidParams, "invalid to address")
+	}
 
-	// Base gas for a simple transfer
-	gas := uint64(21000)
-
-	// Add gas for data payload using QVM's actual gas model:
-	// 16 gas per non-zero byte (GasTxDataNonZero), 4 gas per zero byte (GasTxDataZero).
-	// FIX: Previously used a flat 68 gas/byte (pre-EIP-2028 Ethereum value),
-	// which over-estimated gas for data-heavy transactions. Now matches qvm/gas.go
-	// constants for more accurate heuristic estimates.
+	var data []byte
 	if txObj.Data != "" {
-		if dataBytes, dErr := parseHexBytes(txObj.Data); dErr == nil {
-			for _, b := range dataBytes {
-				if b == 0 {
-					gas += 4 // GasTxDataZero (qvm/gas.go:71)
-				} else {
-					gas += 16 // GasTxDataNonZero (qvm/gas.go:72)
-				}
-			}
+		parsedData, dErr := parseHexBytes(txObj.Data)
+		if dErr != nil {
+			return nil, NewError(ErrCodeInvalidParams, "invalid data")
+		}
+		data = parsedData
+	}
+
+	value := big.NewInt(0)
+	if txObj.Value != "" {
+		vStr := stripHexPrefix(txObj.Value)
+		if _, ok := value.SetString(vStr, 16); !ok {
+			value.SetString(vStr, 10)
 		}
 	}
 
-	// Add gas for contract creation (if 'to' is empty/null)
-	if txObj.To == nil || txObj.To == "" || txObj.To == "0x" || txObj.To == "0x0" {
-		gas += 32000 // contract creation overhead
+	var from types.Address
+	if txObj.From != "" {
+		from, _ = parseAddress(txObj.From)
 	}
 
-	// Apply a 20% safety margin to the computed gas estimate.
-	// This reduces the likelihood of out-of-gas errors for contract calls
-	// where the heuristic underestimates the actual gas needed. The margin
-	// is capped so it does not push simple transfers far above 21000.
-	if gas > 21000 {
-		gas += gas / 5 // 20% safety margin
+	if api.contractCaller != nil {
+		const simulationGas uint64 = 50_000_000
+		req := &ContractCallRequest{
+			From:  from,
+			To:    to,
+			Value: value,
+			Data:  data,
+			Gas:   simulationGas,
+		}
+		result, callErr := api.contractCaller.Call(req)
+		if callErr != nil {
+			return nil, NewError(ErrCodeExecution,
+				fmt.Sprintf("gas estimation failed: %v", callErr))
+		}
+		if result == nil {
+			return nil, NewError(ErrCodeExecution,
+				"gas estimation failed: contract call returned no result")
+		}
+		if result.Error != nil {
+			return nil, executionRPCError(result)
+		}
+		if result.GasUsed > 0 {
+			simGas := result.GasUsed
+			if simGas < 21000 {
+				simGas = 21000
+			}
+			// Apply 20% safety margin on top of simulated gas
+			simGas += simGas / 5
+			// Cap at block gas limit
+			if api.blockReader != nil && simGas > api.blockReader.GetGasLimit() {
+				simGas = api.blockReader.GetGasLimit()
+			}
+			return formatHexUint64(simGas), nil
+		}
+		// GasUsed == 0 and no error: the target holds no code, so this is a
+		// plain transfer. Fall through to the protocol-defined cost.
+	} else if api.stateReader != nil {
+		if len(api.stateReader.GetCode(to)) > 0 {
+			return nil, NewError(ErrCodeExecution,
+				"gas estimation for contract calls is not supported: contract caller unavailable")
+		}
+	} else {
+		return nil, NewError(ErrCodeExecution,
+			"gas estimation is not supported: neither a contract caller nor a state reader is available")
+	}
+
+	// Plain transfer to an account without code: base cost plus calldata, per
+	// the QVM gas model (qvm/gas.go GasTxDataZero=4, GasTxDataNonZero=16).
+	// No execution occurs, so this needs no simulation and no safety margin.
+	gas := uint64(21000)
+	for _, b := range data {
+		if b == 0 {
+			gas += 4 // GasTxDataZero (qvm/gas.go:71)
+		} else {
+			gas += 16 // GasTxDataNonZero (qvm/gas.go:72)
+		}
 	}
 
 	// R43-H-H3 FIX: Add nil check for blockReader to prevent panic when
