@@ -7977,7 +7977,7 @@ func (n *Node) initLightClient() {
 // Set QAU_GRAPHQL_ADDR=off to disable the GraphQL server entirely.
 // Passing --graphql=false also disables it (audit run-3
 // qau.config/graphql-flag-ignored, ported from node 8245a07); omitting the
-// flag keeps the legacy "enabled unless QAU_GRAPHQL_ADDR=off" behaviour.
+// flag keeps the legacy "enabled unless QAU_GRAPHQL_ADDR=off" behavior.
 func (n *Node) startGraphQLServer() {
 	if n.config != nil && n.config.GraphqlExplicit && !n.config.GraphqlEnabled {
 		nodeLog.Info("GraphQL server disabled by --graphql=false")

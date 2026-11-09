@@ -159,7 +159,6 @@ func TestFraudProof_RejectsTamperedHashedFields(t *testing.T) {
 		{"chainID", func(tx *RollupTransaction) { tx.ChainID++ }},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			fp, pre, tampered, tx := newFraudProofFixture(t)
 			rpcTx := rpcShapedTxCopy(tx)

@@ -570,7 +570,7 @@ func ComputeTxContentHash(tx *RollupTransaction) types.Hash {
 	return sha256.Sum256(encodeTxForHash(tx))
 }
 
-// encodeTxForHash serialises the transaction fields bound into its content
+// encodeTxForHash serializes the transaction fields bound into its content
 // hash. Package-level (receiver-free) so the fraud-proof path can recompute it
 // without a *BatchManager.
 func encodeTxForHash(tx *RollupTransaction) []byte {

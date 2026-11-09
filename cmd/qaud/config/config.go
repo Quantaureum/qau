@@ -200,7 +200,7 @@ func applyFlagOverrides(cfg *node.Config, cli *CLI) {
 
 // applyGraphqlFlag propagates an explicit --graphql value into the node config.
 // When the flag is omitted (GraphqlSet == false) the node keeps its legacy
-// behaviour: the GraphQL server starts unless QAU_GRAPHQL_ADDR=off. Passing
+// behavior: the GraphQL server starts unless QAU_GRAPHQL_ADDR=off. Passing
 // --graphql=false disables it. See node.Config.GraphqlExplicit.
 func applyGraphqlFlag(cfg *node.Config, cli *CLI) {
 	if !cli.GraphqlSet {

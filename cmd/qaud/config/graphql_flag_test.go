@@ -9,7 +9,7 @@ import (
 
 // AUDIT run-3 qau.config/graphql-flag-ignored regression tests: the parsed
 // --graphql value must reach node.Config, and a flag that was never passed must
-// leave the legacy behaviour untouched.
+// leave the legacy behavior untouched.
 
 func TestApplyGraphqlFlagExplicitFalse(t *testing.T) {
 	cfg := node.DefaultConfig()

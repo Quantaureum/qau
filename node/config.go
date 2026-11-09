@@ -111,7 +111,7 @@ type Config struct {
 	// GraphQL HTTP API toggle (audit run-3 qau.config/graphql-flag-ignored,
 	// ported from node 8245a07). GraphqlExplicit records whether the operator
 	// actually passed --graphql; only then does GraphqlEnabled take effect.
-	// When the flag is omitted the legacy behaviour is preserved (server starts
+	// When the flag is omitted the legacy behavior is preserved (server starts
 	// unless QAU_GRAPHQL_ADDR=off), so existing deployments keep working
 	// unchanged. Passing --graphql=false stops the server instead of silently
 	// leaving it running. Neither field is persisted in config.json (json:"-"):

@@ -11,10 +11,10 @@ import (
 // AUDIT run-3 qau.config/graphql-flag-ignored regression tests.
 //
 // The --graphql flag used to be parsed and then ignored: startGraphQLServer
-// only honoured QAU_GRAPHQL_ADDR=off, so "--graphql=false" left the listener
+// only honored QAU_GRAPHQL_ADDR=off, so "--graphql=false" left the listener
 // running while the operator believed it was off. The flag is now wired:
 //   - explicit --graphql=false  -> server not started
-//   - flag omitted              -> legacy behaviour (server starts unless env off)
+//   - flag omitted              -> legacy behavior (server starts unless env off)
 //   - explicit --graphql=true   -> server starts
 //   - QAU_GRAPHQL_ADDR=off      -> still wins (backwards compatible)
 
@@ -83,7 +83,7 @@ func TestGraphqlFlagOmittedKeepsLegacyStart(t *testing.T) {
 	n := &Node{config: &Config{}}
 	n.startGraphQLServer()
 	if n.graphqlServer == nil {
-		t.Fatal("omitting --graphql must keep the legacy behaviour (GraphQL enabled)")
+		t.Fatal("omitting --graphql must keep the legacy behavior (GraphQL enabled)")
 	}
 	defer stopGraphQLServer(t, n)
 

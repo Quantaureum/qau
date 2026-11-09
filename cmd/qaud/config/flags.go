@@ -13,7 +13,7 @@ type CLI struct {
 	ShowVersion *bool
 
 	// GraphqlSet reports whether --graphql was passed explicitly. The node
-	// keeps starting GraphQL when the flag is omitted (legacy behaviour); only
+	// keeps starting GraphQL when the flag is omitted (legacy behavior); only
 	// an explicit --graphql=false disables it.
 	GraphqlSet bool
 

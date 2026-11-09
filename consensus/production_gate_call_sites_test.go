@@ -10,7 +10,7 @@ package consensus
 // params.IsProductionEnv(), a node that never declared its network identity
 // would silently run with the production guard disarmed.
 //
-// Covered here (behavioural branches):
+// Covered here (behavioral branches):
 //   - QPOS.CanPropose              (consensus/block.go, no-chamber + chamber paths)
 //   - NewDAAttestationVerifier     (consensus/da_attestation_verifier.go, disabled committee)
 //   - DAAttestationCollector.BuildAggregateAttestation
@@ -26,7 +26,7 @@ package consensus
 //     flow is identical in both modes (the partial signature is accepted and
 //     the lottery phase stays pinned). Asserting log severity would require a
 //     global logger capture harness that this package does not have today, so
-//     the cost outweighs the regression value. Behaviour in these two files is
+//     the cost outweighs the regression value. Behavior in these two files is
 //     pinned by their existing tests.
 //
 // These tests mutate the package-wide attestation network identity, so none of
