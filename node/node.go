@@ -2687,11 +2687,63 @@ func (n *Node) initP2P() error {
 	}
 
 	n.p2pHost = host
+
+	// AUDIT run-3 H-01 FIX: activate the Protocol V2 status-authentication
+	// controls. The p2p host already implements a clock-skew freshness window,
+	// an active-validator-set membership check, and a session-nonce replay
+	// tracker, but production never wired any of them, so the checks were inert
+	// and a replayed validator status could hijack the address→PeerID mapping.
+	n.p2pHost.SetStatusFreshnessWindowSec(statusFreshnessWindowSec)
+	n.p2pHost.SetSessionNonceTracker(p2p.NewSessionNonceTracker())
+	if err := n.p2pHost.EnableSessionNoncePersistence(filepath.Join(n.config.DataDir, "status_nonces.json")); err != nil {
+		nodeLog.Warn("initP2P: failed to enable status nonce persistence: %v", err)
+	}
+	n.p2pHost.SetActiveValidatorIdentityVerifier(n)
+
 	// P2P-R13-CRIT-004: Do NOT call p2pHost.Start() here. Start() is deferred
 	// to startP2P() which runs after initP2PSignatureVerifier() — eliminating
 	// the TOCTOU window where the host accepted connections with no payload
 	// signature verifier wired.
 	return nil
+}
+
+// statusFreshnessWindowSec bounds how far a signed status timestamp may drift
+// from the local clock. Status messages are broadcast every 15s, so 120s
+// tolerates normal clock skew while keeping the replay window small.
+const statusFreshnessWindowSec = 120
+
+// VerifyActiveValidator implements p2p.ActiveValidatorIdentityVerifier
+// (AUDIT run-3 H-01). It confirms that the (address, publicKey) pair claimed by
+// a signed status belongs to a currently active validator, so a validator that
+// has been removed from the active set can no longer own the address→PeerID
+// mapping.
+func (n *Node) VerifyActiveValidator(addr types.Address, publicKey []byte) error {
+	if n.validatorManager == nil {
+		return errors.New("validator manager not initialized")
+	}
+	for _, v := range n.validatorManager.GetActiveValidators() {
+		if v == nil || v.Address != addr {
+			continue
+		}
+		if v.PublicKey == nil {
+			// AUDIT run-4 REG-02 FIX: legacy or third-party genesis files may
+			// carry validator entries without a publicKey field. The host has
+			// already proven that the status signature verifies under the
+			// claimed key AND that the key derives the claimed address
+			// (pubKey.Address() == status.ValidatorAddress), so an attacker
+			// cannot claim this address without a Dilithium key that hashes to
+			// it. Falling back to active-set membership by address keeps the
+			// anti-hijack guarantee and avoids permanently losing the
+			// address→PeerID mapping (which would break TSS/DKG routing).
+			syncLog.Warn("REG-02 fallback: active validator %s has no public key in the active set; verifying membership by address only", addr.ToHexAddress())
+			return nil
+		}
+		if !bytes.Equal(v.PublicKey.Bytes(), publicKey) {
+			return fmt.Errorf("validator %s public key mismatch", addr.ToHexAddress())
+		}
+		return nil
+	}
+	return fmt.Errorf("validator %s is not in the active set", addr.ToHexAddress())
 }
 
 // startP2P starts the P2P host (listener + dialers + GossipSub router).

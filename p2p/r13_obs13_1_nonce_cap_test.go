@@ -58,9 +58,15 @@ func TestOBS13_1_DedupStillWorksUnderCap(t *testing.T) {
 	if !tk.Seen(addr, "peer-2", nonce) {
 		t.Fatal("second sight not reported as replay")
 	}
-	// Same nonce from a different peer is a different tuple.
-	if tk.Seen(addr, "peer-3", nonce) {
-		t.Fatal("same nonce from a different peer treated as replay")
+	// AUDIT run-3 H-01 FIX: same nonce from a different peer is a REPLAY of
+	// one captured frame (validator-scoped key), not a new tuple. The
+	// pre-fix semantics here were exactly the cross-peer replay escape.
+	if !tk.Seen(addr, "peer-3", nonce) {
+		t.Fatal("same validator nonce from a different peer must be treated as replay")
+	}
+	// A genuinely fresh nonce from any peer is still new.
+	if tk.Seen(addr, "peer-3", obs131Nonce(8)) {
+		t.Fatal("fresh nonce from a different peer reported as replay")
 	}
 }
 
@@ -72,8 +78,10 @@ func TestOBS13_1_SetMaxEntriesTrimsImmediately(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		tk.Seen(types.Address{byte(i)}, "p", obs131Nonce(i))
 	}
-	if got := tk.Len(); got != 300 {
-		t.Fatalf("precondition: Len = %d, want 300", got)
+	// Each unique tuple records two entries since run-3 H-01 (exact tuple +
+	// validator-scoped key): 300 Seen calls → 600 entries.
+	if got := tk.Len(); got != 600 {
+		t.Fatalf("precondition: Len = %d, want 600", got)
 	}
 	tk.SetMaxEntries(50)
 	if got := tk.Len(); got > 50 {

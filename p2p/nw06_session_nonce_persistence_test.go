@@ -92,12 +92,14 @@ func TestNW06_SessionNonceTracker_TrimPersistsShrunkSnapshot(t *testing.T) {
 		nonce[0] = byte(i)
 		tk.Seen(types.Address{byte(i)}, "p", nonce)
 	}
-	if got := tk.Len(); got != 10 {
-		t.Fatalf("precondition: Len=%d, want 10", got)
+	// Each unique tuple records two entries since run-3 H-01 (exact tuple +
+	// validator-scoped key): 10 Seen calls → 20 entries.
+	if got := tk.Len(); got != 20 {
+		t.Fatalf("precondition: Len=%d, want 20", got)
 	}
-	tk.Trim(4)
-	if got := tk.Len(); got > 4 {
-		t.Fatalf("Trim(4) left %d entries", got)
+	tk.Trim(8)
+	if got := tk.Len(); got > 8 {
+		t.Fatalf("Trim(8) left %d entries", got)
 	}
 
 	// The persisted store must agree with the post-Trim in-memory set:

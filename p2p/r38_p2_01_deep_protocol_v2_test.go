@@ -292,8 +292,11 @@ func TestR38P2_01_Deep_SessionNonceTracker_ReplayReject(t *testing.T) {
 	if !tk.Seen(addr, peer, nonce) {
 		t.Fatal("second Seen call for the SAME (addr, peer, nonce) must return TRUE (replay)")
 	}
-	if tk.Len() != 1 {
-		t.Fatalf("after 2 Seen calls for the same tuple, tracker Len must be 1 (dedup), got %d", tk.Len())
+	// Each unique (addr, nonce) records two entries: the exact (addr, peer,
+	// nonce) tuple and the validator-scoped (addr, nonce) key added by the
+	// run-3 H-01 fix (cross-peer replay rejection).
+	if tk.Len() != 2 {
+		t.Fatalf("after 2 Seen calls for the same tuple, tracker Len must be 2 (tuple + validator-scoped key), got %d", tk.Len())
 	}
 
 	// Different nonce → distinct tuple → false (new).
@@ -301,17 +304,21 @@ func TestR38P2_01_Deep_SessionNonceTracker_ReplayReject(t *testing.T) {
 	if tk.Seen(addr, peer, nonce2) {
 		t.Fatal("Seen call for a DIFFERENT nonce must return false (new tuple)")
 	}
-	// Different peer → distinct tuple.
-	if tk.Seen(addr, "peer-B", nonce) {
-		t.Fatal("Seen call for a DIFFERENT peerID must return false")
+	// AUDIT run-3 H-01 FIX (run-13 qau.p2p/status-replay-validator-map-hijack):
+	// a DIFFERENT peer presenting the SAME (addr, nonce) is a replay of one
+	// captured frame and must be rejected. The pre-fix semantics treated it
+	// as a new tuple, which is exactly the cross-peer replay escape the
+	// finding describes.
+	if !tk.Seen(addr, "peer-B", nonce) {
+		t.Fatal("Seen call for a DIFFERENT peerID with the SAME validator nonce must return TRUE (cross-peer replay)")
 	}
-	// Different addr → distinct tuple.
+	// Different addr → distinct tuple (validator-scoped key is per-address).
 	addr2 := types.Address{0xBB}
 	if tk.Seen(addr2, peer, nonce) {
 		t.Fatal("Seen call for a DIFFERENT address must return false")
 	}
-	if tk.Len() != 4 {
-		t.Fatalf("after 4 distinct tuples, tracker Len must be 4, got %d", tk.Len())
+	if tk.Len() != 6 {
+		t.Fatalf("after 4 distinct (addr, nonce) pairs, tracker Len must be 6, got %d", tk.Len())
 	}
 }
 
@@ -319,17 +326,20 @@ func TestR38P2_01_Deep_SessionNonceTracker_ReplayReject(t *testing.T) {
 // the tracked-tuple count to the configured max.
 func TestR38P2_01_Deep_SessionNonceTracker_Trim(t *testing.T) {
 	tk := NewSessionNonceTracker()
+	// 100 unique (addr, nonce) tuples record two entries each since the
+	// run-3 H-01 cross-peer fix: the exact tuple key and the validator-
+	// scoped key. 100 Seen calls → 200 entries.
 	for i := 0; i < 100; i++ {
 		nonce := [16]byte{}
 		nonce[0] = byte(i)
 		tk.Seen(types.Address{byte(i)}, "p", nonce)
 	}
-	if got := tk.Len(); got != 100 {
-		t.Fatalf("precondition: tracker Len must be 100, got %d", got)
+	if got := tk.Len(); got != 200 {
+		t.Fatalf("precondition: tracker Len must be 200 (100 tuples × 2 keys), got %d", got)
 	}
-	tk.Trim(50)
-	if got := tk.Len(); got > 50 {
-		t.Fatalf("R38-P2-01 deep-fix: Trim(50) MUST reduce tracker to ≤50 entries — got %d", got)
+	tk.Trim(100)
+	if got := tk.Len(); got > 100 {
+		t.Fatalf("R38-P2-01 deep-fix: Trim(100) MUST reduce tracker to ≤100 entries — got %d", got)
 	}
 	if got := tk.Len(); got < 1 {
 		t.Fatalf("R38-P2-01 deep-fix: Trim MUST not empty the tracker — got %d", got)

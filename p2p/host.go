@@ -4399,21 +4399,34 @@ func (h *Host) handleBaseProtocol(msg *Message) error {
 						// Clock-skew freshness window. When the V2 extension is
 						// present (Timestamp > 0), the status MUST arrive within
 						// +/- window ms of the host's wall clock. Without this
-						// an attacker who replays a recorded status within the
-						// 5-minute TLS-shared-secret rekey window can reset the
-						// Address→PeerID mapping to point at themselves.
-						if verified && status.Timestamp > 0 && h.statusFreshnessWindowSec > 0 {
-							now := uint64(time.Now().Unix())
-							delta := uint64(0)
-							if now > status.Timestamp {
-								delta = now - status.Timestamp
-							} else {
-								delta = status.Timestamp - now
-							}
-							if delta > h.statusFreshnessWindowSec {
+						// AUDIT run-3 H-01 FIX: the freshness window is now
+						// MANDATORY for signed mapping registration whenever
+						// the receiver has it configured. The old condition
+						// skipped the check for V1-shaped frames
+						// (Timestamp == 0), so a captured V1 signature —
+						// which is exactly what legacy senders produced —
+						// could be replayed forever to re-point the
+						// Address→PeerID mapping (TSS routing hijack). With
+						// the window wired, a missing V2 timestamp is treated
+						// as "infinitely stale" and rejected.
+						if verified && h.statusFreshnessWindowSec > 0 {
+							if status.Timestamp == 0 {
 								verified = false
-								hostLog.Warnf("R38-P2-01 deep-fix: status timestamp outside freshness window (validator %x peer %s delta=%ds window=%ds)",
-									status.ValidatorAddress[:4], msg.From, delta, h.statusFreshnessWindowSec)
+								hostLog.Warnf("R38-P2-01 deep-fix: signed status without V2 timestamp rejected (validator %x peer %s) — V1-shaped frames cannot register the Address→PeerID mapping",
+									status.ValidatorAddress[:4], msg.From)
+							} else {
+								now := uint64(time.Now().Unix())
+								delta := uint64(0)
+								if now > status.Timestamp {
+									delta = now - status.Timestamp
+								} else {
+									delta = status.Timestamp - now
+								}
+								if delta > h.statusFreshnessWindowSec {
+									verified = false
+									hostLog.Warnf("R38-P2-01 deep-fix: status timestamp outside freshness window (validator %x peer %s delta=%ds window=%ds)",
+										status.ValidatorAddress[:4], msg.From, delta, h.statusFreshnessWindowSec)
+								}
 							}
 						}
 						// R38-P2-01 DEEP FIX (Protocol V2, 2026-08-02):
@@ -4424,8 +4437,20 @@ func (h *Host) handleBaseProtocol(msg *Message) error {
 						// who records a status frame and replays it within the
 						// freshness window (e.g., 60s drift) can hijack TSS
 						// message routing.
-						if verified && status.SessionNonce != ([16]byte{}) && h.sessionNonceTracker != nil {
-							if h.sessionNonceTracker.Seen(status.ValidatorAddress, msg.From, status.SessionNonce) {
+						// AUDIT run-3 H-01 FIX: with the tracker installed, a
+						// zero nonce is rejected rather than skipped — the
+						// tracker is authoritative for signed mapping
+						// registration, and "no nonce" means "infinitely
+						// replayable". Seen() also matches per-validator
+						// (address, nonce) regardless of the claiming peer, so
+						// replaying a captured frame from a DIFFERENT peer
+						// identity no longer escapes the tracker.
+						if verified && h.sessionNonceTracker != nil {
+							if status.SessionNonce == ([16]byte{}) {
+								verified = false
+								hostLog.Warnf("R38-P2-01 deep-fix: signed status without V2 session nonce rejected (validator %x peer %s)",
+									status.ValidatorAddress[:4], msg.From)
+							} else if h.sessionNonceTracker.Seen(status.ValidatorAddress, msg.From, status.SessionNonce) {
 								verified = false
 								hostLog.Warnf("R38-P2-01 deep-fix: status replay rejected (validator %x peer %s nonce %x)",
 									status.ValidatorAddress[:4], msg.From, status.SessionNonce[:4])
@@ -6233,6 +6258,16 @@ func sessionNonceKey(addr types.Address, peerID PeerID, nonce [16]byte) [56]byte
 // is required to defeat concurrent replay attempts from multiple peers
 // handing stale same-nonce frames to us simultaneously.
 //
+// AUDIT run-3 H-01 FIX: in addition to the exact (addr, peer, nonce) tuple,
+// Seen also tracks a validator-scoped (addr, nonce) key with an all-zero
+// peer field. The nonce is random per frame and chosen by the signer, so
+// the same captured frame replayed from a DIFFERENT peer identity — which
+// the per-peer tuple never matches — is now rejected as well. A legitimate
+// fresh frame always carries a new nonce and is unaffected. Collision risk
+// of a real (truncated) peer ID being all-zero is negligible; if it ever
+// happened, the effect is an over-strict replay rejection for that one
+// (addr, nonce), never an acceptance.
+//
 // On `true` (replay detected) callers MUST set verified=false; the
 // caller's caller (the status handler) logs and drops the status frame.
 func (t *SessionNonceTracker) Seen(addr types.Address, peerID PeerID, nonce [16]byte) bool {
@@ -6245,13 +6280,21 @@ func (t *SessionNonceTracker) Seen(addr types.Address, peerID PeerID, nonce [16]
 	if _, ok := t.seen[k]; ok {
 		return true
 	}
+	// Validator-scoped key: same nonce claimed for the same validator from
+	// ANY peer is a replay of one captured frame.
+	vk := sessionNonceKey(addr, PeerID(make([]byte, 20)), nonce)
+	if _, ok := t.seen[vk]; ok {
+		return true
+	}
 	t.seen[k] = struct{}{}
+	t.seen[vk] = struct{}{}
 	if max := t.effectiveMaxLocked(); max > 0 && len(t.seen) > max {
 		t.trimLocked(max - max/sessionNonceTrimDivisor)
 		// Trim iterates the map in random order, so the tuple we just
 		// recorded can be the one evicted. Re-adding it keeps the freshest
 		// nonce inside the replay window; the 10% headroom leaves room.
 		t.seen[k] = struct{}{}
+		t.seen[vk] = struct{}{}
 	}
 	t.persistLocked()
 	return false

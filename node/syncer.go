@@ -4,6 +4,7 @@ package node
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -2946,21 +2947,43 @@ func (s *Syncer) queryPeerStatus() {
 	// TSS-R7-09 (2026-09): sign the status so peers register the
 	// validator↔PeerID mapping (host.go only trusts a status carrying a valid
 	// ValidatorPublicKey + ValidatorSignature). Without this the mapping stays
-	// empty and TSS/DKG sender validation rejects every message. Sign over the
-	// 104-byte base payload (base[:104]); we intentionally omit the V2
-	// Timestamp/SessionNonce extension so the host verifies against the base
-	// payload directly (see host.go signed-domain handling). Best-effort: if
-	// signing fails, fall back to an unsigned status (mapping just won't
-	// populate from this node, same as before the fix).
+	// empty and TSS/DKG sender validation rejects every message.
+	//
+	// AUDIT run-3 H-01 / R38-P2-01 V2 FIX: always sign the V2 domain. The
+	// previous sender deliberately omitted the Timestamp/SessionNonce
+	// extension, so every legitimate status frame was V1-shaped: on the
+	// receiving side the freshness window and the anti-replay tracker only
+	// engage when those fields are present, so a captured V1 signature could
+	// be replayed forever to re-point the address→PeerID mapping (TSS routing
+	// hijack). The extension is part of the signed domain exactly as the V2
+	// host reconstructs it: base[:104] || Timestamp[8] || SessionNonce[16].
+	// Best-effort: if signing fails, fall back to an unsigned status (mapping
+	// just won't populate from this node, same as before the fix).
 	if s.validatorSignKey != nil && len(s.validatorPubKey) > 0 &&
 		s.validatorAddress != (types.Address{}) {
 		status.ValidatorPublicKey = s.validatorPubKey
-		base := p2p.EncodeStatusMessage(status) // no sig yet
-		if len(base) >= 104 {
-			if sig, serr := s.validatorSignKey.Sign(base[:104]); serr == nil {
-				status.ValidatorSignature = sig
-			} else {
-				status.ValidatorPublicKey = nil // revert to unsigned on failure
+		var nonce [16]byte
+		if _, nerr := crand.Read(nonce[:]); nerr != nil {
+			// A frame without a usable nonce would be V1-shaped and rejected
+			// by V2-enabled receivers; send it unsigned rather than signing
+			// a replayable domain.
+			status.ValidatorPublicKey = nil
+		} else {
+			status.Timestamp = uint64(time.Now().Unix())
+			status.SessionNonce = nonce
+			base := p2p.EncodeStatusMessage(status) // no sig yet
+			if len(base) >= 104 {
+				signed := make([]byte, 0, 104+8+16)
+				signed = append(signed, base[:104]...)
+				var tsBytes [8]byte
+				binary.BigEndian.PutUint64(tsBytes[:], status.Timestamp)
+				signed = append(signed, tsBytes[:]...)
+				signed = append(signed, nonce[:]...)
+				if sig, serr := s.validatorSignKey.Sign(signed); serr == nil {
+					status.ValidatorSignature = sig
+				} else {
+					status.ValidatorPublicKey = nil // revert to unsigned on failure
+				}
 			}
 		}
 	}
