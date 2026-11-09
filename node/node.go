@@ -3479,6 +3479,30 @@ func (n *Node) initRPC() (retErr error) {
 			"real threshold signing. This configuration is blocked on mainnet by Config.Validate().")
 	}
 
+	// D-32 (2026-11-08): startup detector for the local all-shares QTD sealing
+	// path (run-4 P0-1 recurrence). Detection ONLY — it must not change any
+	// behavior or refuse startup.
+	//
+	// The condition reads the shares ACTUALLY loaded into this process
+	// (ShareCount), not the configured tssTotalShares: an imported share file
+	// may hold one share or the full set, and only the loaded count decides
+	// whether a single node can produce every threshold signature by itself.
+	// The tri-state switch (QTDLocalAllSharesActivation) then decides what that
+	// means: absent resolves to the mainnet default (refusal armed), 0 is the
+	// rollback (WARN per seal), and max uint64 is the permanent opt-out. This
+	// ERROR makes the condition visible at startup regardless of the value.
+	if n.tssManager != nil &&
+		!n.config.TSSDistributedMode &&
+		n.tssManager.ShareCount() > 1 {
+		nodeLog.Error("[SECURITY] D-32: local all-shares QTD sealing configuration detected "+
+			"(tssDistributedMode=false, shareCount=%d, threshold=%d, qtdLocalAllSharesActivation resolved=%d). "+
+			"A single node holds every threshold share, so the t-of-n and 2/3 stake-weight gates "+
+			"degrade to a self-declaration; on mainnet the refusal is armed by default (resolved=1), "+
+			"while 0 (rollback) or max uint64 (permanent off) keep the WARN-only path. "+
+			"This message is detection only and does not change behavior.",
+			n.tssManager.ShareCount(), n.tssManager.Threshold(), n.config.localAllSharesActivationEffective())
+	}
+
 	// Register MultiSig API handlers
 	n.multisigStore = multisig.NewMultisigStateStore()
 	multisigAPI := rpc.NewMultisigAPI(n.multisigStore, &stateReaderAdapter{n}, n.stateDB)

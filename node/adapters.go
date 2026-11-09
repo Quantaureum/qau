@@ -1670,6 +1670,43 @@ func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs
 		return nil, fmt.Errorf("cannot aggregate %d external partial signatures without a distributed signer: distributed TSS is permanently disabled (TSS-R3-B-1)", len(partialSigs))
 	}
 
+	// Mainnet activation switch (run-4 P0-1 / D-32): a node that imported
+	// more than one DKG share locally AND is asked to seal with more than one
+	// sealer produces every partial signature itself, so the t-of-n count gate
+	// and the 2/3 stake-weight gate degrade to a single node's self-declaration.
+	// The tri-state switch (Config.QTDLocalAllSharesActivation) decides:
+	// absent (network default) and 1 are fail-closed; 0 is the rollback and
+	// keeps the pre-run-4 behavior with a WARN per seal; max uint64 is the
+	// permanent opt-out (run-4 P0-1 / D-32).
+	// Production sampling on 2026-11-08 found every mainnet validator loading
+	// exactly one share, so ShareCount()==1 keeps a correctly configured node
+	// out of this branch entirely.
+	//
+	// Scope note: the count gate above already requires len(sealers) >=
+	// Threshold, and node.go raises Threshold to >= 2 (R33 CONS-05), so a
+	// genuine single-signer configuration cannot reach this branch at all.
+	// The ShareCount()/len(sealers) checks are therefore defense in depth
+	// on top of the config-level guard (TSSTotalShares on mainnet) — an
+	// imported share file may hold the full set regardless of the configured
+	// total, and only the loaded count decides what one node can sign alone.
+	// Devnet/testnet keep the local path because single-node sealing is their
+	// documented topology.
+	if a.node != nil && a.node.config != nil &&
+		a.node.config.NetworkID == MainnetNetworkID &&
+		a.tss.ShareCount() > 1 && len(sealers) > 1 {
+		if a.node.config.localAllSharesActivationEffective() == 0 {
+			nodeLog.Warn("AggregatePartialSignatures: mainnet local all-shares sealing is DISARMED " +
+				"(qtdLocalAllSharesActivation=0 or permanent off): one node produces every threshold " +
+				"share, so the t-of-n and 2/3 stake-weight gates are a self-declaration; remove the " +
+				"explicit value to restore the mainnet default refusal")
+		} else {
+			return nil, fmt.Errorf("local all-shares QTD sealing is fail-closed on mainnet "+
+				"(networkId=%d, qtdLocalAllSharesActivation armed): a single node holding %d DKG shares "+
+				"cannot honestly satisfy the t-of-n or 2/3 stake-weight threshold; a non-leaking "+
+				"distributed aggregation protocol is required", MainnetNetworkID, a.tss.ShareCount())
+		}
+	}
+
 	// Local mode with no external partialSigs: test/development only.
 	// SignWithRetry uses locally stored qtdShares to produce all partial
 	// signatures — this is NOT threshold security and must not be used

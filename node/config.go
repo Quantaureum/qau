@@ -296,6 +296,25 @@ type Config struct {
 	// verify-only node follow a re-key whose new key no handoff signed by the
 	// replaced key can vouch for. Empty = not used.
 	TSSV1TrustedGroupKey string `json:"tssV1TrustedGroupKey"`
+	// QTDLocalAllSharesActivation is the tri-state switch for the mainnet
+	// refusal of the local all-shares QTD sealing path in node/adapters.go
+	// (run-4 P0-1 / D-32). Interpreted independently of the network:
+	//
+	//	absent (nil) = network default: armed on mainnet (networkId 1668),
+	//	               disarmed on testnet/devnet
+	//	0            = rollback to the pre-run-4 behavior: the path runs and
+	//	               every seal logs a WARN, no refusal
+	//	1            = armed: refuse the path on mainnet
+	//	max uint64   = permanent opt-out: never refuse on any network, even if
+	//	               a future release changes the network default
+	//
+	// Mainnet defaults to armed because production sampling on 2026-11-08
+	// found every validator loading exactly one share (4-of-6,
+	// tssDistributedMode=true): ShareCount()==1 makes the refusal unreachable
+	// on a correctly configured node, so arming turns a silent single-node
+	// self-declaration into a hard stop. The explicit 0 rollback and the
+	// permanent opt-out keep the behavior config-driven rather than hardcoded.
+	QTDLocalAllSharesActivation *uint64 `json:"qtdLocalAllSharesActivation,omitempty"`
 	// TSSDistributedDKG enables runtime distributed DKG (multi-party DKG over
 	// P2P) at node startup. Default: false (OFF) — when off, node behavior is
 	// identical to previous releases (single-process simulated DKG). When on,
@@ -956,6 +975,30 @@ func (c *Config) SaveConfig(path string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+// qtdLocalAllSharesActivationPermanentOff is the explicit value that disables
+// the mainnet all-shares refusal forever, regardless of any future change to
+// the per-network default. It is distinct from 0, which is the temporary
+// rollback used by the coordinated upgrade window.
+const qtdLocalAllSharesActivationPermanentOff uint64 = ^uint64(0)
+
+// localAllSharesActivationEffective resolves the QTDLocalAllSharesActivation
+// tri-state switch. An explicit value wins on every network; absent means the
+// network default: armed on mainnet, disarmed elsewhere. Both 0 and max uint64
+// resolve to 0 (do not refuse) but carry different intent: 0 is the rollback
+// switch, max uint64 is the permanent opt-out.
+func (c *Config) localAllSharesActivationEffective() uint64 {
+	if c.QTDLocalAllSharesActivation == nil {
+		if c.NetworkID == MainnetNetworkID {
+			return 1
+		}
+		return 0
+	}
+	if *c.QTDLocalAllSharesActivation == qtdLocalAllSharesActivationPermanentOff {
+		return 0
+	}
+	return *c.QTDLocalAllSharesActivation
+}
+
 // Validate validates the configuration
 func (c *Config) Validate() error {
 	// audit-fix H-1: reject devMode on mainnet to prevent
@@ -1098,6 +1141,15 @@ func (c *Config) Validate() error {
 		// Operator explicitly acknowledged the risk — log at WARN level via
 		// the standard logger at startup. The node.go init path also emits
 		// a loud warning.
+	}
+
+	// run-4 P0-1 / D-32: tri-state switch. When the key is present only 0
+	// (rollback), 1 (armed), and max uint64 (permanent opt-out) are valid;
+	// absent means the network default. Anything else is a typo, not policy.
+	if v := c.QTDLocalAllSharesActivation; v != nil &&
+		*v != 0 && *v != 1 && *v != qtdLocalAllSharesActivationPermanentOff {
+		return fmt.Errorf("qtdLocalAllSharesActivation must be 0 (rollback), 1 (armed), or %d (permanent off), got %d",
+			uint64(qtdLocalAllSharesActivationPermanentOff), *v)
 	}
 
 	if c.DataDir == "" {
