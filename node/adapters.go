@@ -3,6 +3,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1695,10 +1696,20 @@ func (a *tssSignerAdapter) AggregatePartialSignatures(sealers []int, partialSigs
 		a.node.config.NetworkID == MainnetNetworkID &&
 		a.tss.ShareCount() > 1 && len(sealers) > 1 {
 		if a.node.config.localAllSharesActivationEffective() == 0 {
-			nodeLog.Warn("AggregatePartialSignatures: mainnet local all-shares sealing is DISARMED " +
-				"(qtdLocalAllSharesActivation=0 or permanent off): one node produces every threshold " +
-				"share, so the t-of-n and 2/3 stake-weight gates are a self-declaration; remove the " +
-				"explicit value to restore the mainnet default refusal")
+			// AUDIT memo on 495aab4: the explicit disarm (rollback value 0 or
+			// permanent opt-out max uint64) must leave an AUDIT-GRADE trace, not
+			// a plain WARN. Every seal produced under the disarm is a
+			// single-node self-declaration of a threshold signature, so each
+			// occurrence is logged at ERROR level with the identifying fields:
+			// seal identifier (message hash), sealer roster size, loaded share
+			// count and the resolved switch value.
+			sealID := sha256.Sum256(message)
+			nodeLog.Error("[AUDIT] AggregatePartialSignatures: mainnet local all-shares sealing DISARMED "+
+				"(qtdLocalAllSharesActivation resolved=0: explicit rollback value or permanent opt-out) "+
+				"seal=%x sealers=%d shareCount=%d — one node produces every threshold share, so the "+
+				"t-of-n and 2/3 stake-weight gates are a self-declaration; remove the explicit value "+
+				"to restore the mainnet default refusal",
+				sealID[:8], len(sealers), a.tss.ShareCount())
 		} else {
 			return nil, fmt.Errorf("local all-shares QTD sealing is fail-closed on mainnet "+
 				"(networkId=%d, qtdLocalAllSharesActivation armed): a single node holding %d DKG shares "+

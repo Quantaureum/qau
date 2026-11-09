@@ -371,6 +371,14 @@ type Config struct {
 	// on a correctly configured node, so arming turns a silent single-node
 	// self-declaration into a hard stop. The explicit 0 rollback and the
 	// permanent opt-out keep the behavior config-driven rather than hardcoded.
+	//
+	// RELEASE NOTE REQUIREMENT (audit memo on 495aab4): any release notes,
+	// operator documentation or deployment guide that documents the rollback
+	// value 0 or the permanent opt-out MUST state, in the same section, that
+	// the disarm downgrades every mainnet threshold seal to a single node's
+	// self-declaration and that each disarmed seal is written to the audit
+	// log at ERROR level with the seal identifier, sealer count and share
+	// count (node/adapters.go AggregatePartialSignatures).
 	QTDLocalAllSharesActivation *uint64 `json:"qtdLocalAllSharesActivation,omitempty"`
 	// TSSDistributedDKG enables runtime distributed DKG (multi-party DKG over
 	// P2P) at node startup. Default: false (OFF) — when off, node behavior is
