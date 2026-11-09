@@ -70,7 +70,7 @@ func (v *DefaultValidator) ValidateTx(tx *Transaction) error {
 	// type" and making cross-chain replay attempts invisible in logs.
 	// Use the dedicated sentinel so callers (block_validator, txpool, RPC
 	// admit hook) can classify chain-ID mismatches distinctly.
-	if v.ExpectedChainID > 0 && tx.ChainID != 0 && tx.ChainID != v.ExpectedChainID {
+	if v.ExpectedChainID > 0 && tx.ChainID != v.ExpectedChainID {
 		return fmt.Errorf("%w: expected %d got %d", ErrAuthChainIDMismatch, v.ExpectedChainID, tx.ChainID)
 	}
 

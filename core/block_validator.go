@@ -277,6 +277,20 @@ type BlockValidator struct {
 	// (genesis, historical imports, replay, fastboot) keep the legacy path,
 	// so switching the network on never invalidates existing chain history.
 	vrfEnforcedEpoch uint64
+	// txChainIDEnforcementEpoch is the coordinated activation epoch for the
+	// per-transaction ChainID equality gate (audit H-03, ported from node
+	// 8245a07). 0 = effective from genesis: every block, including historical
+	// replay, must carry tx.ChainID == v.chainID.
+	// TxChainIDEnforcementDisabled is the explicit opt-out that keeps the
+	// legacy path on every block. Any other value activates at that epoch and
+	// grandfathers blocks below it. The value MUST be identical on every node
+	// or the accepted block set diverges.
+	//
+	// 0 was previously the inactive value. It became the hardened default
+	// after a full scan of mainnet blocks 0..377973 (377,974 blocks, 60 txs)
+	// found every transaction carrying ChainID 1668, so activation from
+	// genesis invalidates no existing block.
+	txChainIDEnforcementEpoch uint64
 	// vrfSeed is the seed for VRF verification. When set and vrfEnforced
 	// is true, ValidateBlock calls ValidateVRFProof to cryptographically
 	// verify the VRF proof (not just check existence). audit-fix H-8.
@@ -771,6 +785,47 @@ func (v *BlockValidator) SetVRFEnforced(enforced bool) {
 // a pure function makes the historical-block exemption directly testable.
 func vrfEnforcementActive(blockEpoch uint64, forced bool, activationEpoch uint64) bool {
 	return forced || (activationEpoch > 0 && blockEpoch >= activationEpoch)
+}
+
+// TxChainIDEnforcementDisabled is the sentinel activation epoch that keeps the
+// H-03 per-transaction ChainID gate off for every block. It is needed because
+// epoch 0 now means "effective from genesis" (see txChainIDEnforcementActive).
+const TxChainIDEnforcementDisabled uint64 = ^uint64(0)
+
+// txChainIDEnforcementActive reports whether the per-transaction ChainID
+// equality gate applies to a block of blockEpoch.
+//
+// Activation epoch 0 means "effective from genesis" — the hardened default
+// after the mainnet history audit found no foreign-ChainID transactions.
+// TxChainIDEnforcementDisabled opts out on every block (legacy path); any
+// other value activates at that epoch and grandfathers blocks below it.
+// Keeping the decision in a pure function makes both the inactive no-op and
+// the historical-block exemption directly testable.
+func txChainIDEnforcementActive(blockEpoch, activationEpoch uint64) bool {
+	if activationEpoch == TxChainIDEnforcementDisabled {
+		return false
+	}
+	return blockEpoch >= activationEpoch
+}
+
+// SetTxChainIDEnforcementEpoch wires the H-03 epoch-gated, network-wide
+// per-transaction ChainID gate. epoch == 0 makes the check active from
+// genesis (the hardened default); TxChainIDEnforcementDisabled keeps it
+// inactive on every block (legacy behavior). The value MUST be identical on
+// every node: a divergent activation epoch changes the accepted block set at
+// that boundary and forks the chain.
+func (v *BlockValidator) SetTxChainIDEnforcementEpoch(epoch uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.txChainIDEnforcementEpoch = epoch
+}
+
+// TxChainIDEnforcementEpoch returns the configured activation epoch
+// (0 = active from genesis, TxChainIDEnforcementDisabled = inactive).
+func (v *BlockValidator) TxChainIDEnforcementEpoch() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.txChainIDEnforcementEpoch
 }
 
 // SetVRFEnforcedEpoch wires the QR-40 epoch-gated, network-wide VRF proof
@@ -1978,7 +2033,14 @@ func (v *BlockValidator) validateTransactions(block *encoding.Block) error {
 	v.mu.RLock()
 	sv := v.signingVerifier
 	nr := v.nonceReader
+	chainID := v.chainID
+	txChainIDEpoch := v.txChainIDEnforcementEpoch
 	v.mu.RUnlock()
+
+	// H-03: one pure decision for the whole block. Inactive
+	// (TxChainIDEnforcementDisabled) keeps the legacy path byte-identically;
+	// historical blocks below the activation epoch are grandfathered.
+	txChainIDEnforced := txChainIDEnforcementActive(block.Header.Epoch, txChainIDEpoch)
 
 	type sigItem struct {
 		index int
@@ -2010,6 +2072,19 @@ func (v *BlockValidator) validateTransactions(block *encoding.Block) error {
 		// the self-dealing vector identified by the audit.
 		if err := tx.Validate(); err != nil {
 			return err
+		}
+
+		// H-03: epoch-gated per-transaction ChainID equality. This runs even
+		// when signingVerifier is nil, because cross-chain replay protection
+		// must not depend on whether signatures are locally re-verified.
+		if txChainIDEnforced {
+			if chainID == 0 {
+				return fmt.Errorf("tx ChainID enforcement active but block validator chain ID is zero (fail-closed)")
+			}
+			if tx.ChainID != chainID {
+				return fmt.Errorf("%w: block tx %d has chain ID %d, expected %d",
+					encoding.ErrAuthChainIDMismatch, i, tx.ChainID, chainID)
+			}
 		}
 
 		// CONS- (2026-07-22): EIP-4844 blob tx fee validation.
