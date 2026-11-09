@@ -552,7 +552,13 @@ type Host struct {
 	// opt-in path used by R38-P1-08 deep fix).
 	activeValidatorIdentityVerifier ActiveValidatorIdentityVerifier
 	statusFreshnessWindowSec        uint64
-	sessionNonceTracker             *SessionNonceTracker
+	// statusV1WarnOnce fires the one-time diagnostic WARN when a SIGNED V1-
+	// shaped status registers the Address→PeerID mapping while the V2
+	// freshness window or session-nonce tracker is not wired (audit memo on
+	// 443c60c). Per-process, not per-peer: the point is to surface the
+	// constructor omission once, not to spam per frame.
+	statusV1WarnOnce    sync.Once
+	sessionNonceTracker *SessionNonceTracker
 
 	// Context and cancellation
 	ctx    context.Context
@@ -4463,6 +4469,24 @@ func (h *Host) handleBaseProtocol(msg *Message) error {
 					}
 				}
 				if verified {
+					// AUDIT memo on 443c60c (ported discipline): a SIGNED frame
+					// whose V2 extension is absent registers the mapping only
+					// because the receiver-side V2 controls are unwired (zero
+					// freshness window and/or nil session-nonce tracker) —
+					// production construction (node.initP2P) always wires both,
+					// so reaching this branch means a constructor omission that
+					// silently downgrades the anti-replay posture. Surface it
+					// once per process instead of per frame.
+					if h.statusFreshnessWindowSec == 0 || h.sessionNonceTracker == nil {
+						h.statusV1WarnOnce.Do(func() {
+							hostLog.Warnf("V1-shaped signed status registered the Address-to-PeerID mapping "+
+								"without V2 controls wired (freshnessWindow=%d, nonceTracker=%v) — the freshness "+
+								"window and session-nonce replay tracker are INERT in this process; wire "+
+								"SetStatusFreshnessWindowSec + SetSessionNonceTracker at construction "+
+								"(see node.initP2P)",
+								h.statusFreshnessWindowSec, h.sessionNonceTracker != nil)
+						})
+					}
 					// AUDIT-FULL H-2 FIX (2026-08-14): use the trusted internal
 					// registration path — the exported RegisterValidatorPeer is
 					// capability-gated for arbitrary callers.
