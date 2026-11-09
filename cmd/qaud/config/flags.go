@@ -12,6 +12,11 @@ type CLI struct {
 	GenesisFile *string
 	ShowVersion *bool
 
+	// GraphqlSet reports whether --graphql was passed explicitly. The node
+	// keeps starting GraphQL when the flag is omitted (legacy behaviour); only
+	// an explicit --graphql=false disables it.
+	GraphqlSet bool
+
 	NetworkName *string
 	NetworkID   *uint64
 	ListenAddr  *string
@@ -105,7 +110,7 @@ func DefineFlags() *CLI {
 	// access must opt in explicitly with --wsorigins https://app.example.com.
 	c.WSOrigins = flag.String("wsorigins", "", "Origins from which to accept websockets requests (empty = localhost only)")
 
-	c.GraphqlEnabled = flag.Bool("graphql", false, "Enable GraphQL server")
+	c.GraphqlEnabled = flag.Bool("graphql", false, "GraphQL server toggle (omit to keep the default enabled; --graphql=false disables it; QAU_GRAPHQL_ADDR=off also disables it)")
 	c.GraphqlAddr = flag.String("graphqladdr", ":8547", "GraphQL server listening address")
 
 	c.FrontendEnabled = flag.Bool("frontend", true, "Enable web frontend")
@@ -143,5 +148,12 @@ func DefineFlags() *CLI {
 	c.TLSKey = flag.String("tlskey", "", "Path to TLS key file")
 
 	flag.Parse()
+	// Record explicit flag presence so applyFlagOverrides can distinguish
+	// "--graphql=false" (disable) from "flag omitted" (legacy: keep running).
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "graphql" {
+			c.GraphqlSet = true
+		}
+	})
 	return c
 }

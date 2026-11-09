@@ -65,6 +65,8 @@ func applyFlagOverrides(cfg *node.Config, cli *CLI) {
 		cfg.MetricsAddr = *cli.MetricsAddr
 	}
 
+	applyGraphqlFlag(cfg, cli)
+
 	if *cli.GenesisFile != "" {
 		cfg.GenesisFile = *cli.GenesisFile
 	}
@@ -194,6 +196,18 @@ func applyFlagOverrides(cfg *node.Config, cli *CLI) {
 		cfg.RPCTLSCertFile = *cli.TLSCert
 		cfg.RPCTLSKeyFile = *cli.TLSKey
 	}
+}
+
+// applyGraphqlFlag propagates an explicit --graphql value into the node config.
+// When the flag is omitted (GraphqlSet == false) the node keeps its legacy
+// behaviour: the GraphQL server starts unless QAU_GRAPHQL_ADDR=off. Passing
+// --graphql=false disables it. See node.Config.GraphqlExplicit.
+func applyGraphqlFlag(cfg *node.Config, cli *CLI) {
+	if !cli.GraphqlSet {
+		return
+	}
+	cfg.GraphqlEnabled = *cli.GraphqlEnabled
+	cfg.GraphqlExplicit = true
 }
 
 func validateConsensusConfig() error {

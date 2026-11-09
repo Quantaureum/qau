@@ -20,6 +20,7 @@ import (
 	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
 	"github.com/quantaureum/qau/p2p"
+	"github.com/quantaureum/qau/params"
 	"github.com/quantaureum/qau/privacy"
 	"github.com/quantaureum/qau/qaudb/block"
 	"github.com/quantaureum/qau/qaudb/state"
@@ -179,6 +180,23 @@ type Syncer struct {
 	// used `if status.BestHeight > s.highestKnown`), so a height learned
 	// during a chain reset would stall every node forever.
 	peerHeights map[p2p.PeerID]uint64
+
+	// run-4 F-1 mitigation (ported from node 8245a07): status frames from
+	// unauthenticated peers can otherwise be replayed at line rate to keep
+	// syncing=true and to fan out a 500-block request to every peer per frame.
+	// Bound acceptance to one status per peer per second and dedupe identical
+	// request ranges.
+	lastStatusAt     map[p2p.PeerID]time.Time
+	lastRequestRange map[[2]uint64]time.Time
+
+	// AUDIT run-4 REG-03 (ported from node 8245a07): configurable plausibility
+	// bounds for advertised heights. Over-limit claims are clamped (never
+	// adopted as a sync target) instead of rejecting the whole status. Drift
+	// is a configurable allowance added to the elapsed wall time; the block
+	// interval is a configurable floor (the upper bound on sustainable block
+	// rate).
+	statusHeightMaxDrift         time.Duration
+	statusHeightMinBlockInterval time.Duration
 
 	// Pending blocks waiting for parent
 	// audit-fix H-2: uses pendingBlockEntry with TTL and bounded size
@@ -450,6 +468,11 @@ func NewSyncer(host *p2p.Host, blockStore *block.BlockStore, stateDB *state.Stat
 		peerHeights:       make(map[p2p.PeerID]uint64),
 		snapAccounts:      make(map[types.Address][]byte),
 		snapStorageWanted: make(map[types.Address]bool),
+		// AUDIT run-4 REG-03 defaults (ported from node 8245a07): 10 minutes of
+		// clock-drift allowance and the consensus block interval as the fastest
+		// sustainable block rate.
+		statusHeightMaxDrift:         defaultStatusHeightMaxDrift,
+		statusHeightMinBlockInterval: time.Duration(params.BlockTime) * time.Second,
 		// ETHEREUM-PARITY SYNC (2026-08-13): extended sync client maps.
 		pendingHeaderReqs:    make(map[uint64]*pendingHeaderRequest),
 		skeletonHeaders:      make(map[uint64]*encoding.BlockHeader),
@@ -3162,6 +3185,27 @@ func (s *Syncer) peerStatusLoop() {
 
 // queryPeerStatus queries connected peers for their chain status
 func (s *Syncer) queryPeerStatus() {
+	status := s.buildStatusMessage()
+	if status == nil {
+		return
+	}
+
+	// Encode and broadcast status
+	statusData := p2p.EncodeStatusMessage(status)
+	data, err := p2p.EncodeMessage(p2p.MsgTypeStatus, statusData)
+	if err != nil {
+		return
+	}
+
+	// Use BroadcastRaw since we already encoded the message with correct type
+	s.safeBroadcastRaw(s.ctx, data)
+}
+
+// buildStatusMessage builds the local status frame, signing the Protocol V2
+// signed domain (base[:104] || Timestamp || SessionNonce) when a validator
+// signer is configured. Extracted from queryPeerStatus so the signed-domain
+// construction is unit-testable (AUDIT run-3 H-01, ported from node 8245a07).
+func (s *Syncer) buildStatusMessage() *p2p.StatusMessage {
 	// Build our status message with current height
 	s.mu.Lock()
 	currentHeight := s.currentHeight
@@ -3238,15 +3282,7 @@ func (s *Syncer) queryPeerStatus() {
 		}
 	}
 
-	// Encode and broadcast status
-	statusData := p2p.EncodeStatusMessage(status)
-	data, err := p2p.EncodeMessage(p2p.MsgTypeStatus, statusData)
-	if err != nil {
-		return
-	}
-
-	// Use BroadcastRaw since we already encoded the message with correct type
-	s.safeBroadcastRaw(s.ctx, data)
+	return status
 }
 
 // UpdateHighestKnown updates the highest known block height
@@ -3487,6 +3523,13 @@ func (s *Syncer) HandleStatusMessage(status *p2p.StatusMessage, from p2p.PeerID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// run-4 F-1 mitigation (ported from node 8245a07): bound per-peer status
+	// acceptance before any logging or state mutation. This does not
+	// authenticate the peer.
+	if !s.allowPeerStatus(from, time.Now()) {
+		return
+	}
+
 	syncLog.Info("HandleStatusMessage: peer=%s peerNetworkID=%d, ourNetworkID=%d, peerHeight=%d, ourHeight=%d, ourHighestKnown=%d, peerGenesisHash=%x",
 		from.String()[:min(len(from.String()), 16)], status.NetworkID, s.networkID, status.BestHeight, s.currentHeight, s.highestKnown, status.GenesisHash[:8])
 
@@ -3529,6 +3572,21 @@ func (s *Syncer) HandleStatusMessage(status *p2p.StatusMessage, from p2p.PeerID)
 	// producer mode when peers are connected but slow to advertise height.
 	s.peerStatusReceived = true
 
+	// AUDIT run-4 REG-03 (ported from node 8245a07): set before the
+	// plausibility check so a status that is merely over-limit still proves a
+	// peer is present; only its leading height is discarded.
+
+	// AUDIT run-3 H-02 FIX / run-4 REG-03 (ported from node 8245a07): an
+	// advertised height the chain cannot physically have reached is not
+	// adopted. Over-limit claims are dropped for this peer only: existing
+	// peer heights and other peers' claims are untouched, so a forged 10^9
+	// cannot pin the node in syncing mode.
+	if maxHeight, ok := s.maxCredibleHeight(); ok && status.BestHeight > maxHeight {
+		syncLog.Warn("HandleStatusMessage: ignoring implausible peer height %d (credible max %d) from %s; peer status still counts as received",
+			status.BestHeight, maxHeight, from)
+		return
+	}
+
 	// GHOST-HEIGHT FIX: record this peer's latest advertised height, then
 	// recompute highestKnown as max(currentHeight, all peer heights). This is
 	// what lets highestKnown decay once connected peers re-advertise after a
@@ -3538,7 +3596,9 @@ func (s *Syncer) HandleStatusMessage(status *p2p.StatusMessage, from p2p.PeerID)
 
 	if genesisMismatch {
 		syncLog.Info("HandleStatusMessage: requesting blocks from height 0 to %d (genesis resync)", status.BestHeight)
-		s.requestBlocksByHeightUnlocked(0, status.BestHeight)
+		if s.allowStatusRangeRequest(0, status.BestHeight, time.Now()) {
+			s.requestBlocksByHeightUnlocked(0, status.BestHeight)
+		}
 		return
 	}
 
@@ -3560,8 +3620,117 @@ func (s *Syncer) HandleStatusMessage(status *p2p.StatusMessage, from p2p.PeerID)
 		// block application. Peer status is not sync progress; updating it
 		// here prevents stall detection from firing when peers repeatedly
 		// advertise a height that cannot be delivered/applied.
-		s.requestBlocksByHeightUnlocked(s.currentHeight+1, status.BestHeight)
+		//
+		// run-4 F-1 mitigation (ported from node 8245a07): identical ranges are
+		// requested at most once per dedup window, so a replayed status cannot
+		// fan out a full 500-block request to every peer on each frame.
+		if s.allowStatusRangeRequest(s.currentHeight+1, status.BestHeight, time.Now()) {
+			s.requestBlocksByHeightUnlocked(s.currentHeight+1, status.BestHeight)
+		}
 	}
+}
+
+// statusHeightSlackBlocks tolerates block-cadence jitter without clamping
+// honest peers (2 epochs = 64 blocks).
+const statusHeightSlackBlocks = 2 * params.EpochLength
+
+// run-4 F-1 mitigation bounds (ported from node 8245a07). These limit
+// replay/amplification but do NOT authenticate the status source; a patient
+// peer can still re-advertise once per second and keep the node in syncing
+// state. Full removal of single-peer suppression needs a corroboration design
+// (validator-signed status or an N-independent-peer quorum) and is tracked
+// separately.
+const (
+	statusMinIntervalPerPeer = time.Second
+	statusRequestDedupWindow = 30 * time.Second
+)
+
+// allowPeerStatus reports whether a status frame from the given peer may be
+// processed at time now, and records the acceptance time.
+func (s *Syncer) allowPeerStatus(from p2p.PeerID, now time.Time) bool {
+	if s.lastStatusAt == nil {
+		s.lastStatusAt = make(map[p2p.PeerID]time.Time)
+	}
+	if prev, ok := s.lastStatusAt[from]; ok && now.Sub(prev) < statusMinIntervalPerPeer {
+		return false
+	}
+	s.lastStatusAt[from] = now
+	return true
+}
+
+// allowStatusRangeRequest deduplicates identical block-request ranges within
+// statusRequestDedupWindow and prunes stale entries.
+func (s *Syncer) allowStatusRangeRequest(from, to uint64, now time.Time) bool {
+	if s.lastRequestRange == nil {
+		s.lastRequestRange = make(map[[2]uint64]time.Time)
+	}
+	for key, at := range s.lastRequestRange {
+		if now.Sub(at) >= statusRequestDedupWindow {
+			delete(s.lastRequestRange, key)
+		}
+	}
+	key := [2]uint64{from, to}
+	if prev, ok := s.lastRequestRange[key]; ok && now.Sub(prev) < statusRequestDedupWindow {
+		return false
+	}
+	s.lastRequestRange[key] = now
+	return true
+}
+
+// defaultStatusHeightMaxDrift is the default clock-drift allowance added to
+// the elapsed wall time before it is converted into a credible height
+// (AUDIT run-4 REG-03, ported from node 8245a07). Ten minutes absorbs NTP
+// steps and manual clock fixes while keeping a forged claim bounded to roughly
+// 50 blocks above the true tip.
+const defaultStatusHeightMaxDrift = 10 * time.Minute
+
+// SetStatusHeightBounds overrides the advertised-height plausibility bounds
+// (AUDIT run-4 REG-03). drift is added to the elapsed wall time;
+// minBlockInterval is the fastest block rate the chain is assumed to be able
+// to sustain, so (elapsed + drift) / minBlockInterval caps what a peer may
+// claim. Values that are non-positive or below one second keep the current
+// setting.
+func (s *Syncer) SetStatusHeightBounds(drift, minBlockInterval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if drift > 0 {
+		s.statusHeightMaxDrift = drift
+	}
+	if minBlockInterval >= time.Second {
+		s.statusHeightMinBlockInterval = minBlockInterval
+	}
+}
+
+// maxCredibleHeight returns the highest chain height that is physically
+// plausible given the genesis timestamp, the configured clock-drift allowance
+// and the configured block-rate floor (AUDIT run-3 H-02, widened in run-4
+// REG-03; ported from node 8245a07). It returns ok=false when the local
+// genesis block is unavailable, in which case the caller cannot apply a
+// meaningful bound.
+func (s *Syncer) maxCredibleHeight() (uint64, bool) {
+	if s.blockStore == nil {
+		return 0, false
+	}
+	genesis, err := s.blockStore.GetBlockByHeight(0)
+	if err != nil || genesis == nil || genesis.Header == nil || genesis.Header.Timestamp <= 0 {
+		return 0, false
+	}
+	interval := s.statusHeightMinBlockInterval
+	if interval < time.Second {
+		interval = time.Duration(params.BlockTime) * time.Second
+	}
+	drift := s.statusHeightMaxDrift
+	if drift <= 0 {
+		drift = defaultStatusHeightMaxDrift
+	}
+	// A clock rolled back behind genesis leaves no provable elapsed time; the
+	// drift allowance alone still yields a positive bound so honest low-height
+	// peers are adopted instead of rejected.
+	elapsed := int64(0)
+	if now := time.Now().Unix(); now > genesis.Header.Timestamp {
+		elapsed = now - genesis.Header.Timestamp
+	}
+	return uint64(elapsed+int64(drift/time.Second))/uint64(interval/time.Second) + statusHeightSlackBlocks, true
 }
 
 // recomputeHighestKnownLocked recomputes highestKnown as the maximum of our own

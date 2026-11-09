@@ -108,6 +108,17 @@ type Config struct {
 	HealthEnabled bool   `json:"healthEnabled"`
 	HealthAddr    string `json:"healthAddr"`
 
+	// GraphQL HTTP API toggle (audit run-3 qau.config/graphql-flag-ignored,
+	// ported from node 8245a07). GraphqlExplicit records whether the operator
+	// actually passed --graphql; only then does GraphqlEnabled take effect.
+	// When the flag is omitted the legacy behaviour is preserved (server starts
+	// unless QAU_GRAPHQL_ADDR=off), so existing deployments keep working
+	// unchanged. Passing --graphql=false stops the server instead of silently
+	// leaving it running. Neither field is persisted in config.json (json:"-"):
+	// the toggle is a process-start decision, not a stored setting.
+	GraphqlEnabled  bool `json:"-"`
+	GraphqlExplicit bool `json:"-"`
+
 	// Consensus
 	ValidatorEnabled bool   `json:"validatorEnabled"`
 	ValidatorKey     string `json:"validatorKey"`
@@ -147,6 +158,15 @@ type Config struct {
 	// state afterwards, snap sync for large gaps); "full" = re-execute every
 	// block during sync (geth --syncmode=full equivalent).
 	SyncMode string `json:"syncMode"`
+
+	// AUDIT run-4 REG-03 (ported from node 8245a07): plausibility bounds for
+	// heights advertised in peer status messages. A peer may claim at most
+	// (elapsed_since_genesis + StatusHeightMaxDriftSec) / minBlockInterval
+	// blocks; over-limit claims are clamped (never adopted as a sync target)
+	// instead of rejecting the whole status. Zero keeps the defaults
+	// (10-minute drift allowance, consensus block interval as the rate floor).
+	StatusHeightMaxDriftSec         int64 `json:"statusHeightMaxDriftSec"`
+	StatusHeightMinBlockIntervalSec int64 `json:"statusHeightMinBlockIntervalSec"`
 
 	// Genesis
 	GenesisFile string `json:"genesisFile"`
@@ -207,6 +227,29 @@ type Config struct {
 	// This is a local liveness knob only: it never changes block validity or
 	// the state root, so it does not need to be identical across nodes.
 	StateRootMismatchRetryLimit int `json:"stateRootMismatchRetryLimit,omitempty"`
+	// TxChainIDEnforcementActivationEpoch is the first block epoch at which
+	// every transaction in a block must carry tx.ChainID equal to this node's
+	// chain ID (audit H-03, ported from node 8245a07). 0 / unset = effective
+	// from genesis (the hardened default); set to math.MaxUint64
+	// (18446744073709551615) to disable the gate entirely (legacy behavior).
+	// MUST be identical on every node — a divergent value changes the accepted
+	// block set at the boundary and forks the chain.
+	TxChainIDEnforcementActivationEpoch uint64 `json:"txChainIDEnforcementActivationEpoch,omitempty"`
+	// RollupMinVRFEpochActivation is the first rollup epoch at which a
+	// zero-hash VRF epoch seed refuses sequencer election (P3-RL-05, audit
+	// L-09). 0 / unset = gate inactive: the legacy bootstrap fallback
+	// (keccak256(epoch) % n) stays in effect. Activation changes sequencer
+	// election, so it MUST be identical on every node of the rollup network;
+	// the activation epoch itself is a governance decision (pending) — this
+	// field only carries it.
+	RollupMinVRFEpochActivation uint64 `json:"rollupMinVRFEpochActivation,omitempty"`
+	// VRFProofEnforcementActivationEpoch is an optional independent override
+	// for the epoch at which VRF proof enforcement activates (audit H-04 /
+	// QR-40). 0 / unset = fall back to ConsensusHardeningActivationEpoch
+	// (legacy wiring), which itself defaults to 0 (disabled). Set this to
+	// schedule the VRF gate without enabling the other bundled hardening
+	// semantics. MUST be identical on every node.
+	VRFProofEnforcementActivationEpoch uint64 `json:"vrfProofEnforcementActivationEpoch,omitempty"`
 	// VDFSeedTimeSteps is the VDF sequential length T. 0 = the calibrated
 	// default (16,384). Governance pins this before activation; changing it
 	// after activation is a protocol change (same upgrade path).

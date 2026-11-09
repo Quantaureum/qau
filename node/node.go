@@ -2322,7 +2322,18 @@ func (n *Node) initConsensus() error {
 	n.blockValidator = core.NewBlockValidator(n.chainID, n.config.MaxGasLimit)
 	// QR-40: epoch-gated VRF proof enforcement. 0 keeps the historical
 	// behavior; a non-zero value must be identical on every node.
-	n.blockValidator.SetVRFEnforcedEpoch(n.config.ConsensusHardeningActivationEpoch)
+	// H-04 (ported from node 8245a07): VRFProofEnforcementActivationEpoch is
+	// an independent override; when unset it preserves the legacy
+	// ConsensusHardeningActivationEpoch wiring.
+	vrfActivationEpoch := n.config.VRFProofEnforcementActivationEpoch
+	if vrfActivationEpoch == 0 {
+		vrfActivationEpoch = n.config.ConsensusHardeningActivationEpoch
+	}
+	n.blockValidator.SetVRFEnforcedEpoch(vrfActivationEpoch)
+	// H-03: per-transaction ChainID equality gate (ported from node 8245a07).
+	// 0 = active from genesis (hardened default); math.MaxUint64 = disabled
+	// (legacy behavior). See core.TxChainIDEnforcementDisabled.
+	n.blockValidator.SetTxChainIDEnforcementEpoch(n.config.TxChainIDEnforcementActivationEpoch)
 
 	n.blockValidator.SetValidatorLookup(n.validatorManager)
 	n.blockValidator.SetKeyVersionValidator(&defaultKeyVersionValidator{})
@@ -4051,6 +4062,13 @@ func (n *Node) bridgeSyncCommitteeToLightClient(qpos *consensus.QPOS) {
 func (n *Node) initSyncer() error {
 	n.syncer = NewSyncer(n.p2pHost, n.blockStore, n.stateDB, n.blockValidator, n.config.NetworkID)
 	n.syncer.SetCheckpointManager(n.checkpointManager)
+	// AUDIT run-4 REG-03 (ported from node 8245a07): apply the configurable
+	// advertised-height plausibility bounds (0 keeps the defaults baked into
+	// NewSyncer).
+	n.syncer.SetStatusHeightBounds(
+		time.Duration(n.config.StatusHeightMaxDriftSec)*time.Second,
+		time.Duration(n.config.StatusHeightMinBlockIntervalSec)*time.Second,
+	)
 	// ETHEREUM-PARITY SYNC (2026-08-13): --sync.mode=full re-executes every
 	// block during sync instead of the store-then-rebuild fast path.
 	n.syncer.SetFullSyncMode(n.config.SyncMode == "full")
@@ -5072,6 +5090,11 @@ func (n *Node) initRollup() error {
 	}
 
 	cfg := rollup.DefaultRollupConfig()
+	// AUDIT L-09 (ported from node 8245a07): the P3-RL-05 sequencer-election
+	// gate activation epoch is a governance decision carried by config. The
+	// default (0, unset) keeps the gate inert so election stays byte-identical
+	// to the pre-wiring behavior.
+	cfg.MinVRFEpochActivation = n.config.RollupMinVRFEpochActivation
 
 	// RLLP- (2026-07-16): Set BridgeAddress so processBatchLocked burns
 	// withdrawal value from L2 supply (deducts from sender without crediting
@@ -7952,7 +7975,14 @@ func (n *Node) initLightClient() {
 // The address is read from the QAU_GRAPHQL_ADDR env var, defaulting to
 // 127.0.0.1:8547 (8547 avoids conflict with the WebSocket server on 8546).
 // Set QAU_GRAPHQL_ADDR=off to disable the GraphQL server entirely.
+// Passing --graphql=false also disables it (audit run-3
+// qau.config/graphql-flag-ignored, ported from node 8245a07); omitting the
+// flag keeps the legacy "enabled unless QAU_GRAPHQL_ADDR=off" behaviour.
 func (n *Node) startGraphQLServer() {
+	if n.config != nil && n.config.GraphqlExplicit && !n.config.GraphqlEnabled {
+		nodeLog.Info("GraphQL server disabled by --graphql=false")
+		return
+	}
 	addr := os.Getenv("QAU_GRAPHQL_ADDR")
 	if addr == "off" {
 		nodeLog.Info("GraphQL server disabled by QAU_GRAPHQL_ADDR=off")
@@ -7965,7 +7995,7 @@ func (n *Node) startGraphQLServer() {
 	// Create the GraphQL resolver and handler using a blockchain reader adapter.
 	reader := &graphqlReaderAdapter{n}
 	resolver := graphql.NewResolver(reader)
-	handlerCfg := graphql.DefaultHandlerConfig()
+	handlerCfg := n.graphqlHandlerConfig(addr)
 	graphqlHandler := graphql.NewHandler(resolver, handlerCfg)
 
 	mux := http.NewServeMux()
@@ -7994,6 +8024,41 @@ func (n *Node) startGraphQLServer() {
 			nodeLog.Error("GraphQL server failed: %v", err)
 		}
 	}()
+}
+
+// graphqlHandlerConfig builds the GraphQL handler configuration for the
+// resolved listen address.
+//
+// AUDIT run-3 qau.graphql/forced-auth-unwired-fail-closed-independent-model
+// FIX (ported from node 8245a07): the handler used to be constructed from
+// DefaultHandlerConfig() alone, with no credential source. On a non-loopback
+// listener that left the endpoint permanently fail-closed (every request 401)
+// with no way to authenticate. A non-loopback listener now takes the
+// operator-configured API key from QAU_GRAPHQL_API_KEY. Without one the
+// handler stays fail-closed (AuthDisabled=false, empty key) and the node logs
+// an explicit error.
+func (n *Node) graphqlHandlerConfig(addr string) *graphql.HandlerConfig {
+	cfg := graphql.DefaultHandlerConfig()
+	// AUDIT run-3 qau.graphql/loopback-forwarded-ip-rate-limit-bypass FIX:
+	// reuse the RPC trusted-proxy whitelist for forwarded client-IP
+	// attribution. With no configured proxy the GraphQL handler ignores
+	// X-Real-IP/X-Forwarded-For and rate-limits on the direct peer address.
+	if proxies, err := resolveRPCTrustedProxies(n.config.RPCTrustedProxies, os.Getenv(rpcTrustedProxiesEnv)); err == nil {
+		cfg.TrustedProxies = proxies
+	} else {
+		nodeLog.Warn("GraphQL: invalid trusted-proxy configuration, forwarded headers will be ignored: %v", err)
+	}
+	if !isNonLoopbackAddr(addr) {
+		return cfg
+	}
+	if key := os.Getenv("QAU_GRAPHQL_API_KEY"); key != "" {
+		cfg.APIKey = key
+		nodeLog.Info("GraphQL: API-key authentication enabled for non-loopback listener %s", addr)
+		return cfg
+	}
+	nodeLog.Error("SECURITY: GraphQL is bound to non-loopback %s but QAU_GRAPHQL_API_KEY is not set — "+
+		"every request will be rejected (fail-closed). Set QAU_GRAPHQL_API_KEY to enable authenticated access.", addr)
+	return cfg
 }
 
 // EventBus returns the node's event bus for subscribing to real-time events

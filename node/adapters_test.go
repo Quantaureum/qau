@@ -2,6 +2,7 @@
 package node
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/big"
 	"strings"
@@ -256,6 +257,165 @@ func TestAggregatePartialSignatures_LocalModeNoSigsSucceeds(t *testing.T) {
 	if len(sig) == 0 {
 		t.Error("expected non-empty signature")
 	}
+}
+
+// TestAggregatePartialSignatures_MainnetFailClosed is the regression guard for
+// the run-4 P0-1 recurrence: on mainnet a node that holds more than one DKG
+// share locally can otherwise produce a "threshold" seal signature by itself,
+// so the t-of-n and 2/3 stake gates degrade to a self-declaration. D-32 made
+// the network default armed, so both an absent key and an explicit 1 must refuse.
+func TestAggregatePartialSignatures_MainnetFailClosed(t *testing.T) {
+	mgr, err := tss.NewTSSManager(tss.DefaultTSSConfig())
+	if err != nil {
+		t.Fatalf("NewTSSManager: %v", err)
+	}
+	if _, err := mgr.GenerateKeyShares(); err != nil {
+		t.Fatalf("GenerateKeyShares: %v", err)
+	}
+	if got := mgr.ShareCount(); got <= 1 {
+		t.Fatalf("ShareCount = %d, want > 1 for the multi-share refusal case", got)
+	}
+
+	cases := []struct {
+		name       string
+		activation *uint64
+	}{
+		{"network default (key absent)", nil},
+		{"explicit 1", ptrUint64(1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTSSSignerAdapterWithNode(mgr, &Node{config: &Config{
+				NetworkID:                   MainnetNetworkID,
+				QTDLocalAllSharesActivation: tc.activation,
+			}})
+			_, err := adapter.AggregatePartialSignatures([]int{1, 2, 3}, nil, []byte("mainnet-seal"))
+			if err == nil {
+				t.Fatal("mainnet local all-shares sealing must fail closed when armed")
+			}
+			if !strings.Contains(err.Error(), "all-shares") ||
+				!strings.Contains(err.Error(), "fail-closed on mainnet") {
+				t.Fatalf("error = %v, want an armed mainnet all-shares reason", err)
+			}
+		})
+	}
+}
+
+// TestAggregatePartialSignatures_MainnetSingleShareNotRefused is the direct
+// evidence that the armed mainnet default does not mis-reject the production
+// shape: every sampled validator loads exactly one share of a 4-of-6 group.
+// ShareCount()==1 keeps the call out of the all-shares branch; whatever
+// SignWithRetry does afterwards is a separate (expected) failure.
+func TestAggregatePartialSignatures_MainnetSingleShareNotRefused(t *testing.T) {
+	cfg := tss.DefaultTSSConfig()
+	cfg.Threshold = 4
+	cfg.TotalShares = 6
+
+	src, err := tss.NewTSSManager(cfg)
+	if err != nil {
+		t.Fatalf("NewTSSManager(src): %v", err)
+	}
+	if _, err := src.GenerateKeyShares(); err != nil {
+		t.Fatalf("GenerateKeyShares: %v", err)
+	}
+
+	one, err := tss.NewTSSManager(cfg)
+	if err != nil {
+		t.Fatalf("NewTSSManager(one): %v", err)
+	}
+	if err := one.ImportKeyShares(singleShareBlobForTest(t, src, 1)); err != nil {
+		t.Fatalf("ImportKeyShares: %v", err)
+	}
+	if got := one.ShareCount(); got != 1 {
+		t.Fatalf("ShareCount = %d, want 1 (production shape: one share per validator)", got)
+	}
+
+	// Production configs have no qtdLocalAllSharesActivation key, so nil must
+	// resolve to the armed mainnet default.
+	node := &Node{config: &Config{NetworkID: MainnetNetworkID}}
+	if got := node.config.localAllSharesActivationEffective(); got != 1 {
+		t.Fatalf("mainnet default activation = %d, want 1 (armed)", got)
+	}
+
+	adapter := newTSSSignerAdapterWithNode(one, node)
+	_, err = adapter.AggregatePartialSignatures([]int{1, 2, 3, 4}, nil, []byte("mainnet-seal"))
+	if err != nil && strings.Contains(err.Error(), "fail-closed on mainnet") {
+		t.Fatalf("ShareCount()==1 must not be refused by the mainnet all-shares guard: %v", err)
+	}
+	t.Logf("SignWithRetry result with ShareCount()==1: %v", err)
+}
+
+// TestAggregatePartialSignatures_MainnetGuardInactive pins the rollback and the
+// permanent opt-out: explicit 0 keeps the pre-run-4 behavior, and max uint64 is
+// the permanent off value. Neither may refuse the local path, regardless of how
+// many shares are loaded.
+func TestAggregatePartialSignatures_MainnetGuardInactive(t *testing.T) {
+	mgr, err := tss.NewTSSManager(tss.DefaultTSSConfig())
+	if err != nil {
+		t.Fatalf("NewTSSManager: %v", err)
+	}
+	if _, err := mgr.GenerateKeyShares(); err != nil {
+		t.Fatalf("GenerateKeyShares: %v", err)
+	}
+
+	cases := []struct {
+		name       string
+		activation *uint64
+		want       uint64
+	}{
+		{"explicit 0 rollback", ptrUint64(0), 0},
+		{"max uint64 permanent off", ptrUint64(qtdLocalAllSharesActivationPermanentOff), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &Node{config: &Config{
+				NetworkID:                   MainnetNetworkID,
+				QTDLocalAllSharesActivation: tc.activation,
+			}}
+			if got := node.config.localAllSharesActivationEffective(); got != tc.want {
+				t.Fatalf("effective activation = %d, want %d", got, tc.want)
+			}
+			adapter := newTSSSignerAdapterWithNode(mgr, node)
+			_, err := adapter.AggregatePartialSignatures([]int{1, 2, 3}, nil, []byte("mainnet-seal"))
+			if err != nil && strings.Contains(err.Error(), "fail-closed on mainnet") {
+				t.Fatalf("%s must not refuse the local path: %v", tc.name, err)
+			}
+			// SignWithRetry may fail in the test environment; the assertion
+			// above is that the refusal did not trigger.
+			t.Logf("SignWithRetry result with %s: %v", tc.name, err)
+		})
+	}
+}
+
+// ptrUint64 returns a pointer to v for the tri-state config field.
+func ptrUint64(v uint64) *uint64 { return &v }
+
+// singleShareBlobForTest builds the legacy single-share import blob
+// (uint16 count || uint32 len || share || uint32 len || group key) that
+// ImportKeyShares parses, so the receiving manager ends up holding exactly
+// one share — the production topology (one share per validator).
+func singleShareBlobForTest(t *testing.T, src *tss.TSSManager, participantID int) []byte {
+	t.Helper()
+	share, err := src.GetQTDShare(participantID)
+	if err != nil {
+		t.Fatalf("GetQTDShare(%d): %v", participantID, err)
+	}
+	encoded := share.Encode()
+	if len(encoded) == 0 {
+		t.Fatalf("share %d encoded to zero bytes", participantID)
+	}
+	groupKey, err := src.ExportGroupPublicKey()
+	if err != nil {
+		t.Fatalf("ExportGroupPublicKey: %v", err)
+	}
+
+	buf := make([]byte, 0, 2+4+len(encoded)+4+len(groupKey))
+	buf = binary.BigEndian.AppendUint16(buf, 1)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(encoded)))
+	buf = append(buf, encoded...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(groupKey)))
+	buf = append(buf, groupKey...)
+	return buf
 }
 
 // TestDistributedTSSHasNoEnableSwitch is the regression guard for TSS-R3-B-1.

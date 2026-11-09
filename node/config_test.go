@@ -578,6 +578,119 @@ func TestConfigValidate_KeyRotationBackupDir(t *testing.T) {
 	}
 }
 
+// ── D-32 / run-4 P0-1: mainnet QTD all-shares activation tri-state ──
+
+// TestLocalAllSharesActivationEffective pins the tri-state resolution:
+// absent = network default (armed on mainnet, disarmed elsewhere), explicit 0 =
+// rollback to the pre-run-4 behavior, explicit 1 = armed, max uint64 = permanent
+// opt-out. This is the "config-driven, never hardcoded" guarantee.
+func TestLocalAllSharesActivationEffective(t *testing.T) {
+	cases := []struct {
+		name       string
+		networkID  uint64
+		activation *uint64
+		want       uint64
+	}{
+		{"mainnet absent = armed", MainnetNetworkID, nil, 1},
+		{"testnet absent = disarmed", TestnetNetworkID, nil, 0},
+		{"devnet absent = disarmed", DevnetNetworkID, nil, 0},
+		{"mainnet explicit 1 = armed", MainnetNetworkID, ptrUint64(1), 1},
+		{"mainnet explicit 0 = rollback", MainnetNetworkID, ptrUint64(0), 0},
+		{"mainnet max uint64 = permanent off", MainnetNetworkID, ptrUint64(qtdLocalAllSharesActivationPermanentOff), 0},
+		{"testnet explicit 1 = armed", TestnetNetworkID, ptrUint64(1), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{NetworkID: tc.networkID, QTDLocalAllSharesActivation: tc.activation}
+			if got := cfg.localAllSharesActivationEffective(); got != tc.want {
+				t.Fatalf("effective activation = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_LocalAllSharesActivationDefault proves the production path:
+// a mainnet config.json with no qtdLocalAllSharesActivation key resolves to
+// armed, while an explicit 0 (rollback) and MaxUint64 (permanent off) are
+// honored after a real LoadConfig round-trip.
+func TestLoadConfig_LocalAllSharesActivationDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	doc := map[string]any{
+		"name":      "d32-config",
+		"networkId": MainnetNetworkID,
+		"dataDir":   filepath.Join(dir, "data"),
+	}
+	writeDoc := func(t *testing.T) {
+		t.Helper()
+		raw, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal config: %v", err)
+		}
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	writeDoc(t)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfg.localAllSharesActivationEffective(); got != 1 {
+		t.Fatalf("absent key on mainnet resolved to %d, want 1 (armed default)", got)
+	}
+
+	doc["qtdLocalAllSharesActivation"] = 0
+	writeDoc(t)
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig (rollback): %v", err)
+	}
+	if got := cfg.localAllSharesActivationEffective(); got != 0 {
+		t.Fatalf("explicit 0 resolved to %d, want 0 (rollback)", got)
+	}
+
+	doc["qtdLocalAllSharesActivation"] = qtdLocalAllSharesActivationPermanentOff
+	writeDoc(t)
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig (permanent off): %v", err)
+	}
+	if got := cfg.localAllSharesActivationEffective(); got != 0 {
+		t.Fatalf("max uint64 resolved to %d, want 0 (permanent off)", got)
+	}
+}
+
+// TestConfigValidate_LocalAllSharesActivationRange rejects typos while allowing
+// the three meaningful explicit values.
+func TestConfigValidate_LocalAllSharesActivationRange(t *testing.T) {
+	for _, v := range []uint64{0, 1, qtdLocalAllSharesActivationPermanentOff} {
+		cfg := &Config{
+			NetworkID:                   TestnetNetworkID,
+			DataDir:                     t.TempDir(),
+			QTDLocalAllSharesActivation: ptrUint64(v),
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate with qtdLocalAllSharesActivation=%d should succeed, got: %v", v, err)
+		}
+	}
+
+	cfg := &Config{
+		NetworkID:                   TestnetNetworkID,
+		DataDir:                     t.TempDir(),
+		QTDLocalAllSharesActivation: ptrUint64(2),
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate with qtdLocalAllSharesActivation=2 should fail")
+	}
+	if !strings.Contains(err.Error(), "qtdLocalAllSharesActivation") {
+		t.Errorf("error should name the field, got: %v", err)
+	}
+}
+
 func TestConfigValidate_TLSCertRotationBackupDir(t *testing.T) {
 	cfg := &Config{
 		NetworkID: TestnetNetworkID,
