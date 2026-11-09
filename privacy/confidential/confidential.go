@@ -33,6 +33,13 @@ var (
 	ErrMissingPubKey         = errors.New("confidential: missing recipient public key")
 	ErrDuplicateNullifier    = errors.New("confidential: duplicate nullifier detected")
 	ErrInvalidNullifierProof = errors.New("confidential: invalid nullifier proof")
+
+	// ErrRangeProofBindingUnaudited is returned while the range proof is not
+	// cryptographically bound to the transaction's external Pedersen
+	// commitment (audit run-4 C-2, ported from node 8245a07). Keeping this
+	// fail-closed is a guard, not a fix: the root cause is the Groth16
+	// circuit's public-input set.
+	ErrRangeProofBindingUnaudited = errors.New("confidential: range proof is not bound to the external Pedersen commitment (circuit-level binding pending)")
 )
 
 // Domain separator constants for nullifier derivation
@@ -337,7 +344,22 @@ func (cm *ConfidentialManager) GenerateRangeProofWithBlinding(amount *big.Int, b
 	return proof, nil
 }
 
+// rangeProofBindingAudited is false until the Groth16 circuit takes the
+// transaction's external Pedersen commitment as a public input and constrains
+// its opening amount to [0, 2^BitLength). The current Schnorr binding is
+// self-referential: it proves knowledge of the blinding factor behind the
+// prover's own MiMC-derived commitment (Pedersen(MiMC(amount), r)), not the
+// external commitment Pedersen(amount, r), so the two can encode different
+// values. Do NOT flip this to true without the circuit change and a proof
+// that the range statement applies to the external commitment.
+// (Ported from node 8245a07, audit run-4 C-2; fingerprint
+// node/qzkp-range-proof-self-reference.)
+const rangeProofBindingAudited = false
+
 func (cm *ConfidentialManager) VerifyRangeProof(proof *qzkp.RangeProof, commitment []byte) error {
+	if !rangeProofBindingAudited {
+		return ErrRangeProofBindingUnaudited
+	}
 	if proof == nil {
 		return ErrRangeProofFailed
 	}

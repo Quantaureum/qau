@@ -284,6 +284,10 @@ testnet/node*/
 # ----- devnet node configs -----
 devnet/node*/
 
+# ----- plaintext key material written by cmd/dev_export_keys -----
+# (audit node/cmd-plaintext-key-export-gate: must never be committable)
+.devnet-work/
+
 # ----- tools: exclude all JS/PowerShell/Shell/Bat scripts, keep Go source -----
 tools/*.js
 tools/*.bat

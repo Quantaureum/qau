@@ -182,3 +182,49 @@ func TestSingleNode_StatePersistence(t *testing.T) {
 		t.Errorf("state not persisted: expected height >= %d, got %d", height1, height2)
 	}
 }
+
+// TestStartupSmoke_ServicesWiring is the startup-level smoke for the run-4
+// wiring changes. It starts a real devnet node and asserts the services the
+// changed code wires are actually present afterwards, without panicking.
+//
+// Deliberately NOT covered here: the validator→PeerID mapping registration.
+// The P2P host only registers that mapping from a SIGNED peer status, which
+// requires at least two nodes exchanging status messages over the mesh; a
+// single-process smoke can never produce a peer status event, so an assertion
+// here would pass vacuously. That path remains uncovered by unit tests and is
+// exercised only by a multi-node localtest run.
+func TestStartupSmoke_ServicesWiring(t *testing.T) {
+	cfg := devTestConfig(t)
+	// DefaultConfig binds the P2P listener to a fixed port; use an ephemeral
+	// one so the smoke cannot collide with a local node already running.
+	cfg.ListenAddr = "127.0.0.1:0"
+
+	// Rollup wiring is opt-in. Devnet permits in-memory L1 anchors, so this
+	// needs no additional escape hatch.
+	t.Setenv("QAU_ENABLE_ROLLUP", "1")
+	// Default GraphQL port is fixed and may be taken on a developer machine;
+	// point it at a free loopback port so the smoke exercises the real
+	// listener without colliding with a locally running node.
+	t.Setenv("QAU_GRAPHQL_ADDR", freeLoopbackAddr(t))
+
+	n, err := NewNode(cfg)
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	defer closeNodeDB(n)
+
+	if err := n.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer n.Stop()
+
+	if n.p2pHost == nil {
+		t.Fatal("startup must bring up the P2P host")
+	}
+	if n.syncer == nil {
+		t.Fatal("startup must wire the syncer")
+	}
+	if n.rollupEngine == nil {
+		t.Fatal("QAU_ENABLE_ROLLUP=1 must wire the L2 rollup engine")
+	}
+}

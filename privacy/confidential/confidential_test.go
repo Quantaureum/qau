@@ -3,6 +3,7 @@ package confidential
 
 import (
 	"crypto/rand"
+	"errors"
 	"math/big"
 	"testing"
 
@@ -116,8 +117,12 @@ func TestRangeProof(t *testing.T) {
 		t.Fatal("range proof should not be nil")
 	}
 
-	if err := cm.VerifyRangeProof(proof, commitment); err != nil {
-		t.Fatalf("range proof verification failed: %v", err)
+	// run-4 C-2 guard (ported from node 8245a07): the current Schnorr binding
+	// is self-referential, so the confidential range-proof path stays
+	// fail-closed until the Groth16 circuit binds the external Pedersen
+	// commitment.
+	if err := cm.VerifyRangeProof(proof, commitment); !errors.Is(err, ErrRangeProofBindingUnaudited) {
+		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 	}
 }
 
@@ -178,8 +183,11 @@ func TestVerifyConfidentialTx(t *testing.T) {
 
 	tx, _ := cm.CreateConfidentialTx(inputAmounts, outputAmounts, outputPubKeys, senderKemPub, fee)
 
-	if err := cm.VerifyConfidentialTx(tx); err != nil {
-		t.Fatalf("confidential tx verification failed: %v", err)
+	// run-4 C-2 guard: verification is fail-closed until the circuit binds the
+	// external Pedersen commitment. Creation still succeeds; only acceptance is
+	// blocked.
+	if err := cm.VerifyConfidentialTx(tx); !errors.Is(err, ErrRangeProofBindingUnaudited) {
+		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 	}
 }
 
@@ -199,8 +207,10 @@ func TestConfidentialEndToEnd(t *testing.T) {
 		t.Fatalf("failed to create tx: %v", err)
 	}
 
-	if err := cm.VerifyConfidentialTx(tx); err != nil {
-		t.Fatalf("failed to verify tx: %v", err)
+	// run-4 C-2 guard: the end-to-end acceptance path is fail-closed until the
+	// circuit binds the external Pedersen commitment.
+	if err := cm.VerifyConfidentialTx(tx); !errors.Is(err, ErrRangeProofBindingUnaudited) {
+		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 	}
 
 	if len(tx.Outputs) != 1 {
@@ -246,8 +256,8 @@ func TestConfidentialEdgeCases(t *testing.T) {
 	t.Run("nil range proof", func(t *testing.T) {
 		cm := newTestConfidentialManager()
 		err := cm.VerifyRangeProof(nil, []byte("test"))
-		if err != ErrRangeProofFailed {
-			t.Errorf("expected ErrRangeProofFailed, got %v", err)
+		if !errors.Is(err, ErrRangeProofBindingUnaudited) {
+			t.Errorf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 		}
 	})
 
@@ -428,8 +438,10 @@ func TestR4ZK02_UnboundRangeProof_Rejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("R4-ZK-02: unbound range proof (no Schnorr binding) should be REJECTED")
 	}
-	if err != ErrRangeProofFailed {
-		t.Fatalf("R4-ZK-02: expected ErrRangeProofFailed, got %v", err)
+	// run-4 C-2 guard (node 8245a07 port): the fail-closed binding gate fires
+	// before the R4-ZK-02 Schnorr check, so the guard error is expected here.
+	if !errors.Is(err, ErrRangeProofBindingUnaudited) {
+		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 	}
 }
 
@@ -458,8 +470,11 @@ func TestR4ZK02_BoundRangeProof_Accepted(t *testing.T) {
 		t.Fatal("R4-ZK-02: GenerateRangeProofWithBlinding should produce EcCommitment")
 	}
 
-	if err := cm.VerifyRangeProof(proof, commitment); err != nil {
-		t.Fatalf("R4-ZK-02: bound range proof should be accepted: %v", err)
+	// run-4 C-2 guard: even a bound proof is refused until the circuit binds
+	// the external Pedersen commitment (the R4-ZK-02 Schnorr check is
+	// subsumed by the fail-closed gate).
+	if err := cm.VerifyRangeProof(proof, commitment); !errors.Is(err, ErrRangeProofBindingUnaudited) {
+		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
 	}
 }
 
