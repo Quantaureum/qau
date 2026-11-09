@@ -1461,6 +1461,47 @@ func TestBatchVerifyIPA(t *testing.T) {
 	_ = err
 }
 
+// TestBatchVerifyIPA_MalformedLengths pins the AUDIT FIX: a non-empty batch
+// with a short per-item slice (notably cs) must return a size-mismatch error
+// instead of panicking on cs[0].
+func TestBatchVerifyIPA_MalformedLengths(t *testing.T) {
+	basis, err := NewPedersenBasis(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := []*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3), big.NewInt(4)}
+	b := []*big.Int{big.NewInt(5), big.NewInt(6), big.NewInt(7), big.NewInt(8)}
+	c := innerProduct(a, b)
+	commitment, _ := basis.Commit(a)
+	proof, _ := GenerateIPAProof(basis, a, b, c)
+
+	cases := []struct {
+		name        string
+		commitments []*PedersenCommitment
+		bs          [][]*big.Int
+		cs          []*big.Int
+		proofs      []*IPAProof
+	}{
+		{"short cs", []*PedersenCommitment{commitment}, [][]*big.Int{b}, nil, []*IPAProof{proof}},
+		{"empty cs", []*PedersenCommitment{commitment}, [][]*big.Int{b}, []*big.Int{}, []*IPAProof{proof}},
+		{"short bs", []*PedersenCommitment{commitment}, nil, []*big.Int{c}, []*IPAProof{proof}},
+		{"short proofs", []*PedersenCommitment{commitment}, [][]*big.Int{b}, []*big.Int{c}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, err := BatchVerifyIPA(basis, tc.commitments, tc.bs, tc.cs, tc.proofs)
+			if err == nil {
+				t.Fatalf("expected a size-mismatch error, got ok=%v err=nil", ok)
+			}
+			if ok {
+				t.Fatal("a malformed batch must not verify")
+			}
+		})
+	}
+}
+
 func TestBatchVerifyIPA_Empty(t *testing.T) {
 	basis, _ := NewPedersenBasis(4)
 	ok, err := BatchVerifyIPA(basis, nil, nil, nil, nil)

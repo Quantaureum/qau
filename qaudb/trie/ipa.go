@@ -249,7 +249,10 @@ func VerifyIPAProof(basis *PedersenBasis, commitment *PedersenCommitment, b []*b
 }
 
 func BatchVerifyIPA(basis *PedersenBasis, commitments []*PedersenCommitment, bs [][]*big.Int, cs []*big.Int, proofs []*IPAProof) (bool, error) {
-	if len(commitments) != len(proofs) || len(commitments) != len(bs) {
+	// AUDIT (2026) FIX: cs is indexed below (cs[0]) but was omitted from the
+	// length check, so a non-empty batch with an empty cs panicked instead of
+	// returning an error. Every per-item slice must match commitments.
+	if len(commitments) != len(proofs) || len(commitments) != len(bs) || len(commitments) != len(cs) {
 		return false, fmt.Errorf("batch size mismatch")
 	}
 
