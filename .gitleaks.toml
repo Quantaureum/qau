@@ -7,6 +7,10 @@
 
 [extend]
 # Start from gitleaks' default ruleset.
+# Without useDefault = true this file declares no detection rules at all, so
+# `gitleaks detect` always exits clean no matter what is committed — the CI
+# secret-scan step would be a no-op (audit node/ci-gitleaks-no-rules).
+useDefault = true
 
 [allowlist]
 description = "Synthetic test fixtures and documented devnet conventions"
