@@ -6,11 +6,15 @@ package rpc
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/quantaureum/qau/bridge"
+	"github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/types"
 )
 
@@ -176,13 +180,22 @@ func (api *BridgeAPI) GetSupportedChains(ctx context.Context, params json.RawMes
 // automatic relayer cannot complete the refund.
 // RPC: qau_bridgeRefundFailedLock
 //
-// Params: {"lockId": "...", "caller": "0x..."}
+// Params: {"lockId": "...", "caller": "0x...", "nonce": "...",
+//
+//	"signature": "0x...", "publicKey": "0x..."}
 //
 // Security model:
 //  1. Registered as AdminMethod → server enforces HMAC auth before dispatch.
-//  2. The caller address is parsed from params and passed to the bridge
-//     layer, which independently verifies that caller is in the
-//     authorizedOperators set (fail-closed when no operators are configured).
+//  2. SECURITY (audit N-22, 2026-11-06): the caller address used to be
+//     asserted by the request body alone, so any HMAC-authenticated admin
+//     client could claim to be an authorized operator and trigger refunds.
+//     The caller must now prove possession of the operator key: the request
+//     carries a Dilithium3 public key whose derived address must equal
+//     `caller`, plus a signature over
+//     "QAU-qau_bridgeRefundFailedLock|<caller>|<lockId>|<nonce>" with a
+//     deadline-embedded nonce. Only the proven caller is passed to the
+//     bridge layer, which independently checks the authorizedOperators set
+//     (fail-closed when no operators are configured).
 //  3. All refund attempts are logged with lockID + caller for audit trail.
 func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessage) (any, *Error) {
 	if api.bridge == nil || api.refunder == nil {
@@ -190,8 +203,11 @@ func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessa
 	}
 
 	var req struct {
-		LockID string `json:"lockId"`
-		Caller string `json:"caller"`
+		LockID    string `json:"lockId"`
+		Caller    string `json:"caller"`
+		Nonce     string `json:"nonce"`
+		Signature string `json:"signature"`
+		PublicKey string `json:"publicKey"`
 	}
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, &Error{Code: -32602, Message: "invalid params: " + err.Error()}
@@ -202,6 +218,13 @@ func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessa
 	caller, err := types.ParseHexAddress(req.Caller)
 	if err != nil {
 		return nil, &Error{Code: -32602, Message: "invalid caller address: " + err.Error()}
+	}
+
+	// SECURITY (audit N-22): the caller identity must be proven, not asserted.
+	if err := verifySignedRefundRequest(caller, req.LockID, req.Nonce, req.Signature, req.PublicKey); err != nil {
+		log.Printf("[SECURITY] qau_bridgeRefundFailedLock rejected lockId=%s claimedCaller=%s err=%v",
+			req.LockID, caller.ToHexAddress(), err)
+		return nil, &Error{Code: -32003, Message: "refund request is not authorized: " + err.Error()}
 	}
 
 	// Security audit log: record every refund attempt (success or failure).
@@ -221,6 +244,49 @@ func (api *BridgeAPI) RefundFailedLock(ctx context.Context, params json.RawMessa
 		"success": true,
 		"lockId":  req.LockID,
 	}, nil
+}
+
+// verifySignedRefundRequest proves that the request comes from the claimed
+// caller address. AUDIT N-22 (2026-11-06): previously the bridge trusted the
+// `caller` field from the request body, so an HMAC-authenticated admin who
+// was not an operator could impersonate one. The proof mirrors the DeFi
+// state-mutating pattern: Dilithium3 pubkey ↔ address binding plus a
+// signature over a domain-separated message that includes the lock ID and a
+// deadline-embedded nonce (replay/freshness protection).
+func verifySignedRefundRequest(caller types.Address, lockID, nonce, signature, pubKeyHex string) error {
+	if signature == "" || pubKeyHex == "" || nonce == "" {
+		return fmt.Errorf("signature, publicKey and nonce are required: the caller address must be proven by a Dilithium3 signature (client-asserted caller is not accepted)")
+	}
+
+	// Expired / over-far deadlines are rejected before any cryptographic work.
+	if _, err := ParseAuthNonceDeadline(nonce, time.Now()); err != nil {
+		return err
+	}
+
+	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "0x"))
+	if err != nil {
+		return fmt.Errorf("invalid signature hex: %w", err)
+	}
+	pubKeyBytes, err := hex.DecodeString(strings.TrimPrefix(pubKeyHex, "0x"))
+	if err != nil {
+		return fmt.Errorf("invalid publicKey hex: %w", err)
+	}
+
+	pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
+	if err != nil {
+		return fmt.Errorf("invalid Dilithium3 public key: %w", err)
+	}
+	if pubKey.Address() != caller {
+		return fmt.Errorf("public key does not match claimed caller address")
+	}
+
+	// Domain-separated so a signature collected for another RPC method (or
+	// another lock) cannot be replayed here.
+	message := []byte(fmt.Sprintf("QAU-qau_bridgeRefundFailedLock|%s|%s|%s", caller.ToHexAddress(), lockID, nonce))
+	if !crypto.Verify(pubKey, message, sigBytes) {
+		return fmt.Errorf("invalid caller signature")
+	}
+	return nil
 }
 
 // bridgeMessageToMap converts a BridgeMessage to a JSON-friendly map.
