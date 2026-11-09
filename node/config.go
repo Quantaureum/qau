@@ -1163,7 +1163,7 @@ func (c *Config) Validate() error {
 	if v := c.QTDLocalAllSharesActivation; v != nil &&
 		*v != 0 && *v != 1 && *v != qtdLocalAllSharesActivationPermanentOff {
 		return fmt.Errorf("qtdLocalAllSharesActivation must be 0 (rollback), 1 (armed), or %d (permanent off), got %d",
-			uint64(qtdLocalAllSharesActivationPermanentOff), *v)
+			qtdLocalAllSharesActivationPermanentOff, *v)
 	}
 
 	if c.DataDir == "" {
