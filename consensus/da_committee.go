@@ -696,7 +696,10 @@ func (c *DAAttestationCollector) BuildAggregateAttestation(slot uint64, commitme
 			// binding. The legacy fallback path in attestationCommitmentsMatch
 			// remains available for dev/test networks, but mainnet must
 			// require the full BlobCommitments trailing block.
-			if params.IsProductionEnv() && len(att.BlobCommitments) == 0 {
+			// run-13 B6: production determination includes the configured
+			// network ID (SetAttestationNetworkID), so the mainnet reject no
+			// longer depends on the env var alone.
+			if params.IsProduction(GetAttestationNetworkID()) && len(att.BlobCommitments) == 0 {
 				daCommitteeLogger.Errorf(
 					"[da] DA- legacy attestation (empty BlobCommitments) rejected in production mode for slot %d validator %d — full commitment set required",
 					slot, att.ValidatorIndex,

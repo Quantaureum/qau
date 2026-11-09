@@ -250,6 +250,10 @@ func TestShardQPOSAdapter_WrongProposer(t *testing.T) {
 	ResetAttestationNetworkIDForTesting()
 	SetAttestationNetworkID(1668)
 	FreezeAttestationNetworkID()
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// frozen mainnet ID left behind by this test would arm guards in later
+	// tests. Unfreeze and restore via the testing-only reset.
+	defer ResetAttestationNetworkIDForTesting()
 
 	validators := createVerificationTestValidators(5)
 	vs, _ := NewValidatorSet(validators)
@@ -282,6 +286,10 @@ func TestShardQPOSAdapter_CorrectProposer(t *testing.T) {
 	ResetAttestationNetworkIDForTesting()
 	SetAttestationNetworkID(1668)
 	FreezeAttestationNetworkID()
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// frozen mainnet ID left behind by this test would arm guards in later
+	// tests. Unfreeze and restore via the testing-only reset.
+	defer ResetAttestationNetworkIDForTesting()
 
 	validators := createVerificationTestValidators(5)
 	vs, _ := NewValidatorSet(validators)
@@ -307,6 +315,10 @@ func TestShardQPOSAdapter_CustomSlotResolver(t *testing.T) {
 	ResetAttestationNetworkIDForTesting()
 	SetAttestationNetworkID(1668)
 	FreezeAttestationNetworkID()
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// frozen mainnet ID left behind by this test would arm guards in later
+	// tests. Unfreeze and restore via the testing-only reset.
+	defer ResetAttestationNetworkIDForTesting()
 
 	validators := createVerificationTestValidators(5)
 	vs, _ := NewValidatorSet(validators)
@@ -347,6 +359,10 @@ func TestShardQPOSAdapter_NoProposer(t *testing.T) {
 	ResetAttestationNetworkIDForTesting()
 	SetAttestationNetworkID(1668)
 	FreezeAttestationNetworkID()
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// frozen mainnet ID left behind by this test would arm guards in later
+	// tests. Unfreeze and restore via the testing-only reset.
+	defer ResetAttestationNetworkIDForTesting()
 
 	// Empty validator set → no proposer.
 	validators := []*Validator{}

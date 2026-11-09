@@ -219,10 +219,11 @@ func (sbl *SealedBidLottery) updatePhaseLocked() {
 	// explicit phase transitions (TransitionToReveal) or accept that the
 	// lottery stays in its current phase.
 	//
-	// In production mode (QAU_PRODUCTION=1), log an error to alert operators
-	// that SetCurrentSlot has not been called. In dev/test mode, log a
-	// warning. The phase remains pinned — no automatic transition.
-	if params.IsProductionEnv() {
+	// In production mode (QAU_PRODUCTION=1 or mainnet network ID — run-13
+	// B6), log an error to alert operators that SetCurrentSlot has not been
+	// called. In dev/test mode, log a warning. The phase remains pinned — no
+	// automatic transition.
+	if params.IsProduction(GetAttestationNetworkID()) {
 		log.Printf("ERROR: SealedBidLottery.updatePhaseLocked: currentSlot is 0 in production mode — phase transitions require SetCurrentSlot (slot=%d, phase=%s)", sbl.slot, sbl.phase)
 		return
 	}

@@ -355,6 +355,9 @@ func TestR4GOV01_OneVoteLockRegression(t *testing.T) {
 
 func TestReviewRecountsAfterSlotRootArrives(t *testing.T) {
 	SetAttestationNetworkID(1668)
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// leaked mainnet ID would arm guards in unrelated tests. Always restore.
+	defer SetAttestationNetworkID(0)
 	qpos, keys := setupQPOSWithKeys(9)
 	review := NewReviewChamber(qpos)
 
@@ -407,6 +410,9 @@ func TestReviewRecountsAfterSlotRootArrives(t *testing.T) {
 
 func TestReviewTimeoutRecountsBeforeTimingOut(t *testing.T) {
 	SetAttestationNetworkID(1668)
+	// run-13 B6: production guards now read the attestation network ID, so a
+	// leaked mainnet ID would arm guards in unrelated tests. Always restore.
+	defer SetAttestationNetworkID(0)
 	qpos, keys := setupQPOSWithKeys(9)
 	review := NewReviewChamber(qpos)
 

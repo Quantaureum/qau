@@ -76,12 +76,16 @@ func NewDAAttestationVerifier(
 		}
 		if !committeeMgr.config.Enabled {
 			// DA-FIX (2026-07-17): Committee disabled. In production
-			// mode (QAU_PRODUCTION=1), this is a hard reject — mainnet must
-			// never operate without committee membership enforcement, since
-			// otherwise any holder of a valid Dilithium3 key could submit DA
-			// attestations bypassing committee admission control. In
-			// dev/test mode, skip the membership check (small networks).
-			if params.IsProductionEnv() {
+			// mode (QAU_PRODUCTION=1 or mainnet network ID), this is a hard
+			// reject — mainnet must never operate without committee
+			// membership enforcement, since otherwise any holder of a valid
+			// Dilithium3 key could submit DA attestations bypassing committee
+			// admission control. In dev/test mode, skip the membership check
+			// (small networks).
+			// run-13 B6: production determination includes the configured
+			// network ID (SetAttestationNetworkID), so the mainnet hard
+			// reject no longer depends on the env var alone.
+			if params.IsProduction(GetAttestationNetworkID()) {
 				return fmt.Errorf("DA committee disabled in production mode; attestation membership check required")
 			}
 			return nil

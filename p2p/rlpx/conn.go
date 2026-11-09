@@ -245,6 +245,13 @@ func computePoWNonceFromID(nodeID enode.ID) (uint64, error) {
 	// resistance for RLPx handshakes. This is acceptable for local dev/test
 	// but must never be allowed in production. We now check QAU_PRODUCTION
 	// and refuse to honor the dev bypass if production mode is active.
+	//
+	// run-13 B6: this deliberately remains the env-only check
+	// (params.IsProductionEnv). The rlpx package carries no network/chain ID
+	// in scope (Dial/computePoWNonceFromID key on node IDs only) and is not
+	// currently wired into the node's live dial path. If this package is
+	// ever wired to a networked transport, thread the node's network ID
+	// through Dial and switch to params.IsProduction(networkID).
 	if os.Getenv("QAU_DEV_MODE_BLOCKS") == "1" {
 		if params.IsProductionEnv() {
 			// Production mode: dev bypass is forbidden. Fall through to

@@ -831,12 +831,19 @@ func (q *QPOS) CanPropose(validatorIndex int, slot uint64) bool {
 	// that depended on those blocks would still be polluted.
 	//
 	// Fix strategy:
-	//   - Production (QAU_PRODUCTION=1): CanPropose hard-rejects a parent
-	//     slot whose DA is unavailable, blocking continued production while
-	//     DA is down. Pairs with FinalizeBlock's check as a double gate.
+	//   - Production (QAU_PRODUCTION=1 or mainnet network ID): CanPropose
+	//     hard-rejects a parent slot whose DA is unavailable, blocking
+	//     continued production while DA is down. Pairs with FinalizeBlock's
+	//     check as a double gate.
 	//   - Dev/test: keep the soft check (warning) so local development does
 	//     not require the DA layer to be configured.
-	isProduction := params.IsProductionEnv()
+	//
+	// run-13 B6: production determination is no longer env-only. The node's
+	// network ID (wired from config via SetAttestationNetworkID) is checked
+	// against params.MainnetChainID, so a mainnet node keeps this guard armed
+	// even when the QAU_PRODUCTION env var is forgotten. When no network ID
+	// is configured (0), behavior degrades to the legacy env-only check.
+	isProduction := params.IsProduction(GetAttestationNetworkID())
 
 	if chambers == nil {
 		// DA: hard-reject in production, soft-check in non-production (liveness priority).
@@ -1012,13 +1019,17 @@ func (q *QPOS) SetDAAvailabilityChecker(checker func(slot uint64) error) {
 // closed when no checker is configured — DA verification must not be
 // bypassed on mainnet. In dev/test mode, returns nil (available) for
 // backward compatibility (DA verification is opt-in during development).
+// run-13 B6: production mode is additionally inferred from the configured
+// network ID (mainnet = params.MainnetChainID), so the fail-closed backstop
+// holds even when the env var is forgotten. With no network ID configured
+// (0), the legacy env-only determination applies.
 func (q *QPOS) CheckDAAvailability(slot uint64) error {
 	q.mu.RLock()
 	checker := q.daAvailabilityCheck
 	q.mu.RUnlock()
 	if checker == nil {
 		// R33 P2-21: Fail-closed in production to prevent DA review bypass.
-		if params.IsProductionEnv() {
+		if params.IsProduction(GetAttestationNetworkID()) {
 			return fmt.Errorf("DA availability checker not configured (production mode requires DA verification)")
 		}
 		return nil

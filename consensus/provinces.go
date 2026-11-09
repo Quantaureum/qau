@@ -586,14 +586,17 @@ func (tpc *ThreeChambersCoordinator) AssignExecutive(validatorIndices []int, epo
 	defer tpc.mu.Unlock()
 
 	// R30-IMPLEMENT (2026-07-27): P2-ASSIGN-EXECUTIVE production gate.
-	// In production (QAU_PRODUCTION=1 or requireDistributedDKG=true), direct
-	// Executive assignment is forbidden — production code MUST use
-	// TransitionExecutiveForEpoch, which runs VRF-based stake-weighted random
-	// selection (SelectExecutiveForEpoch) and enforces the
-	// requireDistributedDKG production gate. This test/devnet-only helper
-	// must fail-closed in production so an attacker cannot bypass VRF
-	// selection by calling AssignExecutive directly.
-	if tpc.requireDistributedDKG || params.IsProductionEnv() {
+	// In production (QAU_PRODUCTION=1 or mainnet network ID, or
+	// requireDistributedDKG=true), direct Executive assignment is forbidden —
+	// production code MUST use TransitionExecutiveForEpoch, which runs
+	// VRF-based stake-weighted random selection (SelectExecutiveForEpoch) and
+	// enforces the requireDistributedDKG production gate. This
+	// test/devnet-only helper must fail-closed in production so an attacker
+	// cannot bypass VRF selection by calling AssignExecutive directly.
+	// run-13 B6: production determination includes the configured network ID
+	// (SetAttestationNetworkID), so the mainnet gate no longer depends on the
+	// env var alone.
+	if tpc.requireDistributedDKG || params.IsProduction(GetAttestationNetworkID()) {
 		return ErrAssignExecutiveDisabledInProduction
 	}
 

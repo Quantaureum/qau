@@ -72,6 +72,14 @@ type ConnPoolConfig struct {
 	// MinOutboundRatio is the minimum fraction of connections that must be
 	// outbound. Default 0.3 means at least 30% of connections are dialed out.
 	MinOutboundRatio float64
+	// NetworkID is the chain/network ID of the node this pool serves (e.g.
+	// params.MainnetChainID). run-13 B6: the plaintext-dial production gate
+	// in dial() keys on this field, so a mainnet node refuses plaintext P2P
+	// transport even when the QAU_PRODUCTION env var is forgotten. Zero
+	// means "no network identity configured" and falls back to the legacy
+	// env-only determination (params.IsProductionEnv), preserving dev/test
+	// behavior.
+	NetworkID uint64
 }
 
 // DefaultConnPoolConfig returns a default connection pool configuration.
@@ -117,8 +125,10 @@ type PeerConnPool struct {
 
 	// P2P-R11-H03 (2026-07-20): TLS config for encrypted transport.
 	// When set, dial() uses tls.Dial instead of plaintext net.Dial.
-	// When nil, behavior depends on QAU_PRODUCTION env var:
-	//   - QAU_PRODUCTION=1: dial() fails closed (returns error).
+	// When nil, behavior depends on the production determination
+	// (run-13 B6: params.IsProduction(config.NetworkID) — QAU_PRODUCTION=1
+	// OR mainnet network ID):
+	//   - production: dial() fails closed (returns error).
 	//   - otherwise (dev/test): dial() falls back to plaintext TCP
 	//     to preserve backward compatibility with dev deployments.
 	// This ensures production NEVER uses plaintext P2P transport while
@@ -357,11 +367,15 @@ func (p *PeerConnPool) dial(ctx context.Context) (net.Conn, error) {
 	}
 
 	// No TLS configured.
-	if params.IsProductionEnv() {
+	// run-13 B6: production determination now includes the configured
+	// network ID, so a mainnet node arms the plaintext-dial refusal even
+	// when QAU_PRODUCTION is not set. Zero NetworkID falls back to the
+	// env-only check (legacy behavior for tests/dev tooling).
+	if params.IsProduction(p.config.NetworkID) {
 		// P2P-R11-H03: fail closed in production. Plaintext P2P transport
 		// exposes blocks/votes/transactions to passive eavesdroppers and
 		// enables active tampering. Refuse to dial rather than risk it.
-		return nil, errors.New("connpool: plaintext dial refused in production (QAU_PRODUCTION=1); configure TLS via SetTLSConfig")
+		return nil, errors.New("connpool: plaintext dial refused in production mode (QAU_PRODUCTION=1 or mainnet network ID); configure TLS via SetTLSConfig")
 	}
 
 	// Dev/test fallback: plaintext TCP. The original code path, kept for

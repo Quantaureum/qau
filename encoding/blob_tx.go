@@ -86,6 +86,13 @@ func (s *BlobTxSidecar) Validate() error {
 	// (or a future Danksharding-enabled mainnet without sidecar FRI
 	// extension) from accepting blob txs through the RPC path. Dev/test
 	// networks keep the hash-stub validation for backward compatibility.
+	//
+	// run-13 B6: this deliberately remains the env-only check
+	// (params.IsProductionEnv). BlobTxSidecar.Validate is pure decode-library
+	// code with no access to the node's network/chain ID — threading one in
+	// would change the public API of the decoding path for every caller.
+	// Network-aware enforcement for mainnet happens upstream at the DA- hard
+	// guard and the RPC submission path, which do know the network ID.
 	if params.IsProductionEnv() {
 		return fmt.Errorf("blob sidecar: hash-stub validation refused in production mode (DA-R7-12); FRI polynomial commitment verification required but sidecar does not carry FRIDABlobData")
 	}

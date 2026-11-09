@@ -824,11 +824,12 @@ func (qfs *QTDFinalityState) SubmitPartialSeal(validatorIndex int, slot uint64, 
 		// it's either rejected at aggregation (local) or ignored (distributed).
 		//
 		// The log below makes the acceptance visible. In production mode
-		// (QAU_PRODUCTION=1), escalate to Error so operators investigate
-		// any TSS partial sig that bypasses crypto verification — it
-		// indicates either a misconfiguration (should be using Dilithium3
-		// full sigs) or a potential attack attempt.
-		if params.IsProductionEnv() {
+		// (QAU_PRODUCTION=1 or mainnet network ID — run-13 B6), escalate to
+		// Error so operators investigate any TSS partial sig that bypasses
+		// crypto verification — it indicates either a misconfiguration
+		// (should be using Dilithium3 full sigs) or a potential attack
+		// attempt.
+		if params.IsProduction(GetAttestationNetworkID()) {
 			qposAdvLogger.Errorf("R14-MED: TSS partial signature accepted without crypto verification in PRODUCTION mode (validator %d slot %d len=%d) — should use full Dilithium3 signatures (3293 bytes); aggregated sig will fail-closed if invalid",
 				validatorIndex, slot, len(signature))
 		} else {
