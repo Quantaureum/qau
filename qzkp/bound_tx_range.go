@@ -174,8 +174,16 @@ func (trp *TxRangeProof) UnmarshalBinary(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("qzkp: BitLength overflow: %w", err)
 	}
+	offset += 4
 	if bitLength <= 0 || bitLength > MaxTxRangeBitLength {
 		return fmt.Errorf("qzkp: BitLength %d out of range [1, %d]", bitLength, MaxTxRangeBitLength)
+	}
+	// Strict trailing-byte check: the MarshalBinary format is a fixed
+	// field sequence, so any bytes left after BitLength mean the payload
+	// is not the canonical encoding. Reject instead of silently ignoring
+	// the tail (a decoded proof must round-trip byte-exactly).
+	if offset != len(data) {
+		return fmt.Errorf("qzkp: %d trailing bytes after BitLength", len(data)-offset)
 	}
 
 	trp.ProofBytes = proofBytes

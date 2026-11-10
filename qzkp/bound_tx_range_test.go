@@ -225,4 +225,21 @@ func TestTxRangeProof_MarshalRoundTrip(t *testing.T) {
 	if _, err := oob.MarshalBinary(); err == nil {
 		t.Fatal("BitLength 0 must be rejected on marshal")
 	}
+
+	// Trailing bytes after the BitLength field: rejected. The MarshalBinary
+	// format is a fixed field sequence, so a payload with garbage appended
+	// after an otherwise valid encoding is not the canonical proof and must
+	// fail closed instead of being silently truncated at parse time.
+	trailing := append(append([]byte(nil), data...), 0xDE, 0xAD, 0xBE, 0xEF)
+	parsedTrailing := &TxRangeProof{}
+	if err := parsedTrailing.UnmarshalBinary(trailing); err == nil {
+		t.Fatal("trailing bytes after BitLength must be rejected")
+	}
+
+	// Boundary: a single trailing byte is also rejected.
+	oneExtra := append(append([]byte(nil), data...), 0x00)
+	parsedOne := &TxRangeProof{}
+	if err := parsedOne.UnmarshalBinary(oneExtra); err == nil {
+		t.Fatal("a single trailing byte after BitLength must be rejected")
+	}
 }
