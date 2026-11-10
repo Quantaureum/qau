@@ -7,7 +7,7 @@ This list is derived from the handler registration call sites in the source tree
 the code rather than a hand-maintained list. If it ever disagrees with a registration
 call site, treat this document as the bug and regenerate it.
 
-- Methods registered: **227**
+- Methods registered: **228**
 - Methods requiring admin authorization: **52**
 
 Transport, request/response envelope, error codes and the concrete schemas for the
@@ -35,7 +35,7 @@ limits for expensive or key-handling methods; see `rpc/ratelimit.go`.
 | `evm_` | 2 | 2 |
 | `net_` | 3 | 0 |
 | `personal_` | 7 | 7 |
-| `qau_` | 158 | 27 |
+| `qau_` | 159 | 27 |
 | `txpool_` | 3 | 2 |
 | `web3_` | 2 | 0 |
 
@@ -135,7 +135,7 @@ limits for expensive or key-handling methods; see `rpc/ratelimit.go`.
 | `personal_sign` | yes | rpc/personal.go |
 | `personal_unlockAccount` | yes | rpc/personal.go |
 
-### `qau_` (156 methods)
+### `qau_` (159 methods)
 
 | Method | Admin | Registered in |
 | --- | --- | --- |
@@ -179,6 +179,7 @@ limits for expensive or key-handling methods; see `rpc/ratelimit.go`.
 | `qau_getLiquidityPools` |  | rpc/defi_api.go |
 | `qau_getLiquidStakingPosition` |  | rpc/economics_api.go |
 | `qau_getMultisigProposal` |  | rpc/multisig_api.go |
+| `qau_getMultisigProposalPreimage` |  | rpc/multisig_api.go |
 | `qau_getMultisigWallet` |  | rpc/multisig_api.go |
 | `qau_getPendingMultisigProposals` |  | rpc/multisig_api.go |
 | `qau_getPendingRewards` |  | rpc/api.go |

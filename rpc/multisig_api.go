@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -178,6 +179,7 @@ func (api *MultisigAPI) RegisterHandlers(server *Server) {
 	server.RegisterHandler("qau_isMultisigWallet", api.IsMultisigWallet)
 	server.RegisterHandler("qau_getPendingMultisigProposals", api.GetPendingProposals)
 	server.RegisterHandler("qau_getMultisigProposal", api.GetMultisigProposal)
+	server.RegisterHandler("qau_getMultisigProposalPreimage", api.GetMultisigProposalPreimage)
 	server.RegisterHandler("qau_getAllMultisigProposals", api.GetAllProposals)
 	server.RegisterHandler("qau_getProposalsForSigner", api.GetProposalsForSigner)
 	server.RegisterHandler("qau_getIncomingMultisigTransfers", api.GetIncomingTransfers)
@@ -316,6 +318,119 @@ func (api *MultisigAPI) GetMultisigProposal(ctx context.Context, params json.Raw
 	}
 
 	return api.proposalToMap(proposal), nil
+}
+
+// GetMultisigProposalPreimage returns every field needed to rebuild the
+// canonical multisig proposal digest off-node, plus the node-side digest
+// for comparison. This is the node side of the cross-layer blind-signing
+// fix: qau_approveMultisigProposal hands the wallet a bare 32-byte digest,
+// and before this method the RPC never exposed the nonce, chain ID, or
+// callData that went into it, so the wallet had to sign sight unseen. With
+// the preimage a wallet can (1) rebuild the digest locally from the fields
+// below, (2) compare it against the digest it was asked to sign, and (3)
+// only then release the signature.
+//
+// The canonical digest is (types.ComputeMultisigV2ProposalHash,
+// types/multisig_v2.go, mirrored by the TypeScript SDK):
+//
+//	Keccak256("QAU_MULTISIG_PROPOSAL_V2" ||
+//	          chainID(u64 BE) || hashWalletAddr(20B) || to(20B) ||
+//	          value(u256 BE) || nonce(u64 BE) || expiresAt(u64 BE) ||
+//	          Keccak256(callData))
+//
+// Access level matches the other read-only multisig queries
+// (qau_getMultisigProposal et al.): public. Every field is derivable from
+// the proposal hash by any node, so nothing is privileged, and the response
+// contains no key material.
+//
+// R39-P1-02 invariant, evaluated read-only: the fields are re-hashed with
+// the same fallback rule VerifyProposalHash applies (HashWalletAddr when
+// set, else WalletAddr). A malformed proposal (zero chainID/nonce,
+// negative or oversized value) cannot be hashed — fail closed, no
+// preimage is served. A well-formed proposal whose stored digest differs
+// from the recomputed one is served with hashMatch=false so the caller
+// sees the drift; the wallet-side rebuild-and-compare remains the real
+// signing gate.
+func (api *MultisigAPI) GetMultisigProposalPreimage(ctx context.Context, params json.RawMessage) (any, *Error) {
+	if api.multisigStore == nil {
+		return nil, NewError(ErrCodeInternal, "multisig store not available")
+	}
+
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, ErrInvalidParams
+	}
+
+	hashBytes, err := hex.DecodeString(strings.TrimPrefix(args[0], "0x"))
+	if err != nil {
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid proposal hash", err.Error())
+	}
+	if len(hashBytes) != types.HashLength {
+		return nil, NewErrorWithData(ErrCodeInvalidParams, "invalid hash length",
+			fmt.Sprintf("expected %d bytes, got %d", types.HashLength, len(hashBytes)))
+	}
+
+	var hash types.Hash
+	copy(hash[:], hashBytes)
+
+	proposal := api.multisigStore.GetProposal(hash)
+	if proposal == nil {
+		return nil, NewError(ErrCodeNotFound, "proposal not found")
+	}
+
+	// Effective wallet address mixed into the digest — same fallback
+	// VerifyProposalHash applies (state.go R39-P1-02 comment).
+	hashWallet := proposal.HashWalletAddr
+	if hashWallet == (types.Address{}) {
+		hashWallet = proposal.WalletAddr
+	}
+
+	recomputed, rerr := types.ComputeMultisigV2ProposalHash(
+		proposal.ChainID,
+		hashWallet,
+		proposal.To,
+		proposal.Value,
+		proposal.Data,
+		proposal.Nonce,
+		uint64(proposal.ExpiresAt),
+	)
+	if rerr != nil {
+		return nil, NewErrorWithData(ErrCodeInternal,
+			"proposal preimage unavailable — malformed proposal",
+			fmt.Sprintf("ComputeMultisigV2ProposalHash: %v (R39-P1-02 invariant)", rerr))
+	}
+
+	callData := proposal.Data
+	if callData == nil {
+		callData = []byte{}
+	}
+
+	return map[string]any{
+		// Stored digest — what qau_approveMultisigProposal signs over.
+		"hash": "0x" + hex.EncodeToString(proposal.Hash[:]),
+		// Node-side recomputation from the fields below. Callers compare
+		// this (and their own rebuild) against `hash`.
+		"recomputedHash": "0x" + hex.EncodeToString(recomputed[:]),
+		"hashMatch":      recomputed == proposal.Hash,
+		// Digest domain string, prepended verbatim to the hashed payload.
+		"domain":  types.MultisigV2ProposalDomain,
+		"chainId": proposal.ChainID,
+		// walletAddr is the store cache key (V1 caller EOA or canonical V2
+		// wallet); hashWalletAddr is the address actually mixed into the
+		// digest. They differ on the V2 path — wallets MUST rebuild with
+		// hashWalletAddr.
+		"walletAddr":     proposal.WalletAddr.String(),
+		"hashWalletAddr": hashWallet.String(),
+		"to":             proposal.To.String(),
+		"value":          proposal.Value.String(),
+		// Decimal string, not a JSON number: the nonce is a nanosecond
+		// timestamp (~1.7e18) beyond the 2^53 JS safe-integer range, and a
+		// precision-rounded nonce would make every wallet-side rebuild
+		// mismatch.
+		"nonce":     strconv.FormatUint(proposal.Nonce, 10),
+		"expiresAt": uint64(proposal.ExpiresAt),
+		"callData":  "0x" + hex.EncodeToString(callData),
+	}, nil
 }
 
 func (api *MultisigAPI) GetAllProposals(ctx context.Context, params json.RawMessage) (any, *Error) {

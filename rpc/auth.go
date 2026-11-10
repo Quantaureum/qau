@@ -349,6 +349,9 @@ func DefaultAuthConfig() *AuthConfig {
 			"qau_isMultisigWallet",
 			"qau_getPendingMultisigProposals",
 			"qau_getMultisigProposal",
+			// Read-only preimage exposure for off-node digest rebuild
+			// before approveMultisigProposal signs (blind-signing fix).
+			"qau_getMultisigProposalPreimage",
 			"qau_getAllMultisigProposals",
 			"qau_getProposalsForSigner",
 			"qau_getIncomingMultisigTransfers",
