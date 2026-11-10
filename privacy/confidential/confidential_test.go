@@ -516,6 +516,34 @@ func TestR4ZK02_BoundRangeProof_WrongCommitment_Rejected(t *testing.T) {
 	}
 }
 
+// TestGenerateRangeProofWithBlinding_BitLengthBound pins the unified outer
+// bit-length bound: the prover input validation now shares the circuit's own
+// limit (qzkp.MaxTxRangeBitLength = 254) instead of the stale 256, so an
+// out-of-range width is rejected as input validation (ErrInvalidAmount)
+// before any circuit work instead of leaking into ProveTxValueInRange's
+// circuit-level rejection. Compile-free: both cases are rejected before
+// compilation.
+func TestGenerateRangeProofWithBlinding_BitLengthBound(t *testing.T) {
+	cm := newTestConfidentialManager()
+
+	pg := NewPedersenGeneratorOrPanic()
+	blinding := make([]byte, 32)
+	for i := range blinding {
+		blinding[i] = byte(i + 3)
+	}
+	value := big.NewInt(1000)
+	commitment := pg.Commit(value, blinding)
+
+	// Above the unified bound (255 > MaxTxRangeBitLength 254): rejected.
+	if _, err := cm.GenerateRangeProofWithBlinding(value, 255, commitment, blinding); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("bitLength 255: expected ErrInvalidAmount, got %v", err)
+	}
+	// Zero width: still rejected (PRIV-RP-01).
+	if _, err := cm.GenerateRangeProofWithBlinding(value, 0, commitment, blinding); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("bitLength 0: expected ErrInvalidAmount, got %v", err)
+	}
+}
+
 // TestRangeProofPolicyBitWidth_Enforced pins the verifier-side policy bit
 // width gate: VerifyRangeProof accepts only TxProofs at
 // PolicyTxValueBitLength. The verification layer previously allowed any

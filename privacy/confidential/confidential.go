@@ -328,8 +328,12 @@ func (cm *ConfidentialManager) GenerateRangeProof(amount *big.Int, bitLength int
 func (cm *ConfidentialManager) GenerateRangeProofWithBlinding(amount *big.Int, bitLength int, commitment []byte, blinding []byte) (*qzkp.RangeProof, error) {
 	// Validate bitLength and amount before any arithmetic. bitLength==0
 	// would make uint(bitLength-1) wrap; a nil or negative amount panics in
-	// Cmp (PRIV-RP-01 fix).
-	if bitLength < 1 || bitLength > 256 {
+	// Cmp (PRIV-RP-01 fix). The upper bound is the circuit's own limit
+	// (qzkp.MaxTxRangeBitLength): a larger width would pass here and then
+	// fail inside ProveTxValueInRange, so prover input validation and the
+	// circuit share one limit. (Widths below the policy width are not
+	// restricted here: the verifier-side policy gate is the boundary.)
+	if bitLength < 1 || bitLength > qzkp.MaxTxRangeBitLength {
 		return nil, ErrInvalidAmount
 	}
 	if amount == nil || amount.Sign() < 0 {
