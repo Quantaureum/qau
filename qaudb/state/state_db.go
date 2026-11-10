@@ -1069,25 +1069,26 @@ func (s *StateDB) MarkEpochRewardPending(epoch, blockHeight uint64) {
 	s.mu.Unlock()
 }
 
-// dropEpochRewardMarksFromLocked removes epoch-reward markers whose recorded
-// block height is at or above forkHeight. M4-F2: after a rollback those blocks
-// will be re-executed, so their epoch rewards must not be treated as already
-// paid. Caller must hold s.mu (RollbackToHeight does).
-func (s *StateDB) dropEpochRewardMarksFromLocked(forkHeight uint64) {
-	// Staged-but-not-yet-committed marks must be dropped too: a failed Commit
-	// leaves them in memory, and keeping them would make a retried boundary
-	// block skip rewards that were never persisted.
-	for epoch, height := range s.pendingEpochRewardMarks {
-		if height >= forkHeight {
-			delete(s.pendingEpochRewardMarks, epoch)
-		}
-	}
+// epochRewardMarkerKeysToDropLocked returns the durable epoch-reward marker
+// keys whose recorded block height is at or above forkHeight. M4-F2: after a
+// rollback those blocks will be re-executed, so their epoch rewards must not
+// be treated as already paid.
+//
+// M4-F2 hardening (audit: epoch-reward marker drop not atomic with rollback):
+// this helper only COLLECTS the doomed keys. The caller stages their deletion
+// into the SAME batch as the balance rollback (RollbackToHeight), so the
+// markers can no longer survive a "successful" rollback in a separate,
+// best-effort batch whose failure was previously swallowed as a WARN — stale
+// durable markers would make re-execution skip the epoch rewards a second
+// time. Any scan error is surfaced so the rollback aborts fail-closed instead
+// of proceeding with an incomplete delete set.
+// Caller must hold s.mu (RollbackToHeight does).
+func (s *StateDB) epochRewardMarkerKeysToDropLocked(forkHeight uint64) ([][]byte, error) {
 	if s.db == nil {
-		return
+		return nil, nil
 	}
+	var doomed [][]byte
 	iter := s.db.NewIterator(epochRewardAppliedPrefix, nil)
-	type doomedKey struct{ key []byte }
-	var doomed []doomedKey
 	for iter.Next() {
 		key := append([]byte(nil), iter.Key()...)
 		value := append([]byte(nil), iter.Value()...)
@@ -1095,25 +1096,15 @@ func (s *StateDB) dropEpochRewardMarksFromLocked(forkHeight uint64) {
 			continue
 		}
 		if binary.BigEndian.Uint64(value) >= forkHeight {
-			doomed = append(doomed, doomedKey{key: key})
+			doomed = append(doomed, key)
 		}
+	}
+	if err := iter.Error(); err != nil {
+		iter.Release()
+		return nil, fmt.Errorf("failed to scan epoch reward markers for rollback (target height %d): %w", forkHeight, err)
 	}
 	iter.Release()
-	if len(doomed) == 0 {
-		return
-	}
-	batch := s.db.NewBatch()
-	for _, d := range doomed {
-		if err := batch.Delete(d.key); err != nil {
-			log.Printf("[WARN] M4-F2: failed to stage epoch reward marker delete during rollback: %v", err)
-			return
-		}
-	}
-	if err := batch.Write(); err != nil {
-		log.Printf("[WARN] M4-F2: failed to write epoch reward marker deletes during rollback: %v — stale markers may skip rewards after re-execution", err)
-		return
-	}
-	log.Printf("[INFO] M4-F2: dropped %d epoch reward marker(s) at or above height %d during rollback", len(doomed), forkHeight)
+	return doomed, nil
 }
 
 // RecoverConsistency checks whether the previous Commit completed
@@ -3536,6 +3527,29 @@ func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 		pendingUndoHeights = append(pendingUndoHeights, h)
 	}
 
+	// M4-F2 hardening (audit: epoch-reward marker drop not atomic with
+	// rollback): stage the epoch-reward marker deletes into the SAME batch as
+	// the balance rollback. Previously the deletes ran in a separate
+	// best-effort batch AFTER this one committed, and a failure there was
+	// swallowed as a WARN while the rollback still reported success — stale
+	// durable markers survived, and re-executing the rolled-back epoch
+	// boundary blocks skipped the rewards a second time. Staging the deletes
+	// here makes the unit atomic: either the balances are restored AND the
+	// markers dropped, or the batch fails and the rollback aborts with the
+	// in-memory undo preserved (R38-P1-05 semantics) for a clean retry.
+	doomedMarkers, markerScanErr := s.epochRewardMarkerKeysToDropLocked(forkHeight)
+	if markerScanErr != nil {
+		return fmt.Errorf("rollback aborted before writing (fail-closed): %w", markerScanErr)
+	}
+	for _, markerKey := range doomedMarkers {
+		if err := batchDelete(markerKey); err != nil {
+			return fmt.Errorf("failed to stage epoch reward marker delete during rollback at height %d: %w", forkHeight, err)
+		}
+	}
+	if len(doomedMarkers) > 0 {
+		log.Printf("[INFO] M4-F2: staged %d epoch reward marker delete(s) at or above height %d into the rollback batch", len(doomedMarkers), forkHeight)
+	}
+
 	// P1-STATE-03 FIX (2026-07-30, R36): Write commit-pending marker in the
 	// SAME batch as the rollback data (atomic). If a crash occurs between
 	// batch.Write() and the Verkle tree Flush(), the marker survives and
@@ -3671,9 +3685,18 @@ func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 		s.lastCommittedHeight = 0
 	}
 
-	// M4-F2: the rolled-back blocks will be re-executed on the new canonical
-	// chain, so their epoch-reward markers must be dropped as well.
-	s.dropEpochRewardMarksFromLocked(forkHeight)
+	// M4-F2: the durable epoch-reward marker deletes were staged into the same
+	// batch as the balance rollback (above) and are now committed with it.
+	// The staged-but-not-yet-committed in-memory marks must be dropped too: a
+	// failed Commit leaves them in memory, and keeping them would make a
+	// retried boundary block skip rewards that were never persisted. This runs
+	// only after batch.Write() succeeded, so a failed rollback retries with
+	// the in-memory marks intact.
+	for epoch, height := range s.pendingEpochRewardMarks {
+		if height >= forkHeight {
+			delete(s.pendingEpochRewardMarks, epoch)
+		}
+	}
 
 	// R87-M4-RESTART (2026-08-29): persist the rolled-back height — a crash
 	// between here and the next CommitWithBlock would otherwise restart with
