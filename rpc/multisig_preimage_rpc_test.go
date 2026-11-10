@@ -358,3 +358,104 @@ func TestMultisigAPI_GetMultisigProposalPreimage_NoStore(t *testing.T) {
 		t.Fatalf("nil store: want ErrCodeInternal (%d), got %#v", ErrCodeInternal, apiErr)
 	}
 }
+
+// TestMultisigAPI_GetMultisigProposalPreimage_NilValueServedAsZero pins the
+// nil-Value guard: a proposal whose Value is nil (insertable into the store
+// by a write that bypasses the RPC create path — the store hash gate cannot
+// see it because ComputeMultisigV2ProposalHash maps nil to zero) must NOT
+// panic the handler. It is served with value "0", mirroring the hash
+// function's nil-to-zero semantics, and the drift is reported as
+// hashMatch=false exactly like any other stored-field drift.
+func TestMultisigAPI_GetMultisigProposalPreimage_NilValueServedAsZero(t *testing.T) {
+	store := multisig.NewMultisigStateStore()
+	api := NewMultisigAPI(store, newMockStateReader(), &mockChainStateDBHC{})
+	api.SetChainInfo(newMockChainInfo())
+
+	callerHex, _ := registerSingleSignerWallet(t, api)
+
+	createReq := fmt.Sprintf(`{"from":"%s","to":"%s","value":"555"}`, callerHex, callerHex)
+	if _, apiErr := api.CreateProposal(context.Background(), json.RawMessage(createReq)); apiErr != nil {
+		t.Fatalf("CreateProposal RPC error: %v", apiErr)
+	}
+	proposals := store.GetAllProposals(parseRespAddr(t, callerHex))
+	if len(proposals) != 1 {
+		t.Fatalf("expected 1 proposal persisted, got %d", len(proposals))
+	}
+
+	// Simulate a nil-Value proposal reaching the store: GetProposal returns
+	// the live pointer, so a caller that writes the struct directly (not via
+	// the gated create path) can nil the value behind the store's back.
+	nilValue := store.GetProposal(proposals[0].Hash)
+	nilValue.Value = nil
+
+	pre := preimageFromRPC(t, api, "0x"+hex.EncodeToString(nilValue.Hash[:]))
+
+	if got := pre["value"].(string); got != "0" {
+		t.Fatalf("response value = %q, want \"0\" (nil Value must map to zero, matching ComputeMultisigV2ProposalHash)", got)
+	}
+	if match := pre["hashMatch"].(bool); match {
+		t.Fatal("response hashMatch = true for a nil-Value proposal, want false (drift must be reported)")
+	}
+	// A wallet rebuilding the digest from the response fields must land on
+	// the node-side recomputed digest (value 0).
+	rebuilt, rerr := types.ComputeMultisigV2ProposalHash(
+		uint64(pre["chainId"].(float64)),
+		parseRespAddr(t, pre["hashWalletAddr"].(string)),
+		parseRespAddr(t, pre["to"].(string)),
+		big.NewInt(0),
+		nil,
+		func() uint64 {
+			n, err := strconv.ParseUint(pre["nonce"].(string), 10, 64)
+			if err != nil {
+				t.Fatalf("response nonce does not parse: %v", err)
+			}
+			return n
+		}(),
+		uint64(pre["expiresAt"].(float64)),
+	)
+	if rerr != nil {
+		t.Fatalf("rebuild canonical hash: %v", rerr)
+	}
+	if gotRecomputed := pre["recomputedHash"].(string); gotRecomputed != "0x"+hex.EncodeToString(rebuilt[:]) {
+		t.Fatalf("response recomputedHash = %s, want rebuild-from-fields %s", gotRecomputed, "0x"+hex.EncodeToString(rebuilt[:]))
+	}
+}
+
+// TestMultisigAPI_GetMultisigProposalPreimage_ZeroNonceFailClosed pins the
+// zero-nonce fail-closed gate: ComputeMultisigV2ProposalHash hashes a zero
+// nonce without error, so the handler checks it explicitly (matching the
+// R39-P1-02 invariant in multisig.VerifyProposalHash and this method's
+// documented malformed-proposal contract). A store-resident proposal whose
+// nonce became zero must get no preimage at all.
+func TestMultisigAPI_GetMultisigProposalPreimage_ZeroNonceFailClosed(t *testing.T) {
+	store := multisig.NewMultisigStateStore()
+	api := NewMultisigAPI(store, newMockStateReader(), &mockChainStateDBHC{})
+	api.SetChainInfo(newMockChainInfo())
+
+	callerHex, _ := registerSingleSignerWallet(t, api)
+
+	createReq := fmt.Sprintf(`{"from":"%s","to":"%s","value":"555"}`, callerHex, callerHex)
+	if _, apiErr := api.CreateProposal(context.Background(), json.RawMessage(createReq)); apiErr != nil {
+		t.Fatalf("CreateProposal RPC error: %v", apiErr)
+	}
+	proposals := store.GetAllProposals(parseRespAddr(t, callerHex))
+	if len(proposals) != 1 {
+		t.Fatalf("expected 1 proposal persisted, got %d", len(proposals))
+	}
+
+	// Simulate a gate-bypassing write: zero the nonce on the live pointer.
+	zeroed := store.GetProposal(proposals[0].Hash)
+	zeroed.Nonce = 0
+
+	params, err := json.Marshal([]string{"0x" + hex.EncodeToString(zeroed.Hash[:])})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	_, apiErr := api.GetMultisigProposalPreimage(context.Background(), params)
+	if apiErr == nil {
+		t.Fatal("zero-nonce proposal: want a fail-closed error, got a preimage")
+	}
+	if apiErr.Code != ErrCodeInternal {
+		t.Fatalf("zero-nonce proposal: want ErrCodeInternal (%d), got %#v", ErrCodeInternal, apiErr)
+	}
+}

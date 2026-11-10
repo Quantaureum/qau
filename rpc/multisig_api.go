@@ -378,6 +378,17 @@ func (api *MultisigAPI) GetMultisigProposalPreimage(ctx context.Context, params 
 		return nil, NewError(ErrCodeNotFound, "proposal not found")
 	}
 
+	// Fail closed on a zero nonce, matching the R39-P1-02 invariant gate in
+	// multisig.VerifyProposalHash and the malformed-proposal contract in this
+	// method's doc comment. ComputeMultisigV2ProposalHash itself hashes a zero
+	// nonce without error, so without this explicit check a proposal inserted
+	// or mutated in the store by a path that bypasses the gate would still be
+	// served a preimage.
+	if proposal.Nonce == 0 {
+		return nil, NewErrorWithData(ErrCodeInternal,
+			"proposal preimage unavailable — malformed proposal",
+			"proposal Nonce unset (R39-P1-02 invariant)")
+	}
 	// Effective wallet address mixed into the digest — same fallback
 	// VerifyProposalHash applies (state.go R39-P1-02 comment).
 	hashWallet := proposal.HashWalletAddr
@@ -405,6 +416,15 @@ func (api *MultisigAPI) GetMultisigProposalPreimage(ctx context.Context, params 
 		callData = []byte{}
 	}
 
+	// nil-Value guard: ComputeMultisigV2ProposalHash treats a nil Value as
+	// zero, so a nil-Value proposal (insertable by a store write that
+	// bypasses the RPC create path) hashes fine above but would panic here
+	// on Value.String(). Mirror the hash function's nil-to-zero semantics.
+	valueStr := "0"
+	if proposal.Value != nil {
+		valueStr = proposal.Value.String()
+	}
+
 	return map[string]any{
 		// Stored digest — what qau_approveMultisigProposal signs over.
 		"hash": "0x" + hex.EncodeToString(proposal.Hash[:]),
@@ -422,7 +442,7 @@ func (api *MultisigAPI) GetMultisigProposalPreimage(ctx context.Context, params 
 		"walletAddr":     proposal.WalletAddr.String(),
 		"hashWalletAddr": hashWallet.String(),
 		"to":             proposal.To.String(),
-		"value":          proposal.Value.String(),
+		"value":          valueStr,
 		// Decimal string, not a JSON number: the nonce is a nanosecond
 		// timestamp (~1.7e18) beyond the 2^53 JS safe-integer range, and a
 		// precision-rounded nonce would make every wallet-side rebuild
