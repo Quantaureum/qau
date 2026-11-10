@@ -515,3 +515,57 @@ func TestR4ZK02_BoundRangeProof_WrongCommitment_Rejected(t *testing.T) {
 		t.Fatal("R4-ZK-02: range proof verified against wrong commitment should be REJECTED")
 	}
 }
+
+// TestRangeProofPolicyBitWidth_Enforced pins the verifier-side policy bit
+// width gate: VerifyRangeProof accepts only TxProofs at
+// PolicyTxValueBitLength. The verification layer previously allowed any
+// BitLength in [1, qzkp.MaxTxRangeBitLength], so a malicious transaction
+// could self-select bitLength=254 and have the verifier accept a
+// near-vacuous range statement ([0, 2^254)) instead of the policy range
+// ([0, 2^128)).
+//
+// The negative case generates a GENUINE circuit-bound proof at bitLength=254
+// (the prover accepts it; it even verifies at the qzkp layer) and asserts
+// that VerifyRangeProof still rejects it as a policy violation.
+func TestRangeProofPolicyBitWidth_Enforced(t *testing.T) {
+	cm := newTestConfidentialManager()
+
+	pg := NewPedersenGeneratorOrPanic()
+	blinding := make([]byte, 32)
+	for i := range blinding {
+		blinding[i] = byte(i + 2)
+	}
+	value := big.NewInt(1000)
+	commitment := pg.Commit(value, blinding)
+
+	// Sanity: a policy-width proof verifies.
+	policyProof, err := cm.GenerateRangeProofWithBlinding(value, PolicyTxValueBitLength, commitment, blinding)
+	if err != nil {
+		t.Fatalf("GenerateRangeProofWithBlinding (policy width): %v", err)
+	}
+	if err := cm.VerifyRangeProof(policyProof, commitment); err != nil {
+		t.Fatalf("VerifyRangeProof (policy width): %v", err)
+	}
+
+	// Negative case: a genuine bound proof at the structural maximum width.
+	// The prover accepts 254 <= qzkp.MaxTxRangeBitLength, so only the
+	// verifier-side policy gate can stop it.
+	wideProof, err := cm.GenerateRangeProofWithBlinding(value, 254, commitment, blinding)
+	if err != nil {
+		t.Fatalf("GenerateRangeProofWithBlinding (bitLength=254): %v", err)
+	}
+	if wideProof.TxProof == nil || wideProof.TxProof.BitLength != 254 {
+		t.Fatal("expected a circuit-bound TxProof with BitLength 254")
+	}
+
+	// The proof is genuine: it verifies at the qzkp layer against the same
+	// commitment (the 254-bit circuit was compiled during generation and is
+	// cached in this manager's protocol). Only the policy layer rejects it.
+	if err := cm.protocol.VerifyTxValueInRange(wideProof.TxProof, commitment); err != nil {
+		t.Fatalf("precondition: the 254-bit proof should be valid at the qzkp layer, got %v", err)
+	}
+
+	if err := cm.VerifyRangeProof(wideProof, commitment); !errors.Is(err, ErrRangeProofFailed) {
+		t.Fatalf("policy bit width: expected ErrRangeProofFailed for a bitLength=254 proof, got %v", err)
+	}
+}

@@ -56,6 +56,16 @@ const (
 	DomainNullifierCommit = "quantaureum-nullifier-commit-v1"
 )
 
+// PolicyTxValueBitLength is the fixed range-proof bit width for confidential
+// transaction amounts: the proven AND verified statement is
+// "amount < 2^PolicyTxValueBitLength". Prover and verifier MUST share this
+// single source of truth — a prover-chosen wider bit width (up to the
+// structural qzkp.MaxTxRangeBitLength of 254) would weaken the range
+// statement the verifier accepts (e.g., to a near-vacuous [0, 2^254)), so
+// VerifyRangeProof rejects any TxProof whose BitLength differs from this
+// policy constant (fail-closed).
+const PolicyTxValueBitLength = 128
+
 type ConfidentialAmount struct {
 	Commitment      []byte
 	EncryptedAmount []byte
@@ -376,7 +386,9 @@ func (cm *ConfidentialManager) GenerateRangeProofWithBlinding(amount *big.Int, b
 const rangeProofBindingAudited = true
 
 // VerifyRangeProof verifies the range proof for a confidential amount
-// against the commitment extracted from the transaction.
+// against the commitment extracted from the transaction. Only the
+// circuit-bound format at the fixed policy bit width (PolicyTxValueBitLength)
+// is accepted; anything else fails closed.
 func (cm *ConfidentialManager) VerifyRangeProof(proof *qzkp.RangeProof, commitment []byte) error {
 	if !rangeProofBindingAudited {
 		return ErrRangeProofBindingUnaudited
@@ -392,6 +404,15 @@ func (cm *ConfidentialManager) VerifyRangeProof(proof *qzkp.RangeProof, commitme
 	// commitment (self-referential) and are rejected unconditionally.
 	if proof.TxProof == nil {
 		return ErrLegacyRangeProofFormat
+	}
+	// Policy bit width: the range statement is only meaningful at the
+	// fixed policy width shared with the prover. A wider (attacker-
+	// chosen) BitLength would weaken the verified range up to
+	// [0, 2^MaxTxRangeBitLength), so reject before any cryptographic
+	// work. Collapsed to ErrRangeProofFailed like every other
+	// verification failure (no verification internals leaked).
+	if proof.TxProof.BitLength != PolicyTxValueBitLength {
+		return ErrRangeProofFailed
 	}
 	if err := cm.protocol.VerifyTxValueInRange(proof.TxProof, commitment); err != nil {
 		// Do not leak verification internals to callers.
@@ -507,7 +528,7 @@ func (cm *ConfidentialManager) CreateConfidentialTx(inputAmounts []*big.Int, out
 			return nil, err
 		}
 
-		rangeProof, err := cm.GenerateRangeProofWithBlinding(amt, 128, commitment, blinding)
+		rangeProof, err := cm.GenerateRangeProofWithBlinding(amt, PolicyTxValueBitLength, commitment, blinding)
 		if err != nil {
 			return nil, err
 		}
@@ -545,7 +566,7 @@ func (cm *ConfidentialManager) CreateConfidentialTx(inputAmounts []*big.Int, out
 			return nil, err
 		}
 
-		rangeProof, err := cm.GenerateRangeProofWithBlinding(amt, 128, commitment, blinding)
+		rangeProof, err := cm.GenerateRangeProofWithBlinding(amt, PolicyTxValueBitLength, commitment, blinding)
 		if err != nil {
 			return nil, err
 		}
