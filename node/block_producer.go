@@ -3096,9 +3096,21 @@ func (bp *BlockProducer) buildBlock(
 		if r87Diag() {
 			bpLog.Warn("R87DIAG produce h=%d rootBeforeTxCommit=%s", newHeight, r87Short(stateDB.Root()))
 		}
-		if committed, err := stateDB.CommitWithBlock(newHeight); err != nil {
-			bpDebugLog("ERROR: Failed to commit state in buildBlock: %v\n", err)
-		} else if r87Diag() {
+		// M4-F5 fail-closed (audit: producer publishes stale root after a
+		// failed state commit): a failed CommitWithBlock on the build copy
+		// means the block's transaction state is not durably derivable.
+		// Previously the error was only debug-logged and the build continued,
+		// letting the final commit below stamp a state root that did not match
+		// this node's own commitment. Abort the build instead: the caller
+		// treats a nil block as "slot abandoned" and the buffered writes are
+		// discarded with the copy (R7-01), so the next slot rebuilds on the
+		// committed tip.
+		committed, commitErr := stateDB.CommitWithBlock(newHeight)
+		if commitErr != nil {
+			bpLog.Error("CommitWithBlock failed while committing transaction state for block %d: %v — discarding the block (fail-closed, M4-F5; no block is produced or signed)", newHeight, commitErr)
+			return nil
+		}
+		if r87Diag() {
 			bpLog.Warn("R87DIAG produce h=%d rootAfterTxCommit=%s txs=%d", newHeight, r87Short(committed), len(txs))
 		}
 	}
@@ -3244,14 +3256,24 @@ func (bp *BlockProducer) buildBlock(
 		if r87Diag() {
 			bpLog.Warn("R87DIAG produce h=%d rootBeforeFinalCommit=%s", newHeight, r87Short(stateDB.Root()))
 		}
-		if committed, err := stateDB.CommitWithBlock(newHeight); err == nil {
-			stateRoot = committed
-			if r87Diag() {
-				bpLog.Warn("R87DIAG produce h=%d rootStampedIntoHeader=%s", newHeight, r87Short(committed))
-			}
-		} else {
-			bpLog.Warn("CommitWithBlock failed while producing block %d: %v (falling back to uncommitted Root)", newHeight, err)
-			stateRoot = stateDB.Root()
+		// M4-F5 fail-closed (audit: producer publishes stale root after a
+		// failed state commit): CommitWithBlock errors on the produce path
+		// used to be treated as non-fatal — the block header was stamped with
+		// stateDB.Root(), the root of a PARTIALLY updated tree, and the block
+		// was signed and published with a state root this node never committed
+		// to. Fail closed instead: abandon the build (nil block → the slot is
+		// skipped and the buffered copy discarded) rather than signing a block
+		// whose header contradicts the local state commitment. The next slot
+		// rebuilds on the committed tip; a persistent failure surfaces as
+		// repeated missed slots instead of a divergent chain.
+		committed, err := stateDB.CommitWithBlock(newHeight)
+		if err != nil {
+			bpLog.Error("CommitWithBlock failed while producing block %d: %v — discarding the block instead of stamping an uncommitted state root (fail-closed, M4-F5; slot abandoned)", newHeight, err)
+			return nil
+		}
+		stateRoot = committed
+		if r87Diag() {
+			bpLog.Warn("R87DIAG produce h=%d rootStampedIntoHeader=%s", newHeight, r87Short(committed))
 		}
 	}
 
