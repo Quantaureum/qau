@@ -34,12 +34,20 @@ var (
 	ErrDuplicateNullifier    = errors.New("confidential: duplicate nullifier detected")
 	ErrInvalidNullifierProof = errors.New("confidential: invalid nullifier proof")
 
-	// ErrRangeProofBindingUnaudited is returned while the range proof is not
-	// cryptographically bound to the transaction's external Pedersen
-	// commitment (audit run-4 C-2, ported from node 8245a07). Keeping this
-	// fail-closed is a guard, not a fix: the root cause is the Groth16
-	// circuit's public-input set.
+	// ErrRangeProofBindingUnaudited is returned only while the kill-switch
+	// rangeProofBindingAudited is closed (false). It is no longer the guard
+	// against run-8: the circuit-level root fix (TxProof, a Groth16 proof
+	// whose public input is the real transaction commitment) replaced the
+	// self-referential Schnorr binding, and legacy-format proofs are
+	// structurally rejected with ErrLegacyRangeProofFormat.
 	ErrRangeProofBindingUnaudited = errors.New("confidential: range proof is not bound to the external Pedersen commitment (circuit-level binding pending)")
+
+	// ErrLegacyRangeProofFormat is returned for range proofs that do not
+	// carry the circuit-bound TxProof (audit run-8: node/qzkp-range-proof-
+	// self-reference). Such proofs prove a range statement about a
+	// prover-chosen MiMC commitment and never constrain the real
+	// transaction commitment; they are rejected unconditionally.
+	ErrLegacyRangeProofFormat = errors.New("confidential: legacy range proof format rejected (not bound to the transaction commitment)")
 )
 
 // Domain separator constants for nullifier derivation
@@ -260,6 +268,13 @@ func decryptWithKey(encrypted []byte, key []byte) (*big.Int, error) {
 	return amount, nil
 }
 
+// GenerateRangeProof produces the LEGACY (unbound) range proof format.
+//
+// DEPRECATED (run-8 root fix): the returned proof states the range condition
+// about a prover-chosen MiMC commitment and is NOT bound to the transaction's
+// Pedersen commitment; VerifyRangeProof rejects it with
+// ErrLegacyRangeProofFormat. Retained only for input-validation tests and API
+// compatibility. Production code MUST use GenerateRangeProofWithBlinding.
 func (cm *ConfidentialManager) GenerateRangeProof(amount *big.Int, bitLength int, commitment []byte) (*qzkp.RangeProof, error) {
 	// PRIV-RP-01 FIX (deep-audit 2026-07-12): validate bitLength and amount
 	// before the shift. bitLength==0 makes uint(bitLength-1) wrap to ~2^64, so
@@ -288,74 +303,80 @@ func (cm *ConfidentialManager) GenerateRangeProof(amount *big.Int, bitLength int
 	return proof, nil
 }
 
-// GenerateRangeProofWithBlinding generates a range proof AND a Schnorr binding
-// proof that cryptographically links the MiMC commitment to a Pedersen
-// commitment via the shared blinding factor.
+// GenerateRangeProofWithBlinding generates a range proof cryptographically
+// bound to the REAL transaction Pedersen commitment.
 //
-// AUDIT (2026) ZK-NN-2 FIX: The basic GenerateRangeProof only stores the
-// Pedersen commitment as ExternalCommitment (byte comparison). This method
-// additionally creates ecCommitment = PedersenCommit(mimcCommit, blinding) and
-// a Schnorr DLP proof that ecCommitment - mimcCommit*G = blinding*H. This
-// proves the prover knows the blinding factor, preventing the attack where an
-// attacker generates a range proof for a small value while the real Pedersen
-// commitment encodes a different value.
+// AUDIT run-8 ROOT FIX (node/qzkp-range-proof-self-reference): the previous
+// implementation produced a MiMC-circuit proof plus a self-referential
+// Schnorr binding (ecCommitment = Pedersen(MiMC(amount), blinding) was
+// prover-chosen, never the transaction commitment), so the proven range
+// statement did not constrain the committed amount. The new implementation
+// calls ProveTxValueInRange, whose Groth16 circuit takes C_tx as a public
+// input and constrains C_tx == amount*G + blinding*H with amount < 2^bitLen.
+// Since the Pedersen opening is unique (G, H independent), the proven range
+// statement applies to the transaction's committed amount.
 func (cm *ConfidentialManager) GenerateRangeProofWithBlinding(amount *big.Int, bitLength int, commitment []byte, blinding []byte) (*qzkp.RangeProof, error) {
-	proof, err := cm.GenerateRangeProof(amount, bitLength, commitment)
-	if err != nil {
-		return nil, err
+	// Validate bitLength and amount before any arithmetic. bitLength==0
+	// would make uint(bitLength-1) wrap; a nil or negative amount panics in
+	// Cmp (PRIV-RP-01 fix).
+	if bitLength < 1 || bitLength > 256 {
+		return nil, ErrInvalidAmount
+	}
+	if amount == nil || amount.Sign() < 0 {
+		return nil, ErrInvalidAmount
+	}
+	// Match the circuit's proven bound exactly: amount < 2^bitLength.
+	maxVal := new(big.Int).Lsh(big.NewInt(1), uint(bitLength))
+	if amount.Cmp(maxVal) >= 0 {
+		return nil, ErrInvalidAmount
 	}
 	if len(blinding) == 0 {
 		return nil, ErrInvalidCommitment
 	}
+	if len(commitment) != qzkp.G1PointSize {
+		return nil, ErrInvalidCommitment
+	}
 
-	// Generate Schnorr binding proof linking MiMC commitment to Pedersen commitment
 	gen, err := pedersen.NewGenerator()
 	if err != nil {
 		return nil, fmt.Errorf("pedersen generator: %w", err)
 	}
 
-	mimcCommitInt := new(big.Int).SetBytes(proof.Commitment)
 	blindingInt := new(big.Int).SetBytes(blinding)
-	ecCommit := gen.Commit(mimcCommitInt, blindingInt)
-	ecBytes := ecCommit.Bytes()
-	ecCopy := make([]byte, len(ecBytes))
-	copy(ecCopy, ecBytes)
+	defer blindingInt.SetInt64(0)
 
-	bindingQ := cm.config.QRNG
-	if bindingQ == nil {
-		bindingQ, err = qrng.New(qrng.DefaultQRNGConfig())
-		if err != nil {
-			return nil, fmt.Errorf("qrng init for binding: %w", err)
-		}
-		defer bindingQ.Close()
-	}
-
-	bindingProof, err := qzkp.GenerateSchnorrBinding(bindingQ, blindingInt, ecCommit, gen, proof.Commitment)
+	txProof, err := cm.protocol.ProveTxValueInRange(amount, blindingInt, bitLength, commitment, gen)
 	if err != nil {
-		return nil, fmt.Errorf("range proof schnorr binding: %w", err)
+		return nil, fmt.Errorf("tx range proof: %w", err)
 	}
-
-	// Zero sensitive material
-	mimcCommitInt.SetInt64(0)
-	blindingInt.SetInt64(0)
-
-	proof.EcCommitment = ecCopy
-	proof.SchnorrBinding = bindingProof
-	return proof, nil
+	return &qzkp.RangeProof{
+		BitLength: bitLength,
+		TxProof:   txProof,
+	}, nil
 }
 
-// rangeProofBindingAudited is false until the Groth16 circuit takes the
-// transaction's external Pedersen commitment as a public input and constrains
-// its opening amount to [0, 2^BitLength). The current Schnorr binding is
-// self-referential: it proves knowledge of the blinding factor behind the
-// prover's own MiMC-derived commitment (Pedersen(MiMC(amount), r)), not the
-// external commitment Pedersen(amount, r), so the two can encode different
-// values. Do NOT flip this to true without the circuit change and a proof
-// that the range statement applies to the external commitment.
-// (Ported from node 8245a07, audit run-4 C-2; fingerprint
-// node/qzkp-range-proof-self-reference.)
-const rangeProofBindingAudited = false
+// rangeProofBindingAudited gates the confidential range-proof acceptance
+// path. It stays in the code as a kill-switch: flipping it back to false
+// re-closes the path without a code rollback.
+//
+// It was flipped to TRUE for the run-8 root fix
+// (node/qzkp-range-proof-self-reference): VerifyRangeProof now verifies
+// TxProof, a Groth16 proof whose PUBLIC input is the real transaction
+// Pedersen commitment C_tx, constraining C_tx == amount*G + blinding*H with
+// amount < 2^BitLength in-circuit (emulated BLS12-381 G1 arithmetic; Pedersen
+// opening uniqueness gives the soundness argument). The legacy
+// self-referential format (MiMC circuit + Schnorr binding to a
+// prover-chosen commitment) is structurally rejected. Justification for the
+// flip: algebraic soundness argument in qzkp/bound_tx_range.go plus negative
+// tests (wrong commitment, replay, tampered commitment, legacy format) and
+// positive end-to-end tests all pass. Pre-existing deployment prerequisite
+// (unchanged, orthogonal to this fix): production cross-node verification
+// still requires an MPC-ceremony trusted setup via LoadTrustedSetup
+// (ZK-NN-7); with per-process local setup, cross-node proofs fail closed.
+const rangeProofBindingAudited = true
 
+// VerifyRangeProof verifies the range proof for a confidential amount
+// against the commitment extracted from the transaction.
 func (cm *ConfidentialManager) VerifyRangeProof(proof *qzkp.RangeProof, commitment []byte) error {
 	if !rangeProofBindingAudited {
 		return ErrRangeProofBindingUnaudited
@@ -366,67 +387,17 @@ func (cm *ConfidentialManager) VerifyRangeProof(proof *qzkp.RangeProof, commitme
 	if commitment == nil || len(commitment) == 0 {
 		return ErrRangeProofFailed
 	}
-	// AUDIT (2026) HIGH-18 (ZK-NN-2): The external (Pedersen) commitment
-	// MUST be bound to the range proof. Previously, when ExternalCommitment
-	// was empty, the binding check was silently skipped — allowing an attacker
-	// to produce a valid range proof for MiMC(1) while the actual Pedersen
-	// commitment encoded a huge or negative value. Now we reject proofs
-	// without a bound ExternalCommitment (fail-closed).
-	if len(proof.ExternalCommitment) == 0 {
+	// run-8 root fix: only the circuit-bound format is accepted. Proofs
+	// without TxProof prove a range statement about a prover-chosen MiMC
+	// commitment (self-referential) and are rejected unconditionally.
+	if proof.TxProof == nil {
+		return ErrLegacyRangeProofFormat
+	}
+	if err := cm.protocol.VerifyTxValueInRange(proof.TxProof, commitment); err != nil {
+		// Do not leak verification internals to callers.
 		return ErrRangeProofFailed
 	}
-	if len(proof.ExternalCommitment) != len(commitment) {
-		return ErrRangeProofFailed
-	}
-	var diff uint8
-	for i := range proof.ExternalCommitment {
-		diff |= proof.ExternalCommitment[i] ^ commitment[i]
-	}
-	if diff != 0 {
-		return ErrRangeProofFailed
-	}
-
-	// AUDIT (2026) R4-ZK-02 FIX: Schnorr binding is now MANDATORY
-	// (fail-closed). Previously this check was optional
-	// (`if proof.SchnorrBinding != nil`), which allowed an attacker to call
-	// GenerateRangeProof() (without blinding) to produce a valid range proof
-	// for a small value, then attach any Pedersen commitment as
-	// ExternalCommitment. The byte comparison at line 355-364 would pass (it
-	// only checks the stored commitment equals the provided one), but there
-	// was NO cryptographic proof linking the MiMC commitment (circuit public
-	// input) to the Pedersen commitment. This means the Pedersen commitment
-	// could encode a completely different (e.g., huge or negative) value while
-	// the range proof only proves a small value is in range — enabling domain
-	// wraparound to mint confidential value.
-	//
-	// The Schnorr binding proof cryptographically links the MiMC commitment
-	// to the Pedersen commitment via the shared blinding factor: the prover
-	// created ecCommitment = PedersenCommit(mimcCommit, blinding) and a
-	// Schnorr DLP proof that ecCommitment - mimcCommit*G = blinding*H. This
-	// proves the prover knows the blinding factor, making it infeasible to
-	// generate a range proof for a different value than the Pedersen
-	// commitment encodes.
-	//
-	// All production callers (CreateConfidentialTx at lines 499, 537) already
-	// use GenerateRangeProofWithBlinding() which produces the Schnorr binding.
-	// Only test code used the unbound GenerateRangeProof().
-	if proof.SchnorrBinding == nil || len(proof.EcCommitment) == 0 {
-		return ErrRangeProofFailed
-	}
-	gen, err := pedersen.NewGenerator()
-	if err != nil {
-		return ErrRangeProofFailed
-	}
-	ecCommit, err := pedersen.CommitmentFromBytes(proof.EcCommitment)
-	if err != nil {
-		return ErrRangeProofFailed
-	}
-	if err := qzkp.VerifySchnorrBinding(proof.SchnorrBinding, ecCommit, gen, proof.Commitment); err != nil {
-		return ErrRangeProofFailed
-	}
-
-	// Verify the ZK proof (uses MiMC commitment internally)
-	return cm.protocol.VerifyValueInRange(proof, proof.Commitment)
+	return nil
 }
 
 func (cm *ConfidentialManager) GeneratePedersenBalanceProof(

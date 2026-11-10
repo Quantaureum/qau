@@ -132,6 +132,16 @@ type RangeProof struct {
 	// out-of-range value.
 	EcCommitment   []byte
 	SchnorrBinding *SchnorrBindingProof
+	// TxProof is the circuit-bound range proof (run-8 root fix): a Groth16
+	// proof whose public input is the REAL transaction Pedersen commitment,
+	// constraining C_tx == amount*G + blinding*H with amount < 2^BitLength.
+	// VerifyRangeProof (privacy/confidential) accepts ONLY this form. The
+	// legacy fields above (Commitment/ExternalCommitment/EcCommitment/
+	// SchnorrBinding) are self-referential — the MiMC commitment and the
+	// Pedersen commitment they link were both prover-chosen, so they never
+	// constrain the real transaction commitment — and are retained only for
+	// API compatibility. Legacy-only proofs are rejected by the verifier.
+	TxProof *TxRangeProof
 }
 
 type EqualityProof struct {

@@ -2,7 +2,6 @@
 package privacy
 
 import (
-	"errors"
 	"math/big"
 	"testing"
 
@@ -87,11 +86,10 @@ func TestPrivacyEndToEnd(t *testing.T) {
 		t.Fatalf("failed to send: %v", err)
 	}
 
-	// run-4 C-2 guard (node 8245a07 port): confidential acceptance is
-	// fail-closed until the Groth16 circuit binds the external Pedersen
-	// commitment, so validation must refuse with the guard error.
-	if err := pm.ValidatePrivacyTransaction(tx); !errors.Is(err, confidential.ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// run-8 root fix: range proofs are circuit-bound to the real transaction
+	// commitments, so confidential validation now succeeds.
+	if err := pm.ValidatePrivacyTransaction(tx); err != nil {
+		t.Fatalf("ValidatePrivacyTransaction: %v", err)
 	}
 
 	outputs, err := pm.ScanPrivacyTransactions(kemPrivKey, metaAddr.SpendPublicKey)

@@ -97,9 +97,9 @@ func TestEncryptDecryptAmount(t *testing.T) {
 func TestRangeProof(t *testing.T) {
 	cm := newTestConfidentialManager()
 
-	// AUDIT (2026) R4-ZK-02: VerifyRangeProof now requires Schnorr
-	// binding (fail-closed). Must use GenerateRangeProofWithBlinding to
-	// produce a proof that passes verification. The unbound
+	// run-8 root fix: GenerateRangeProofWithBlinding now produces a
+	// circuit-bound proof (TxProof) whose public input is the REAL
+	// transaction commitment, so VerifyRangeProof accepts it. The unbound
 	// GenerateRangeProof is only for testing input validation.
 	pg := NewPedersenGeneratorOrPanic()
 	blinding := make([]byte, 32)
@@ -112,17 +112,29 @@ func TestRangeProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate range proof: %v", err)
 	}
-
 	if proof == nil {
 		t.Fatal("range proof should not be nil")
 	}
+	if proof.TxProof == nil {
+		t.Fatal("run-8 fix: proof must carry the circuit-bound TxProof")
+	}
 
-	// run-4 C-2 guard (ported from node 8245a07): the current Schnorr binding
-	// is self-referential, so the confidential range-proof path stays
-	// fail-closed until the Groth16 circuit binds the external Pedersen
-	// commitment.
-	if err := cm.VerifyRangeProof(proof, commitment); !errors.Is(err, ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// Positive: verifying against the same commitment succeeds.
+	if err := cm.VerifyRangeProof(proof, commitment); err != nil {
+		t.Fatalf("VerifyRangeProof (same commitment): %v", err)
+	}
+
+	// Negative (replay): the same proof against a DIFFERENT commitment
+	// (different amount) must be rejected.
+	otherCommitment := pg.Commit(big.NewInt(999), blinding)
+	if err := cm.VerifyRangeProof(proof, otherCommitment); !errors.Is(err, ErrRangeProofFailed) {
+		t.Fatalf("replay onto different commitment: expected ErrRangeProofFailed, got %v", err)
+	}
+
+	// Negative: legacy format (no TxProof) is structurally rejected.
+	legacy := &qzkp.RangeProof{BitLength: 128}
+	if err := cm.VerifyRangeProof(legacy, commitment); !errors.Is(err, ErrLegacyRangeProofFormat) {
+		t.Fatalf("legacy format: expected ErrLegacyRangeProofFormat, got %v", err)
 	}
 }
 
@@ -183,11 +195,10 @@ func TestVerifyConfidentialTx(t *testing.T) {
 
 	tx, _ := cm.CreateConfidentialTx(inputAmounts, outputAmounts, outputPubKeys, senderKemPub, fee)
 
-	// run-4 C-2 guard: verification is fail-closed until the circuit binds the
-	// external Pedersen commitment. Creation still succeeds; only acceptance is
-	// blocked.
-	if err := cm.VerifyConfidentialTx(tx); !errors.Is(err, ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// run-8 root fix: verification now succeeds end to end — range proofs
+	// are circuit-bound to the real transaction commitments.
+	if err := cm.VerifyConfidentialTx(tx); err != nil {
+		t.Fatalf("VerifyConfidentialTx: %v", err)
 	}
 }
 
@@ -207,10 +218,10 @@ func TestConfidentialEndToEnd(t *testing.T) {
 		t.Fatalf("failed to create tx: %v", err)
 	}
 
-	// run-4 C-2 guard: the end-to-end acceptance path is fail-closed until the
-	// circuit binds the external Pedersen commitment.
-	if err := cm.VerifyConfidentialTx(tx); !errors.Is(err, ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// run-8 root fix: the end-to-end acceptance path is open — range proofs
+	// are circuit-bound to the real transaction commitments.
+	if err := cm.VerifyConfidentialTx(tx); err != nil {
+		t.Fatalf("VerifyConfidentialTx: %v", err)
 	}
 
 	if len(tx.Outputs) != 1 {
@@ -256,8 +267,8 @@ func TestConfidentialEdgeCases(t *testing.T) {
 	t.Run("nil range proof", func(t *testing.T) {
 		cm := newTestConfidentialManager()
 		err := cm.VerifyRangeProof(nil, []byte("test"))
-		if !errors.Is(err, ErrRangeProofBindingUnaudited) {
-			t.Errorf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+		if !errors.Is(err, ErrRangeProofFailed) {
+			t.Errorf("expected ErrRangeProofFailed, got %v", err)
 		}
 	})
 
@@ -430,23 +441,23 @@ func TestR4ZK02_UnboundRangeProof_Rejected(t *testing.T) {
 		t.Fatalf("GenerateRangeProof should succeed for small value: %v", err)
 	}
 
-	// VerifyRangeProof MUST reject this proof because it lacks Schnorr binding
-	// — without it, there's no cryptographic link between the MiMC commitment
-	// (circuit input, proving smallValue is in range) and the Pedersen
-	// commitment (encoding bigValue).
+	// VerifyRangeProof MUST reject this proof because it carries no
+	// circuit-bound TxProof — without it there is no constraint linking the
+	// proven range statement to the real Pedersen commitment (which encodes
+	// bigValue, out of the 128-bit range).
 	err = cm.VerifyRangeProof(proof, commitment)
 	if err == nil {
-		t.Fatal("R4-ZK-02: unbound range proof (no Schnorr binding) should be REJECTED")
+		t.Fatal("R4-ZK-02: unbound range proof (no TxProof) should be REJECTED")
 	}
-	// run-4 C-2 guard (node 8245a07 port): the fail-closed binding gate fires
-	// before the R4-ZK-02 Schnorr check, so the guard error is expected here.
-	if !errors.Is(err, ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// run-8 root fix: legacy-format proofs are structurally rejected.
+	if !errors.Is(err, ErrLegacyRangeProofFormat) {
+		t.Fatalf("run-8 fix: expected ErrLegacyRangeProofFormat, got %v", err)
 	}
 }
 
 // TestR4ZK02_BoundRangeProof_Accepted verifies that a range proof generated
-// WITH Schnorr binding (via GenerateRangeProofWithBlinding) is accepted.
+// WITH the transaction blinding (via GenerateRangeProofWithBlinding) carries
+// the circuit-bound TxProof and is accepted by VerifyRangeProof.
 func TestR4ZK02_BoundRangeProof_Accepted(t *testing.T) {
 	cm := newTestConfidentialManager()
 
@@ -463,18 +474,14 @@ func TestR4ZK02_BoundRangeProof_Accepted(t *testing.T) {
 		t.Fatalf("GenerateRangeProofWithBlinding failed: %v", err)
 	}
 
-	if proof.SchnorrBinding == nil {
-		t.Fatal("R4-ZK-02: GenerateRangeProofWithBlinding should produce Schnorr binding")
-	}
-	if len(proof.EcCommitment) == 0 {
-		t.Fatal("R4-ZK-02: GenerateRangeProofWithBlinding should produce EcCommitment")
+	if proof.TxProof == nil {
+		t.Fatal("run-8 fix: GenerateRangeProofWithBlinding should produce the circuit-bound TxProof")
 	}
 
-	// run-4 C-2 guard: even a bound proof is refused until the circuit binds
-	// the external Pedersen commitment (the R4-ZK-02 Schnorr check is
-	// subsumed by the fail-closed gate).
-	if err := cm.VerifyRangeProof(proof, commitment); !errors.Is(err, ErrRangeProofBindingUnaudited) {
-		t.Fatalf("run-4 C-2 guard: expected ErrRangeProofBindingUnaudited, got %v", err)
+	// run-8 root fix: the proof binds to the real commitment in-circuit
+	// (public input C_tx), so verification succeeds.
+	if err := cm.VerifyRangeProof(proof, commitment); err != nil {
+		t.Fatalf("VerifyRangeProof: %v", err)
 	}
 }
 
@@ -500,8 +507,9 @@ func TestR4ZK02_BoundRangeProof_WrongCommitment_Rejected(t *testing.T) {
 	// Generate a different commitment (different value)
 	wrongCommitment := pg.Commit(big.NewInt(999), blinding)
 
-	// VerifyRangeProof should reject because ExternalCommitment (stored in
-	// proof) won't match wrongCommitment (byte comparison fails).
+	// VerifyRangeProof must reject: the circuit's public input is the
+	// original commitment, so the proof cannot verify against a different
+	// point (constant-time mismatch before any cryptographic work).
 	err = cm.VerifyRangeProof(proof, wrongCommitment)
 	if err == nil {
 		t.Fatal("R4-ZK-02: range proof verified against wrong commitment should be REJECTED")
