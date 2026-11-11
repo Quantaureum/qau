@@ -63,7 +63,13 @@ jobs:
       # ~18 minutes locally, so the fast-package 10m budget killed the run
       # mid-test and CI looked like a crash. It now has its own 30m step.
       - name: Test (fast packages)
-        run: go test $(go list ./... | grep -vE '/(core|encoding|consensus|simulation|p2p|node)(/|$)') -timeout 10m -race
+        run: go test $(go list ./... | grep -vE '/(core|encoding|consensus|simulation|p2p|node|privacy|qzkp|wallet/tss)(/|$)') -timeout 10m -race
+      # run-19: the bound_tx_range circuit (run-8 root fix) made the
+      # privacy/qzkp Groth16 proofs ~6x heavier (nbConstraints 334 -> 2197);
+      # they exceed the 10m fast budget on 2-vCPU runners. Give them their
+      # own step like the other heavy packages.
+      - name: Test (privacy/qzkp crypto)
+        run: go test ./privacy/... ./qzkp/... ./wallet/tss/... -timeout 40m
       - name: Test (encoding)
         run: go test ./encoding/... -timeout 30m -race
       # R2-14: crypto and types are separate modules in go.work, so

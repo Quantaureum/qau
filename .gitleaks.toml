@@ -17,9 +17,19 @@ description = "Synthetic test fixtures and documented devnet conventions"
 paths = [
   '''log/log_test\.go''',
   '''cmd/validator_keygen_ceremony/main_test\.go''',
+  # websocket WG test keys are IETF test vectors (run-19 scan hit)
+  '''rpc/websocket_r15_h02_wg_test\.go''',
+  # rust SDK account test fixtures (run-19 scan hit)
+  '''sdks/rust-sdk/src/accounts/account\.rs''',
 ]
 regexes = [
   # The devnet-only deterministic share password, public by design
   # (QUANTAUREUM-DEV-* convention, mirrors the dev-chain seeds).
   '''QUANTAUREUM-DEV-''',
+  # RFC 8439 / IETF sample nonce test vector ("the sample nonce") —
+  # the canonical ChaCha20/Poly1305 test input, not a credential.
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+  # rlpx handshake doc comment naming the mac/aes key VARIABLES
+  # (run-19 gitleaks false positive on p2p/rlpx/conn_test.go).
+  '''IngressMAC=macKeyBA''',
 ]
