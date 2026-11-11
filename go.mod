@@ -1,6 +1,6 @@
 module github.com/quantaureum/qau
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/awnumar/memguard v0.23.0
