@@ -33,15 +33,17 @@ func legacyRequestFrame(packetType byte, payload []byte) []byte {
 	return frame
 }
 
-func TestN19_ActivationValueIsZero(t *testing.T) {
-	if wireAuthActivation != 0 {
-		t.Fatalf("wireAuthActivation = %d, want 0 (must stay dormant until the coordinated upgrade)", wireAuthActivation)
+func TestN19_ActivationValueIsOne(t *testing.T) {
+	// run-19 coordinated upgrade (2026-11-11): the whole fleet swapped to the
+	// activated binary in the same window, so the gate is now fleet-wide ON.
+	if wireAuthActivation != 1 {
+		t.Fatalf("wireAuthActivation = %d, want 1 (fleet-wide activation)", wireAuthActivation)
 	}
-	if wireAuthActive(wireAuthActivation) {
-		t.Fatal("activation value 0 must keep wire authentication inactive")
-	}
-	if !wireAuthActive(1) {
+	if !wireAuthActive(wireAuthActivation) {
 		t.Fatal("activation value 1 must enable wire authentication")
+	}
+	if wireAuthActive(0) {
+		t.Fatal("activation value 0 must keep wire authentication inactive")
 	}
 }
 

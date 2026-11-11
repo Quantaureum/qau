@@ -43,10 +43,11 @@ import (
 
 const (
 	// wireAuthActivation is the activation value for N-19 wire authentication.
-	// 0 means inactive: the mechanism is fully wired but never engaged, so the
-	// encoded frames are identical to the legacy encoding. It must only be
-	// changed together with the H-01/H-02 coordinated upgrade window.
-	wireAuthActivation uint64 = 0
+	// Activated fleet-wide in the run-19 coordinated upgrade (2026-11-11):
+	// every node swapped to this binary in the same window, so the wire
+	// encoding flipped fleet-wide. FINDNODE additionally retains its
+	// P2P-08 endpoint-proof and P2-06 rate-limit guards.
+	wireAuthActivation uint64 = 1
 
 	// wireAuthDomain separates this MAC from any other use of the same secret.
 	wireAuthDomain = "QAU-DISC-WIRE-AUTH-v1"

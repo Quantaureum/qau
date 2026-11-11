@@ -5319,6 +5319,15 @@ func (n *Node) initRollup() error {
 		qpos := n.blockProducer.QPOS()
 		adapter := &qposSequencerAdapter{qpos: qpos}
 		elector := rollup.NewQPOSSequencerElector(adapter)
+		// AUDIT L-09 (run-19 wiring completion): carry the governance-decided
+		// activation epoch from config into the elector. 0 / unset keeps the
+		// gate inert (byte-identical election); a nonzero epoch makes the
+		// elector REQUIRE VRF-derived election from that epoch on, retiring
+		// the predictable keccak256(epoch) % n fallback (P3-RL-05).
+		if n.config.RollupMinVRFEpochActivation > 0 {
+			elector.SetMinVRFEpoch(n.config.RollupMinVRFEpochActivation)
+			nodeLog.Info("Rollup sequencer election: VRF gate activates at epoch %d (P3-RL-05)", n.config.RollupMinVRFEpochActivation)
+		}
 		engine.SetSequencerElector(elector)
 
 		// Set the local validator address so the engine knows whether this
