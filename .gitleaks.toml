@@ -32,4 +32,17 @@ regexes = [
   # rlpx handshake doc comment naming the mac/aes key VARIABLES
   # (run-19 gitleaks false positive on p2p/rlpx/conn_test.go).
   '''IngressMAC=macKeyBA''',
+  # Companion line of the same rlpx doc comment block (adjacent line
+  # re-triggered generic-api-key on the IngressAES variable assignment).
+  '''IngressAES=encKeyBA''',
+  # Canonical sequential placeholder hex (0x0123456789abcdef repeated)
+  # used as a documented example in the rust-sdk README and as a unit-test
+  # fixture in validation.rs; sequential by construction, not a credential.
+  # 32-char prefix: matches any continuation of the sequence while keeping
+  # this file free of 40/64-char hex literals (push-audit scanner noise).
+  '''0123456789abcdef0123456789abcdef''',
+  # Go identifier captured as the "secret" from the QTD protocol doc
+  # comment in wallet/tss/qtd/qtd_protocol.go (keyword-triggered
+  # generic-api-key match on a function name, not a credential).
+  '''computeZ0Contribution''',
 ]
