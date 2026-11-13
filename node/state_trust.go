@@ -69,6 +69,18 @@ type stateTrust struct {
 	mismatchStreak int
 	// streakLimit is configurable so tests do not have to loop 32 times.
 	streakLimit int
+	// derivationDiverged is non-empty when this node's root derivation
+	// disagrees with the canonical chain and the R63-STATE-ROOT-TRUST path
+	// accepted the canonical header root after a post-rebuild mismatch.
+	// The node keeps FOLLOWING the chain but must not PROPOSE blocks: the
+	// producer stamps its own committed root into the header (block_producer
+	// CommitWithBlock output), and derivation-aligned validators cannot
+	// reproduce a divergent root — the 2026-11-13 mainnet fork (block
+	// 395297/395298) was exactly this path. Cleared only by a later rebuild
+	// that VERIFIES clean (rebuildState success path); live per-block matches
+	// do not clear it because a derivation-divergent node cannot produce them
+	// in the first place, and operator re-sync/restart resets the process.
+	derivationDiverged string
 }
 
 func newStateTrust() *stateTrust {
@@ -113,22 +125,51 @@ func (t *stateTrust) recordMatch() {
 	}
 }
 
+// breakDerivation marks the node's root derivation as diverged from the
+// canonical chain (the R63 canonical-trust path just accepted a header root
+// the local derivation could not reproduce). Production is gated off while
+// this flag is set; following the chain is unaffected. Idempotent: the first
+// detail wins so operators see the original cause.
+func (t *stateTrust) breakDerivation(detail string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.derivationDiverged != "" {
+		return
+	}
+	t.derivationDiverged = detail
+}
+
+// clearDerivation records that a later rebuild VERIFIED the local derivation
+// against the canonical header, so proposing from local state is safe again.
+func (t *stateTrust) clearDerivation() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.derivationDiverged = ""
+}
+
 // ok reports whether local state is still trusted.
 func (t *stateTrust) ok() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.broken == nil
+	return t.broken == nil && t.derivationDiverged == ""
 }
 
 // reason returns a copy of the break reason, or nil when trust is intact.
 func (t *stateTrust) reason() *stateTrustReason {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if t.broken == nil {
-		return nil
+	if t.broken != nil {
+		r := *t.broken
+		return &r
 	}
-	r := *t.broken
-	return &r
+	if t.derivationDiverged != "" {
+		return &stateTrustReason{
+			Detail: t.derivationDiverged,
+			At:     time.Now(),
+			Hard:   false,
+		}
+	}
+	return nil
 }
 
 // streak returns the current consecutive-mismatch count (diagnostics).
