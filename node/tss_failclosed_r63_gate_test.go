@@ -242,10 +242,16 @@ func tssFailClosedProducer(t *testing.T, signer *failingThresholdSigner, validat
 	}
 }
 
-// TSS-FC-01: SignBlock fails ("share not found") with an elected proposer in
-// hand. The build must be ABORTED — no block, no individual Dilithium3
-// downgrade — and the stub must have been consulted exactly once.
-func TestTSSFC01_SignBlockFailureAbortsBuild(t *testing.T) {
+// TSS hotfix (2026-11-14): the proposer-level TSS session has failed
+// network-wide ("share not found") since the epoch-14596 DKG roster rotation,
+// while the t-of-n guarantee lives in the SEAL layer. PR #8's fail-closed
+// attempt conflated the layers and halted all production. These tests pin the
+// RESTORED liveness: a failing proposer TSS session falls back to the
+// individual header signature and the block is still built.
+
+// Hotfix: SignBlock fails ("share not found") with an elected proposer in
+// hand. The build must SUCCEED via the individual-signature fallback.
+func TestTSSHotfix_SignBlockFailureFallsBackToIndividual(t *testing.T) {
 	val := &consensus.Validator{
 		Address: types.Address{0x01},
 		Stake:   new(big.Int).Exp(big.NewInt(32), big.NewInt(18), nil),
@@ -264,20 +270,18 @@ func TestTSSFC01_SignBlockFailureAbortsBuild(t *testing.T) {
 	}
 
 	blk := bp.buildBlock(5, 10, types.Hash{}, nil, buildState)
-	if blk != nil {
-		t.Fatalf("TSS-FC-01 NOT FIXED: buildBlock published a block despite the TSS signing failure — "+
-			"header would carry an individual signature under a threshold policy (stateRoot=%x)",
-			blk.Header.StateRoot[:8])
+	if blk == nil {
+		t.Fatal("TSS hotfix NOT APPLIED: buildBlock aborted on a proposer TSS failure — " +
+			"the network-wide share-not-found state would halt all production again")
 	}
 	if signer.calls != 1 {
 		t.Fatalf("SignBlock must be attempted exactly once, got %d", signer.calls)
 	}
 }
 
-// TSS-FC-02: the elected proposer cannot be determined — the QR-21 stop-pin
-// makes GetProposerForSlot refuse the slot's epoch. The build must be ABORTED
-// for the same reason (and SignBlock must never be consulted).
-func TestTSSFC02_UndeterminedProposerAbortsBuild(t *testing.T) {
+// Hotfix: the elected proposer cannot be determined (QR-21 stop-pin refuses
+// the slot's epoch). The build must still SUCCEED via the fallback.
+func TestTSSHotfix_UndeterminedProposerStillBuilds(t *testing.T) {
 	val := &consensus.Validator{
 		Address: types.Address{0x01},
 		Stake:   new(big.Int).Exp(big.NewInt(32), big.NewInt(18), nil),
@@ -299,8 +303,8 @@ func TestTSSFC02_UndeterminedProposerAbortsBuild(t *testing.T) {
 	}
 
 	blk := bp.buildBlock(5, 10, types.Hash{}, nil, buildState)
-	if blk != nil {
-		t.Fatal("TSS-FC-02 NOT FIXED: buildBlock published a block without a deterministically elected proposer")
+	if blk == nil {
+		t.Fatal("TSS hotfix NOT APPLIED: buildBlock aborted without an elected proposer")
 	}
 	if signer.calls != 0 {
 		t.Fatalf("SignBlock must not be attempted without an elected proposer, got %d", signer.calls)
