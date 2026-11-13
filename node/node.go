@@ -4120,6 +4120,16 @@ func (n *Node) initSyncer() error {
 		}
 		n.recordStateRootMismatch(height)
 	})
+	// R63-STATE-TRUST (2026-11-13): when the R63 canonical-trust path accepts
+	// a header root our derivation cannot reproduce, gate production (the
+	// node keeps following). A verified rebuild re-enables it.
+	n.syncer.SetOnStateDerivationResult(func(diverged bool, detail string) {
+		if diverged {
+			n.markStateDerivationDiverged(detail)
+			return
+		}
+		n.clearStateDerivationDiverged()
+	})
 	// M4-F5: an unusable state index (Verkle tree update failed) means no
 	// valid root can be derived — stop producing instead of retrying.
 	n.syncer.SetOnStateFatal(func(detail string) {

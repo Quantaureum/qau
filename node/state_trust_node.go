@@ -47,6 +47,42 @@ func (n *Node) recordStateRootMatch() {
 	n.stateTrust.recordMatch()
 }
 
+// markStateDerivationDiverged records that the R63-STATE-ROOT-TRUST path
+// accepted a canonical header root this node's own derivation could not
+// reproduce. The node keeps following the chain but stops PROPOSING blocks:
+// its producer would stamp the divergent local root into new headers, which
+// derivation-aligned validators reject (root cause of the 2026-11-13 mainnet
+// fork at blocks 395297/395298). Cleared when a later rebuild verifies the
+// derivation, or by an operator re-sync/restart.
+func (n *Node) markStateDerivationDiverged(detail string) {
+	if n == nil || n.stateTrust == nil {
+		return
+	}
+	wasClear := n.stateTrust.derivationDiverged == ""
+	n.stateTrust.breakDerivation(detail)
+	if wasClear {
+		nodeLog.Error("R63-STATE-TRUST: local root derivation diverged from the canonical chain (%s). "+
+			"This node will KEEP FOLLOWING the chain but will NOT PROPOSE blocks — a header stamped "+
+			"from the divergent local state cannot be reproduced by derivation-aligned validators. "+
+			"Production resumes when a later rebuild verifies the derivation against the canonical "+
+			"header, or after an operator re-sync.", detail)
+	}
+}
+
+// clearStateDerivationDiverged records that a rebuild completed with a root
+// that MATCHES the canonical header, so the local derivation is aligned again
+// and proposing from local state is safe.
+func (n *Node) clearStateDerivationDiverged() {
+	if n == nil || n.stateTrust == nil {
+		return
+	}
+	if n.stateTrust.derivationDiverged != "" {
+		n.stateTrust.clearDerivation()
+		nodeLog.Info("R63-STATE-TRUST: rebuild verified the local derivation against the canonical " +
+			"header — derivation divergence cleared, block production re-enabled")
+	}
+}
+
 // IsStateTrusted reports whether local state is still considered consistent
 // with the network. Block production is gated on this.
 func (n *Node) IsStateTrusted() bool {
@@ -94,7 +130,8 @@ func (bp *BlockProducer) shouldSkipForStateTrust(slot uint64) bool {
 	if slot%20 == 0 {
 		bpLog.Error("tryProduceBlock: slot=%d SKIPPED — R87-STATE-TRUST: local state "+
 			"is not trusted (%s). Still following the chain; production stays disabled "+
-			"until this node is re-synced.", slot, bp.node.StateTrustDetail())
+			"until the state issue is resolved (a rebuild verifies the derivation, "+
+			"or an operator re-sync).", slot, bp.node.StateTrustDetail())
 	}
 	return true
 }

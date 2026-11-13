@@ -269,6 +269,12 @@ type Syncer struct {
 	// check so the node can track how long it has been diverging. Injected by
 	// node.go; nil in unit tests.
 	onStateRootResult func(height uint64, matched bool)
+	// R63-STATE-TRUST (2026-11-13): reports whether the R63 canonical-trust
+	// path accepted a header root the local derivation could not reproduce
+	// (diverged=true) or a rebuild verified the derivation (diverged=false).
+	// The node gates PRODUCTION on this while keeping sync alive. Injected by
+	// node.go; nil in unit tests.
+	onStateDerivationResult func(diverged bool, detail string)
 	// M4-F5: invoked when the state index (Verkle tree) is unusable. The
 	// node treats this as a hard state-trust break and stops producing.
 	onStateFatal func(detail string)
@@ -1716,6 +1722,14 @@ func (s *Syncer) SetStrictStateRoot(enabled bool) {
 // state-root comparison during block application.
 func (s *Syncer) SetOnStateRootResult(fn func(height uint64, matched bool)) {
 	s.onStateRootResult = fn
+}
+
+// SetOnStateDerivationResult installs the R63-STATE-TRUST hook invoked when
+// the R63 canonical-trust path accepts an unreproducible header root
+// (diverged=true) or a rebuild verifies the local derivation (diverged=false).
+// The node disables block production while the derivation is diverged.
+func (s *Syncer) SetOnStateDerivationResult(fn func(diverged bool, detail string)) {
+	s.onStateDerivationResult = fn
 }
 
 // M4-F5: SetOnStateFatal installs the hook invoked when the state index
@@ -5439,6 +5453,18 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 			"trusting canonical header root to keep sync advancing (computed=%x header=%x block=%d). "+
 			"Local state derivation bug still tracked under M4; sealer will NOT block sync on this.",
 			computedRoot[:8], finalBlk.Header.StateRoot[:8], toHeight)
+		// R63-STATE-TRUST (2026-11-13): trusting the canonical root keeps SYNC
+		// alive, but this node's derivation is now KNOWN to disagree with the
+		// chain it follows. Letting it propose would stamp the divergent local
+		// root into new headers (block_producer stamps its own CommitWithBlock
+		// output), which derivation-aligned validators cannot reproduce — the
+		// 2026-11-13 mainnet fork at blocks 395297/395298. Notify the node so
+		// production is gated until a rebuild verifies the derivation.
+		if s.onStateDerivationResult != nil {
+			s.onStateDerivationResult(true, fmt.Sprintf(
+				"R63: post-rebuild state root mismatch at block %d (computed=%x header=%x) — local derivation diverged",
+				toHeight, computedRoot[:8], finalBlk.Header.StateRoot[:8]))
+		}
 		s.mu.Lock()
 		s.stateVerifiedHeight = toHeight
 		cb := s.onStateDBVerified
@@ -5473,6 +5499,13 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 	}
 	syncLog.Info("rebuildState: state root verified at block %d (computed=%x header=%x)",
 		toHeight, computedRoot[:8], finalBlk.Header.StateRoot[:8])
+
+	// R63-STATE-TRUST (2026-11-13): a verified rebuild proves the local
+	// derivation reproduces the canonical root — any prior divergence flag
+	// is stale and proposing from local state is safe again.
+	if s.onStateDerivationResult != nil {
+		s.onStateDerivationResult(false, "")
+	}
 
 	s.mu.Lock()
 	s.stateVerifiedHeight = toHeight

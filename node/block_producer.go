@@ -3443,42 +3443,42 @@ func (bp *BlockProducer) buildBlock(
 			if proposerIndex >= 0 {
 				sig, err := bp.qpos.SignBlock(proposerIndex, signingData)
 				if err != nil {
-					// QTD noise discipline: a network whose block signing is
-					// legacy-only falls back on every slot, so the failure is
-					// logged once per epoch at Warn and the rest at Debug with
-					// the running count replayed at the next boundary.
+					// TSS-FC-01 (2026-11-13): fail closed. A node configured
+					// with a threshold signer must never downgrade a block to
+					// an individual Dilithium3 signature — that silently
+					// bypasses the t-of-n seal guarantee (on mainnet the
+					// 4/6 threshold devolved to single-signer seals during
+					// the DKG roster rotation at epoch 14596, which is what
+					// kept a two-node divergent branch sealable during the
+					// 395297 fork). The slot is abandoned instead; the next
+					// proposer takes over. The epoch-bucketed log discipline
+					// is kept so a fleet-wide TSS degradation stays visible
+					// without flooding.
 					if epoch != bp.tssFallbackWarnedEpoch {
 						if bp.tssFallbackWarnedEpoch != 0 || bp.tssFallbackSuppressed != 0 {
-							bpLog.Warn("TSS signing fallback: epoch %d had %d suppressed fallbacks",
+							bpLog.Error("TSS signing failures: epoch %d had %d suppressed slot skips",
 								bp.tssFallbackWarnedEpoch, bp.tssFallbackSuppressed)
 						}
 						bp.tssFallbackWarnedEpoch = epoch
 						bp.tssFallbackSuppressed = 0
-						bpLog.Warn("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+						bpLog.Error("TSS signing failed for block %d — refusing to fall back to an individual "+
+							"Dilithium3 signature (threshold seal guarantee), abandoning slot: %v", newHeight, err)
 					} else {
 						bp.tssFallbackSuppressed++
-						bpLog.Debug("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+						bpLog.Debug("TSS signing failed for block %d — slot abandoned (individual-sign fallback disabled): %v", newHeight, err)
 					}
-					// Fall back to individual Dilithium3 signing
-					if bp.validatorKey != nil {
-						sig, err = bp.validatorKey.Sign(signingData)
-						if err != nil {
-							bpLog.Error("Failed to sign block %d with individual key: %v", newHeight, err)
-							return nil
-						}
-					}
+					return nil
 				}
 				newBlock.Header.Signature = sig
 			} else {
-				bpLog.Warn("Could not determine elected proposer for TSS signing block %d, using individual Dilithium3", newHeight)
-				if bp.validatorKey != nil {
-					sig, err := bp.validatorKey.Sign(signingData)
-					if err != nil {
-						bpLog.Error("Failed to sign block %d with individual key: %v", newHeight, err)
-						return nil
-					}
-					newBlock.Header.Signature = sig
-				}
+				// TSS-FC-02 (2026-11-13): fail closed. Without a deterministically
+				// elected proposer the TSS signer cannot bind the right key share,
+				// and signing with the local individual key would publish a
+				// single-signature block under a threshold policy. Abandon the slot.
+				bpLog.Error("Could not determine elected proposer for TSS signing block %d — "+
+					"refusing to fall back to an individual Dilithium3 signature (threshold seal guarantee), "+
+					"abandoning slot", newHeight)
+				return nil
 			}
 		}
 	} else if bp.validatorKey != nil {
