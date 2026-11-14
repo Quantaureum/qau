@@ -343,6 +343,20 @@ type Config struct {
 	// This is the mainnet-legal activation path: it introduces no runtime
 	// DKG (mainnet keeps refusing runtime DKG regardless of this field).
 	TSSV1SealingActivationEpoch uint64 `json:"tssV1SealingActivationEpoch"`
+	// TSSV1ProposalActivationEpoch arms the block validator's per-epoch
+	// Dilithium3 v1 group-signature verification branch (TSS-R3-B-1 P0):
+	// from this epoch on, a 3293-byte header signature is first checked
+	// against the epoch's anchored v1 group public key, and only falls back
+	// to the individual Dilithium3 verification when that group check does
+	// not verify (a proposer may always legitimately fall back to an
+	// individual signature). 0/absent = disabled (the default on every
+	// network): the branch is inert and validation behavior is identical to
+	// a build without it. The value MUST be identical on every node or the
+	// accepted block set diverges. This changeset wires both sides: the
+	// validator branch consumes this field (node.go initConsensus) and the
+	// producer side is gated by QAU_ENABLE_TDILITHIUM3_V1_PROPOSAL plus this
+	// epoch (node/tdilithium3_signing_proposal.go).
+	TSSV1ProposalActivationEpoch uint64 `json:"tssV1ProposalActivationEpoch"`
 	// TSSV1TrustedGroupKey is the hex-encoded group public key of the armed
 	// offline ceremony (the ceremony manifest's group_public_key). It is read
 	// only by verify-only nodes, which hold no share of that ceremony: at

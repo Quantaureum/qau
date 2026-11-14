@@ -2938,6 +2938,44 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 	return validateGroupKey(key, "qtdSigner.GroupPublicKey")
 }
 
+// GroupPublicKeyForEpoch is the read-only export of the per-epoch QTD group
+// public key for consumers OUTSIDE the seal-verification path (TSS-R3-B-1
+// P0: the block validator's optional per-epoch v1 group-signature branch is
+// the intended consumer). It serves exactly the key material the anchor
+// custody discipline vouches for:
+//
+//   - The lookup is getGroupPublicKeyForEpochLocked (QTD-H03 floor semantics,
+//     QTD-009 fail-closed for unrecorded future epochs), so every reachable
+//     key entered groupKeyHistory through a validated write-side chokepoint
+//     only: setQTDSignerLocked (local signer, write-side length/degenerate
+//     gates), ReRootGroupKeyCustody (ceremony trust root), or
+//     ObserveAnchoredGroupKey (observer anchor with the R19-F02 chained
+//     adoption / first-establishment cross-checks). There is no path here
+//     that serves a raw header-supplied key which has not passed those
+//     checks — the round19 F-02 cross-protection carries over to this
+//     export by construction.
+//   - The returned slice is a defensive copy; callers cannot mutate the
+//     custody table through it.
+//
+// Read-only contract: this function never installs, rotates, or re-roots a
+// key. An empty return means "no validated key for this epoch"; callers must
+// treat that as fail-closed (the consuming verification branch simply does
+// not engage).
+func (qfs *QTDFinalityState) GroupPublicKeyForEpoch(epoch uint64) []byte {
+	if qfs == nil {
+		return nil
+	}
+	// CONS-P0-03 lock discipline: precompute currentEpoch OUTSIDE qfs.mu
+	// (qpos.GetCurrentEpoch is lock-free), then take qfs.mu for the lookup.
+	currentEpoch := uint64(0)
+	if qfs.qpos != nil {
+		currentEpoch = qfs.qpos.GetCurrentEpoch()
+	}
+	qfs.mu.RLock()
+	defer qfs.mu.RUnlock()
+	return qfs.getGroupPublicKeyForEpochLocked(epoch, currentEpoch)
+}
+
 // ObserveAnchoredGroupKey consumes the optional QTDGroupKey header field that
 // armed networks anchor on an epoch's first block. It is the observer (e.g.
 // verify-only validator) learning channel for the epoch's group key.
