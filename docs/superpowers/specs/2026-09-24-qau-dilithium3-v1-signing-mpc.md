@@ -935,10 +935,13 @@ commitment to its own signer.
 
 The t-shares-in-one-process shape is a TEST-ONLY construction, and the guard
 against it in production is STRUCTURAL rather than a runtime check: the
-reference session builders (`newSigningAttempt`, `newSigningExecutorSession`)
-are unexported, and the networked wiring installs exactly one share per node
-(`LoadActiveAtEpoch` resolves a single active share, the schedule binds one
-`config.Share` that must belong to the signer subset). The networked party's
+guarantee is the single-share binding rather than constructor visibility —
+`LoadActiveAtEpoch` resolves exactly one active share per node, and every
+schedule invocation binds one `config.Share` that must belong to the signer
+subset. `newSigningExecutorSession` IS production-reachable through that
+schedule, but only ever with that single share, and the multi-share
+reference driver is reachable only through the unexported
+`newSigningAttempt`, which production never calls. The networked party's
 corresponding integrity check is the `reconstructPartialSecrets`
 local-reproducibility cross-check. This note records the guarantee's nature
 explicitly (2026-11-14 reduction review F-4); the reference driver stays
