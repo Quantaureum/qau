@@ -753,12 +753,14 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 // The pre-registered inbox shells are released when this run ends, whatever
 // the outcome. A shell the request schedule adopted is owned by its slot
 // driver from that point and is unregistered by the driver itself when the
-// candidate exits; because the schedule's run is synchronous (it waits for
-// every candidate before returning), every driver has already cleaned up by
-// the time this deferred unregister executes, so it only removes shells that
-// never reached a schedule -- an attempt refused before the schedule was
-// built (permit, share, roster, binding) would otherwise leak one inbox with
-// its identity snapshot per candidate slot.
+// candidate exits. The schedule returns after the FIRST candidate succeeds
+// (cancelling the rest), so a cancelled candidate's driver unregisters its
+// own shell asynchronously and may run after this deferred unregister; the
+// interleaving is safe because every unregister goes through the same
+// mutex-guarded map with a pointer-identity check, making any order an
+// idempotent remove. Shells that never reached a schedule (an attempt
+// refused before it was built: permit, share, roster, binding) would
+// otherwise leak one inbox with its identity snapshot per candidate slot.
 func (n *Node) tdilithium3ProposalTriggerRun(ctx context.Context, session *tdilithium3ProposalTriggerSession, activationEpoch, epoch, slot uint64, bound [32]byte, ordinal uint64, shells []*tdilithium3SigningInbox) {
 	defer func() {
 		n.unregisterTDilithium3ProposalShells(shells)
