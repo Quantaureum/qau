@@ -219,6 +219,13 @@ const (
 	// idempotent duplicate rather than a replay. It is NOT a threshold
 	// envelope: the node layer must route it before the signing-envelope
 	// path, which keys on session ids that no receiver has registered yet.
+	//
+	// MIXED-VERSION COMPATIBILITY: the cluster must be fully upgraded before
+	// the proposal gate opens — a peer on a binary that predates kind 103
+	// scores a BadMessage validation violation on every trigger (the penalty
+	// ladder escalates repeated violations to a temporary disconnect), which
+	// is acceptable only while the gate is closed (the default) and zero
+	// triggers are broadcast.
 	MsgTypeTDilithium3ProposalTrigger uint8 = 103
 )
 

@@ -170,6 +170,20 @@ func tdilithium3ProposalWithinWindow(slot uint64, now time.Time) bool {
 	return now.Sub(consensus.GetSlotStartTime(slot)) <= tdilithium3ProposalSigningWindow
 }
 
+// tdilithium3ProposalWithinFutureTolerance refuses a trigger whose slot has
+// not started yet: a trigger for a future slot can only be a misconfigured or
+// hostile announcement (a slot's own proposer cannot have anything to sign
+// before its slot begins), and starting a session for it would burn one-time
+// material on a message no header will carry. One slot of tolerance absorbs
+// modest clock skew between peers; without a configured genesis time there is
+// no chain clock and the check bounds nothing.
+func tdilithium3ProposalWithinFutureTolerance(slot uint64, now time.Time) bool {
+	if !consensus.IsGenesisTimeConfigured() {
+		return true
+	}
+	return !consensus.GetSlotStartTime(slot).After(now.Add(consensus.SlotDuration))
+}
+
 // tdilithium3ProposalAttemptRetryable reports whether a failed attempt moves
 // the header on to the next ordinal: its candidate slots were all filtered (a
 // statistical outcome of the per-slot rejection sampling), or one of its
@@ -639,16 +653,31 @@ func (n *Node) tdilithium3ProposalOrdinalRecordLocked(slot, ordinal uint64) {
 }
 
 // tdilithium3ProposalSigningStart makes this node run the announced attempt
-// of one proposal slot, replacing a lower attempt that is still running. It
+// of one proposal slot, replacing a lower attempt that is still running. The
+// caller's pre-registered inbox shells travel with the start: a refusal drops
+// them immediately (they would otherwise queue messages for a session that
+// never runs), and an accepted start hands them to the run, which releases
+// them when the attempt ends (a shell the schedule adopted is owned by its
+// slot driver from that point, so the late unregister is a safe no-op). It
 // returns false, without any state change, when the gate is closed, the
 // ordinal is out of bounds or out of sequence, the proposal window has
 // passed, the epoch precedes the share's activation, or the anchor custody
 // does not vouch for the ceremony key -- every refusal is fail-closed, and a
 // refusal never leaves a goroutine or an inbox behind.
-func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byte, ordinal uint64) bool {
+func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byte, ordinal uint64, shells []*tdilithium3SigningInbox) bool {
 	if n == nil {
 		return false
 	}
+	started := false
+	defer func() {
+		if !started {
+			// Every refusal drops the pre-registered shells: a refused
+			// attempt has no schedule that could adopt them, so the
+			// registrations would leak one inbox (with its identity
+			// snapshot) per candidate slot.
+			n.unregisterTDilithium3ProposalShells(shells)
+		}
+	}()
 	if !tdilithium3ProposalSigningEnabled(n, epoch) {
 		// Gate closed (the default posture): zero side effects, zero logs.
 		return false
@@ -659,6 +688,10 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 	}
 	if !tdilithium3ProposalWithinWindow(slot, time.Now()) {
 		tdilithium3ProposalTrace("slot %d: attempt %d arrived after the proposal window", slot, ordinal)
+		return false
+	}
+	if !tdilithium3ProposalWithinFutureTolerance(slot, time.Now()) {
+		tdilithium3ProposalTrace("slot %d: attempt %d is from a slot that has not started yet", slot, ordinal)
 		return false
 	}
 	if !n.tdilithium3ProposalOrdinalAdmissible(slot, ordinal) {
@@ -686,8 +719,10 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 		if existing.attempt >= ordinal {
 			n.tdilithium3ProposalSigningMu.Unlock()
 			// An idempotent retransmission or a superseded announcement: the
-			// running attempt is not replaced. The caller's pre-registered
-			// inbox shells (if any) are its responsibility to drop.
+			// running attempt is not replaced, and its schedule owns the
+			// inboxes of that session id -- the duplicate's shells (same
+			// derivation, fresh registrations) are dropped here so they
+			// cannot shadow the live session's registrations.
 			tdilithium3ProposalTrace("slot %d: attempt %d is not newer than the running %d", slot, ordinal, existing.attempt)
 			return false
 		}
@@ -703,7 +738,8 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 	n.tdilithium3ProposalTriggerSessions[slot] = session
 	n.tdilithium3ProposalSigningMu.Unlock()
 	tdilithium3ProposalTrace("slot %d: starting triggered attempt %d for epoch %d", slot, ordinal, epoch)
-	go n.tdilithium3ProposalTriggerRun(ctx, session, activationEpoch, epoch, slot, bound, ordinal)
+	started = true
+	go n.tdilithium3ProposalTriggerRun(ctx, session, activationEpoch, epoch, slot, bound, ordinal, shells)
 	return true
 }
 
@@ -713,8 +749,21 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 // the ordinal admission in the start. The converged signature is a byproduct
 // on a signer -- the proposer attaches its own copy to the header -- so it
 // passes the attempt body's self-checks and is dropped.
-func (n *Node) tdilithium3ProposalTriggerRun(ctx context.Context, session *tdilithium3ProposalTriggerSession, activationEpoch, epoch, slot uint64, bound [32]byte, ordinal uint64) {
-	defer n.tdilithium3ProposalTriggerForget(slot, session)
+//
+// The pre-registered inbox shells are released when this run ends, whatever
+// the outcome. A shell the request schedule adopted is owned by its slot
+// driver from that point and is unregistered by the driver itself when the
+// candidate exits; because the schedule's run is synchronous (it waits for
+// every candidate before returning), every driver has already cleaned up by
+// the time this deferred unregister executes, so it only removes shells that
+// never reached a schedule -- an attempt refused before the schedule was
+// built (permit, share, roster, binding) would otherwise leak one inbox with
+// its identity snapshot per candidate slot.
+func (n *Node) tdilithium3ProposalTriggerRun(ctx context.Context, session *tdilithium3ProposalTriggerSession, activationEpoch, epoch, slot uint64, bound [32]byte, ordinal uint64, shells []*tdilithium3SigningInbox) {
+	defer func() {
+		n.unregisterTDilithium3ProposalShells(shells)
+		n.tdilithium3ProposalTriggerForget(slot, session)
+	}()
 	if !n.acquireTDilithium3ProposalSigning(ctx) {
 		tdilithium3ProposalTrace("slot %d attempt %d: proposal permit unavailable", slot, ordinal)
 		return
@@ -875,12 +924,9 @@ func (n *Node) handleTDilithium3ProposalTrigger(msg p2p.PeerMessage) {
 	// proposer begins its own attempt's round messages as soon as its local
 	// run starts, and a first message that outruns this node's session
 	// goroutine would otherwise be dropped at routing. The start's schedule
-	// factory reuses a registered inbox for the same session id.
-	inboxes := n.tdilithium3ProposalPrebuildInboxes(epoch, slot, bound, ordinal)
-	if !n.tdilithium3ProposalSigningStart(epoch, slot, bound, ordinal) {
-		// The start refused (ordinal raced ahead, window closed, custody
-		// changed): drop the shells so a dead session's id cannot queue
-		// messages.
-		n.unregisterTDilithium3ProposalShells(inboxes)
-	}
+	// factory reuses a registered inbox for the same session id. The shells
+	// travel with the start: a refusal drops them immediately, an accepted
+	// start releases them when the attempt's run ends (see
+	// tdilithium3ProposalTriggerRun for the ownership hand-off).
+	n.tdilithium3ProposalSigningStart(epoch, slot, bound, ordinal, n.tdilithium3ProposalPrebuildInboxes(epoch, slot, bound, ordinal))
 }

@@ -100,22 +100,22 @@ func TestTDilithium3ProposalTriggerPayloadRoundTrip(t *testing.T) {
 func TestTDilithium3ProposalSigningStartFailsClosed(t *testing.T) {
 	var unconfigured *Node
 	bound := triggerTestBound()
-	if unconfigured.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0) {
+	if unconfigured.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0, nil) {
 		t.Fatal("nil node started a session")
 	}
 	// Gate closed (the default): refuse with zero side effects.
 	closed := &Node{config: &Config{NetworkID: TestnetNetworkID}}
-	if closed.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0) {
+	if closed.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0, nil) {
 		t.Fatal("node with a closed gate started a session")
 	}
 	// Gate open: the attempt bound refuses before anything expensive runs.
 	node := triggerTestOpenNode(t)
-	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, tdilithium3ProposalSigningMaxAttempts) {
+	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, tdilithium3ProposalSigningMaxAttempts, nil) {
 		t.Fatal("an attempt beyond the bound started a session")
 	}
 	// Ordinal admission: a skip ahead of the attempts seen so far refuses.
 	node.tdilithium3ProposalOrdinalRecord(triggerTestSlot, 1)
-	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 3) {
+	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 3, nil) {
 		t.Fatal("a skip-ahead attempt started a session")
 	}
 	// Past the slot's proposal window.
@@ -125,13 +125,13 @@ func TestTDilithium3ProposalSigningStartFailsClosed(t *testing.T) {
 	if err := consensus.SetGenesisTime(1700000000); err != nil {
 		t.Fatal(err)
 	}
-	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0) {
+	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0, nil) {
 		t.Fatal("a trigger far past the slot window started a session")
 	}
 	// Gate open, ordinal and window fine, but no active share: the session's
 	// inputs are missing, so the start refuses.
 	consensus.ResetGenesisTimeForTesting()
-	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0) {
+	if node.tdilithium3ProposalSigningStart(triggerTestEpoch, triggerTestSlot, bound, 0, nil) {
 		t.Fatal("node without an active share started a session")
 	}
 	if len(node.tdilithium3ProposalTriggerSessions) != 0 {
@@ -509,4 +509,34 @@ func newTriggerConvergenceValidator(t *testing.T, groupKey []byte, epoch uint64)
 		return append([]byte(nil), groupKey...)
 	})
 	return validator
+}
+
+// TestTDilithium3ProposalFutureTolerance pins the future-slot gate (audit
+// follow-up, fix 3): a trigger whose slot has not started — beyond one slot
+// of clock-skew tolerance — is refused, the slot's own window passes, and
+// without a chain clock the gate bounds nothing.
+func TestTDilithium3ProposalFutureTolerance(t *testing.T) {
+	consensus.EnableTestHelpers()
+	consensus.ResetGenesisTimeForTesting()
+	defer consensus.ResetGenesisTimeForTesting()
+	if !tdilithium3ProposalWithinFutureTolerance(5, time.Now()) {
+		t.Fatal("without a chain clock the future-tolerance gate must not bound anything")
+	}
+	if err := consensus.SetGenesisTime(1700000000); err != nil {
+		t.Fatal(err)
+	}
+	const slot = 40
+	start := consensus.GetSlotStartTime(slot)
+	// The slot's own window: inside the tolerance.
+	if !tdilithium3ProposalWithinFutureTolerance(slot, start) {
+		t.Fatal("the slot's own start was refused as a future slot")
+	}
+	// One slot of skew tolerance: a start up to one slot ahead still passes.
+	if !tdilithium3ProposalWithinFutureTolerance(slot, start.Add(-consensus.SlotDuration)) {
+		t.Fatal("a start within the one-slot skew tolerance was refused")
+	}
+	// Beyond the tolerance: refused.
+	if tdilithium3ProposalWithinFutureTolerance(slot, start.Add(-consensus.SlotDuration-time.Second)) {
+		t.Fatal("a slot start beyond the skew tolerance was accepted")
+	}
 }
