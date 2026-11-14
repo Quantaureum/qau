@@ -221,6 +221,64 @@ func TestProposalTamperedHeaderBreaksBothVerifications(t *testing.T) {
 	}
 }
 
+// TestProposalTamperedHeaderFieldCanaries extends the single GasUsed
+// representative in TestProposalTamperedHeaderBreaksBothVerifications with
+// two further binding inputs as canaries: identity (ProposerAddr) and
+// position (Slot). Each mutation is a distinct header field, so the signing
+// root — and with it the canonical binding — moves for a different reason in
+// every case, and no single-field tamper class can slip past the group check.
+func TestProposalTamperedHeaderFieldCanaries(t *testing.T) {
+	fixture := signingTestFixtureFor(t)
+	journal := signingTestJournal(t)
+	header, validator, signingData := proposalVectorHeader(t, fixture)
+	bound := consensus.ComputeTSSCanonicalBinding(
+		header.ChainID, header.Epoch, header.Slot, header.ProposerAddr, "block", signingData,
+	)
+	request := protocol.SignRequest{
+		Protocol:     protocol.ThresholdProtocolDilithium3V1,
+		Key:          fixture.key.Clone(),
+		Committee:    fixture.shares[0].Committee.Clone(),
+		ChainID:      header.ChainID,
+		Epoch:        header.Epoch,
+		Slot:         header.Slot,
+		Domain:       protocol.SigningDomainBlock,
+		Message:      append([]byte(nil), bound[:]...),
+		AttemptNonce: [32]byte{0xC1, 0x0D, 0x0E},
+	}
+	source := rand.New(rand.NewSource(int64(0x7A5)))
+	session, _, _ := signingTestSign(t, journal, request, fixture.activeShares(t, 0x0F), source)
+
+	canaries := []struct {
+		name   string
+		mutate func(h *encoding.BlockHeader)
+	}{
+		{"ProposerAddr", func(h *encoding.BlockHeader) { h.ProposerAddr[0] ^= 0xFF }},
+		{"Slot", func(h *encoding.BlockHeader) { h.Slot++ }},
+	}
+	for _, canary := range canaries {
+		t.Run(canary.name, func(t *testing.T) {
+			tampered := *header
+			canary.mutate(&tampered)
+			tampered.Signature = append([]byte(nil), session.signature...)
+			if err := validator.ValidateSignature(&tampered); err == nil {
+				t.Fatalf("block validator accepted the signature for a tampered %s", canary.name)
+			}
+			tamperedRoot, err := encoding.BlockHeaderSigningRoot(&tampered)
+			if err != nil {
+				t.Fatalf("tampered header signing root: %v", err)
+			}
+			tamperedBound := consensus.ComputeTSSCanonicalBinding(
+				tampered.ChainID, tampered.Epoch, tampered.Slot, tampered.ProposerAddr, "block", tamperedRoot[:],
+			)
+			if err := qcrypto.VerifySignatureForAlgorithm(
+				fixture.key.Algorithm, fixture.key.PublicKey, tamperedBound[:], nil, session.signature,
+			); err == nil {
+				t.Fatalf("signature verified over the tampered-%s binding", canary.name)
+			}
+		})
+	}
+}
+
 // TestProposalSessionJournalReplayRefused requires the journal's single-use
 // discipline for the proposal-shaped session: a finalized session id cannot
 // be prepared again, even with a fresh one-time record and fresh randomness.

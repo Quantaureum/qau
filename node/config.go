@@ -379,12 +379,12 @@ type Config struct {
 	//	max uint64   = permanent opt-out: never refuse on any network, even if
 	//	               a future release changes the network default
 	//
-	// Mainnet defaults to armed because production sampling on 2026-11-08
-	// found every validator loading exactly one share (4-of-6,
-	// tssDistributedMode=true): ShareCount()==1 makes the refusal unreachable
-	// on a correctly configured node, so arming turns a silent single-node
-	// self-declaration into a hard stop. The explicit 0 rollback and the
-	// permanent opt-out keep the behavior config-driven rather than hardcoded.
+	// Mainnet defaults to armed because production sampling found every
+	// validator loading exactly one share (4-of-6, tssDistributedMode=true):
+	// ShareCount()==1 makes the refusal unreachable on a correctly configured
+	// node, so arming turns a silent single-node self-declaration into a hard
+	// stop. The explicit 0 rollback and the permanent opt-out keep the
+	// behavior config-driven rather than hardcoded.
 	//
 	// RELEASE NOTE REQUIREMENT (audit memo on 495aab4): any release notes,
 	// operator documentation or deployment guide that documents the rollback
