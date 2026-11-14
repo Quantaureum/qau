@@ -282,6 +282,15 @@ type Node struct {
 	// per slot (guarded by tdilithium3SealSigningMu); it outlives the run so a
 	// member that sat out an attempt still advances one ordinal at a time.
 	tdilithium3SealSigningOrdinals map[uint64]uint64
+	// tdilithium3ProposalSigningRunning bounds how many Dilithium3 v1 proposal
+	// signing sessions run at once on this node (TSS-R3-B-1 P1). This is the
+	// proposal path's OWN budget, never shared with the seal executor's
+	// permits. The proposal session runs synchronously in the producer
+	// goroutine, so under normal cadence at most one is live; the permit is
+	// structural headroom mirroring the seal cap's shape. Lazily initialized
+	// under tdilithium3ProposalSigningMu.
+	tdilithium3ProposalSigningMu      sync.Mutex
+	tdilithium3ProposalSigningRunning chan struct{}
 	// tdilithium3SigningJournals caches the per-key signing journal handles.
 	// Each is a bbolt database that takes an exclusive file lock, so a fresh
 	// handle per session (the old single-session path opened one per attempt)
@@ -2334,6 +2343,13 @@ func (n *Node) initConsensus() error {
 	// 0 = active from genesis (hardened default); math.MaxUint64 = disabled
 	// (legacy behavior). See core.TxChainIDEnforcementDisabled.
 	n.blockValidator.SetTxChainIDEnforcementEpoch(n.config.TxChainIDEnforcementActivationEpoch)
+	// TSS-R3-B-1 P0/P1: the block validator's per-epoch Dilithium3 v1
+	// group-signature verification branch. 0 (the default) keeps the branch
+	// inert; a configured epoch must be identical on every node. The epoch's
+	// v1 group public keys are served read-only from the QTD anchor custody
+	// (wired below in wireTSSVerifier), so only anchor-checked keys are
+	// reachable by the branch.
+	n.blockValidator.SetTSSV1ProposalActivationEpoch(n.config.TSSV1ProposalActivationEpoch)
 
 	n.blockValidator.SetValidatorLookup(n.validatorManager)
 	n.blockValidator.SetKeyVersionValidator(&defaultKeyVersionValidator{})
@@ -7783,6 +7799,16 @@ func (n *Node) wireTSSVerifier() {
 	if n.tssManager != nil {
 		n.blockValidator.SetTSSVerifier(n.tssManager)
 		nodeLog.Info("TSS verifier wired to block validator")
+	}
+	// TSS-R3-B-1 P0/P1: serve the block validator's v1 proposal verification
+	// branch with the per-epoch group public keys from the QTD anchor custody.
+	// The lookup is the read-only export (GroupPublicKeyForEpoch), so only
+	// keys that passed the anchor continuity checks are reachable; it returns
+	// empty for unknown epochs, which keeps the branch inert there.
+	if n.blockProducer != nil && n.blockProducer.QPOS() != nil {
+		if qfs := n.blockProducer.QPOS().GetQTDFinality(); qfs != nil {
+			n.blockValidator.SetTSSV1GroupKeyLookup(qfs.GroupPublicKeyForEpoch)
+		}
 	}
 }
 

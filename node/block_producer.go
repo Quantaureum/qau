@@ -3418,10 +3418,18 @@ func (bp *BlockProducer) buildBlock(
 	}
 
 	// --- Sign block ---
+	// TSS-R3-B-1 P1: when both proposal feature layers are open (env opt-in +
+	// activation epoch), the header is signed by the Dilithium3 v1 four-signer
+	// proposal session over the canonical TSS binding; on success the group
+	// signature is the header signature and the legacy paths below are skipped.
+	// A closed gate or a failed session returns nil, and every legacy path
+	// below runs byte-for-byte unchanged (the individual fallback preserved).
 	// Try TSS threshold signing first (for QTD integration). If TSS is not available
 	// or fails (e.g., insufficient participants for multi-node coordination), fall back
 	// to individual Dilithium3 signing. The block validator handles both signature types.
-	if bp.qpos != nil && bp.qpos.HasThresholdSigner() {
+	if v1GroupSig := bp.node.tdilithium3V1ProposalHeaderSignature(newBlock.Header); len(v1GroupSig) > 0 {
+		newBlock.Header.Signature = v1GroupSig
+	} else if bp.qpos != nil && bp.qpos.HasThresholdSigner() {
 		signingData := bp.computeSigningData(newBlock.Header)
 		if signingData != nil {
 			// P1-1 FIX: Use GetProposerForSlot (deterministic shuffle election)

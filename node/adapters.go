@@ -34,11 +34,24 @@ import (
 // The sole remaining caller-visible effect is that every distributed branch in
 // this file stays unreachable.
 //
-// REASON (TSS-R3-B-1, unresolved). The QTD aggregator is the block proposer.
-// From the aggregated Z0Share contributions it learns c·(t0-s2). In the NTT
-// ring Z_q[X]/(X^256+1) (q=8380417) the challenge polynomial c (τ=49 ±1
-// coefficients) is invertible with overwhelming probability, so the aggregator
-// recovers (t0-s2) by NTT inversion and then s1 from the overdetermined system
+// REASON (TSS-R3-B-1, unresolved). The leak is dual-path, and the strictly
+// worse path does not need the aggregator at all:
+//
+// Path A — any P2P observer (severity: critical). Round1 broadcasts every
+// WShare_i = A·y_i in the clear, so any peer that hears one session can sum
+// them into w_agg = A·y_agg. A is publicly derived from the group key's rho,
+// and its NTT-domain expansion (Z_q[X]/(X^256+1), q=8380417) is invertible
+// with overwhelming probability, so inverting w_agg yields the mask y_agg.
+// The block header then publishes z = s1·c + y_agg, and the challenge c is
+// derivable from the public (mu, w1), so s1 = (z − y_agg)·c⁻¹. One observed
+// session permanently recovers the group's s1 — no aggregator identity, no
+// participation, no more than the Round1 gossip plus the published signature.
+//
+// Path B — the aggregator (which is the block proposer). From the aggregated
+// Z0Share contributions it learns c·(t0-s2). The challenge polynomial c
+// (τ=49 ±1 coefficients) is invertible with overwhelming probability, so the
+// aggregator recovers (t0-s2) by NTT inversion and then s1 from the
+// overdetermined system
 //
 //	A·s1 = t1·2^d + (t0-s2)
 //
@@ -49,7 +62,9 @@ import (
 // The Round5 change (Z0Share = λ_i·c·(t0_i - s2_i)) removed the *separate*
 // c·s2 and c·t0 transmissions, so the aggregator can no longer recover s2 or
 // t0 and cannot forge on its own. That lowers the exposure from full-key
-// recovery to s1 recovery; it does not close it.
+// recovery to s1 recovery on path B; it does not close either path, and path
+// A is strictly worse than path B — it hands s1 to every listener instead of
+// one proposer.
 //
 // Closure needs a protocol redesign in which the aggregator only ever combines
 // partial signatures — distributed hint generation under MPC, or an equivalent

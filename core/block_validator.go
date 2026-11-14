@@ -249,7 +249,17 @@ type BlockValidator struct {
 	multisigRosterProvider MultiSigRosterProvider
 	keyVersionValidator    KeyVersionValidator
 	tssVerifier            TSSVerifier
-	devMode                bool
+	// TSS-R3-B-1 P0: optional per-epoch Dilithium3 v1 group-signature
+	// verification branch. tssV1ProposalActivationEpoch is the coordinated
+	// activation gate (0 = never active, the default on every network);
+	// tssV1GroupKeyLookup supplies the epoch's validated v1 group public key
+	// (sourced from consensus.QTDFinalityState.GroupPublicKeyForEpoch, so
+	// only keys that passed the anchor custody checks are reachable). Both
+	// are injected via setters; with the gate unset the branch is inert and
+	// ValidateSignature behaves exactly like the main 792226b build.
+	tssV1ProposalActivationEpoch uint64
+	tssV1GroupKeyLookup          func(epoch uint64) []byte
+	devMode                      bool
 	// signingVerifier verifies Dilithium3 transaction signatures in blocks.
 	// When set, validateTransactions batch-verifies all tx signatures in parallel.
 	// SECURITY FIX: Without this, a malicious proposer could include
@@ -500,6 +510,36 @@ func (v *BlockValidator) SetTSSVerifier(verifier TSSVerifier) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.tssVerifier = verifier
+}
+
+// SetTSSV1ProposalActivationEpoch arms the per-epoch Dilithium3 v1
+// group-signature verification branch in ValidateSignature (TSS-R3-B-1 P0).
+// From the configured epoch on, a 3293-byte header signature is first checked
+// against the epoch's v1 group public key (see SetTSSV1GroupKeyLookup) and
+// accepted on success; otherwise it falls through to the individual
+// Dilithium3 verification unchanged — the branch only ever ADDS an acceptance
+// path, it never rejects. 0 (the default) = the branch never engages and
+// ValidateSignature behaves exactly like a build without it. The value MUST
+// be identical on every node or the accepted block set diverges.
+func (v *BlockValidator) SetTSSV1ProposalActivationEpoch(epoch uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.tssV1ProposalActivationEpoch = epoch
+}
+
+// SetTSSV1GroupKeyLookup injects the read-only lookup that resolves an epoch
+// to that epoch's validated v1 group public key. The intended production
+// source is consensus.QTDFinalityState.GroupPublicKeyForEpoch, so only keys
+// that passed the anchor custody checks (R19-F02 chained adoption /
+// first-establishment cross-checks) are reachable. An empty return means "no
+// validated key for this epoch" and the v1 branch stays inert for that epoch.
+// The lookup is invoked only when the activation gate is armed; it must be
+// safe for concurrent use and must not retain or mutate the returned slice
+// beyond the verifier's own copy.
+func (v *BlockValidator) SetTSSV1GroupKeyLookup(lookup func(epoch uint64) []byte) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.tssV1GroupKeyLookup = lookup
 }
 
 // SetNonceReader sets the pre-state nonce reader for replay detection.
@@ -2468,6 +2508,10 @@ func (v *BlockValidator) ValidateSignature(header *encoding.BlockHeader) error {
 	devMode := v.devMode
 	validatorLookup := v.validatorLookup
 	tssVerifier := v.tssVerifier
+	// TSS-R3-B-1 P0: snapshot the v1 branch gate with the rest of the mutable
+	// state (same R37-P3-31 race-safety rationale as the fields above).
+	tssV1ActivationEpoch := v.tssV1ProposalActivationEpoch
+	tssV1GroupKeyLookup := v.tssV1GroupKeyLookup
 	v.mu.RUnlock()
 
 	if devMode {
@@ -2509,6 +2553,36 @@ func (v *BlockValidator) ValidateSignature(header *encoding.BlockHeader) error {
 			// individual Dilithium3 signature. Fall through to individual verification.
 		} else {
 			return nil
+		}
+	}
+
+	// TSS-R3-B-1 P0: optional per-epoch Dilithium3 v1 group-signature branch.
+	// Pure addition, orthogonal to the legacy tssVerifier block above (which
+	// is untouched): it engages only when (a) an activation epoch is
+	// configured, (b) this header's epoch has reached it, and (c) the epoch
+	// has a validated v1 group public key. Acceptance requires the group key
+	// to verify the 3293-byte signature — this is the ONLY acceptance this
+	// branch adds, and it never rejects: on group-verification failure it
+	// falls through to the individual Dilithium3 verification below, because
+	// a proposer is allowed to legitimately fall back to an individual
+	// signature at any time. With the gate unset (the default) the branch is
+	// inert and behavior is byte-for-byte identical to main 792226b.
+	if tssV1ActivationEpoch > 0 && header.Epoch >= tssV1ActivationEpoch &&
+		sigLen == crypto.Dilithium3SignatureSize && tssV1GroupKeyLookup != nil {
+		if groupKeyBytes := tssV1GroupKeyLookup(header.Epoch); len(groupKeyBytes) > 0 {
+			if groupKey, err := crypto.PublicKeyFromBytes(groupKeyBytes); err == nil {
+				if groupKey.Verify(signingData, header.Signature) {
+					return nil
+				}
+				// The v1 proposal signer (P1) binds its message to the
+				// canonical TSS binding over (chainID, epoch, slot, proposer,
+				// "block"); accept that form too, mirroring the dual-message
+				// fallback the legacy block above performs.
+				bound := consensus.ComputeTSSCanonicalBinding(header.ChainID, header.Epoch, header.Slot, header.ProposerAddr, "block", signingData)
+				if groupKey.Verify(bound[:], header.Signature) {
+					return nil
+				}
+			}
 		}
 	}
 
