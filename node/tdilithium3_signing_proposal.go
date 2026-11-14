@@ -754,7 +754,7 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 // the outcome. A shell the request schedule adopted is owned by its slot
 // driver from that point and is unregistered by the driver itself when the
 // candidate exits. The schedule returns after the FIRST candidate succeeds
-// (cancelling the rest), so a cancelled candidate's driver unregisters its
+// (canceling the rest), so a canceled candidate's driver unregisters its
 // own shell asynchronously and may run after this deferred unregister; the
 // interleaving is safe because every unregister goes through the same
 // mutex-guarded map with a pointer-identity check, making any order an
