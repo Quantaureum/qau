@@ -318,6 +318,37 @@ func TestTDilithium3ProposalSessionIsolatedFromSeal(t *testing.T) {
 	if err != nil || again != proposalID {
 		t.Fatalf("session derivation is not deterministic (err %v)", err)
 	}
+	// Trigger-channel round trip (TSS-R3-B-1 P2): the payload the proposer
+	// broadcasts parses back to the same tuple, and the request a triggered
+	// signer derives from it lands on the SAME proposal session id -- the
+	// wire carries everything the session needs and nothing that would
+	// derail it into a foreign session.
+	wire := tdilithium3ProposalTriggerPayload(epoch, slot, bound, 0)
+	wireEpoch, wireSlot, wireBound, wireAttempt, ok := tdilithium3ProposalTriggerParse(wire)
+	if !ok || wireEpoch != epoch || wireSlot != slot || wireBound != bound || wireAttempt != 0 {
+		t.Fatalf("trigger payload round trip broken: ok=%v", ok)
+	}
+	triggerNonce, err := dilithium3v1.SigningRequestAttemptNonce(
+		1669, wireEpoch, wireSlot, protocol.SigningDomainBlock, wireBound[:], wireAttempt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if triggerNonce != proposalNonce {
+		t.Fatal("the trigger-derived nonce diverged from the proposer-side derivation")
+	}
+	triggerID, err := dilithium3v1.Dilithium3SigningSessionID(
+		build(protocol.SigningDomainBlock, wireBound[:], triggerNonce), fixture.signers,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if triggerID != proposalID {
+		t.Fatal("a trigger-established session id diverged from the local derivation")
+	}
+	if triggerID == sealID {
+		t.Fatal("the trigger-established session collided with the seal session")
+	}
 }
 
 // TestTDilithium3ProposalTraceDefaultOff pins the default log posture: the

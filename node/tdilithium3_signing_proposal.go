@@ -40,21 +40,21 @@ package node
 // input fails closed: the active share, the roster, the peer bindings, and
 // the signer subset are all required, exactly as for the seal executor.
 //
-// KNOWN SCOPE NOTE (P1): the four signers of an attempt converge only when
-// each signer's node runs the same attempt. The seal path reaches its signers
-// through the per-slot seal-request broadcast; the proposal path has no
-// per-slot announcement channel of its own yet (a new p2p message kind is a
-// cross-layer change deliberately out of this phase's scope), so until that
-// trigger lands, a multi-node deployment converges only where the peers
-// independently start the same attempt. This does not weaken the default
-// posture: the gate is closed everywhere unless explicitly opened, and a
-// session that cannot converge times out inside the bounded budget and the
-// legacy individual signature is produced as before.
+// TRIGGER CHANNEL (P2): the four signers of an attempt converge on a
+// multi-node network through the proposal trigger (p2p message kind 103, see
+// the trigger-channel section below). The proposer announces every attempt it
+// runs; a signer that hears the announcement starts the same session, and the
+// attempt's other signers need nothing else -- the announcement carries the
+// full public tuple (epoch, slot, bound, attempt) the session derives from.
+// This does not weaken the default posture: the gate is closed everywhere
+// unless explicitly opened, an unannounced attempt still times out inside the
+// bounded budget, and the legacy individual signature is produced as before.
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -63,7 +63,9 @@ import (
 	"github.com/quantaureum/qau/consensus"
 	qcrypto "github.com/quantaureum/qau/crypto"
 	"github.com/quantaureum/qau/encoding"
+	"github.com/quantaureum/qau/p2p"
 	"github.com/quantaureum/qau/wallet/tss/protocol"
+	"github.com/quantaureum/qau/wallet/tss/protocol/dilithium3v1"
 )
 
 const (
@@ -207,7 +209,7 @@ func (n *Node) tdilithium3V1ProposalHeaderSignature(header *encoding.BlockHeader
 	// the identical binding, so acceptance here and acceptance there are the
 	// same equation.
 	bound := consensus.ComputeTSSCanonicalBinding(header.ChainID, epoch, slot, header.ProposerAddr, "block", signingData)
-	activationEpoch, groupKey, _, err := n.tdilithium3ActiveShareIdentityCached()
+	activationEpoch, _, _, err := n.tdilithium3ActiveShareIdentityCached()
 	if err != nil {
 		tdilithium3ProposalTrace("epoch %d slot %d: active share: %v", epoch, slot, err)
 		return nil
@@ -240,27 +242,13 @@ func (n *Node) tdilithium3V1ProposalHeaderSignature(header *encoding.BlockHeader
 				return nil
 			}
 		}
-		signature, err := n.tdilithium3ProposalSigningAttempt(ctx, activationEpoch, epoch, slot, bound[:], attempt)
+		// Announce the attempt BEFORE running it: the attempt's other signers
+		// start their session on the trigger, and a host never receives its
+		// own broadcast, so the proposer must run its own attempt locally
+		// (the seal request's broadcast-plus-local-start shape).
+		n.broadcastTDilithium3ProposalTrigger(epoch, slot, bound, attempt)
+		signature, err := n.tdilithium3ProposalAttemptRun(ctx, activationEpoch, epoch, slot, bound, attempt)
 		if err == nil {
-			// Self-check 1 (cryptographic): the produced signature must
-			// verify under the CEREMONY group public key over the bound. A
-			// header that no validator would accept must not leave the
-			// producer.
-			if !tdilithium3ProposalGroupVerify(groupKey, bound[:], signature) {
-				tdilithium3ProposalTrace("epoch %d slot %d: group self-check failed; falling back", epoch, slot)
-				return nil
-			}
-			// Self-check 2 (anchor agreement, audit R3-B-1 follow-up): the
-			// validators' v1 branch verifies against the QTD anchor custody's
-			// key for THIS epoch, so the ceremony key must be exactly what
-			// that custody serves. A disagreement (experimental DKG rotation
-			// ahead of this node) or an empty custody would produce a header
-			// the network rejects as a whole; fall back to the individual
-			// signature instead.
-			if !n.tdilithium3ProposalAnchorAgrees(epoch, groupKey) {
-				tdilithium3ProposalTrace("epoch %d slot %d: anchor custody does not vouch for the ceremony key; falling back", epoch, slot)
-				return nil
-			}
 			tdilithium3ProposalTrace("epoch %d slot %d: signed by attempt %d", epoch, slot, attempt)
 			return signature
 		}
@@ -269,6 +257,14 @@ func (n *Node) tdilithium3V1ProposalHeaderSignature(header *encoding.BlockHeader
 			tdilithium3ProposalTrace("slot %d attempt %d: local validator not in the subset", slot, attempt)
 			continue
 		}
+		if errors.Is(err, errTDilithium3ProposalSelfCheck) {
+			// A produced signature that fails the ceremony or anchor
+			// self-check is structural for this slot's material: retrying
+			// reproduces it, so the header falls back to the individual
+			// signature instead of rotating attempts.
+			tdilithium3ProposalTrace("slot %d attempt %d: self-check failed: %v", slot, attempt, err)
+			return nil
+		}
 		tdilithium3ProposalTrace("slot %d attempt %d failed: %v", slot, attempt, err)
 		if !tdilithium3ProposalAttemptRetryable(err) {
 			return nil
@@ -276,6 +272,43 @@ func (n *Node) tdilithium3V1ProposalHeaderSignature(header *encoding.BlockHeader
 	}
 	tdilithium3ProposalTrace("slot %d: attempts exhausted; falling back", slot)
 	return nil
+}
+
+// errTDilithium3ProposalSelfCheck reports that a produced signature did not
+// pass one of the two self-checks (the ceremony key verification or the
+// anchor-custody agreement). It is structural for the slot's material: the
+// caller falls back instead of rotating attempts.
+var errTDilithium3ProposalSelfCheck = errors.New("Dilithium3 v1 proposal executor self-check failed")
+
+// tdilithium3ProposalAttemptRun executes ONE attempt end to end -- signer
+// resolution, binding, the four-round session, and both self-checks -- and
+// returns the signature that passed them. It is the shared attempt body of
+// the local producer path (which loops over attempts synchronously,
+// announcing each one to the committee) and the trigger path (which runs the
+// announced attempt once, asynchronously).
+func (n *Node) tdilithium3ProposalAttemptRun(ctx context.Context, activationEpoch, epoch, slot uint64, bound [32]byte, attempt uint64) ([]byte, error) {
+	signature, err := n.tdilithium3ProposalSigningAttempt(ctx, activationEpoch, epoch, slot, bound[:], attempt)
+	if err != nil {
+		return nil, err
+	}
+	// Self-check 1 (cryptographic): the produced signature must verify under
+	// the CEREMONY group public key over the bound. A header that no
+	// validator would accept must not leave the producer.
+	_, groupKey, _, err := n.tdilithium3ActiveShareIdentityCached()
+	if err != nil {
+		return nil, fmt.Errorf("%w: identity: %v", errTDilithium3ProposalSelfCheck, err)
+	}
+	if !tdilithium3ProposalGroupVerify(groupKey, bound[:], signature) {
+		return nil, fmt.Errorf("%w: signature failed the ceremony key verification", errTDilithium3ProposalSelfCheck)
+	}
+	// Self-check 2 (anchor agreement): the validators' v1 branch verifies
+	// against the QTD anchor custody's key for THIS epoch, so the ceremony
+	// key must be exactly what that custody serves. See
+	// tdilithium3ProposalAnchorAgrees for the empty-custody verdict.
+	if !n.tdilithium3ProposalAnchorAgrees(epoch, groupKey) {
+		return nil, fmt.Errorf("%w: anchor custody does not vouch for the ceremony key", errTDilithium3ProposalSelfCheck)
+	}
+	return signature, nil
 }
 
 // tdilithium3ProposalSigningAttempt runs one attempt: it resolves the
@@ -424,5 +457,430 @@ func (n *Node) releaseTDilithium3ProposalSigning() {
 	case <-running:
 	default:
 		nodeLog.Warn("Dilithium3 v1 proposal executor: release without a matching acquire")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proposal trigger channel (TSS-R3-B-1 P2). The block proposer announces each
+// attempt of a proposal signing session on the p2p trigger kind (103); the
+// attempt's other signers start the same session on the announcement, which
+// is what makes the four-of-six threshold session converge on a multi-node
+// network. The shape mirrors the seal executor's trigger flow (announcement,
+// receiver-side B-5 authentication, per-peer rate limit, ordinal admission,
+// session replacement) with one deliberate simplification: the trigger is
+// self-sufficient (it carries the full signed-message binding, so a signer
+// starts immediately and nothing waits for pending state), which removes the
+// seal's deferred-latch half -- the pre-registered candidate inboxes, the
+// load-bearing half that keeps a first round message from being dropped
+// before a party exists, remain.
+// ---------------------------------------------------------------------------
+
+const (
+	// tdilithium3ProposalTriggerPayloadLen is the base trigger payload:
+	// epoch(8) | slot(8) | bound(32) | attempt(8), all big endian.
+	tdilithium3ProposalTriggerPayloadLen = 56
+
+	// tdilithium3ProposalTriggerPayloadMaxLen bounds appended future fields,
+	// mirroring the seal request's 40/48 dual-length precedent.
+	tdilithium3ProposalTriggerPayloadMaxLen = 96
+
+	// tdilithium3ProposalTriggerPerPeerWindow is the sliding window for the
+	// per-peer rate limit of inbound triggers (the seal request's
+	// NODE-R12-H01 posture). An honest proposer announces at most a few
+	// attempts per slot.
+	tdilithium3ProposalTriggerPerPeerWindow = 10 * time.Second
+
+	// tdilithium3ProposalTriggerPerPeerMax caps one peer's triggers per
+	// window. An honest proposer sends at most one trigger per attempt and
+	// at most tdilithium3ProposalSigningMaxAttempts attempts per slot, so 20
+	// is generous for honest peers and blocks floods.
+	tdilithium3ProposalTriggerPerPeerMax = 20
+
+	// tdilithium3ProposalTriggerPeerRateMaxSize caps the peers tracked in
+	// the rate map (the qtdPeerRateMaxSize rationale).
+	tdilithium3ProposalTriggerPeerRateMaxSize = 1024
+
+	// tdilithium3ProposalTriggerPeerRateTTL is the entry time-to-live (the
+	// qtdPeerRateTTL rationale).
+	tdilithium3ProposalTriggerPeerRateTTL = time.Hour
+
+	// tdilithium3ProposalOrdinalHistorySlots is how many slots of admitted
+	// ordinal history a node keeps (the seal executor's retention shape).
+	tdilithium3ProposalOrdinalHistorySlots = 256
+)
+
+// tdilithium3ProposalTriggerRateInfo tracks one peer's trigger rate-limit
+// state (the qtdPeerRateInfo layout: window start, count, last seen).
+type tdilithium3ProposalTriggerRateInfo struct {
+	windowStart time.Time
+	count       int
+	lastSeen    time.Time
+}
+
+// tdilithium3ProposalTriggerSession is the running executor attempt of one
+// triggered proposal slot on a signer. A higher announced ordinal replaces
+// the running one (the attempt cancel below).
+type tdilithium3ProposalTriggerSession struct {
+	attempt uint64
+	cancel  context.CancelFunc
+}
+
+// tdilithium3ProposalTriggerParse splits one trigger payload into its public
+// tuple. A payload shorter than the base layout (or beyond the extension
+// bound) is not a trigger the executor can act on.
+func tdilithium3ProposalTriggerParse(payload []byte) (epoch, slot uint64, bound [32]byte, attempt uint64, ok bool) {
+	if len(payload) < tdilithium3ProposalTriggerPayloadLen || len(payload) > tdilithium3ProposalTriggerPayloadMaxLen {
+		return 0, 0, [32]byte{}, 0, false
+	}
+	epoch = binary.BigEndian.Uint64(payload[0:8])
+	slot = binary.BigEndian.Uint64(payload[8:16])
+	copy(bound[:], payload[16:48])
+	attempt = binary.BigEndian.Uint64(payload[48:56])
+	return epoch, slot, bound, attempt, true
+}
+
+// broadcastTDilithium3ProposalTrigger announces one attempt of one proposal
+// slot to the committee. The proposer sends this before running its own
+// attempt: a host never receives its own broadcast, so the local run below is
+// the proposer's own participation (the seal request's
+// broadcast-plus-local-start shape, qtd_seal.go).
+// tdilithium3ProposalTriggerPayload encodes one trigger's public tuple into
+// the wire format (epoch | slot | bound | attempt, big endian). It is the
+// exact inverse of tdilithium3ProposalTriggerParse, and the sender-side and
+// receiver-side session derivations consume the same bound bytes, so both
+// ends derive one session id.
+func tdilithium3ProposalTriggerPayload(epoch, slot uint64, bound [32]byte, attempt uint64) []byte {
+	msg := make([]byte, tdilithium3ProposalTriggerPayloadLen)
+	binary.BigEndian.PutUint64(msg[0:8], epoch)
+	binary.BigEndian.PutUint64(msg[8:16], slot)
+	copy(msg[16:48], bound[:])
+	binary.BigEndian.PutUint64(msg[48:56], attempt)
+	return msg
+}
+
+func (n *Node) broadcastTDilithium3ProposalTrigger(epoch, slot uint64, bound [32]byte, attempt uint64) {
+	if n == nil || n.p2pHost == nil {
+		return
+	}
+	if err := n.p2pHost.BroadcastTDilithium3ProposalTrigger(tdilithium3ProposalTriggerPayload(epoch, slot, bound, attempt)); err != nil {
+		tdilithium3ProposalTrace("slot %d attempt %d: trigger broadcast failed: %v", slot, attempt, err)
+	}
+}
+
+// allowTDilithium3ProposalTriggerFromPeer is the per-peer sliding-window rate
+// limit for inbound triggers (the allowQTDSealFromPeer shape): entries beyond
+// the cap are cleaned first, a window older than
+// tdilithium3ProposalTriggerPerPeerWindow resets, and the count is capped.
+func (n *Node) allowTDilithium3ProposalTriggerFromPeer(peerID p2p.PeerID) bool {
+	if n == nil {
+		return false
+	}
+	n.tdilithium3ProposalTriggerRateMu.Lock()
+	defer n.tdilithium3ProposalTriggerRateMu.Unlock()
+	if n.tdilithium3ProposalTriggerRate == nil {
+		n.tdilithium3ProposalTriggerRate = make(map[p2p.PeerID]*tdilithium3ProposalTriggerRateInfo)
+	}
+	now := time.Now()
+	if len(n.tdilithium3ProposalTriggerRate) >= tdilithium3ProposalTriggerPeerRateMaxSize {
+		for pid, info := range n.tdilithium3ProposalTriggerRate {
+			if now.Sub(info.lastSeen) >= tdilithium3ProposalTriggerPeerRateTTL {
+				delete(n.tdilithium3ProposalTriggerRate, pid)
+			}
+		}
+	}
+	info, ok := n.tdilithium3ProposalTriggerRate[peerID]
+	if !ok || now.Sub(info.windowStart) >= tdilithium3ProposalTriggerPerPeerWindow {
+		info = &tdilithium3ProposalTriggerRateInfo{windowStart: now, count: 0}
+		n.tdilithium3ProposalTriggerRate[peerID] = info
+	}
+	info.count++
+	info.lastSeen = now
+	return info.count <= tdilithium3ProposalTriggerPerPeerMax
+}
+
+// tdilithium3ProposalOrdinalAdmissible reports whether an announced attempt
+// may start here: attempts advance one ordinal at a time, so an ordinal is
+// admitted only up to one past the highest this node has admitted for the
+// slot (the seal executor's admission semantics). The proposer announces its
+// attempts sequentially, so honest announcements always pass.
+func (n *Node) tdilithium3ProposalOrdinalAdmissible(slot, ordinal uint64) bool {
+	n.tdilithium3ProposalSigningMu.Lock()
+	defer n.tdilithium3ProposalSigningMu.Unlock()
+	highest, seen := n.tdilithium3ProposalTriggerOrdinals[slot]
+	if !seen {
+		return ordinal <= 1
+	}
+	return ordinal <= highest+1
+}
+
+// tdilithium3ProposalOrdinalRecord notes an admitted ordinal for the slot.
+func (n *Node) tdilithium3ProposalOrdinalRecord(slot, ordinal uint64) {
+	n.tdilithium3ProposalSigningMu.Lock()
+	defer n.tdilithium3ProposalSigningMu.Unlock()
+	n.tdilithium3ProposalOrdinalRecordLocked(slot, ordinal)
+}
+
+// tdilithium3ProposalOrdinalRecordLocked is tdilithium3ProposalOrdinalRecord
+// for a caller holding tdilithium3ProposalSigningMu; it also prunes old slots.
+func (n *Node) tdilithium3ProposalOrdinalRecordLocked(slot, ordinal uint64) {
+	if n.tdilithium3ProposalTriggerOrdinals == nil {
+		n.tdilithium3ProposalTriggerOrdinals = make(map[uint64]uint64)
+	}
+	if highest, seen := n.tdilithium3ProposalTriggerOrdinals[slot]; !seen || ordinal > highest {
+		n.tdilithium3ProposalTriggerOrdinals[slot] = ordinal
+	}
+	if len(n.tdilithium3ProposalTriggerOrdinals) > 2*tdilithium3ProposalOrdinalHistorySlots {
+		for old := range n.tdilithium3ProposalTriggerOrdinals {
+			if old+tdilithium3ProposalOrdinalHistorySlots < slot {
+				delete(n.tdilithium3ProposalTriggerOrdinals, old)
+			}
+		}
+	}
+}
+
+// tdilithium3ProposalSigningStart makes this node run the announced attempt
+// of one proposal slot, replacing a lower attempt that is still running. It
+// returns false, without any state change, when the gate is closed, the
+// ordinal is out of bounds or out of sequence, the proposal window has
+// passed, the epoch precedes the share's activation, or the anchor custody
+// does not vouch for the ceremony key -- every refusal is fail-closed, and a
+// refusal never leaves a goroutine or an inbox behind.
+func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byte, ordinal uint64) bool {
+	if n == nil {
+		return false
+	}
+	if !tdilithium3ProposalSigningEnabled(n, epoch) {
+		// Gate closed (the default posture): zero side effects, zero logs.
+		return false
+	}
+	if ordinal >= tdilithium3ProposalSigningMaxAttempts {
+		tdilithium3ProposalTrace("slot %d: attempt %d is beyond the attempt bound", slot, ordinal)
+		return false
+	}
+	if !tdilithium3ProposalWithinWindow(slot, time.Now()) {
+		tdilithium3ProposalTrace("slot %d: attempt %d arrived after the proposal window", slot, ordinal)
+		return false
+	}
+	if !n.tdilithium3ProposalOrdinalAdmissible(slot, ordinal) {
+		tdilithium3ProposalTrace("slot %d: attempt %d skips ahead of the attempts seen so far", slot, ordinal)
+		return false
+	}
+	activationEpoch, groupKey, _, err := n.tdilithium3ActiveShareIdentityCached()
+	if err != nil {
+		tdilithium3ProposalTrace("slot %d attempt %d: active share: %v", slot, ordinal, err)
+		return false
+	}
+	if epoch < activationEpoch {
+		tdilithium3ProposalTrace("slot %d attempt %d: epoch %d precedes the activation epoch %d", slot, ordinal, epoch, activationEpoch)
+		return false
+	}
+	if !n.tdilithium3ProposalAnchorAgrees(epoch, groupKey) {
+		tdilithium3ProposalTrace("slot %d attempt %d: anchor custody does not vouch for the ceremony key", slot, ordinal)
+		return false
+	}
+	n.tdilithium3ProposalSigningMu.Lock()
+	if n.tdilithium3ProposalTriggerSessions == nil {
+		n.tdilithium3ProposalTriggerSessions = make(map[uint64]*tdilithium3ProposalTriggerSession)
+	}
+	if existing := n.tdilithium3ProposalTriggerSessions[slot]; existing != nil {
+		if existing.attempt >= ordinal {
+			n.tdilithium3ProposalSigningMu.Unlock()
+			// An idempotent retransmission or a superseded announcement: the
+			// running attempt is not replaced. The caller's pre-registered
+			// inbox shells (if any) are its responsibility to drop.
+			tdilithium3ProposalTrace("slot %d: attempt %d is not newer than the running %d", slot, ordinal, existing.attempt)
+			return false
+		}
+		existing.cancel()
+	}
+	n.tdilithium3ProposalOrdinalRecordLocked(slot, ordinal)
+	base := n.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithCancel(base)
+	session := &tdilithium3ProposalTriggerSession{attempt: ordinal, cancel: cancel}
+	n.tdilithium3ProposalTriggerSessions[slot] = session
+	n.tdilithium3ProposalSigningMu.Unlock()
+	tdilithium3ProposalTrace("slot %d: starting triggered attempt %d for epoch %d", slot, ordinal, epoch)
+	go n.tdilithium3ProposalTriggerRun(ctx, session, activationEpoch, epoch, slot, bound, ordinal)
+	return true
+}
+
+// tdilithium3ProposalTriggerRun drives the ANNOUNCED attempt once, on the
+// triggered signer. There is no retry loop here: the proposer drives the
+// retries and announces each fresh attempt, which supersedes this one via
+// the ordinal admission in the start. The converged signature is a byproduct
+// on a signer -- the proposer attaches its own copy to the header -- so it
+// passes the attempt body's self-checks and is dropped.
+func (n *Node) tdilithium3ProposalTriggerRun(ctx context.Context, session *tdilithium3ProposalTriggerSession, activationEpoch, epoch, slot uint64, bound [32]byte, ordinal uint64) {
+	defer n.tdilithium3ProposalTriggerForget(slot, session)
+	if !n.acquireTDilithium3ProposalSigning(ctx) {
+		tdilithium3ProposalTrace("slot %d attempt %d: proposal permit unavailable", slot, ordinal)
+		return
+	}
+	defer n.releaseTDilithium3ProposalSigning()
+	if ctx.Err() != nil {
+		return
+	}
+	if _, err := n.tdilithium3ProposalAttemptRun(ctx, activationEpoch, epoch, slot, bound, ordinal); err != nil {
+		tdilithium3ProposalTrace("slot %d attempt %d: triggered attempt failed: %v", slot, ordinal, err)
+		return
+	}
+	tdilithium3ProposalTrace("slot %d attempt %d: trigger session converged", slot, ordinal)
+}
+
+// tdilithium3ProposalTriggerForget drops this run's session entry, never a
+// newer one that replaced it.
+func (n *Node) tdilithium3ProposalTriggerForget(slot uint64, session *tdilithium3ProposalTriggerSession) {
+	n.tdilithium3ProposalSigningMu.Lock()
+	defer n.tdilithium3ProposalSigningMu.Unlock()
+	if n.tdilithium3ProposalTriggerSessions[slot] == session {
+		delete(n.tdilithium3ProposalTriggerSessions, slot)
+	}
+}
+
+// tdilithium3ProposalPrebuildInboxes builds and registers the candidate
+// inboxes of one announced attempt WITHOUT starting any party, so a first
+// round message that arrives before this node's session goroutine has built
+// its party queues in the inbox instead of being dropped at routing (the
+// seal executor's prebuild shape; the request schedule reuses a registered
+// inbox for the same session id). Failures degrade to the old behavior:
+// first messages dropped, then retransmitted by the session's own cadence.
+func (n *Node) tdilithium3ProposalPrebuildInboxes(epoch, slot uint64, bound [32]byte, ordinal uint64) []*tdilithium3SigningInbox {
+	var inboxes []*tdilithium3SigningInbox
+	defer func() {
+		if r := recover(); r != nil {
+			tdilithium3ProposalTrace("slot %d attempt %d: inbox prebuild failed: %v", slot, ordinal, r)
+		}
+	}()
+	if !tdilithium3ProposalSigningEnabled(n, epoch) {
+		return nil
+	}
+	activationEpoch, _, _, err := n.tdilithium3ActiveShareIdentityCached()
+	if err != nil {
+		return nil
+	}
+	signers, localSigner, err := n.tdilithium3SealSigningSigners(activationEpoch, slot, ordinal)
+	if err != nil || !localSigner {
+		return nil
+	}
+	binding, err := n.newTDilithium3SigningBinding(activationEpoch, signers, rand.Reader)
+	if err != nil {
+		return nil
+	}
+	defer binding.close()
+	request, err := binding.request(epoch, slot, protocol.SigningDomainBlock, bound[:], ordinal)
+	if err != nil {
+		return nil
+	}
+	params, err := dilithium3v1.SigningParametersForShares([]*dilithium3v1.LocalShare{binding.Share})
+	if err != nil {
+		return nil
+	}
+	for candidate := uint16(1); candidate <= uint16(params.ParallelSlots); candidate++ {
+		slotRequest := dilithium3v1.SigningExecutorSlotRequestFor(request, candidate)
+		sessionID, err := dilithium3v1.Dilithium3SigningSessionForShare(slotRequest, binding.Share, signers)
+		if err != nil {
+			return inboxes
+		}
+		slotContext := tdilithium3SigningContext{
+			SessionID:        sessionID,
+			KeyGeneration:    request.Key.Generation,
+			CommitteeVersion: request.Committee.Version,
+			Signers:          signers,
+		}
+		inbox, err := newTDilithium3SigningInboxFromIdentitySnapshot(slotContext, binding.Identities)
+		if err != nil {
+			return inboxes
+		}
+		inboxes = append(inboxes, inbox)
+	}
+	for _, inbox := range inboxes {
+		n.registerTDilithium3SigningInbox(inbox)
+	}
+	return inboxes
+}
+
+// unregisterTDilithium3ProposalShells drops pre-registered candidate inboxes
+// whose session never started (the start refused after the prebuild).
+func (n *Node) unregisterTDilithium3ProposalShells(inboxes []*tdilithium3SigningInbox) {
+	for _, inbox := range inboxes {
+		n.unregisterTDilithium3SigningInbox(inbox)
+	}
+}
+
+// tdilithium3ProposalTriggerSenderAuthed is the trigger's B-5 decision: only
+// the slot's proposer may announce proposal attempts -- all of them,
+// including retries (the proposal's retry is proposer-driven; there is no
+// delegate announcer, unlike the seal's retry delegation). An unresolvable
+// sender, an unresolvable slot proposer, or a missing consensus engine all
+// refuse.
+func (n *Node) tdilithium3ProposalTriggerSenderAuthed(slot uint64, sender p2p.PeerID) bool {
+	if n == nil || n.blockProducer == nil || n.blockProducer.QPOS() == nil {
+		return false
+	}
+	proposer, err := n.blockProducer.QPOS().GetProposerForSlot(slot)
+	if err != nil || proposer == nil {
+		return false
+	}
+	addr, found := n.resolveSenderAddress(sender)
+	return found && bytes.Equal(addr[:], proposer.Address[:])
+}
+
+// handleTDilithium3ProposalTrigger consumes one proposal signing trigger.
+// Refusal ordering, cheapest and purest first: parse, gate (zero side
+// effects and zero logs when closed -- the default posture), zero-binding
+// check, per-peer rate limit, B-5 authentication, duplicate suppression,
+// inbox prebuild, start. Every refusal drops the message; none starts a
+// goroutine or leaves an inbox behind.
+func (n *Node) handleTDilithium3ProposalTrigger(msg p2p.PeerMessage) {
+	epoch, slot, bound, ordinal, ok := tdilithium3ProposalTriggerParse(msg.Payload)
+	if !ok {
+		return
+	}
+	// Gate first (a pure config read): with either gate layer closed the
+	// trigger is a zero-side-effect, zero-log drop.
+	if !tdilithium3ProposalSigningEnabled(n, epoch) {
+		return
+	}
+	var zeroBound [32]byte
+	if bound == zeroBound {
+		tdilithium3ProposalTrace("slot %d: trigger with a zero binding dropped", slot)
+		return
+	}
+	// Per-peer rate limit before any expensive work (the proposer resolution
+	// and the roster read), the NODE-R12-H01 posture.
+	if !n.allowTDilithium3ProposalTriggerFromPeer(msg.From) {
+		tdilithium3ProposalTrace("trigger from peer %s rate-limited", msg.From)
+		return
+	}
+	// B-5: only the slot's proposer may announce proposal attempts -- all of
+	// them, including retries: the proposal's retry is proposer-driven and
+	// has no delegate announcer. An unresolvable sender is refused too.
+	if !n.tdilithium3ProposalTriggerSenderAuthed(slot, msg.From) {
+		tdilithium3ProposalTrace("slot %d: trigger sender is not the proposer (B-5)", slot)
+		return
+	}
+	// Duplicate suppression before the prebuild: an attempt that is not
+	// newer than the running one is an idempotent no-op, and prebuilding
+	// shells for it would replace a live session's inbox registration.
+	n.tdilithium3ProposalSigningMu.Lock()
+	if existing := n.tdilithium3ProposalTriggerSessions[slot]; existing != nil && existing.attempt >= ordinal {
+		n.tdilithium3ProposalSigningMu.Unlock()
+		return
+	}
+	n.tdilithium3ProposalSigningMu.Unlock()
+	// Pre-register the attempt's candidate inboxes BEFORE starting: the
+	// proposer begins its own attempt's round messages as soon as its local
+	// run starts, and a first message that outruns this node's session
+	// goroutine would otherwise be dropped at routing. The start's schedule
+	// factory reuses a registered inbox for the same session id.
+	inboxes := n.tdilithium3ProposalPrebuildInboxes(epoch, slot, bound, ordinal)
+	if !n.tdilithium3ProposalSigningStart(epoch, slot, bound, ordinal) {
+		// The start refused (ordinal raced ahead, window closed, custody
+		// changed): drop the shells so a dead session's id cannot queue
+		// messages.
+		n.unregisterTDilithium3ProposalShells(inboxes)
 	}
 }

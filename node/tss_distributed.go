@@ -391,6 +391,17 @@ func (n *Node) handleTSSMessage(msg p2p.PeerMessage) {
 		// (which refuses activation envelopes) or the running exchange.
 		n.adoptTDilithium3DKGActivationCertificate(msg.Payload)
 		return
+	case p2p.MsgTypeTDilithium3ProposalTrigger:
+		// Dilithium3 v1 proposal signing trigger (TSS-R3-B-1 P2): the block
+		// proposer's per-attempt announcement. It is NOT a threshold
+		// envelope, so it MUST be handled before the signing-envelope case
+		// below: that case routes by session id, and no receiver has an
+		// inbox registered for a session it has not started — an envelope
+		// fall-through would drop the trigger silently. With the proposal
+		// gate closed (the default) the handler is a zero-side-effect,
+		// zero-log drop.
+		n.handleTDilithium3ProposalTrigger(msg)
+		return
 	case p2p.MsgTypeTDilithium3SigningCommit, p2p.MsgTypeTDilithium3SigningReveal,
 		p2p.MsgTypeTDilithium3SigningAcceptance, p2p.MsgTypeTDilithium3SigningResponse:
 		// Signing-executor round messages reach the inbox of their own session.

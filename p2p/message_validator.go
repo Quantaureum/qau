@@ -434,6 +434,10 @@ func NewMessageValidator() *MessageValidator {
 	// Activation certificate is a serialized JSON blob (magic "QTD3ACT1"),
 	// NOT a threshold envelope, so it uses a plain size-bounded validator.
 	v.RegisterValidator(MsgTypeTDilithium3DKGActivationCertificate, &BatchMessageValidator{})
+	// Dilithium3 v1 proposal signing trigger (TSS-R3-B-1 P2): fixed-width
+	// binary announcement, NOT a threshold envelope — its own size-bounded
+	// validator (56 base bytes, up to 96 with future extensions).
+	v.RegisterValidator(MsgTypeTDilithium3ProposalTrigger, &TDilithium3ProposalTriggerValidator{})
 
 	// R19-F4 (2026-10-28): register validators for the shard protocol message
 	// types (80-85). Without these, ValidateMessage rejects every inbound shard
@@ -676,9 +680,17 @@ func (v *MessageValidator) ValidateMessage(msg *Message) error {
 	// identical retransmission as an idempotent duplicate, so a content-hash
 	// dedup window would only delay recovery of a lost round message while the
 	// signatures of the envelope still bind every message to its session.
+	// The proposal signing trigger (TSS-R3-B-1 P2) is exempt on the same
+	// terms: the trigger is bound to (epoch, slot, bound, attempt) and its
+	// receiver-side start treats an identical retransmission as an idempotent
+	// no-op (the ordinal admission refuses an ordinal that is not newer than
+	// the running one), while the B-5 proposer check and the per-peer rate
+	// limit still apply — so a retransmission recovers a lost announcement
+	// instead of being swallowed as a replay.
 	if !isControlMessageType(msg.Type) && !isTDilithium3DKGMessageType(msg.Type) &&
 		!isTDilithium3SigningMessageType(msg.Type) &&
-		msg.Type != MsgTypeTDilithium3DKGActivationCertificate {
+		msg.Type != MsgTypeTDilithium3DKGActivationCertificate &&
+		msg.Type != MsgTypeTDilithium3ProposalTrigger {
 		msgHash := fmt.Sprintf("%x-%d", sha3.Sum256(msg.Payload), msg.Type)
 		if v.IsDuplicate(msgHash) {
 			return ErrDuplicateMessage
@@ -1105,6 +1117,32 @@ type QTDSealAnnouncementValidator struct{}
 
 type QTDSealRequestValidator struct{}
 
+// TDilithium3ProposalTriggerValidator bounds the Dilithium3 v1 proposal
+// signing trigger (TSS-R3-B-1 P2). The payload is fixed-width binary, the
+// seal-request shape with a 32-byte message binding:
+//
+//	[0:8]    uint64 epoch (big endian)
+//	[8:16]   uint64 slot (big endian)
+//	[16:48]  32-byte canonical TSS binding (the session's signed message)
+//	[48:56]  uint64 attempt ordinal (big endian)
+//
+// MinSize = 56 (the exact base payload). MaxSize = 96 leaves bounded room for
+// future appended fields, mirroring the seal request's 40/48 dual-length
+// precedent: a receiver that predates an extension simply does not read the
+// appended bytes.
+type TDilithium3ProposalTriggerValidator struct{}
+
+func (v *TDilithium3ProposalTriggerValidator) MinSize() uint64 { return 56 }
+func (v *TDilithium3ProposalTriggerValidator) MaxSize() uint64 { return 96 }
+
+func (v *TDilithium3ProposalTriggerValidator) Validate(payload []byte) error {
+	if len(payload) < 56 || len(payload) > 96 {
+		return fmt.Errorf("%w: Dilithium3 v1 proposal trigger requires 56 bytes (up to %d with extensions)",
+			ErrInvalidMessageFormat, v.MaxSize())
+	}
+	return nil
+}
+
 // The payload is the legacy 40-byte seal request (slot + block hash); the v1
 // executor's retry announcement appends the 8-byte attempt ordinal, which a
 // receiver that predates the extension simply does not read (the session
@@ -1343,6 +1381,9 @@ func ValidateMessageType(msgType uint8) bool {
 		MsgTypeTDilithium3SigningReveal,
 		MsgTypeTDilithium3SigningAcceptance,
 		MsgTypeTDilithium3SigningResponse,
+		// Dilithium3 v1 proposal signing trigger (103): the proposer's
+		// per-attempt announcement; fixed-width binary, not an envelope.
+		MsgTypeTDilithium3ProposalTrigger,
 		// Dilithium3 v1 activation certificate broadcast (101)
 		MsgTypeTDilithium3DKGActivationCertificate,
 		// QTD consensus message types
