@@ -2571,13 +2571,13 @@ func (v *BlockValidator) ValidateSignature(header *encoding.BlockHeader) error {
 		sigLen == crypto.Dilithium3SignatureSize && tssV1GroupKeyLookup != nil {
 		if groupKeyBytes := tssV1GroupKeyLookup(header.Epoch); len(groupKeyBytes) > 0 {
 			if groupKey, err := crypto.PublicKeyFromBytes(groupKeyBytes); err == nil {
-				if groupKey.Verify(signingData, header.Signature) {
-					return nil
-				}
-				// The v1 proposal signer (P1) binds its message to the
-				// canonical TSS binding over (chainID, epoch, slot, proposer,
-				// "block"); accept that form too, mirroring the dual-message
-				// fallback the legacy block above performs.
+				// The v1 proposal signer (P1) signs exactly the canonical TSS
+				// binding over (chainID, epoch, slot, proposer, "block") — never
+				// the raw signing hash (the R38-P1-03 producer contract). The raw
+				// form is therefore a dead acceptance surface and is NOT accepted
+				// here (R57 reduction review F-3, 2026-11-14): a raw-form group
+				// signature falls through to the individual verification and is
+				// rejected, which also keeps the message contract one-sided.
 				bound := consensus.ComputeTSSCanonicalBinding(header.ChainID, header.Epoch, header.Slot, header.ProposerAddr, "block", signingData)
 				if groupKey.Verify(bound[:], header.Signature) {
 					return nil

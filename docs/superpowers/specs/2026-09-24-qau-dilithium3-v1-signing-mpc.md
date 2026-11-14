@@ -309,9 +309,11 @@ r' = M^(1/(N*(L+K))) * r
 ```
 
 give a divergence of at most `M`. The per-party acceptance probability is
-`(r/r')^{N*(L+K)} = 1/M` (measured `0.5595` against the model `0.5596` at our
-parameters, see the parameter section), and the per-slot acceptance
-probability over the `T = 4` active signers is
+`(r/r')^{N*(L+K)} = 1/M` — the zero-shift candidate is the geometric maximum
+and any nonzero shift only lowers it (2026-11-14 reduction review F-1
+withdraws an earlier measured pair `0.5595`/`0.5596` that predated the final
+radius pinning; see the parameter section for the pinned value), and the
+per-slot acceptance probability over the `T = 4` active signers is
 
 ```text
 p = (1/M)^T = 2^(-expo),   expo pinned at 3.3
@@ -553,9 +555,14 @@ with two validations:
   `B = 2082.79`, `r = 488704.3`, `r' = 488969.0` against the published
   `488704 / 488969`, and `J = 812` against the published `804` (the difference
   is Monte Carlo resolution in the check probabilities, about 1%);
-- the per-party acceptance model `1/M` matches a direct simulation of `HRej`:
-  `0.5595` measured against `0.5596` at our parameters, and `0.2200` against
-  `0.2176` at the reference's `(4,6)` mode3 row. The reference's published
+- the per-party acceptance is bounded by the geometric maximum `1/M` (the
+  zero-shift candidate; strictly decreasing in the shift norm). A historical
+  simulation note recorded `0.5595` against a pre-pinning model of `0.5596`
+  at our parameters; that pair predates the final radius pinning and was
+  withdrawn by the 2026-11-14 reduction review (F-1) — the pinned value is
+  `1/M = 0.5645` (closed form `0.56448` at the exact radii, `0.56469` at the
+  rounded radii). The reference-row crosscheck stands: `0.2200` against
+  `0.2176` at the reference's `(4,6)` mode3 row, and the reference's published
   acceptance exponents for all five `(T, 6)` mode3 rows are reproduced by
   `p = M^(-T)` to the published precision.
 
@@ -564,14 +571,14 @@ with two validations:
 | parameter | value | note |
 |---|---|---|
 | component bound `eta` | `1` | `RSSComponentEta`, unchanged from R49 |
-| smoothing `phi` | `8` | `2*eps < 1.39e-16` at `N*(L+K) = 2816` |
+| smoothing `phi` | `8` | `2*eps < 3e-11` at `N*(L+K) = 2816` (recomputed 2026-11-14; an earlier note recorded `1.39e-16`, not reproducible under the recorded formula — both orders are negligible for the Renyi correction `1+eps`) |
 | expansion `nu` | `6` | the reference's mode3 value |
 | target exponent `expo` | `3.3` | `p = (1/M)^T = 2^-3.3 = 0.10153` |
 | divergence `M` | `1.7715` | `M = (1/p)^(1/4)` |
 | shift bound `B` | `658.64` | `1.3` margin over the RMS norm |
 | test radius `r` | `407958.8` | `HRej` accept radius |
 | sampling radius `r'` | `408041.6` | `r' - r = 82.8` |
-| per-party acceptance | `0.5645` model | `1/M`; measured `0.5759` |
+| per-party acceptance | `<= 0.5645` | `1/M`; the zero-shift candidate is the geometric maximum, real shifts only lower it |
 | per-slot acceptance `p` | `0.10153` | all four signers accept |
 | check `\|z^(1)\|inf < Gamma1 - 196` | `1.0000` | 40k samples |
 | check `\|delta\|inf <= Gamma2` | `1.0000` | 40k samples |
@@ -585,11 +592,16 @@ executions per accepted signature: `1.90`.
 
 ### Verification of the pinned point
 
-- The measured per-party acceptance (`0.5759` over 20k samples) is slightly
-  above the `1/M` model, because the actual shifts are typically below the
-  `1.3*RMS` bound; taken at face value it would allow `J = 10`. `J = 11` is
-  pinned deliberately: it is the value from the model acceptance, which is the
-  one the analysis provides, and the measured figure is not a proven bound.
+- The per-party acceptance has no measured figure above the model: the
+  geometric maximum is `1/M = (r/r')^{N*(L+K)} = 0.56448` at the exact radii
+  (the zero-shift candidate), and the acceptance is strictly decreasing in
+  the shift norm, so a historical note recording `0.5759` over 20k samples
+  was impossible for the pinned radii and was withdrawn by the 2026-11-14
+  reduction review (F-1) — the figure cannot come from the pinned `(r, r')`
+  and no mechanism was identified for it. `J = 11` is pinned from the model
+  acceptance, which is the value the analysis provides and the only proven
+  bound; a real acceptance at or below the maximum can only make slots abort
+  more often, never weaken the signature.
 - The hint-weight check is the binding constraint (mean hint weight about 53
   against `Omega = 55`), and it varies with the key's `t0` realization: over 40
   sampled keys the joint `P2 * Phint` probability stayed in `[0.605, 0.688]`
@@ -920,6 +932,17 @@ rushing signer could adapt its randomness after seeing the others and bias
 `w1`. The reference driver drives all four signers in one process and folds the
 four commitments into one digest; the networked executor must attribute each
 commitment to its own signer.
+
+The t-shares-in-one-process shape is a TEST-ONLY construction, and the guard
+against it in production is STRUCTURAL rather than a runtime check: the
+reference session builders (`newSigningAttempt`, `newSigningExecutorSession`)
+are unexported, and the networked wiring installs exactly one share per node
+(`LoadActiveAtEpoch` resolves a single active share, the schedule binds one
+`config.Share` that must belong to the signer subset). The networked party's
+corresponding integrity check is the `reconstructPartialSecrets`
+local-reproducibility cross-check. This note records the guarantee's nature
+explicitly (2026-11-14 reduction review F-4); the reference driver stays
+unreachable from production code paths.
 
 **Round 2 - reveal and challenge.** Every signer reveals `w_i`; anyone computes
 `w = sum_i w_i`, `w1 = HighBits(w)`, `c_tilde = SHAKE256(mu ||
