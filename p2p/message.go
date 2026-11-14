@@ -209,6 +209,24 @@ const (
 	// threshold envelope whose body is a reshare delta message
 	// (wallet/tss/protocol/dilithium3v1: ReshareDeltaWire).
 	MsgTypeTDilithium3ReshareDelta uint8 = 102
+
+	// Dilithium3 v1 proposal signing trigger (TSS-R3-B-1 P2): the block
+	// proposer's per-attempt announcement that starts the same threshold
+	// signing attempt on the attempt's other signers. Fixed-width binary
+	// payload (epoch | slot | bound | attempt), B-5 authenticated on the
+	// receiver side (only the slot's proposer may broadcast it), and exempt
+	// from content-hash dedup like the DKG kinds so a retransmission is an
+	// idempotent duplicate rather than a replay. It is NOT a threshold
+	// envelope: the node layer must route it before the signing-envelope
+	// path, which keys on session ids that no receiver has registered yet.
+	//
+	// MIXED-VERSION COMPATIBILITY: the cluster must be fully upgraded before
+	// the proposal gate opens — a peer on a binary that predates kind 103
+	// scores a BadMessage validation violation on every trigger (the penalty
+	// ladder escalates repeated violations to a temporary disconnect), which
+	// is acceptable only while the gate is closed (the default) and zero
+	// triggers are broadcast.
+	MsgTypeTDilithium3ProposalTrigger uint8 = 103
 )
 
 // Message flags
@@ -1262,6 +1280,14 @@ func ValidateMessage(msg *Message) error {
 		// empty payloads; upper bound matches the thresholdActivationMaxSize
 		// 128KB cap enforced by decodeThresholdActivationCertificate.
 		if len(msg.Payload) < 16 || len(msg.Payload) > 128*1024 {
+			return ErrMalformedMessage
+		}
+	case MsgTypeTDilithium3ProposalTrigger:
+		// Dilithium3 v1 proposal signing trigger (TSS-R3-B-1 P2): fixed-width
+		// binary announcement, NOT a threshold envelope. Base payload 56
+		// bytes (epoch | slot | bound | attempt); up to 96 with future
+		// appended fields, mirroring the seal request's 40/48 dual length.
+		if len(msg.Payload) < 56 || len(msg.Payload) > 96 {
 			return ErrMalformedMessage
 		}
 	// Shard protocol messages — qau_shard (80-89 range)

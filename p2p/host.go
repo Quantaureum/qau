@@ -4233,6 +4233,11 @@ func (h *Host) registerProtocols() {
 			MsgTypeTDilithium3SigningResponse:          true,
 			MsgTypeTDilithium3DKGActivationCertificate: true,
 			MsgTypeTDilithium3ReshareDelta:             true,
+			// Dilithium3 v1 proposal signing trigger (TSS-R3-B-1 P2): the
+			// proposer's per-attempt announcement that starts the same
+			// signing attempt on the other signers. Fixed-width binary,
+			// B-5 authenticated on the receiver side.
+			MsgTypeTDilithium3ProposalTrigger: true,
 		},
 		Handler: h.handleTSSProtocol,
 	})
@@ -5934,6 +5939,16 @@ func (h *Host) BroadcastQTDSealRequest(data []byte) error {
 	return h.broadcast(MsgTypeQTDSealRequest, data)
 }
 
+// BroadcastTDilithium3ProposalTrigger broadcasts the Dilithium3 v1 proposal
+// signing trigger (TSS-R3-B-1 P2) to all peers: the block proposer's
+// per-attempt announcement that starts the same signing attempt on the
+// attempt's other signers. The payload is the fixed-width binary trigger
+// (epoch | slot | bound | attempt); receivers authenticate the sender as the
+// slot's proposer (B-5) before starting anything.
+func (h *Host) BroadcastTDilithium3ProposalTrigger(data []byte) error {
+	return h.broadcast(MsgTypeTDilithium3ProposalTrigger, data)
+}
+
 // BroadcastQTDSealAnnouncement broadcasts a completed QTD seal to all peers.
 // HIGH-01 (R18, 2026-07-23): called by the block producer after the QTD
 // seal is completed, so syncing nodes can attach the seal to their copy
@@ -6884,7 +6899,8 @@ func (h *Host) broadcast(msgType uint8, data []byte) error {
 // tssProtocolMessageType reports whether a message type belongs to the
 // retransmission-free TSS/Dilithium3 protocol family whose broadcasts must
 // be logged (Dilithium3 DKG rounds 90-96, signing rounds 97-100, activation
-// certificate 101, reshare deltas 102, legacy distributed-DKG 77-79).
+// certificate 101, reshare deltas 102, proposal trigger 103, legacy
+// distributed-DKG 77-79).
 func tssProtocolMessageType(msgType uint8) bool {
 	switch msgType {
 	case MsgTypeTSSDKGCommitment, MsgTypeTSSDKGAck, MsgTypeTSSDKGReshare,
@@ -6894,7 +6910,8 @@ func tssProtocolMessageType(msgType uint8) bool {
 		MsgTypeTDilithium3DKGRandomnessCommitment,
 		MsgTypeTDilithium3SigningCommit, MsgTypeTDilithium3SigningReveal,
 		MsgTypeTDilithium3SigningAcceptance, MsgTypeTDilithium3SigningResponse,
-		MsgTypeTDilithium3DKGActivationCertificate, MsgTypeTDilithium3ReshareDelta:
+		MsgTypeTDilithium3DKGActivationCertificate, MsgTypeTDilithium3ReshareDelta,
+		MsgTypeTDilithium3ProposalTrigger:
 		return true
 	}
 	return false

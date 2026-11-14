@@ -291,6 +291,18 @@ type Node struct {
 	// under tdilithium3ProposalSigningMu.
 	tdilithium3ProposalSigningMu      sync.Mutex
 	tdilithium3ProposalSigningRunning chan struct{}
+	// TSS-R3-B-1 P2 trigger channel state, all guarded by
+	// tdilithium3ProposalSigningMu (sessions and ordinals) or
+	// tdilithium3ProposalTriggerRateMu (rate limit), all lazily initialized:
+	// tdilithium3ProposalTriggerSessions holds the running triggered attempt
+	// per slot (a higher announced ordinal replaces a lower running one);
+	// tdilithium3ProposalTriggerOrdinals is the highest admitted ordinal per
+	// slot; tdilithium3ProposalTriggerRate is the per-peer sliding-window
+	// rate limit of inbound triggers.
+	tdilithium3ProposalTriggerSessions map[uint64]*tdilithium3ProposalTriggerSession
+	tdilithium3ProposalTriggerOrdinals map[uint64]uint64
+	tdilithium3ProposalTriggerRate     map[p2p.PeerID]*tdilithium3ProposalTriggerRateInfo
+	tdilithium3ProposalTriggerRateMu   sync.Mutex
 	// tdilithium3SigningJournals caches the per-key signing journal handles.
 	// Each is a bbolt database that takes an exclusive file lock, so a fresh
 	// handle per session (the old single-session path opened one per attempt)
@@ -7735,9 +7747,15 @@ func (n *Node) startServices() error {
 	// The offline-ceremony sealing path (tssV1SealingActivationEpoch) likewise
 	// routes its activation exchange and seal session traffic through this
 	// loop, so it forces the loop on independently of the experimental gates.
-	nodeLog.Info("offline v1 sealing: tss spawn gate: signer=%v coordinator=%v distDKG=%v inboxAllowed=%v experimental=%v offlineArmedCfg=%v hostSet=%v",
-		n.distributedSigner != nil, n.dkgCoordinator != nil, n.config.TSSDistributedDKG, n.tdilithium3DKGInboundAllowed(), experimentalTDilithium3V1Enabled(), n.offlineTDilithium3SealingConfigured(), n.p2pHost != nil)
-	if n.distributedSigner != nil || n.dkgCoordinator != nil || n.config.TSSDistributedDKG || n.tdilithium3DKGInboundAllowed() || experimentalTDilithium3V1Enabled() || n.offlineTDilithium3SealingConfigured() {
+	// The Dilithium3 v1 proposal trigger (TSS-R3-B-1 P2, message kind 103)
+	// arrives through the same loop: a signer whose proposal gate is open has
+	// no other receiver for its triggers, so the proposal env gate forces the
+	// loop on too. The handler itself re-checks both gate layers, so a loop
+	// spawned by the env gate alone stays a zero-side-effect drop until the
+	// activation epoch is configured.
+	nodeLog.Info("offline v1 sealing: tss spawn gate: signer=%v coordinator=%v distDKG=%v inboxAllowed=%v experimental=%v offlineArmedCfg=%v proposalEnv=%v hostSet=%v",
+		n.distributedSigner != nil, n.dkgCoordinator != nil, n.config.TSSDistributedDKG, n.tdilithium3DKGInboundAllowed(), experimentalTDilithium3V1Enabled(), n.offlineTDilithium3SealingConfigured(), tdilithium3ProposalSigningEnvEnabled(n.config.NetworkID), n.p2pHost != nil)
+	if n.distributedSigner != nil || n.dkgCoordinator != nil || n.config.TSSDistributedDKG || n.tdilithium3DKGInboundAllowed() || experimentalTDilithium3V1Enabled() || n.offlineTDilithium3SealingConfigured() || tdilithium3ProposalSigningEnvEnabled(n.config.NetworkID) {
 		n.wg.Add(1)
 		go n.tssProcessingLoop()
 	}
