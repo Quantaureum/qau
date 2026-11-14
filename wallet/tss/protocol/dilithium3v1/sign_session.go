@@ -37,11 +37,16 @@ func Dilithium3SigningSessionID(request protocol.SignRequest, signerIDs []uint32
 	if _, err := SigningParametersForThresholdCount(len(signerIDs)); err != nil {
 		return [32]byte{}, ErrInvalidDilithium3SigningSession
 	}
+	// prev mirrors signerIDs[index-1] for index > 0 without the slice index,
+	// so the monotonicity check is provably in range (gosec G602 flags the
+	// indexed form even though the index > 0 short-circuit guards it).
+	prev := uint32(0)
 	for index, signerID := range signerIDs {
 		if !slices.Contains(request.Committee.Participants, signerID) ||
-			(index > 0 && signerIDs[index-1] >= signerID) {
+			(index > 0 && prev >= signerID) {
 			return [32]byte{}, ErrInvalidDilithium3SigningSession
 		}
+		prev = signerID
 	}
 	encoded := make([]byte, 0, len(dilithium3SigningSetDomain)+32+len(signerIDs)*4)
 	encoded = append(encoded, dilithium3SigningSetDomain...)
