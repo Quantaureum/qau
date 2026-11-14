@@ -398,9 +398,11 @@ func (binding *tdilithium3SigningBinding) request(
 // signWithTDilithium3Signing runs one signing attempt for one message over the
 // network and returns the signature with every candidate slot's outcome. It is
 // the entry point the finality and sealing wiring calls behind the gates; the
-// schedule itself refuses a mainnet node and a closed gate before any party
-// starts. The attempt ordinal is part of the request nonce, so a retry is a
-// fresh session and every active signer of the attempt derives the same one.
+// schedule itself is gate-agnostic — each caller checks its own network/env
+// gate and activation epoch before invoking it (the seal wiring and the
+// proposal executor gate their own entries). The attempt ordinal is part of
+// the request nonce, so a retry is a fresh session and every active signer of
+// the attempt derives the same one.
 func (n *Node) signWithTDilithium3Signing(
 	ctx context.Context,
 	binding *tdilithium3SigningBinding,

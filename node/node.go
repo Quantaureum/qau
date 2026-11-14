@@ -7805,10 +7805,22 @@ func (n *Node) wireTSSVerifier() {
 	// The lookup is the read-only export (GroupPublicKeyForEpoch), so only
 	// keys that passed the anchor continuity checks are reachable; it returns
 	// empty for unknown epochs, which keeps the branch inert there.
+	lookupWired := false
 	if n.blockProducer != nil && n.blockProducer.QPOS() != nil {
 		if qfs := n.blockProducer.QPOS().GetQTDFinality(); qfs != nil {
 			n.blockValidator.SetTSSV1GroupKeyLookup(qfs.GroupPublicKeyForEpoch)
+			lookupWired = true
 		}
+	}
+	// A node form without a block producer (sync-only shapes) never reaches
+	// the wiring above. That is harmless while the gate is closed (the
+	// default), but an operator who arms tssV1ProposalActivationEpoch on such
+	// a node would silently reject every group-signed header — the individual
+	// fallback fails on them. Fail LOUD at startup instead; a default node
+	// (gate 0) stays as quiet as before.
+	if !lookupWired && n.config != nil && n.config.TSSV1ProposalActivationEpoch > 0 {
+		nodeLog.Warn("tssV1ProposalActivationEpoch is configured but the Dilithium3 v1 proposal group-key lookup could not be wired (no block producer or QTD finality state); group-signed headers will be REJECTED by this node (activation epoch %d)",
+			n.config.TSSV1ProposalActivationEpoch)
 	}
 }
 
