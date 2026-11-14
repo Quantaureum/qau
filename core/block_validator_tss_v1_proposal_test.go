@@ -107,9 +107,12 @@ func TestValidateSignature_TSSV1_GateUnconfigured_Inert(t *testing.T) {
 }
 
 // TestValidateSignature_TSSV1_GateArmed_GroupSignatureAccepted pins
-// invariant 2 for both accepted message forms: the raw signing hash and the
-// canonical TSS binding (the form the P1 proposal signer commits to). A
-// header below the activation epoch keeps the branch inert and is rejected.
+// invariant 2 for the ONE accepted message form: the canonical TSS binding
+// (the form the P1 proposal signer commits to, R57 review F-3). A
+// raw-signing-data group signature is a dead acceptance surface: the group
+// check does not accept it, the individual fallback fails on it, and the
+// header is rejected. A header below the activation epoch keeps the branch
+// inert and is rejected exactly as on main 792226b.
 func TestValidateSignature_TSSV1_GateArmed_GroupSignatureAccepted(t *testing.T) {
 	groupKP, err := crypto.GenerateKeyPair()
 	if err != nil {
@@ -118,8 +121,15 @@ func TestValidateSignature_TSSV1_GateArmed_GroupSignatureAccepted(t *testing.T) 
 
 	newArmedValidator := func(t *testing.T) *BlockValidator {
 		t.Helper()
+		individualKP, err := crypto.GenerateKeyPair()
+		if err != nil {
+			t.Fatalf("GenerateKeyPair failed: %v", err)
+		}
 		v := NewBlockValidator(1333, 30_000_000)
-		v.SetValidatorLookup(&tssV1StaticLookup{pub: groupKP.Public.Bytes()})
+		// The registered proposer key is a DISTINCT individual key (not the
+		// group key), mirroring production: the individual fallback must not
+		// be able to rescue a group signature (R57 review F-3 fixture fix).
+		v.SetValidatorLookup(&tssV1StaticLookup{pub: individualKP.Public.Bytes()})
 		v.SetTSSV1ProposalActivationEpoch(10)
 		v.SetTSSV1GroupKeyLookup(func(epoch uint64) []byte { return groupKP.Public.Bytes() })
 		return v
@@ -134,14 +144,15 @@ func TestValidateSignature_TSSV1_GateArmed_GroupSignatureAccepted(t *testing.T) 
 		t.Fatalf("canonical-bound v1 group signature rejected: %v", err)
 	}
 
-	// Raw-signing-data group signature (the legacy block's first form):
-	// accepted too.
+	// Raw-signing-data group signature (a form no legitimate producer emits):
+	// the group check does not accept it and the individual fallback fails on
+	// a group signature, so the header is rejected (F-3 one-sided contract).
 	v = newArmedValidator(t)
 	header = tssV1NewHeader(10)
 	signingData = tssV1SigningData(t, v, header)
 	header.Signature = tssV1Sign(t, groupKP, signingData)
-	if err := v.ValidateSignature(header); err != nil {
-		t.Fatalf("raw-signing-data v1 group signature rejected: %v", err)
+	if err := v.ValidateSignature(header); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("raw-signing-data v1 group signature accepted: %v", err)
 	}
 
 	// Below the activation epoch the branch is inert: the same valid group
