@@ -3443,31 +3443,38 @@ func (bp *BlockProducer) buildBlock(
 			if proposerIndex >= 0 {
 				sig, err := bp.qpos.SignBlock(proposerIndex, signingData)
 				if err != nil {
-					// TSS hotfix (2026-11-14): RESTORED the individual-sign
-					// fallback. The t-of-n guarantee on this chain is enforced
-					// by the SEAL executor (Dilithium3 v1 four-signer session),
-					// not by the proposer's header signature — mainnet blocks
-					// have long carried individual header signatures on top of
-					// threshold seals. The TSS-FC-01 fail-closed attempt
-					// (PR #8) conflated the two layers and halted the chain:
-					// the proposer-level TSS session has failed network-wide
-					// ("share not found") ever since the epoch-14596 DKG
-					// roster rotation, so abandoning those slots stopped ALL
-					// production. The epoch-bucketed log discipline stays so
-					// fleet-wide degradation remains visible; the real
-					// fail-closed obligation (no single-signer seal
-					// aggregation) lives in the seal path and is unchanged.
-					if epoch != bp.tssFallbackWarnedEpoch {
-						if bp.tssFallbackWarnedEpoch != 0 || bp.tssFallbackSuppressed != 0 {
-							bpLog.Warn("TSS signing fallback: epoch %d had %d suppressed fallbacks",
-								bp.tssFallbackWarnedEpoch, bp.tssFallbackSuppressed)
-						}
-						bp.tssFallbackWarnedEpoch = epoch
-						bp.tssFallbackSuppressed = 0
-						bpLog.Warn("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+					// TSS-A1 (2026-11-14 root-cause analysis): the individual
+					// header-signature fallback is the steady-state posture,
+					// and the structural proposer-layer TSS failure is now
+					// reported as the named ErrProposerTSSUnavailable (see
+					// adapters.go guardProposerTSS) rather than a confusing
+					// "share not found". The t-of-n guarantee on this chain
+					// is enforced by the SEAL executor (Dilithium3 v1
+					// four-signer session), not by the proposer's header
+					// signature. (History: PR #8 attempted fail-closed here
+					// under the misreading that the header signature carried
+					// the threshold guarantee; it halted all production and
+					// was reverted by the PR #9 hotfix.)
+					if errors.Is(err, ErrProposerTSSUnavailable) {
+						bpLog.Info("proposer header for block %d signed individually "+
+							"(proposer-layer TSS unavailable: local shares below threshold; "+
+							"t-of-n enforced at seal layer)", newHeight)
 					} else {
-						bp.tssFallbackSuppressed++
-						bpLog.Debug("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+						// Unexpected TSS failure (not the structural posture):
+						// keep the epoch-bucketed log discipline so a genuine
+						// fleet-wide TSS degradation stays visible.
+						if epoch != bp.tssFallbackWarnedEpoch {
+							if bp.tssFallbackWarnedEpoch != 0 || bp.tssFallbackSuppressed != 0 {
+								bpLog.Warn("TSS signing fallback: epoch %d had %d suppressed fallbacks",
+									bp.tssFallbackWarnedEpoch, bp.tssFallbackSuppressed)
+							}
+							bp.tssFallbackWarnedEpoch = epoch
+							bp.tssFallbackSuppressed = 0
+							bpLog.Warn("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+						} else {
+							bp.tssFallbackSuppressed++
+							bpLog.Debug("TSS signing failed for block %d, falling back to individual Dilithium3: %v", newHeight, err)
+						}
 					}
 					// Fall back to individual Dilithium3 signing
 					if bp.validatorKey != nil {

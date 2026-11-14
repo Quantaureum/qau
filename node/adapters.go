@@ -1495,7 +1495,39 @@ func newTSSSignerAdapterWithNode(mgr *tss.TSSManager, node *Node) *tssSignerAdap
 	return &tssSignerAdapter{tss: mgr, node: node}
 }
 
+// ErrProposerTSSUnavailable reports that this deployment's local TSS state
+// cannot support threshold signing at the proposer layer. The standard
+// production posture holds exactly one share per validator (TotalShares >
+// local shares), so a local full-share threshold session is structurally
+// impossible. Callers (block_producer) fall back to an individual header
+// signature; the t-of-n guarantee is enforced by the Dilithium3 v1 seal
+// executor, which is fully decoupled from this layer.
+var ErrProposerTSSUnavailable = errors.New("proposer-layer TSS unavailable: local shares below threshold")
+
+func (a *tssSignerAdapter) guardProposerTSS() error {
+	// TSS-A1 (2026-11-14): the legacy local signing path below requires EVERY
+	// declared participant's share in this process (CreateSigningSession
+	// resolves all of participantIDs against m.qtdShares). With the production
+	// posture of one share per validator it fails deterministically with
+	// ErrShareNotFound on every single proposal — mainnet logged exactly that
+	// since its first binary, misattributed to the epoch-14596 roster rotation
+	// until the 2026-11-14 root-cause analysis. Fail fast with the named
+	// error so the caller can fall back to the individual header signature
+	// without burning a session construction per slot. Deployments that DO
+	// hold every share (ceremony exports, single-process devnets) keep the
+	// legacy path below untouched.
+	if a.tss.ShareCount() < a.tss.Threshold() {
+		participants := a.allParticipantIDs()
+		return fmt.Errorf("%w: localShares=%d threshold=%d declaredParticipants=%d",
+			ErrProposerTSSUnavailable, a.tss.ShareCount(), a.tss.Threshold(), len(participants))
+	}
+	return nil
+}
+
 func (a *tssSignerAdapter) SignBlock(validatorIndex int, message []byte) ([]byte, error) {
+	if err := a.guardProposerTSS(); err != nil {
+		return nil, err
+	}
 	participants := a.allParticipantIDs()
 	if len(participants) < a.tss.Threshold() {
 		return nil, fmt.Errorf("insufficient participants for threshold signing: have %d, need %d", len(participants), a.tss.Threshold())
@@ -1527,6 +1559,9 @@ func (a *tssSignerAdapter) SignBlock(validatorIndex int, message []byte) ([]byte
 }
 
 func (a *tssSignerAdapter) SignVote(validatorIndex int, message []byte) ([]byte, error) {
+	if err := a.guardProposerTSS(); err != nil {
+		return nil, err
+	}
 	participants := a.allParticipantIDs()
 	if len(participants) < a.tss.Threshold() {
 		return nil, fmt.Errorf("insufficient participants for threshold signing: have %d, need %d", len(participants), a.tss.Threshold())

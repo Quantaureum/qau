@@ -21,6 +21,7 @@ package node
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/quantaureum/qau/qaudb/db"
 	"github.com/quantaureum/qau/qaudb/state"
 	"github.com/quantaureum/qau/types"
+	"github.com/quantaureum/qau/wallet/tss"
 )
 
 // --- 1. stateTrust: derivation divergence flag -----------------------------
@@ -218,7 +220,7 @@ func (f *failingThresholdSigner) AggregatePartialSignatures([]int, map[int][]byt
 	return nil, errors.New("not implemented in test stub")
 }
 
-func tssFailClosedProducer(t *testing.T, signer *failingThresholdSigner, validators *consensus.ValidatorSet) *BlockProducer {
+func tssFailClosedProducer(t *testing.T, signer consensus.ThresholdKeySigner, validators *consensus.ValidatorSet) *BlockProducer {
 	t.Helper()
 	qpos, err := consensus.NewQPOS(validators)
 	if err != nil {
@@ -309,4 +311,113 @@ func TestTSSHotfix_UndeterminedProposerStillBuilds(t *testing.T) {
 	if signer.calls != 0 {
 		t.Fatalf("SignBlock must not be attempted without an elected proposer, got %d", signer.calls)
 	}
+}
+
+// --- 5. TSS-A1: the proposer gate fails fast when local shares < threshold --
+
+// The 2026-11-14 root-cause analysis found the proposer-layer TSS path
+// structurally impossible under the standard one-share-per-validator posture
+// (CreateSigningSession demands every declared participant's share locally),
+// yet every proposal still burned a full session construction and logged a
+// misleading "share not found". The guard must short-circuit with the named
+// ErrProposerTSSUnavailable BEFORE any session work, and the legacy path must
+// stay reachable when a deployment genuinely holds all shares.
+
+func TestTSSA1_GuardFailsFastWhenSharesBelowThreshold(t *testing.T) {
+	mgr, err := tss.NewTSSManager(tss.TSSConfig{Threshold: 4, TotalShares: 6, SecurityLevel: 256})
+	if err != nil {
+		t.Fatalf("NewTSSManager: %v", err)
+	}
+	// No shares imported: the production posture (one share per validator)
+	// is represented here by an empty local set — ShareCount()=0 < 4.
+	if mgr.ShareCount() != 0 {
+		t.Fatalf("precondition: ShareCount()=0, got %d", mgr.ShareCount())
+	}
+
+	adapter := newTSSSignerAdapter(mgr)
+	_, err = adapter.SignBlock(0, []byte("block signing data"))
+	if !errors.Is(err, ErrProposerTSSUnavailable) {
+		t.Fatalf("SignBlock must fail fast with ErrProposerTSSUnavailable when local shares are below the threshold, got: %v", err)
+	}
+
+	_, err = adapter.SignVote(0, []byte("vote signing data"))
+	if !errors.Is(err, ErrProposerTSSUnavailable) {
+		t.Fatalf("SignVote must fail fast with ErrProposerTSSUnavailable, got: %v", err)
+	}
+}
+
+func TestTSSA1_LegacyPathStaysReachableWithFullShares(t *testing.T) {
+	mgr, err := tss.NewTSSManager(tss.TSSConfig{Threshold: 4, TotalShares: 6, SecurityLevel: 256})
+	if err != nil {
+		t.Fatalf("NewTSSManager: %v", err)
+	}
+	// Simulated trusted-dealer ceremony (test env): populates ALL shares, so
+	// the legacy full-share path is legitimately usable — the guard must NOT
+	// fire. Devnets and ceremony-export deployments rely on this.
+	if _, err := mgr.GenerateKeyShares(); err != nil {
+		t.Fatalf("GenerateKeyShares: %v", err)
+	}
+	if mgr.ShareCount() < 4 {
+		t.Fatalf("precondition: ShareCount()=%d, want >= threshold 4", mgr.ShareCount())
+	}
+
+	adapter := newTSSSignerAdapter(mgr)
+	_, err = adapter.SignBlock(0, []byte("block signing data"))
+	if errors.Is(err, ErrProposerTSSUnavailable) {
+		t.Fatal("the guard must not fire when every declared share is held locally")
+	}
+	// Whatever the legacy protocol does beyond the guard is out of scope here;
+	// the assertion above only pins that the gate stays open.
+}
+
+// Hotfix follow-up: when the signer layer reports the named structural error,
+// the producer must still publish the block (individual fallback), not abort.
+func TestTSSA1_ProducerPublishesOnNamedStructuralError(t *testing.T) {
+	val := &consensus.Validator{
+		Address: types.Address{0x01},
+		Stake:   new(big.Int).Exp(big.NewInt(32), big.NewInt(18), nil),
+		Active:  true,
+	}
+	vset, err := consensus.NewValidatorSet([]*consensus.Validator{val})
+	if err != nil {
+		t.Fatalf("NewValidatorSet: %v", err)
+	}
+	signer := &namedErrorThresholdSigner{}
+	bp := tssFailClosedProducer(t, signer, vset)
+
+	buildState := &blockBuildState{stateDB: state.NewStateDB()}
+	if _, err := buildState.stateDB.CommitWithBlock(10); err != nil {
+		t.Fatalf("build baseline commit failed: %v", err)
+	}
+
+	blk := bp.buildBlock(5, 10, types.Hash{}, nil, buildState)
+	if blk == nil {
+		t.Fatal("buildBlock aborted on the named structural proposer-TSS error — " +
+			"the individual fallback must keep the slot alive")
+	}
+	if signer.calls != 1 {
+		t.Fatalf("SignBlock must be attempted exactly once, got %d", signer.calls)
+	}
+}
+
+// namedErrorThresholdSigner returns the wrapped ErrProposerTSSUnavailable the
+// adapter produces under the one-share-per-validator posture.
+type namedErrorThresholdSigner struct {
+	calls int
+}
+
+func (f *namedErrorThresholdSigner) SignBlock(int, []byte) ([]byte, error) {
+	f.calls++
+	return nil, fmt.Errorf("%w: localShares=1 threshold=4 declaredParticipants=6", ErrProposerTSSUnavailable)
+}
+func (f *namedErrorThresholdSigner) SignVote(int, []byte) ([]byte, error) {
+	return nil, fmt.Errorf("%w: votes", ErrProposerTSSUnavailable)
+}
+func (f *namedErrorThresholdSigner) VerifyBlock([]byte, []byte, []byte) bool { return false }
+func (f *namedErrorThresholdSigner) VerifyVote([]byte, []byte, []byte) bool  { return false }
+func (f *namedErrorThresholdSigner) GroupPublicKey() []byte                  { return nil }
+func (f *namedErrorThresholdSigner) IsThresholdMode() bool                   { return true }
+func (f *namedErrorThresholdSigner) Threshold() int                          { return 4 }
+func (f *namedErrorThresholdSigner) AggregatePartialSignatures([]int, map[int][]byte, []byte) ([]byte, error) {
+	return nil, errors.New("not implemented in test stub")
 }
