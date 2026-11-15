@@ -398,3 +398,59 @@ func TestTDilithium3V1AnchorFieldStrippedFromSigning(t *testing.T) {
 	}
 	var _ = mode3.SignatureSize // keep the mode3 import tied to the signature-size contract
 }
+
+// TestTDilithium3V1AnchorProducedHeaderSelfCertifies pins the P2-4 devnet
+// finding fix: a locally produced carrier header must flip the producer's
+// OWN canonical-anchor record (anchorProducedHeader). The producer's own
+// blocks never pass through BlockProducer.onCanonicalBlockImported — that
+// hook runs only on the peer-import paths — so without self-certification an
+// armed producer that seeded the era stays gate-closed forever while the
+// anchored majority group-signs (the P2-4 fleet split: 23 minutes without
+// self-heal, 5 of 19 headers group-signed).
+func TestTDilithium3V1AnchorProducedHeaderSelfCertifies(t *testing.T) {
+	node, groupKey, _, _, _ := triggerE2EFixture(t)
+	const activation = triggerE2EActivationEpoch
+	midSlot := activation*consensus.SlotsPerEpoch + 5
+
+	// Before production: the un-anchored window is open for this producer.
+	if node.tdilithium3V1CanonicalAnchorObserved(activation, groupKey) {
+		t.Fatal("the anchor gate is open before any carrier was produced")
+	}
+
+	// The producer seeds its own carrier: anchorProducedHeader embeds the
+	// active ceremony key and SELF-CERTIFIES the record under the same
+	// monotonic guard the import path uses.
+	header := &encoding.BlockHeader{
+		ChainID:      tdilithium3SeamTestChainID,
+		Epoch:        activation,
+		Slot:         midSlot,
+		ProposerAddr: node.blockProducer.validatorAddr,
+	}
+	node.blockProducer.anchorProducedHeader(header, midSlot)
+	if len(header.QTDGroupKey) == 0 {
+		t.Fatal("the carrier header left without the anchor embedded")
+	}
+	if !bytes.Equal(header.QTDGroupKey, groupKey) {
+		t.Fatal("the embedded anchor is not the active ceremony key")
+	}
+	if !node.tdilithium3V1CanonicalAnchorObserved(activation, groupKey) {
+		t.Fatal("self-certification did not close the un-anchored window: the producer of the era's own carrier would stay gate-closed forever (P2-4 regression)")
+	}
+
+	// The monotonic guard applies to self-certification: producing an
+	// OLDER-epoch carrier cannot downgrade the record.
+	oldHeader := &encoding.BlockHeader{
+		ChainID:      tdilithium3SeamTestChainID,
+		Epoch:        activation - 1,
+		Slot:         (activation - 1) * consensus.SlotsPerEpoch,
+		ProposerAddr: node.blockProducer.validatorAddr,
+	}
+	node.blockProducer.anchorProducedHeader(oldHeader, oldHeader.Slot)
+	if !node.tdilithium3V1CanonicalAnchorObserved(activation, groupKey) {
+		t.Fatal("an older-epoch carrier downgraded the anchor record")
+	}
+
+	// A nil-node producer (defensive shape) must not panic.
+	var nilBP *BlockProducer
+	nilBP.anchorProducedHeader(header, midSlot)
+}

@@ -42,9 +42,11 @@ package node
 //     produced header carries the anchor. This covers the runtime-DKG case
 //     where the ceremony completes mid-epoch: the epoch boundary of the
 //     activation epoch was produced BEFORE the key existed, so the first
-//     armed block(s) must seed the anchor themselves. The window closes as
-//     soon as any armed producer's anchor block is applied (the producer
-//     observes its own and peers' blocks through the same import path).
+//     armed block(s) must seed the anchor themselves. The window closes
+//     when the producer SELF-CERTIFIES its own carrier (anchorProducedHeader
+//     — its own blocks never pass through onCanonicalBlockImported, so the
+//     embedding hit is the only self-evidence it gets) or observes any armed
+//     producer's anchor block through the import path.
 //
 // Both gates are additive on top of the existing gates: with the proposal
 // layer closed (the default) the session path returns nil before reaching
@@ -203,3 +205,52 @@ func (bp *BlockProducer) tdilithium3V1HeaderAnchorKey(header *encoding.BlockHead
 // errTDilithium3V1AnchorIdentityEmpty reports an armed producer whose share
 // store answered without a usable group public key.
 var errTDilithium3V1AnchorIdentityEmpty = errors.New("Dilithium3 v1 anchor: active share identity has no group key")
+
+// anchorProducedHeader embeds the v1 anchor on a produced header when the
+// carrier rules require it, and — on the embedding hit — SELF-CERTIFIES the
+// anchor into the canonical-anchor record (P2-4 devnet finding, 2026-11-15).
+//
+// Why self-certification is required and sound: the producer's own blocks
+// never pass through BlockProducer.onCanonicalBlockImported — that hook runs
+// only on the peer-block import paths (node.go's blockInsertLoop and
+// handleIncomingBlock) — so a locally produced carrier header updated the
+// CHAIN but never the producer's own record. Every armed producer that
+// produced the era's early carriers stayed gate-closed forever, the fleet
+// split into anchored (group-signing) and un-anchored (individual-only)
+// factions, and the un-anchored faction starved once the anchored majority
+// stopped producing carriers (P2-4: 23 minutes without self-heal, 5 of 19
+// headers group-signed).
+//
+// Trust argument: the self-recorded anchor's trust source is the node's OWN
+// active ceremony share — the identical source every P2P-imported carrier
+// carries (the import path trusts anchors written from OTHER nodes' active
+// shares, under the same adoption discipline). No new trust root is
+// introduced; the record still flows through the same monotonic guard and
+// the same (activation, key) gate check. Residual (accepted): the record is
+// written at BUILD time, one step before the block is broadcast and canonical
+// — if this exact block is orphaned, this node's gate is open on evidence the
+// canonical chain may not carry; the fleet's other armed producers keep
+// producing carriers until THEY observe one, so fresh-node protection on the
+// canonical chain is unaffected, and the next observed carrier re-anchors
+// this node's view through the import path as usual.
+func (bp *BlockProducer) anchorProducedHeader(header *encoding.BlockHeader, slot uint64) {
+	if header == nil || len(header.QTDGroupKey) != 0 {
+		return
+	}
+	key, anchorErr := bp.tdilithium3V1HeaderAnchorKey(header)
+	switch {
+	case anchorErr == nil && len(key) > 0:
+		header.QTDGroupKey = append([]byte(nil), key...)
+		// Local carrier self-certification: the same (epoch, key) record the
+		// import path would make for this header, under the same monotonic
+		// guard (see recordTDilithium3CanonicalAnchor).
+		if bp.node != nil {
+			bp.node.recordTDilithium3CanonicalAnchor(header.Epoch, key)
+		}
+		bpLog.Info("QTD group key anchored on individually signed header (v1 sealing, self-certified): slot %d epoch %d",
+			slot, header.Epoch)
+	case anchorErr != nil && consensus.EpochStartSlot(header.Epoch) == header.Slot:
+		bpLog.Warn("QTD group key anchor skipped (armed but no v1 share key): slot %d epoch %d err=%v",
+			slot, header.Epoch, anchorErr)
+	}
+}

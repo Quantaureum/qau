@@ -3591,19 +3591,12 @@ func (bp *BlockProducer) buildBlock(
 	// individually signed in both cases (the session gates of
 	// tdilithium3V1ProposalHeaderSignature skip boundary and un-anchored
 	// headers), because anchor adoption is post-apply: a group-signed carrier
-	// is rejected by every node whose custody is still empty.
-	if len(newBlock.Header.QTDGroupKey) == 0 {
-		key, anchorErr := bp.tdilithium3V1HeaderAnchorKey(newBlock.Header)
-		switch {
-		case anchorErr != nil && consensus.EpochStartSlot(newBlock.Header.Epoch) == newBlock.Header.Slot:
-			bpLog.Warn("QTD group key anchor skipped (armed but no v1 share key): slot %d epoch %d err=%v",
-				slot, newBlock.Header.Epoch, anchorErr)
-		case anchorErr == nil && len(key) > 0:
-			newBlock.Header.QTDGroupKey = append([]byte(nil), key...)
-			bpLog.Info("QTD group key anchored on individually signed header (v1 sealing): slot %d epoch %d",
-				slot, newBlock.Header.Epoch)
-		}
-	}
+	// is rejected by every node whose custody is still empty. On the
+	// embedding hit the producer SELF-CERTIFIES the anchor into its
+	// canonical-anchor record (anchorProducedHeader): its own blocks never
+	// pass through onCanonicalBlockImported, so without this the producer
+	// would stay gate-closed on an anchor it just put on the wire.
+	bp.anchorProducedHeader(newBlock.Header, slot)
 
 	// P1-2 (2026-07-14): Process blob transactions through the DA layer.
 	// Extract blobs from blob txs and store the erasure-coded matrix via
