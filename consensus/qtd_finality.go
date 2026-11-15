@@ -2823,6 +2823,17 @@ func (qfs *QTDFinalityState) ReRootGroupKeyCustody(epoch uint64, key []byte) {
 // current key is the ONLY key that ever existed, so it is valid for ALL
 // epochs — the fallback is safe.
 //
+// TSS-R3-B-1 fresh-sync bootstrap (Fix B, 2026-11-15): the current-epoch
+// query of a node WITHOUT a live signer also takes the floor path. The
+// live-signer fallback only ever ran for nodes that hold a signer, so a
+// fresh / verify-only node was structurally wedged once its verification
+// position reached the wall-clock current epoch (every later epoch failed
+// the lookup despite an adopted custody chain). The floor entry comes from
+// the same validated chokepoints as the past-epoch floor — no new trust
+// root, no signer-injection surface (the QTD-009 attacker model targets the
+// LIVE SIGNER's key, which this path still never serves; with a signer
+// present the fallback is byte-for-byte unchanged).
+//
 // R30-IMPLEMENT (2026-07-27): QTD-H03 + QTD-009. Caller must hold qfs.mu
 // (at least RLock).
 //
@@ -2897,7 +2908,22 @@ func (qfs *QTDFinalityState) getGroupPublicKeyForEpochLocked(epoch, currentEpoch
 	}
 
 	// No exact record for this epoch.
-	if len(qfs.groupKeyHistory) > 0 && epoch != currentEpoch {
+	//
+	// TSS-R3-B-1 fresh-sync bootstrap (Fix B, 2026-11-15): the floor path now
+	// also answers the CURRENT epoch when the node holds NO live signer — the
+	// fresh / verify-only case. Before this change such a lookup fell through
+	// to the live-signer fallback, found qtdSigner == nil, and returned nil,
+	// so a node syncing from genesis was structurally wedged the moment its
+	// verification position caught up with the wall-clock epoch: every later
+	// epoch advanced past the keys it HAD adopted, and each became a fresh
+	// permanent stall. The floor entry is custody-table material installed
+	// only through the validated write-side chokepoints (anchor adoption under
+	// the R19-F02 first-establishment / chained-adoption discipline, or a
+	// ceremony re-root) — the same trust root the past-epoch floor has always
+	// served, so no new key source is introduced. A node WITH a signer keeps
+	// the live-signer fallback below unchanged (armed nodes: zero behavior
+	// change), and future epochs still fail closed exactly as before.
+	if len(qfs.groupKeyHistory) > 0 && (epoch != currentEpoch || qfs.qtdSigner == nil) {
 		// QTD-009 (unchanged invariant): once any rotation history exists,
 		// a non-current epoch is NEVER answered with the live signer's key.
 		// Future epochs keep failing closed exactly as before.

@@ -223,13 +223,30 @@ func (n *Node) tdilithium3V1ProposalHeaderSignature(header *encoding.BlockHeader
 	// the identical binding, so acceptance here and acceptance there are the
 	// same equation.
 	bound := consensus.ComputeTSSCanonicalBinding(header.ChainID, epoch, slot, header.ProposerAddr, "block", signingData)
-	activationEpoch, _, _, err := n.tdilithium3ActiveShareIdentityCached()
+	activationEpoch, activeKey, _, err := n.tdilithium3ActiveShareIdentityCached()
 	if err != nil {
 		tdilithium3ProposalTrace("epoch %d slot %d: active share: %v", epoch, slot, err)
 		return nil
 	}
 	if epoch < activationEpoch {
 		tdilithium3ProposalTrace("epoch %d slot %d: precedes the activation epoch %d", epoch, slot, activationEpoch)
+		return nil
+	}
+	// TSS-R3-B-1 fresh-sync bootstrap (R-1 fix): anchor adoption is post-apply,
+	// so the first group-signed header must never be the epoch key's first
+	// carrier. Two gates keep the header individually signed exactly when an
+	// observer without custody could not verify it otherwise (see
+	// tdilithium3_v1_anchor_bootstrap.go for the trust model):
+	//   - the epoch's first block is the boundary carrier: individually signed
+	//     and anchored, verifiable with no custody for the new epoch;
+	//   - while no canonical block has anchored the ACTIVE ceremony key yet
+	//     (the un-anchored window), every header stays individual + anchor.
+	if slot == consensus.EpochStartSlot(epoch) {
+		tdilithium3ProposalTrace("epoch %d slot %d: epoch boundary keeps the individual anchor carrier", epoch, slot)
+		return nil
+	}
+	if !n.tdilithium3V1CanonicalAnchorObserved(activationEpoch, activeKey) {
+		tdilithium3ProposalTrace("epoch %d slot %d: ceremony key not chain-anchored yet, header stays the individual anchor carrier", epoch, slot)
 		return nil
 	}
 	base := n.ctx
@@ -404,17 +421,18 @@ func (n *Node) tdilithium3ProposalSleep(ctx context.Context) bool {
 // The EMPTY custody case refuses too, deliberately. The alternative reading
 // -- "empty means the epoch is not anchored yet, and the header's own
 // QTDGroupKey field self-anchors it" -- does not hold: the anchor adoption
-// (ObserveAnchoredGroupKey, called only from onCanonicalBlockImported at
-// block_producer.go:163, invoked post-apply at node.go:9125 and node.go:10563)
-// runs AFTER ValidateSignature in every import path (syncer.go:1059), so an
+// (ObserveAnchoredGroupKey, called only from BlockProducer.onCanonicalBlockImported,
+// which node.go's import loops invoke post-apply under shouldSwitch) runs
+// AFTER the syncer's ValidateSignature in every import path, so an
 // empty-custody validator rejects a group-signed header before the anchor
 // inside it can ever be adopted. An armed validator's custody is non-empty by
 // construction instead (registerTDilithium3SigningFinalitySigner re-roots and
-// installs at activation, tdilithium3_signing_finality.go:157-163, refreshed
-// at startup node.go:7673), so an empty lookup here means this node's
-// verification side is not reachable for the epoch -- the same refusal every
-// like-configured peer would produce. Refusing keeps the individual fallback
-// and never broadcasts a header the network rejects as a whole.
+// installs at activation, refreshed at startup by
+// refreshTDilithium3SigningFinalitySigner), so an empty lookup here means
+// this node's verification side is not reachable for the epoch -- the same
+// refusal every like-configured peer would produce. Refusing keeps the
+// individual fallback and never broadcasts a header the network rejects as a
+// whole.
 func (n *Node) tdilithium3ProposalAnchorAgrees(epoch uint64, ceremonyKey []byte) bool {
 	if n == nil || n.blockProducer == nil || n.blockProducer.QPOS() == nil {
 		return false
@@ -705,6 +723,20 @@ func (n *Node) tdilithium3ProposalSigningStart(epoch, slot uint64, bound [32]byt
 	}
 	if epoch < activationEpoch {
 		tdilithium3ProposalTrace("slot %d attempt %d: epoch %d precedes the activation epoch %d", slot, ordinal, epoch, activationEpoch)
+		return false
+	}
+	// TSS-R3-B-1 fresh-sync bootstrap: the signer side applies the same two
+	// carrier gates as the producer's own session (tdilithium3V1ProposalHeaderSignature),
+	// so no attempt ever produces a group signature for an epoch-boundary slot
+	// or for a ceremony key no canonical block has anchored yet — a signature
+	// like that is rejected by every custody-empty observer before the anchor
+	// inside it could be adopted.
+	if slot == consensus.EpochStartSlot(epoch) {
+		tdilithium3ProposalTrace("slot %d attempt %d: epoch boundary keeps the individual anchor carrier", slot, ordinal)
+		return false
+	}
+	if !n.tdilithium3V1CanonicalAnchorObserved(activationEpoch, groupKey) {
+		tdilithium3ProposalTrace("slot %d attempt %d: ceremony key not chain-anchored yet", slot, ordinal)
 		return false
 	}
 	if !n.tdilithium3ProposalAnchorAgrees(epoch, groupKey) {
