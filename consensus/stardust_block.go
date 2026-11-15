@@ -84,8 +84,18 @@ func PopulateStardustFields(header *encoding.BlockHeader, qpos *QPOS) error {
 		// epoch's active group public key, so verify-only consumers can learn
 		// it from the chain instead of an out-of-band ceremony artifact.
 		// Emitted only when this proposer actually holds the epoch's key.
+		// LOCKING (TSS-R3-B-1 follow-up, 2026-11-15): this runs on the block
+		// PRODUCTION goroutine while block imports adopt anchors
+		// (ObserveAnchoredGroupKey) on other goroutines, so the custody-table
+		// read must hold qfs.mu. The unlocked getGroupPublicKeyForEpoch
+		// wrapper documents "caller must hold qfs.mu" and was raced here
+		// against import-time map writes (concurrent map read/write is a
+		// fatal runtime error). GroupPublicKeyForEpoch is the same lookup —
+		// identical locked inner (CONS-P0-03 currentEpoch precompute) and the
+		// same defensive copy — under qfs.mu.RLock, built exactly for
+		// consumers outside the seal-verification path.
 		if header.Slot == EpochStartSlot(header.Epoch) {
-			if key := qfs.getGroupPublicKeyForEpoch(header.Epoch); len(key) > 0 {
+			if key := qfs.GroupPublicKeyForEpoch(header.Epoch); len(key) > 0 {
 				header.QTDGroupKey = append([]byte(nil), key...)
 				qtdLogger.Info("QTD group key anchored on epoch boundary block",
 					map[string]any{"slot": header.Slot, "epoch": header.Epoch, "keyPrefix": key[:8]})

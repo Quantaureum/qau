@@ -286,7 +286,12 @@ func triggerE2EFixture(t *testing.T) (*Node, []byte, p2p.PeerID, types.Address, 
 
 	// Production custody registration: the ceremony key re-roots the anchor
 	// custody and installs the finality signer at the activation epoch, so
-	// the anchor-agreement self-check finds exactly the ceremony key.
+	// the anchor-agreement self-check finds exactly the ceremony key. The
+	// canonical-anchor observation state stays EMPTY here: the fixture models
+	// a node whose key is not on the chain yet, and the fresh-sync bootstrap
+	// gates treat exactly that state as "keep headers individually signed".
+	// Tests that model a chain-anchored key call recordTDilithium3CanonicalAnchor
+	// themselves.
 	if err := node.registerTDilithium3SigningFinalitySigner(triggerE2EActivationEpoch, groupKey, 4); err != nil {
 		t.Fatalf("custody registration: %v", err)
 	}
@@ -417,7 +422,12 @@ func runningTriggerAttempt(node *Node, slot uint64) (bool, uint64) {
 // refused by the start AFTER the prebuild succeeded — leaves no shells
 // behind (the fix-1 hygiene on the refuse path).
 func TestTDilithium3ProposalTriggerHandlerEndToEnd(t *testing.T) {
-	node, _, proposerPeer, proposerAddr, triggerSlot := triggerE2EFixture(t)
+	node, groupKey, proposerPeer, proposerAddr, triggerSlot := triggerE2EFixture(t)
+	// The lifecycle tests model a chain that already carries the ceremony
+	// key's canonical anchor (what an armed producer's applied anchor block
+	// records); without it the fresh-sync bootstrap gates would refuse every
+	// start, which is the correct behavior for a key that is not on the chain.
+	node.recordTDilithium3CanonicalAnchor(triggerE2EActivationEpoch, groupKey)
 	capture := &triggerE2ELogBuffer{}
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(capture, &slog.HandlerOptions{Level: slog.LevelDebug})))

@@ -357,6 +357,14 @@ type Node struct {
 	tdilithium3ShareCache      *dilithium3v1.LocalShare
 	tdilithium3ShareCacheEpoch uint64
 	tdilithium3ShareCacheAt    time.Time
+	// tdilithium3AnchorMu/tdilithium3AnchorObserved hold the canonical-block
+	// anchor observation of the fresh-sync bootstrap (TSS-R3-B-1 R-1 fix, see
+	// tdilithium3_v1_anchor_bootstrap.go): the last anchor a canonical import
+	// ADOPTED, used to keep group-signed headers off the wire while the active
+	// ceremony key is not yet on the chain. Lazily allocated, so an unconfigured
+	// node allocates nothing.
+	tdilithium3AnchorMu       sync.Mutex
+	tdilithium3AnchorObserved *tdilithium3CanonicalAnchorState
 	// tdilithium3DKGEpochRosterStore is the lazily created finalized-epoch
 	// validator roster sidecar (Dilithium3 v1 CNF-RSS "Finalized-Epoch
 	// Validator Snapshot", option 2). It is nil until an epoch-boundary capture
