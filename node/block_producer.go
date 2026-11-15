@@ -158,9 +158,14 @@ func (bp *BlockProducer) onCanonicalBlockImported(header *encoding.BlockHeader) 
 	// public key; learn/cross-check it (no-op when absent or already known).
 	// Runs before the slot-root check so the path-independent sync of an
 	// observer — which has no slot root recorded yet — still learns the key.
+	// TSS-R3-B-1 fresh-sync bootstrap: only an ADOPTED anchor counts as
+	// canonical evidence for the producer gate; a refused anchor (R19-F02
+	// mismatch or chained-adoption refusal) must not flip it open.
 	if len(header.QTDGroupKey) > 0 {
 		if qfs := bp.qpos.GetQTDFinality(); qfs != nil {
-			qfs.ObserveAnchoredGroupKey(header.Epoch, header.QTDGroupKey, header.QTDGroupKeyProof)
+			if qfs.ObserveAnchoredGroupKey(header.Epoch, header.QTDGroupKey, header.QTDGroupKeyProof) && bp.node != nil {
+				bp.node.recordTDilithium3CanonicalAnchor(header.Epoch, header.QTDGroupKey)
+			}
 		}
 	}
 	root, known := bp.qpos.GetSlotBlockRoot(header.Slot)
@@ -3575,21 +3580,28 @@ func (bp *BlockProducer) buildBlock(
 		}
 	}
 
-	// V1 offline-sealing observer anchor: on the epoch's first block, when this
-	// producer is armed and holds the active v1 share, embed the epoch's group
-	// public key so verify-only consumers learn it from the chain. The v1 key
-	// comes from the ceremony share store, not the legacy qfs signer table
-	// (which is empty exactly on the armed path).
-	if bp.node != nil && bp.node.offlineTDilithium3SealingArmed(newBlock.Header.Epoch) &&
-		consensus.EpochStartSlot(newBlock.Header.Epoch) == newBlock.Header.Slot &&
-		len(newBlock.Header.QTDGroupKey) == 0 {
-		if _, key, _, err := bp.node.tdilithium3ActiveShareIdentityCached(); err == nil && len(key) > 0 {
-			newBlock.Header.QTDGroupKey = key
-			bpLog.Info("QTD group key anchored on epoch boundary block (v1 offline sealing): slot %d epoch %d",
-				slot, newBlock.Header.Epoch)
-		} else {
+	// V1 offline-sealing observer anchor: embed the epoch's group public key
+	// so verify-only consumers learn it from the chain. The v1 key comes from
+	// the ceremony share store, not the legacy qfs signer table (which is
+	// empty exactly on the armed path). TSS-R3-B-1 fresh-sync bootstrap: the
+	// carrier rules live in tdilithium3V1HeaderAnchorKey — the epoch's first
+	// block always anchors, and any produced block anchors while the active
+	// key is not yet chain-observed (the un-anchored window), so the first
+	// group-signed header is never the key's first carrier. The header stays
+	// individually signed in both cases (the session gates of
+	// tdilithium3V1ProposalHeaderSignature skip boundary and un-anchored
+	// headers), because anchor adoption is post-apply: a group-signed carrier
+	// is rejected by every node whose custody is still empty.
+	if len(newBlock.Header.QTDGroupKey) == 0 {
+		key, anchorErr := bp.tdilithium3V1HeaderAnchorKey(newBlock.Header)
+		switch {
+		case anchorErr != nil && consensus.EpochStartSlot(newBlock.Header.Epoch) == newBlock.Header.Slot:
 			bpLog.Warn("QTD group key anchor skipped (armed but no v1 share key): slot %d epoch %d err=%v",
-				slot, newBlock.Header.Epoch, err)
+				slot, newBlock.Header.Epoch, anchorErr)
+		case anchorErr == nil && len(key) > 0:
+			newBlock.Header.QTDGroupKey = append([]byte(nil), key...)
+			bpLog.Info("QTD group key anchored on individually signed header (v1 sealing): slot %d epoch %d",
+				slot, newBlock.Header.Epoch)
 		}
 	}
 
