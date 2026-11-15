@@ -12,7 +12,7 @@ package node
 //   - candidates start concurrently: every candidate's Start() is entered
 //     while all others are still in-flight (a serial walk deadlocks the
 //     barrier and fails the test);
-//   - first-win cleanup: when one candidate signs, the cancelled siblings'
+//   - first-win cleanup: when one candidate signs, the canceled siblings'
 //     parties are Finished (one-time material consumed) — no record leaks;
 //   - per-candidate session identity: every candidate carries its own session
 //     id (the slot index enters the derivation), so concurrent candidates
@@ -155,7 +155,7 @@ func waitForScheduleBarrier(mu *sync.Mutex, entered *int, want int, timeout time
 }
 
 // TestTDilithium3SigningScheduleFirstWinFinishesCancelledCandidates pins the
-// first-win cleanup: when the last candidate accepts, the cancelled siblings
+// first-win cleanup: when the last candidate accepts, the canceled siblings
 // (still in flight) are starved by the cancellation and their parties are
 // Finished — the one-time material is consumed, nothing leaks.
 func TestTDilithium3SigningScheduleFirstWinFinishesCancelledCandidates(t *testing.T) {
@@ -187,7 +187,7 @@ func TestTDilithium3SigningScheduleFirstWinFinishesCancelledCandidates(t *testin
 	if winner.wasBurned() {
 		t.Fatal("the winning candidate's material was burned")
 	}
-	// The schedule returns on first-win while the cancelled siblings are
+	// The schedule returns on first-win while the canceled siblings are
 	// still draining their contexts; their drivers starve-and-Finish a
 	// moment later. Poll for the cleanup instead of asserting it
 	// synchronously — a permanent failure here would be a material leak.
@@ -207,10 +207,10 @@ func TestTDilithium3SigningScheduleFirstWinFinishesCancelledCandidates(t *testin
 	}) {
 		for index, stub := range stubs {
 			if !stub.wasStarted() {
-				t.Fatalf("cancelled candidate %d never started", index+1)
+				t.Fatalf("canceled candidate %d never started", index+1)
 			}
 			if !stub.wasBurned() {
-				t.Fatalf("cancelled candidate %d was not Finished (material leak)", index+1)
+				t.Fatalf("canceled candidate %d was not Finished (material leak)", index+1)
 			}
 		}
 	}
