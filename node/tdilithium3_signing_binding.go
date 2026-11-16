@@ -395,6 +395,24 @@ func (binding *tdilithium3SigningBinding) request(
 	return request, nil
 }
 
+// tdilithium3SigningSlotTimeoutFor tiers the per-candidate-slot deadline by
+// signing domain (TSS-R3-B-1 Wave C). The block (proposal) domain starts its
+// signers on the attempt trigger the producer announces up front, so its
+// window must cover only the four-round exchange and is tiered down to
+// tdilithium3ProposalSigningSlotTimeout; a failed attempt's silence then ends
+// in that window instead of waiting out the seal-sized default. The finality
+// (seal) domain keeps the default window (a zero return, meaning
+// tdilithium3SigningSlotTimeout): its signers start only once the block and
+// the pending seal land on them, a measured ~6s start spread the window must
+// outlast. Any other domain returns zero as well, so an unknown caller keeps
+// the existing, wider window rather than inheriting the proposal tier.
+func tdilithium3SigningSlotTimeoutFor(domain protocol.SigningDomain) time.Duration {
+	if domain == protocol.SigningDomainBlock {
+		return tdilithium3ProposalSigningSlotTimeout
+	}
+	return 0
+}
+
 // signWithTDilithium3Signing runs one signing attempt for one message over the
 // network and returns the signature with every candidate slot's outcome. It is
 // the entry point the finality and sealing wiring calls behind the gates; the
@@ -402,7 +420,8 @@ func (binding *tdilithium3SigningBinding) request(
 // gate and activation epoch before invoking it (the seal wiring and the
 // proposal executor gate their own entries). The attempt ordinal is part of
 // the request nonce, so a retry is a fresh session and every active signer of
-// the attempt derives the same one.
+// the attempt derives the same one. The per-slot deadline is tiered by domain
+// (tdilithium3SigningSlotTimeoutFor).
 func (n *Node) signWithTDilithium3Signing(
 	ctx context.Context,
 	binding *tdilithium3SigningBinding,
@@ -419,14 +438,15 @@ func (n *Node) signWithTDilithium3Signing(
 		return nil, nil, err
 	}
 	schedule, err := newTDilithium3SigningSchedule(n, tdilithium3SigningPartyConfig{
-		Request:    request,
-		Share:      binding.Share,
-		Signers:    binding.Signers,
-		Journal:    binding.Journal,
-		Identities: binding.Identities,
-		Sign:       binding.Sign,
-		Broadcast:  binding.Broadcast,
-		Entropy:    binding.Entropy,
+		Request:     request,
+		Share:       binding.Share,
+		Signers:     binding.Signers,
+		Journal:     binding.Journal,
+		Identities:  binding.Identities,
+		Sign:        binding.Sign,
+		Broadcast:   binding.Broadcast,
+		Entropy:     binding.Entropy,
+		SlotTimeout: tdilithium3SigningSlotTimeoutFor(domain),
 	})
 	if err != nil {
 		return nil, nil, err

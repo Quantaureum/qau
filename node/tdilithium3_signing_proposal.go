@@ -101,6 +101,28 @@ const (
 	// one header synchronously), so this is generous headroom that the
 	// acquire path never blocks on, mirroring the seal cap's structure.
 	tdilithium3ProposalSigningMaxConcurrent = 8
+
+	// tdilithium3ProposalSigningSlotTimeout bounds one candidate slot of the
+	// proposal path's signing sessions (TSS-R3-B-1 Wave C). The seal path
+	// keeps the wider tdilithium3SigningSlotTimeout window because its
+	// signers start only once the block and the pending seal land on them --
+	// a measured ~6s start spread the window must outlast. The proposal
+	// path's signers start instead on the attempt trigger (kind 103), which
+	// the producer announces before running the attempt, so the start spread
+	// is one message hop and the window needs to cover only the four-round
+	// exchange. The measured 1.33s signer response p99 does not distinguish
+	// a per-round from a whole-exchange caliber; 5.5s is the safe value under
+	// either reading -- at the per-round reading four sequential rounds reach
+	// ~5.3s, which a 5s window would race -- and it keeps margin above the
+	// whole-exchange reading besides. A candidate whose peers never respond
+	// is indistinguishable from a slow peer, so a failed attempt would
+	// otherwise wait out the full seal-sized window in silence (measured up
+	// to 15.04s) before the retry chain moves on; this tier cuts that tail
+	// without touching the seal's. The window stays under the producer's
+	// overall tdilithium3ProposalSigningBudget (6s), so a silent attempt
+	// ends by the slot deadline with its outcomes recorded rather than by
+	// the budget cancel.
+	tdilithium3ProposalSigningSlotTimeout = 5500 * time.Millisecond
 )
 
 // errTDilithium3ProposalSigningNotASigner reports that the local validator is

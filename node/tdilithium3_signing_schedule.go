@@ -42,7 +42,10 @@ import (
 // Because distinct slots now seal concurrently, a session that runs past the
 // consensus-slot boundary does not block the next slot. The party's own
 // randomness is single-use, so a slot that still cannot converge within the
-// window is closed rather than retried forever.
+// window is closed rather than retried forever. This default window is the
+// seal path's tier: the proposal path (block domain) starts its signers on
+// the attempt trigger and uses the shorter tdilithium3ProposalSigningSlotTimeout
+// (see tdilithium3SigningSlotTimeoutFor).
 const tdilithium3SigningSlotTimeout = 15 * time.Second
 
 // errTDilithium3SigningRequestExhausted reports a request whose candidate slots
