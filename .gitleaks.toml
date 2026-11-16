@@ -21,6 +21,12 @@ paths = [
   '''rpc/websocket_r15_h02_wg_test\.go''',
   # rust SDK account test fixtures (run-19 scan hit)
   '''sdks/rust-sdk/src/accounts/account\.rs''',
+  # TSS-R3-B-1 Wave F handoff proof test: the flagged lines are Go variable
+  # assignments of synthetic record fields (firstKey, firstSig :=
+  # record8.NewKey/Signature) and a KeyGeneration counter increment - no
+  # credentials (true-key reverse lookup zero-hit). generic-api-key
+  # false-positives on the variable names (run-21 scan hit).
+  '''node/tdilithium3_handoff_proof_test\.go''',
 ]
 regexes = [
   # The devnet-only deterministic share password, public by design
