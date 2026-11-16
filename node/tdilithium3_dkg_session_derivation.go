@@ -33,6 +33,15 @@ var (
 	errTDilithium3DKGSessionUnavailable = errors.New("Dilithium3 v1 DKG session is unavailable")
 )
 
+// errTDilithium3DKGLocalNotACommitteeMember reports that the local validator
+// is not part of the epoch's committee. Committee membership is fixed for the
+// whole epoch (the roster is captured at the epoch's boundary), so this is a
+// DETERMINISTIC refusal rather than a startup-order one: retrying within the
+// epoch cannot change the outcome. Wrapped alongside
+// errTDilithium3DKGSessionUnavailable so existing callers keep their
+// sentinel-based refusal contract while retry policy can distinguish the two.
+var errTDilithium3DKGLocalNotACommitteeMember = errors.New("Dilithium3 v1 DKG: local validator is not in the epoch committee")
+
 // tdilithium3DKGSessionRosterEpoch returns the epoch whose boundary roster
 // anchors a session that activates for activationEpoch.
 //
@@ -84,8 +93,8 @@ func (n *Node) tdilithium3DKGCommitteeForRoster(roster *tdilithium3DKGEpochRoste
 			return committee, uint8(position), nil
 		}
 	}
-	return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator %s is not in the epoch %d committee",
-		errTDilithium3DKGSessionUnavailable, address.String(), roster.Epoch)
+	return protocol.CommitteeID{}, 0, fmt.Errorf("%w: local validator %s is not in the epoch %d committee: %w",
+		errTDilithium3DKGSessionUnavailable, address.String(), roster.Epoch, errTDilithium3DKGLocalNotACommitteeMember)
 }
 
 // tdilithium3DKGChainGenesisHash returns the genesis block hash, which anchors

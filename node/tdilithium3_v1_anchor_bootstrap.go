@@ -125,6 +125,23 @@ func (n *Node) anchorState() *tdilithium3CanonicalAnchorState {
 // conflicting key at a recorded epoch is refused by the adoption discipline),
 // so skipping them loses nothing; a strictly newer epoch — rotation included —
 // advances the record.
+//
+// Same-epoch key advance (TSS-R3-B-1 lag fix, P2-4 round 2): the experimental
+// runtime-DKG posture rotates the ceremony key EVERY epoch, and the ceremony
+// completes mid-epoch when it could not finish before the boundary. The record
+// then holds (N, outgoingKey) while the active share has already moved to
+// (N, freshKey), and the old "skip anything at or below the recorded epoch"
+// rule refused the fresh key's self-certification forever — the un-anchored
+// window for the fresh key never closed, every proposal attempt was refused
+// with "ceremony key not chain-anchored yet", and group signing died for the
+// rest of the epoch (the pre-fix devnet collapse measured in the P2-4
+// round-2 posture verification). The record therefore advances on a
+// same-epoch KEY CHANGE. This is safe by construction: the only same-epoch
+// key-changing writer is the producer's own self-certification (the active
+// share's key); the import path cannot supply one, because a conflicting key
+// at a custody-recorded epoch is refused by ObserveAnchoredGroupKey before the
+// record is ever reached. Rewinds (strictly older epochs) and same-key
+// re-anchors keep the original skip.
 func (n *Node) recordTDilithium3CanonicalAnchor(epoch uint64, key []byte) {
 	if n == nil || len(key) == 0 {
 		return
@@ -132,7 +149,10 @@ func (n *Node) recordTDilithium3CanonicalAnchor(epoch uint64, key []byte) {
 	state := n.anchorState()
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if epoch <= state.epoch {
+	if epoch < state.epoch {
+		return
+	}
+	if epoch == state.epoch && bytes.Equal(state.key, key) {
 		return
 	}
 	state.epoch = epoch
@@ -181,6 +201,25 @@ func (n *Node) tdilithium3V1AnchorArmed(epoch uint64) bool {
 // superseded share refuses the identity probe and anchors nothing. An existing
 // anchor (PopulateStardustFields wrote one through the qfs signer table on the
 // experimental path) is left untouched.
+//
+// Boundary epoch-membership (TSS-R3-B-1 lag fix, P2-4 round 2): on the
+// experimental runtime-DKG posture the ceremony key rotates EVERY epoch, and a
+// ceremony that has not finished before the boundary leaves the PREVIOUS
+// epoch's share as the active one. Embedding that outgoing key at the boundary
+// pinned it for the whole epoch — observers adopted it as a same-key
+// continuation, the mid-epoch fresh key then hit the conflicting-key refusal,
+// and fresh-sync nodes adopted a key no signer would use (the one-way
+// fresh-sync stall). The runtime-DKG posture therefore embeds only a key that
+// BELONGS to the header's epoch — the active share's activation epoch must
+// equal the header's epoch; otherwise the anchor stays off and the un-anchored
+// window seeds the fresh key once its ceremony completes (the ① fallback of
+// the approved ①+③ fix). The rule covers mid-epoch headers too: a restarted
+// node's empty observation record would otherwise re-seed the outgoing key
+// mid-epoch through the un-anchored window and re-create the same poisoning.
+// The offline ceremony posture is exempt byte-for-byte: its key precedes the
+// boundary and continues across epochs (activation <= epoch), so the legacy
+// embed flow — unconditional at the boundary, observation-gated mid-epoch —
+// is exactly right there.
 func (bp *BlockProducer) tdilithium3V1HeaderAnchorKey(header *encoding.BlockHeader) ([]byte, error) {
 	if bp == nil || bp.node == nil || header == nil {
 		return nil, nil
@@ -194,6 +233,16 @@ func (bp *BlockProducer) tdilithium3V1HeaderAnchorKey(header *encoding.BlockHead
 			err = errTDilithium3V1AnchorIdentityEmpty
 		}
 		return nil, err
+	}
+	// The offline posture keeps the legacy flow untouched: its group key is
+	// constant across epochs, so the active share's activation epoch
+	// legitimately trails the header's epoch.
+	if !bp.node.offlineTDilithium3SealingArmed(header.Epoch) && activation != header.Epoch {
+		// Runtime-DKG posture: a key that belongs to an earlier epoch (the
+		// ceremony for this epoch has not activated yet) must never anchor —
+		// and a key that activates LATER than the header's epoch must never
+		// anchor anything. Both leave the anchor off.
+		return nil, nil
 	}
 	if consensus.EpochStartSlot(header.Epoch) != header.Slot &&
 		bp.node.tdilithium3V1CanonicalAnchorObserved(activation, key) {

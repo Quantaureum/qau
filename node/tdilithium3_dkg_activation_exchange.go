@@ -4,6 +4,7 @@ package node
 import (
 	"context"
 	"crypto/sha3"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -38,6 +39,14 @@ const tdilithium3DKGActivationSinkCapacity = 6
 // The exchange is a single 30-second round (one broadcast + one collection
 // window + one assembly), so 30 seconds matches the round timeout.
 const tdilithium3DKGActivationExchangeTimeout = 30 * time.Second
+
+// errTDilithium3ActivationDeferred reports that the activation exchange
+// CONVERGED (the certificate is assembled and parked) but the commit was
+// deferred because the chain has not reached the activation epoch yet
+// (TSS-R3-B-1 lag fix: an early-beat ceremony must not replace the active
+// share ahead of the chain). Callers treat it as success: the produce-loop
+// tick commits the parked certificate at the activation epoch's boundary.
+var errTDilithium3ActivationDeferred = errors.New("Dilithium3 v1 activation converged; commit deferred to the activation epoch")
 
 // runTDilithium3DKGActivationExchange signs the locally finalized candidate
 // share, broadcasts the signed acknowledgement, collects six verified
@@ -225,15 +234,44 @@ func (n *Node) runTDilithium3ActivationExchange(
 		nodeLog.Warn("R77-DIAG activation exchange: in-memory share pos=%d id=%d epoch=%d transcript=%x pub=%x candDigest=%x acks=%d",
 			share.ParticipantPosition, share.ParticipantID, session.ActivationEpoch, share.TranscriptDigest[:4], share.Key.PublicKey[:4], memDigest[:4], len(certificate.Acknowledgements))
 	}
-	// Rotation-era fix: the activation record also stores the identity
-	// bindings the session was verified under (v2), so a later lookup never
-	// needs to re-derive them from a renumbered roster view.
-	if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, password); err != nil {
-		return fmt.Errorf("commit active share: %w", err)
+	// TSS-R3-B-1 lag fix: an early-beat ceremony (run one epoch before its
+	// activation, see tdilithium3_v1_early_ceremony.go) must not replace the
+	// ACTIVE share while the chain has not reached the activation epoch —
+	// every signing gate refuses `epoch < activationEpoch`, so an early commit
+	// would strip the rest of the current epoch of group signing and QTD
+	// sealing. Park the verified certificate instead: the produce-loop tick
+	// commits it exactly when the chain enters the activation epoch, before
+	// that epoch's boundary header is built. The gossip below still runs, so
+	// peers that missed their own exchange converge through the adoption path.
+	// The offline adoption path never defers (it only launches at or after the
+	// activation epoch).
+	deferredCommit := false
+	if chainEpoch, ok := n.tdilithium3ChainEpoch(); ok && chainEpoch < session.ActivationEpoch {
+		groupKey := append([]byte(nil), share.Key.PublicKey...)
+		n.parkTDilithium3PendingActivation(&tdilithium3PendingActivation{
+			activationEpoch: session.ActivationEpoch,
+			groupPublicKey:  groupKey,
+			threshold:       int(session.Committee.Threshold),
+			certificate:     certificate,
+			sessionDigest:   sessionDigest,
+			verifier:        verifier,
+			bindings:        bindings,
+		})
+		deferredCommit = true
+		nodeLog.Info("Dilithium3 v1 activation armed for epoch %d (chain epoch %d): commit deferred to the epoch boundary",
+			session.ActivationEpoch, chainEpoch)
 	}
-	n.invalidateTDilithium3ShareCache()
-	nodeLog.Info("Dilithium3 v1 activation committed (activation epoch %d, session %x, group key prefix %x)",
-		session.ActivationEpoch, sessionDigest[:8], sharePublicKey[:4])
+	if !deferredCommit {
+		// Rotation-era fix: the activation record also stores the identity
+		// bindings the session was verified under (v2), so a later lookup never
+		// needs to re-derive them from a renumbered roster view.
+		if err := shareStore.ActivateCandidate(certificate, sessionDigest, session.ActivationEpoch, verifier, bindings, password); err != nil {
+			return fmt.Errorf("commit active share: %w", err)
+		}
+		n.invalidateTDilithium3ShareCache()
+		nodeLog.Info("Dilithium3 v1 activation committed (activation epoch %d, session %x, group key prefix %x)",
+			session.ActivationEpoch, sessionDigest[:8], sharePublicKey[:4])
+	}
 
 	// Gossip the assembled certificate so peers that never reached the full
 	// six-acknowledgement set for this session can adopt the same group key
@@ -248,9 +286,15 @@ func (n *Node) runTDilithium3ActivationExchange(
 		// A failure here does not invalidate the local commit; log and move
 		// on. Peers that ran their own exchange still converge independently.
 		nodeLog.Warn("Dilithium3 v1 activation certificate encode for gossip failed: %v", err)
+		if deferredCommit {
+			return errTDilithium3ActivationDeferred
+		}
 		return nil
 	}
 	n.broadcastTDilithium3DKGActivationCertificate(ctx, broadcast, encoded)
+	if deferredCommit {
+		return errTDilithium3ActivationDeferred
+	}
 	return nil
 }
 
@@ -259,6 +303,15 @@ func (n *Node) runTDilithium3ActivationExchange(
 // best-effort, so a small burst covers peers whose subscription installs
 // slightly after the first send without flooding the topic.
 const tdilithium3DKGActivationCertificateGossipRounds = 3
+
+// tdilithium3AdoptCandidateProbe is the gossip-adoption path's candidate
+// probe, split into a package variable so the probe→commit interleaving is
+// testable: a candidate that lands between the probe and the commit (the
+// local ceremony persisting it concurrently) is exactly the window the
+// fail-closed adoption rule closes (audit round-3 medium-1).
+var tdilithium3AdoptCandidateProbe = func(store *thresholdShareStore, password []byte) (uint64, []byte, uint32, uint32, error) {
+	return store.CandidateSharePublicIdentity(password)
+}
 
 // tdilithium3DKGActivationCertificateGossipInterval spaces out the rebroadcast
 // burst so peers have time to receive, verify, and adopt between rounds.
@@ -497,6 +550,48 @@ func (n *Node) adoptTDilithium3DKGActivationCertificate(payload []byte) {
 				}
 			}
 		}
+	}
+	// TSS-R3-B-1 lag fix: a certificate for a FUTURE activation epoch (a
+	// peer's early-beat ceremony gossiping ahead of the chain) must not commit
+	// now — park it exactly like the exchange core does, so the produce-loop
+	// tick commits it when the chain reaches the activation epoch.
+	//
+	// FAIL-CLOSED on a missed probe (audit round-3 medium-1): when the
+	// candidate probe does not positively confirm this node's candidate for
+	// the activation epoch, the commit below must not run anyway. A commit on
+	// a missed probe is a fail-open: the local ceremony may persist its own
+	// candidate in the milliseconds between this probe and the commit (or the
+	// probe may fail transiently on a store lock), and committing the
+	// certificate then replaces the ACTIVE share with a share the signing
+	// gates refuse (`epoch < activationEpoch`) — the rest of the current epoch
+	// loses group signing and QTD sealing. Dropping the certificate is safe:
+	// the committing peers rebroadcast it (tdilithium3DKGActivationCertificate
+	// GossipRounds) and this node's own ceremony remains the recovery path.
+	// The exchange-core path is exempt: its candidate was persisted by the
+	// same ceremony that assembled the certificate, so there is no probe→
+	// commit window to close.
+	if chainEpoch, ok := n.tdilithium3ChainEpoch(); ok && chainEpoch < activationEpoch {
+		candEpoch, candKey, candThreshold, _, candErr := tdilithium3AdoptCandidateProbe(store, password)
+		if candErr != nil || candEpoch != activationEpoch {
+			// Quiet by design: the committing peers rebroadcast this
+			// certificate and this node's own ceremony remains the recovery
+			// path; the entry log above keeps the delivery attributable.
+			nodeLog.Debug("Dilithium3 v1 activation certificate for epoch %d dropped (chain epoch %d): candidate probe did not confirm the activation-epoch candidate (err=%v)",
+				activationEpoch, chainEpoch, candErr)
+			return
+		}
+		n.parkTDilithium3PendingActivation(&tdilithium3PendingActivation{
+			activationEpoch: activationEpoch,
+			groupPublicKey:  candKey,
+			threshold:       int(candThreshold),
+			certificate:     certificate,
+			sessionDigest:   sessionDigest,
+			verifier:        verifier,
+			bindings:        bindings,
+		})
+		nodeLog.Info("Dilithium3 v1 activation certificate for epoch %d parked (chain epoch %d): commit deferred to the epoch boundary",
+			activationEpoch, chainEpoch)
+		return
 	}
 	if err := store.ActivateCandidate(certificate, sessionDigest, activationEpoch, verifier, bindings, password); err != nil {
 		// R77-DIAG: adoption rejection is the decisive reason a straggler

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"log/slog"
 	"math/big"
+	"os"
 	"testing"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
@@ -453,4 +454,124 @@ func TestTDilithium3V1AnchorProducedHeaderSelfCertifies(t *testing.T) {
 	// A nil-node producer (defensive shape) must not panic.
 	var nilBP *BlockProducer
 	nilBP.anchorProducedHeader(header, midSlot)
+}
+
+// TestTDilithium3CanonicalAnchorRecordSameEpochRotation pins the same-epoch
+// key advance of the canonical-anchor record (TSS-R3-B-1 lag fix): the
+// experimental runtime-DKG posture rotates the ceremony key every epoch, and
+// a ceremony completing mid-epoch must advance the record from the outgoing
+// key to the fresh key AT the same epoch — the old strictly-monotonic skip
+// refused the fresh key's self-certification forever, the un-anchored window
+// for the fresh key never closed, and every proposal attempt was refused with
+// "ceremony key not chain-anchored yet" (the pre-fix collapse measured in
+// the P2-4 round-2 posture verification). Rewinds
+// and same-key re-anchors keep the original skip.
+func TestTDilithium3CanonicalAnchorRecordSameEpochRotation(t *testing.T) {
+	outgoingKey := anchorTestKey(t, "outgoing")
+	freshKey := anchorTestKey(t, "fresh-mid-epoch")
+	node := &Node{}
+
+	// Baseline: the boundary carrier anchored the outgoing key at epoch 4
+	// (the lag shape the boundary epoch-membership rule now prevents; the
+	// record itself treats it as ordinary history).
+	node.recordTDilithium3CanonicalAnchor(4, outgoingKey)
+
+	// The ceremony completed mid-epoch and self-certified the fresh key at the
+	// SAME epoch: the record must advance to the fresh key.
+	node.recordTDilithium3CanonicalAnchor(4, freshKey)
+	if !node.tdilithium3V1CanonicalAnchorObserved(4, freshKey) {
+		t.Fatal("a same-epoch key rotation did not advance the record")
+	}
+	if node.tdilithium3V1CanonicalAnchorObserved(4, outgoingKey) {
+		t.Fatal("the replaced outgoing key still vouched after the same-epoch rotation")
+	}
+
+	// Rewinds stay refused: an older epoch never demotes the rotated record.
+	node.recordTDilithium3CanonicalAnchor(2, outgoingKey)
+	if !node.tdilithium3V1CanonicalAnchorObserved(4, freshKey) {
+		t.Fatal("an older anchor demoted the rotated record")
+	}
+
+	// Same-epoch same-key re-anchors stay idempotent no-ops.
+	node.recordTDilithium3CanonicalAnchor(4, freshKey)
+	if !node.tdilithium3V1CanonicalAnchorObserved(4, freshKey) {
+		t.Fatal("a same-key re-anchor disturbed the record")
+	}
+
+	// A strictly newer epoch still advances (the steady-state rotation lane).
+	nextKey := anchorTestKey(t, "next")
+	node.recordTDilithium3CanonicalAnchor(5, nextKey)
+	if !node.tdilithium3V1CanonicalAnchorObserved(5, nextKey) {
+		t.Fatal("a newer-epoch rotation did not advance the record")
+	}
+}
+
+// TestTDilithium3V1HeaderAnchorKeyEpochMembership pins the boundary
+// epoch-membership rule of the lag fix: on the experimental runtime-DKG
+// posture a produced header anchors only the key that belongs to the header's
+// epoch, so a ceremony that has not finished before the boundary leaves the
+// boundary carrier anchor-free (the un-anchored window seeds the fresh key
+// mid-epoch) instead of pinning the outgoing key for the whole epoch. The
+// offline ceremony posture is exempt byte-for-byte: its key continues across
+// epochs, so the legacy embed flow is preserved.
+func TestTDilithium3V1HeaderAnchorKeyEpochMembership(t *testing.T) {
+	node, groupKey, _, _, _ := triggerE2EFixture(t)
+	const activation = triggerE2EActivationEpoch // the active share activates at 7
+	nextBoundary := (activation + 1) * consensus.SlotsPerEpoch
+	nextMid := nextBoundary + 3
+
+	// Regression: the activation epoch's own boundary carrier still anchors —
+	// the active share belongs to that epoch.
+	ownBoundary := &encoding.BlockHeader{Epoch: activation, Slot: activation * consensus.SlotsPerEpoch}
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(ownBoundary); err != nil || !bytes.Equal(key, groupKey) {
+		t.Fatalf("the epoch's own boundary carrier stopped anchoring (key=%v err=%v)", key, err)
+	}
+
+	// THE FIX: the next epoch's boundary carrier must NOT anchor the still-
+	// active outgoing key (the ceremony for the next epoch has not activated
+	// yet). Embedding it pinned the outgoing key for the whole epoch — the
+	// pre-fix defect measured in the P2-4 round-2 posture verification.
+	staleBoundary := &encoding.BlockHeader{Epoch: activation + 1, Slot: nextBoundary}
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(staleBoundary); key != nil || err != nil {
+		t.Fatalf("the next epoch's boundary anchored the outgoing key (key=%v err=%v)", key, err)
+	}
+
+	// The rule covers mid-epoch headers too: a restarted node's empty
+	// observation record must not re-seed the outgoing key mid-epoch through
+	// the un-anchored window.
+	staleMid := &encoding.BlockHeader{Epoch: activation + 1, Slot: nextMid}
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(staleMid); key != nil || err != nil {
+		t.Fatalf("a mid-epoch header anchored the outgoing key (key=%v err=%v)", key, err)
+	}
+
+	// Once the fresh key activates, its headers anchor again: simulate the
+	// promoted share by re-reading the identity through a record advance —
+	// the identity probe is share-store-backed, so the full promotion is
+	// covered by the early-ceremony tests; here the epoch-membership rule is
+	// pinned with the activation-epoch headers only.
+
+	// OFFLINE POSTURE ZERO CHANGE: with the experimental gate closed and the
+	// offline sealing armed for the share's activation epoch, the boundary of
+	// a LATER epoch keeps the legacy unconditional embed (the continuing key
+	// legitimately trails the header's epoch), and the mid-epoch flow keeps
+	// the observation-gated behavior.
+	t.Setenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1", "")
+	_ = os.Unsetenv("QAU_ENABLE_EXPERIMENTAL_TDILITHIUM3_V1")
+	node.config.TSSV1SealingActivationEpoch = activation
+
+	laterBoundary := &encoding.BlockHeader{Epoch: activation + 2, Slot: (activation + 2) * consensus.SlotsPerEpoch}
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(laterBoundary); err != nil || !bytes.Equal(key, groupKey) {
+		t.Fatalf("the offline posture's boundary embed changed (key=%v err=%v)", key, err)
+	}
+	laterMid := &encoding.BlockHeader{Epoch: activation + 2, Slot: (activation+2)*consensus.SlotsPerEpoch + 3}
+	// Un-observed record: the offline mid-epoch window keeps embedding.
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(laterMid); err != nil || !bytes.Equal(key, groupKey) {
+		t.Fatalf("the offline posture's mid-epoch embed changed (key=%v err=%v)", key, err)
+	}
+	// Observed record: the offline mid-epoch header stops embedding, exactly
+	// as before the fix.
+	node.recordTDilithium3CanonicalAnchor(activation+2, groupKey)
+	if key, err := node.blockProducer.tdilithium3V1HeaderAnchorKey(laterMid); key != nil || err != nil {
+		t.Fatalf("the offline posture's observation gate changed (key=%v err=%v)", key, err)
+	}
 }

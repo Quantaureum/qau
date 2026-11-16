@@ -133,6 +133,28 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 		n.tdilithium3DKGCeremonyMu.Unlock()
 	}()
 
+	// Adoption short-circuit, hoisted ahead of every protocol round
+	// (TSS-R3-B-1 lag fix): when the share store already holds the ACTIVE
+	// share for this activation epoch — the previous epoch's early-beat
+	// ceremony committed it at the boundary, a prior attempt completed, or
+	// gossip adoption landed — the rounds below would only reproduce it. The
+	// store is the source of truth (the same trust the late short-circuit
+	// always applied), so register the finality surface and return the stored
+	// key in milliseconds instead of re-running the 20-40 second ceremony on
+	// every chamber retry tick after the boundary.
+	if store := newThresholdShareStore(n.config.DataDir); store != nil {
+		activeEpoch, activeKey, activeThreshold, activeErr := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
+		if activeErr == nil && activeEpoch == activationEpoch {
+			nodeLog.Info("Dilithium3 v1 DKG ceremony: active share already adopted for epoch %d (group key prefix %x); skipping protocol rounds",
+				activationEpoch, activeKey[:4])
+			if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, activeKey, int(activeThreshold)); err != nil {
+				nodeLog.Warn("Dilithium3 v1 DKG finality surface registration deferred (adopted path): %v", err)
+			}
+			copy(publicKey[:], activeKey)
+			return publicKey, nil
+		}
+	}
+
 	rosterEpoch, err := tdilithium3DKGSessionRosterEpoch(activationEpoch)
 	if err != nil {
 		return publicKey, err
@@ -313,32 +335,24 @@ func (n *Node) runTDilithium3DKGCeremony(ctx context.Context, activationEpoch ui
 	// ceremony closed; the candidate on disk is replay-safe and the next
 	// epoch's ceremony supersedes it.
 	//
-	// Short-circuit: when the active share was already adopted via gossip
-	// (a faster node's exchange completed and gossiped its certificate
-	// before this node's ceremony ran its own exchange), the exchange is
-	// redundant. Running it wastes the 30-second round and -- worse -- can
-	// desync the commit-time window so peers that already sealed the slot
-	// with the adopted key do not see this node's signature in time. The
-	// share store is the source of truth: if an active share for this
-	// activation epoch is already on disk, register the finality surface
-	// directly and skip the exchange.
-	if store := newThresholdShareStore(n.config.DataDir); store != nil {
-		activeEpoch, activeKey, activeThreshold, activeErr := store.ActiveSharePublicIdentity([]byte(n.config.ValidatorKeyPassword))
-		if activeErr == nil && activeEpoch == activationEpoch {
-			nodeLog.Info("Dilithium3 v1 DKG ceremony: active share already adopted for epoch %d (group key prefix %x); skipping activation exchange",
-				activationEpoch, activeKey[:4])
-			if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, activeKey, int(activeThreshold)); err != nil {
-				nodeLog.Warn("Dilithium3 v1 DKG finality surface registration deferred (adopted path): %v", err)
-			}
-			nodeLog.Info("Dilithium3 v1 DKG ceremony completed (activation epoch %d, session %x, transcript %x, group key prefix %x, committee size %d, adoption short-circuit)",
-				activationEpoch, diff[:8], result.TranscriptDigest[:8], activeKey[:4], len(committee.Participants))
-			return result.PublicKey, nil
-		}
-	}
+	// The adoption short-circuit for an already-active share is hoisted to the
+	// top of the ceremony (see the comment there): with the early-beat trigger
+	// the share is committed before the chain reaches the activation epoch, so
+	// the chamber-path re-entry at the boundary must not re-run the rounds.
 	activationContext, cancelActivation := context.WithTimeout(ctx, tdilithium3DKGCeremonyRoundTimeout)
 	err = n.runTDilithium3DKGActivationExchange(activationContext, session, runner, result, inbox.verifyIdentity, inbox.IdentityBindings(), sign, broadcast)
 	cancelActivation()
 	if err != nil {
+		// Deferred commit (TSS-R3-B-1 lag fix): the early-beat ceremony
+		// converged and parked its certificate because the chain has not
+		// reached the activation epoch yet. That is a SUCCESS — the produce
+		// loop's tick commits the park at the boundary, and the finality
+		// registration moves there with it.
+		if errors.Is(err, errTDilithium3ActivationDeferred) {
+			nodeLog.Info("Dilithium3 v1 DKG ceremony armed for epoch %d (activation deferred to the epoch boundary, session %x, transcript %x, group key prefix %x, committee size %d)",
+				activationEpoch, diff[:8], result.TranscriptDigest[:8], result.PublicKey[:4], len(committee.Participants))
+			return result.PublicKey, nil
+		}
 		return publicKey, fmt.Errorf("Dilithium3 v1 DKG activation exchange: %w", err)
 	}
 	if err := n.registerTDilithium3SigningFinalitySigner(activationEpoch, result.PublicKey[:], int(runner.session.Committee.Threshold)); err != nil {

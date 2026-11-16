@@ -1218,6 +1218,16 @@ func (bp *BlockProducer) produceLoop() {
 				}
 			}()
 
+			// Early-ceremony beat (TSS-R3-B-1 lag fix): commit a parked
+			// activation whose epoch has arrived, then launch the NEXT epoch's
+			// ceremony one beat early. Must run before this slot's header is
+			// built, so the epoch-boundary carrier embeds the epoch's own key
+			// (see tdilithium3_v1_early_ceremony.go). Inert outside the
+			// experimental runtime-DKG posture.
+			if bp.node != nil {
+				bp.node.tdilithium3V1EarlyCeremonyTick(nextSlot)
+			}
+
 			bp.tryProduceBlock(nextSlot)
 
 			// P1-2/P1-3/P1-6/P1-8: Drive the Three Chambers lifecycle on each slot tick.
