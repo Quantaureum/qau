@@ -50,7 +50,7 @@ func (request SignRequest) Validate() error {
 		return fmt.Errorf("%w: zero slot", ErrInvalidSignRequest)
 	}
 	switch request.Domain {
-	case SigningDomainBlock, SigningDomainVote, SigningDomainFinality:
+	case SigningDomainBlock, SigningDomainVote, SigningDomainFinality, SigningDomainHandoff:
 	default:
 		return fmt.Errorf("%w: unknown domain", ErrInvalidSignRequest)
 	}

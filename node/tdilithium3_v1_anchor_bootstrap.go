@@ -259,6 +259,16 @@ var errTDilithium3V1AnchorIdentityEmpty = errors.New("Dilithium3 v1 anchor: acti
 // carrier rules require it, and — on the embedding hit — SELF-CERTIFIES the
 // anchor into the canonical-anchor record (P2-4 devnet finding, 2026-11-15).
 //
+// Rotation proof discipline (TSS-R3-B-1 Wave F): the function is also the
+// single chokepoint for every anchor a produced header carries — an anchor
+// this function embeds AND an anchor another writer placed (the qfs signer
+// table through PopulateStardustFields). Both get the rotation handoff proof
+// attached, and an anchor this node cannot vouch for (a rotation key without
+// a usable proof, a stale or superseded key) is SUPPRESSED instead of
+// emitted; see tdilithium3_handoff_proof.go for the decision table and the
+// trust model. A suppressed anchor never self-certifies, so the un-anchored
+// window stays open for a later proven carrier.
+//
 // Why self-certification is required and sound: the producer's own blocks
 // never pass through BlockProducer.onCanonicalBlockImported — that hook runs
 // only on the peer-block import paths (node.go's blockInsertLoop and
@@ -283,16 +293,44 @@ var errTDilithium3V1AnchorIdentityEmpty = errors.New("Dilithium3 v1 anchor: acti
 // canonical chain is unaffected, and the next observed carrier re-anchors
 // this node's view through the import path as usual.
 func (bp *BlockProducer) anchorProducedHeader(header *encoding.BlockHeader, slot uint64) {
-	if header == nil || len(header.QTDGroupKey) != 0 {
+	if bp == nil || header == nil {
+		return
+	}
+	if len(header.QTDGroupKey) != 0 {
+		// An anchor another writer placed (the qfs signer table through
+		// PopulateStardustFields on the experimental and offline-registered
+		// paths): apply the v1 anchor discipline to it — the rotation proof
+		// goes on, an anchor this node cannot vouch for comes off. Without
+		// the v1 posture armed the gate is a no-op and the legacy anchor is
+		// untouched.
+		if bp.node != nil {
+			bp.node.tdilithium3V1GateHeaderAnchor(header, slot)
+		}
 		return
 	}
 	key, anchorErr := bp.tdilithium3V1HeaderAnchorKey(header)
 	switch {
 	case anchorErr == nil && len(key) > 0:
+		// Rotation proof discipline (TSS-R3-B-1 Wave F): attach the handoff
+		// proof, or suppress an anchor this node cannot prove (a rotation
+		// whose handoff session did not converge). A suppressed anchor leaves
+		// the un-anchored window open for a later proven carrier.
+		proof, keep := bp.node.tdilithium3V1AnchorProofDecision(header.Epoch, key)
+		if !keep {
+			bpLog.Info("QTD group key anchor suppressed (v1 discipline: rotation without a usable handoff proof): slot %d epoch %d",
+				slot, header.Epoch)
+			return
+		}
 		header.QTDGroupKey = append([]byte(nil), key...)
+		if len(proof) > 0 {
+			header.QTDGroupKeyProof = append([]byte(nil), proof...)
+			bpLog.Info("QTD group key rotation proof attached on individually signed header: slot %d epoch %d", slot, header.Epoch)
+		}
 		// Local carrier self-certification: the same (epoch, key) record the
 		// import path would make for this header, under the same monotonic
-		// guard (see recordTDilithium3CanonicalAnchor).
+		// guard (see recordTDilithium3CanonicalAnchor). Only a KEPT anchor is
+		// self-certified — a suppressed one must leave the un-anchored window
+		// open for the proven carrier.
 		if bp.node != nil {
 			bp.node.recordTDilithium3CanonicalAnchor(header.Epoch, key)
 		}

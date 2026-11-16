@@ -245,6 +245,16 @@ func (n *Node) runTDilithium3ActivationExchange(
 	// peers that missed their own exchange converge through the adoption path.
 	// The offline adoption path never defers (it only launches at or after the
 	// activation epoch).
+	//
+	// Rotation handoff proof (TSS-R3-B-1 Wave F): this point — the certificate
+	// is assembled and verified, the commit has not run — is the one moment on
+	// EVERY commit path (fresh-key ceremony park or inline commit, offline
+	// adoption) where the outgoing share is still active. Run the outgoing
+	// committee's handoff signing session here and persist the proof (or a
+	// pending record on failure) so the rotation's boundary anchor can carry
+	// it. A first establishment and the R77 same-key reshare are quiet no-ops.
+	n.produceTDilithium3HandoffProof(ctx, session.ActivationEpoch, share.Key.PublicKey, shareStore, password)
+
 	deferredCommit := false
 	if chainEpoch, ok := n.tdilithium3ChainEpoch(); ok && chainEpoch < session.ActivationEpoch {
 		groupKey := append([]byte(nil), share.Key.PublicKey...)

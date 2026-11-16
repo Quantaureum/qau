@@ -58,10 +58,16 @@ func VerifyAnchoredGroupKeyProof(prevKey, keyNew []byte, epochNew, chainID, comm
 	return qcrypto.VerifySignatureForAlgorithm(qcrypto.SignatureAlgorithmDilithium3Legacy, prevKey, msg, nil, signature) == nil
 }
 
-// anchoredGroupKeyProofLayout is the (epoch, version) header of a
-// proof-bearing anchor block. Key bytes come from the anchor field itself.
-// CommitteeVersion is not wired today; v1 offline rotations pin it to 1.
-const qtdAnchorProofCommitteeVersion = uint64(1)
+// QTDAnchorProofCommitteeVersion is the committee version every anchor proof
+// is bound to. CommitteeVersion is not wired today; v1 offline rotations pin
+// it to 1, and the runtime-DKG fresh-key ceremonies derive committees with
+// version 1 as well (node/tdilithium3_dkg_committee_sampling.go), so the
+// signer side and this verifier share one constant.
+const QTDAnchorProofCommitteeVersion = uint64(1)
+
+// qtdAnchorProofCommitteeVersion is the internal alias used by the observer
+// verification path below.
+const qtdAnchorProofCommitteeVersion = QTDAnchorProofCommitteeVersion
 
 // observeAnchoredGroupKeyHandoffLocked is the rotation-lane verifier, called
 // with qfs.mu already HELD (observe entry owns the lock). It fails closed on a

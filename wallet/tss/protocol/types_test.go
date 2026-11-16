@@ -176,3 +176,50 @@ func TestSignRequestValidateAndClone(t *testing.T) {
 		t.Fatal("ML-DSA context longer than 255 bytes must fail")
 	}
 }
+
+// TestSignRequestHandoffDomainAdmitted pins the handoff domain's admission
+// into the sign-request whitelist (TSS-R3-B-1 Wave F): the rotation handoff
+// session signs under SigningDomainHandoff, and the domain must validate
+// while staying distinct from the block/vote/finality domains.
+func TestSignRequestHandoffDomainAdmitted(t *testing.T) {
+	request := SignRequest{
+		Protocol: ThresholdProtocolDilithium3V1,
+		Key: ThresholdKeyID{
+			Algorithm:  qcrypto.SignatureAlgorithmDilithium3Legacy,
+			Generation: 1,
+			PublicKey:  bytes.Repeat([]byte{0x37}, qcrypto.SignatureAlgorithmDilithium3Legacy.PublicKeySize()),
+		},
+		Committee: CommitteeID{Version: 1, Threshold: 4, Participants: []uint32{1, 2, 3, 4, 5, 6}},
+		ChainID:   1669,
+		Epoch:     8,
+		Slot:      256,
+		Domain:    SigningDomainHandoff,
+		Message:   []byte("QAU-TDILITHIUM3-V1-KEY-HANDOFF-V1..."),
+	}
+	request.AttemptNonce[0] = 1
+	if err := request.Validate(); err != nil {
+		t.Fatalf("handoff sign request rejected: %v", err)
+	}
+	// The legacy algorithm refuses a context; the handoff session builds none.
+	request.Context = []byte("context")
+	if err := request.Validate(); err == nil {
+		t.Fatal("the legacy algorithm accepted a context")
+	}
+	// The handoff domain derives a distinct session identity from the other
+	// domains: same tuple, different domain, different session ID.
+	handoff := request
+	handoff.Context = nil
+	finality := handoff
+	finality.Domain = SigningDomainFinality
+	handoffID, err := SigningSessionID(handoff)
+	if err != nil {
+		t.Fatalf("handoff session id: %v", err)
+	}
+	finalityID, err := SigningSessionID(finality)
+	if err != nil {
+		t.Fatalf("finality session id: %v", err)
+	}
+	if handoffID == finalityID {
+		t.Fatal("the handoff domain shares a session identity with the finality domain")
+	}
+}
