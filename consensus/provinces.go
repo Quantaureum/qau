@@ -188,11 +188,22 @@ var (
 	// forbids Executive members from proposing, a divergent Executive set
 	// makes the node's CanPropose/CanSeal decisions disagree with its peers
 	// for that epoch — the same class of cross-node divergence R45 fixed for
-	// the proposer shuffle. Fail-closed (do not select, do not cache) is safe:
-	// a missing Executive assignment imposes NO proposing restriction (see
-	// CanPropose), so the worst case is a slightly under-populated Executive
-	// chamber for one epoch until the accumulator arrives and the next epoch
-	// boundary re-selects.
+	// the proposer shuffle. Fail-closed (do not select, do not cache) remains
+	// strictly better than the pre-R88-F behavior: caching a wrong zero-hash
+	// member set would exclude the WRONG validators for the whole epoch on
+	// this node alone.
+	//
+	// TSS-R3-B1-Wave-E (2026-11-16): the old "a missing Executive assignment
+	// imposes NO proposing restriction, so fail-closed is consensus-neutral"
+	// argument no longer holds. Under the deterministic whole-epoch exclusion,
+	// a node whose selection is still pending applies NO exclusion while its
+	// peers (which already selected from the canonical accumulator) exclude
+	// the members — so until the accumulator is imported the two sides can
+	// elect different proposers for the same slot. The window is bounded and
+	// self-converging: the transition retries on every canonical block import
+	// and every locally produced block (ensureEpochStateForBlock), so the
+	// exclusion state aligns as soon as the node processes the same canonical
+	// head; in the worst case the next epoch boundary re-selects.
 	ErrExecutiveScheduleNotReady = fmt.Errorf("executive election randomness not ready (VRF accumulator for epoch-2 missing)")
 )
 
@@ -542,11 +553,12 @@ func (tpc *ThreeChambersCoordinator) AssignProposing(validatorIndex int, slot ui
 	// (Executive) and current slot (Review). The unscoped IsInChamber wrongly
 	// rejected a proposer carrying a stale Review role from a past slot.
 	//
-	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive conflict is gated on
-	// executiveRestrictionsApplyLocked() to stay consistent with CanPropose.
-	// Without this, GetProposerForSlot would elect a DKG-pending executive
-	// member (now permitted) and then fail to register the Proposing role,
-	// logging "AssignProposing failed" every slot.
+	// TSS-R3-B1-Wave-E: the Executive conflict follows the same deterministic
+	// whole-epoch gate as CanPropose (see executiveRestrictionsApplyLocked).
+	// Keeping the two predicates identical is what lets the proposer scan
+	// hand a member's slot to the next eligible validator consistently on
+	// every node; a member rejected here is exactly the member the election
+	// skipped.
 	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberReview, slot) {
@@ -626,39 +638,48 @@ func (tpc *ThreeChambersCoordinator) AssignExecutive(validatorIndices []int, epo
 
 // executiveRestrictionsApplyLocked reports whether ChamberExecutive
 // membership should carry its power-separation restrictions (its member may
-// neither propose nor attest).
+// neither propose nor attest) in the given epoch.
 //
-// R93-CHAMBER-DEGRADED (2026-08-30): the restrictions apply ONLY while the
-// executive chamber is genuinely active (ExecutiveActive / ExecutiveSealing),
-// i.e. once DKG has completed and the chamber can actually produce threshold
-// seals. While DKG is pending the chamber performs no duty, so stripping its
-// member's rights imposes the COST of power separation without its BENEFIT.
+// TSS-R3-B1-Wave-E (deterministic exclusion, 2026-11-16): the restrictions
+// apply for the ENTIRE epoch whose Executive member set has been selected,
+// decoupled from the local DKG state machine. The exclusion is keyed on the
+// epoch-scoped Executive role that SelectExecutiveForEpoch writes under
+// tpc.mu at selection time; every node derives that selection from the same
+// canonical boundary block (header.Epoch drives TransitionExecutiveForEpoch)
+// and the same on-chain epoch-2 VRF accumulator. This removes the last
+// wall-clock input from proposer election: previously the gate required
+// ExecutiveChamber.IsActive(), a per-node DKG-completion moment, so around an
+// epoch boundary the member slots were decided on local DKG progress and
+// nodes elected different proposers for the same slot (observed as the devnet
+// boundary+2 member-slot forks).
+//
+// R93-CHAMBER-DEGRADED (2026-08-30) history and its superseded trade-off:
+// R93 gated the restrictions on the chamber being genuinely active
+// (ExecutiveActive / ExecutiveSealing) so a chamber stuck in DKGRunning —
+// e.g. requireDistributedDKG=true before a distributed runner is wired —
+// would not strip its member's proposing and attesting rights. That
+// degradation made the exclusion itself a wall-clock-dependent predicate and
+// is what forked the network. Under the deterministic rule the member's slots
+// in the DKG-pending window are skipped deterministically (the proposer scan
+// hands the slot to the next eligible validator; no empty block), which is
+// the accepted cost: power separation applies from member selection, DKG
+// complete or not.
 //
 // The threshold is reachable at the minimum mainnet validator count:
 // exactly 6 validators activate chambers, and
 // executiveSizeForValidatorCount(6) == 1 assigns one validator to the
-// Executive chamber. Mainnet also sets requireDistributedDKG=true, while the
-// distributed DKG runner is still being integrated. In that state the chamber
-// must not strip the member's proposing or attesting rights.
-//
-// Degrading to equal rights is the fail-safe direction: it restores exactly
-// the behavior of epoch 0's cold-start round-robin, which is the path already
-// verified in production. When a real distributed DKG runner is wired and the
-// chamber activates, the restrictions resume automatically with no further
-// code change.
+// Executive chamber.
 //
 // Caller must hold tpc.mu (RLock or Lock). tpc.executive is read directly
 // rather than through GetExecutiveChamber() because that method takes
 // tpc.mu.RLock itself, and recursive RLock deadlocks if a writer is queued.
-// ExecutiveChamber.IsActive uses the chamber's own mutex, so no lock
-// ordering issue arises.
 //
 // From the network's executive restriction end epoch (QPOS.
-// SetExecutiveRestrictionEndEpoch) the restrictions no longer apply even to an
-// active chamber: the member keeps the proposing and attesting rights of every
-// other validator (executive_restriction_end.go explains why).
+// SetExecutiveRestrictionEndEpoch) the restrictions no longer apply even to a
+// selected member set: the member keeps the proposing and attesting rights of
+// every other validator (executive_restriction_end.go explains why).
 func (tpc *ThreeChambersCoordinator) executiveRestrictionsApplyLocked(epoch uint64) bool {
-	if tpc.executive == nil || !tpc.executive.IsActive() {
+	if tpc.executive == nil {
 		return false
 	}
 	return !tpc.executiveRestrictionEndedLocked(epoch)
@@ -681,11 +702,12 @@ func (tpc *ThreeChambersCoordinator) CanPropose(validatorIndex int, slot uint64)
 	// a validator from proposing forever once it had ever carried a stale
 	// Executive/Review role, stalling block production on the live network.
 	//
-	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive exclusion is gated on
-	// executiveRestrictionsApplyLocked() — a chamber stuck in DKGRunning must
-	// not strip its member's proposing right. The Review exclusion is NOT
-	// gated: it is a per-slot role assigned by AssignReview and carries no
-	// DKG precondition.
+	// TSS-R3-B1-Wave-E: the Executive exclusion applies for the whole epoch
+	// once that epoch's member set has been selected (see
+	// executiveRestrictionsApplyLocked) — a deterministic pure function of
+	// the epoch-scoped role, with no DKG-state input. The Review exclusion
+	// is NOT gated: it is a per-slot role assigned by AssignReview and
+	// carries no DKG precondition.
 	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberReview, slot) {
@@ -704,12 +726,11 @@ func (tpc *ThreeChambersCoordinator) CanAttest(validatorIndex int, slot uint64) 
 	// permanently blocked attestations from any validator that had ever been
 	// proposer, starving the Review Chamber and preventing block finality.
 	//
-	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive exclusion is gated on
-	// executiveRestrictionsApplyLocked(). With a DKG-pending chamber this was
-	// rejecting the member's attestation on every slot
-	// ("cannot attest: not in Review Chamber") while the chamber did no work.
-	// The Proposing exclusion stays ungated — the slot's own proposer must
-	// never attest for its own block.
+	// TSS-R3-B1-Wave-E: the Executive exclusion applies for the whole epoch
+	// once that epoch's member set has been selected (see
+	// executiveRestrictionsApplyLocked) — deterministic across nodes, no
+	// DKG-state input. The Proposing exclusion stays ungated — the slot's
+	// own proposer must never attest for its own block.
 	if (tpc.executiveRestrictionsApplyLocked(epoch) &&
 		tpc.assignment.IsInChamberForEpoch(validatorIndex, ChamberExecutive, epoch)) ||
 		tpc.assignment.IsInChamberForSlot(validatorIndex, ChamberProposing, slot) {
@@ -1387,11 +1408,16 @@ func (tpc *ThreeChambersCoordinator) CheckDKGTimeout(timeout time.Duration) bool
 			// This is a designed, permanent state — not an incident. Say so,
 			// so operators do not chase it as a fault. Mainnet runs here until
 			// a real P2P distributed DKG runner is implemented and injected.
+			// TSS-R3-B1-Wave-E: the DKG-pending chamber no longer leaves
+			// equal rights — the selected Executive members are excluded from
+			// proposing and attesting for the whole epoch, deterministically,
+			// and their slots go to the next eligible validator.
 			tpfLog.Warnf("DKG pending for %v (>%v) for epoch %d — executive chamber CANNOT activate: "+
 				"requireDistributedDKG=true and no distributedDKGRunner is wired (GOV- production gate). "+
 				"This is the expected state until real P2P distributed DKG is implemented; the network runs "+
-				"without executive-sealed blocks and all validators keep equal proposing/attesting rights "+
-				"(R93-CHAMBER-DEGRADED). Repeats at most once per %v.",
+				"without executive-sealed blocks, and the selected Executive members are deterministically "+
+				"excluded from proposing and attesting for the whole epoch (TSS-R3-B1-Wave-E) — their "+
+				"slots are handed to the next eligible validator. Repeats at most once per %v.",
 				elapsed, timeout, executive.Epoch(), timeout)
 		} else {
 			tpfLog.Warnf("DKG has been running for %v (timeout=%v) for epoch %d — executive chamber still pending. "+
