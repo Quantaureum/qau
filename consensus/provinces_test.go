@@ -212,13 +212,13 @@ func TestThreeChambersPowerSeparation(t *testing.T) {
 		t.Fatalf("AssignExecutive failed: %v", err)
 	}
 
-	// R93-CHAMBER-DEGRADED (2026-08-30): the Executive chamber's propose/attest
-	// exclusion now applies only while the chamber is genuinely ACTIVE (DKG
-	// complete). AssignExecutive alone leaves it in ExecutiveIdle, in which
-	// state members intentionally keep their rights — see
-	// executiveRestrictionsApplyLocked. Drive the chamber to ExecutiveActive so
-	// this test keeps asserting what it was written to assert: power separation
-	// under an operational chamber.
+	// TSS-R3-B1-Wave-E (2026-11-16): the Executive chamber's propose/attest
+	// exclusion is a deterministic whole-epoch rule keyed on the epoch-scoped
+	// Executive role (see executiveRestrictionsApplyLocked) — the local DKG
+	// state no longer gates it. The assertions below therefore hold for an
+	// idle chamber too; the chamber is still driven to ExecutiveActive so the
+	// test keeps covering the DKG-complete path it was written for: power
+	// separation under an operational chamber.
 	if err := coordinator.executive.SetMembers([]int{4, 5, 6}, 0); err != nil {
 		t.Fatalf("SetMembers failed: %v", err)
 	}
@@ -309,9 +309,10 @@ func TestExecutiveSelectionForEpoch(t *testing.T) {
 		memberSet[m] = true
 	}
 
-	// R93-CHAMBER-DEGRADED (2026-08-30): activate the chamber before asserting
-	// the propose/attest exclusion — SelectExecutiveForEpoch only elects members,
-	// it does not complete DKG, and an inactive chamber no longer strips rights.
+	// TSS-R3-B1-Wave-E (2026-11-16): the exclusion applies from member
+	// selection, DKG complete or not — the assertions below hold for this
+	// DKG-pending chamber as-is. The chamber is still driven to ExecutiveActive
+	// so the test keeps covering the DKG-complete path as well.
 	if err := coordinator.executive.SetMembers(members, 1); err != nil {
 		t.Fatalf("SetMembers failed: %v", err)
 	}
