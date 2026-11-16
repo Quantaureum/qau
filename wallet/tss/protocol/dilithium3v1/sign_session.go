@@ -98,7 +98,7 @@ func SigningRequestAttemptNonce(
 		return [32]byte{}, fmt.Errorf("%w: zero slot", ErrInvalidDilithium3SigningSession)
 	}
 	switch domain {
-	case protocol.SigningDomainBlock, protocol.SigningDomainVote, protocol.SigningDomainFinality:
+	case protocol.SigningDomainBlock, protocol.SigningDomainVote, protocol.SigningDomainFinality, protocol.SigningDomainHandoff:
 	default:
 		return [32]byte{}, fmt.Errorf("%w: unknown signing domain", ErrInvalidDilithium3SigningSession)
 	}

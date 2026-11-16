@@ -181,4 +181,10 @@ const (
 	SigningDomainBlock
 	SigningDomainVote
 	SigningDomainFinality
+	// SigningDomainHandoff signs the group-key rotation handoff tuple
+	// (consensus.QTDHandoffMessage): the outgoing committee's endorsement of
+	// the next epoch's group key, carried in the boundary header's
+	// QTDGroupKeyProof field. The domain keeps handoff signatures from being
+	// replayable as block, vote, or finality signatures.
+	SigningDomainHandoff
 )
