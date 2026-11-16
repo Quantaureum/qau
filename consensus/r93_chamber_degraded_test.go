@@ -19,20 +19,19 @@ import (
 // "DKG has been running for 5m17s (timeout=5m0s) ... executive chamber still
 // pending" every slot.
 //
-// Yet CanPropose / CanAttest already deny that validator both rights for the
-// whole epoch. The member can lose proposer rewards and the attestation path
-// even while it is active and staked.
+// R93 FIX (2026-08-30, election half superseded): the Executive restrictions
+// in CanPropose / CanAttest / AssignProposing were gated on the chamber being
+// genuinely active (ExecutiveActive or ExecutiveSealing), so a DKG-pending
+// chamber degraded to equal rights for all validators.
 //
-// ROOT CAUSE: the COST of the Three Chambers power separation (an Executive
-// member may not propose or attest) was enforced while its BENEFIT (an
-// activated executive chamber performing threshold sealing) was unreachable.
-// A chamber that cannot perform its duty must not strip its member's rights.
-//
-// FIX: ChamberExecutive restrictions in CanPropose / CanAttest /
-// AssignProposing apply only while the executive chamber is genuinely
-// active (ExecutiveActive or ExecutiveSealing). While DKG is pending the
-// network degrades to equal rights for all validators — the behavior that
-// was verified working in epoch 0's cold-start round-robin.
+// TSS-R3-B1-Wave-E (2026-11-16) SUPERSEDES the R93 degradation on the
+// election path: gating the exclusion on ExecutiveChamber.IsActive() made it
+// a per-node wall-clock predicate (the local DKG completion moment), which
+// forked the devnet at epoch-boundary member slots. The exclusion now applies
+// for the whole epoch once the member set has been selected, DKG complete or
+// not (see executiveRestrictionsApplyLocked). The tests below assert the new
+// deterministic contract; the DKG-timeout throttling half of R93 is unchanged
+// and still covered.
 func newDegradedTestCoordinator(t *testing.T) *ThreeChambersCoordinator {
 	t.Helper()
 	// A nil-QPOS coordinator is enough: the code paths under test only touch
@@ -57,10 +56,15 @@ func activateExecutive(t *testing.T, tpc *ThreeChambersCoordinator) {
 	}
 }
 
-// TestR93_DKGPendingExecutiveKeepsProposeAndAttestRights is the primary
-// fails-without-fix test. Before the fix both assertions fail with
-// "CanPropose=false" / "CanAttest=false".
-func TestR93_DKGPendingExecutiveKeepsProposeAndAttestRights(t *testing.T) {
+// TestR93_DKGPendingExecutiveExcludedForWholeEpoch pins the
+// TSS-R3-B1-Wave-E contract that superseded the R93 degradation: once the
+// member set for the epoch has been selected, the member loses its proposing
+// and attesting rights for the ENTIRE epoch even while the chamber is stuck
+// in ExecutiveDKGRunning. Under the old R93 rule the rights depended on the
+// local DKG completion moment, which diverged across nodes and forked the
+// network at boundary member slots. Fails without the fix (rights were kept
+// while DKG was pending).
+func TestR93_DKGPendingExecutiveExcludedForWholeEpoch(t *testing.T) {
 	tpc := newDegradedTestCoordinator(t)
 
 	const execIdx = 2
@@ -83,15 +87,22 @@ func TestR93_DKGPendingExecutiveKeepsProposeAndAttestRights(t *testing.T) {
 		t.Fatal("precondition: executive chamber must NOT be active while DKG is pending")
 	}
 
-	if !tpc.CanPropose(execIdx, slot) {
-		t.Errorf("CanPropose(%d, slot %d) = false; an executive member whose DKG never "+
-			"completes must keep its proposing right (R93-CHAMBER-DEGRADED). "+
-			"This must not happen while the chamber cannot seal.", execIdx, slot)
+	if tpc.CanPropose(execIdx, slot) {
+		t.Errorf("CanPropose(%d, slot %d) = true; a selected executive member must be "+
+			"excluded for the whole epoch regardless of the local DKG state "+
+			"(TSS-R3-B1-Wave-E deterministic exclusion)", execIdx, slot)
 	}
-	if !tpc.CanAttest(execIdx, slot) {
-		t.Errorf("CanAttest(%d, slot %d) = false; an executive member whose DKG never "+
-			"completes must keep its attesting right (R93-CHAMBER-DEGRADED). "+
-			"This must not happen while the chamber cannot seal.", execIdx, slot)
+	if tpc.CanAttest(execIdx, slot) {
+		t.Errorf("CanAttest(%d, slot %d) = true; a selected executive member must be "+
+			"excluded for the whole epoch regardless of the local DKG state "+
+			"(TSS-R3-B1-Wave-E deterministic exclusion)", execIdx, slot)
+	}
+
+	// A validator that holds no Executive role for this epoch keeps both
+	// rights while DKG is pending — the exclusion must stay scoped to the
+	// selected member set, not widen to the whole network.
+	if !tpc.CanPropose(execIdx+1, slot) || !tpc.CanAttest(execIdx+1, slot) {
+		t.Errorf("a non-member must keep its propose/attest rights while DKG is pending")
 	}
 }
 
@@ -122,12 +133,14 @@ func TestR93_ActiveExecutiveLosesProposeAndAttestRights(t *testing.T) {
 	}
 }
 
-// TestR93_AssignProposingSucceedsForDKGPendingExecutive covers the follow-on
-// failure the fix would otherwise expose: once the executive member is elected
-// again, GetProposerForSlot calls AssignProposing, whose conflict check also
-// keys off ChamberExecutive membership. Without the same relaxation it returns
-// ErrProposerPowerExceeded and every slot logs "AssignProposing failed".
-func TestR93_AssignProposingSucceedsForDKGPendingExecutive(t *testing.T) {
+// TestR93_AssignProposingRejectsDKGPendingExecutive pins the Wave E pairing
+// of the two predicates: the proposer scan skips a member because CanPropose
+// says false, so AssignProposing must refuse the same validator under the
+// same DKG-pending state. If the two gates ever diverge, GetProposerForSlot
+// would either elect a member it cannot register (an "AssignProposing
+// failed" log every slot) or register a role for a validator other nodes
+// excluded — an election divergence.
+func TestR93_AssignProposingRejectsDKGPendingExecutive(t *testing.T) {
 	tpc := newDegradedTestCoordinator(t)
 
 	const execIdx = 2
@@ -139,10 +152,13 @@ func TestR93_AssignProposingSucceedsForDKGPendingExecutive(t *testing.T) {
 	}
 	tpc.assignment.Assign(execIdx, ChamberExecutive, 0, epoch)
 
-	if err := tpc.AssignProposing(execIdx, slot); err != nil {
-		t.Errorf("AssignProposing(%d, slot %d) = %v; must succeed while the executive "+
-			"chamber's DKG is pending, otherwise the elected proposer is rejected every "+
-			"slot (R93-CHAMBER-DEGRADED)", execIdx, slot, err)
+	if tpc.CanPropose(execIdx, slot) {
+		t.Fatalf("precondition: CanPropose must already exclude the DKG-pending member")
+	}
+	if err := tpc.AssignProposing(execIdx, slot); err == nil {
+		t.Errorf("AssignProposing(%d, slot %d) = nil; must be refused under the same "+
+			"deterministic whole-epoch gate as CanPropose (TSS-R3-B1-Wave-E)",
+			execIdx, slot)
 	}
 }
 
