@@ -4,9 +4,13 @@ package node
 import (
 	"crypto/rand"
 	"crypto/sha3"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/quantaureum/qau/consensus"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/quantaureum/qau/p2p"
@@ -299,5 +303,73 @@ func TestHandleTSSMessageRoutesActivationCertificateWithoutPanic(t *testing.T) {
 	store := newThresholdShareStore(n.config.DataDir)
 	if _, err := store.LoadActive(password); err == nil {
 		t.Fatal("routed garbage was adopted")
+	}
+}
+
+// TestAdoptTDilithium3ActivationCertificateFailsClosedOnMissedProbe pins the
+// fail-closed adoption rule (audit round-3 medium-1): when the candidate probe
+// does not positively confirm this node's candidate for the activation epoch,
+// the adoption must not fall through to the commit. The probe→commit window
+// is exactly where the local ceremony persists its own candidate on a
+// concurrent node run — a fall-through commit there replaces the ACTIVE share
+// with a share the signing gates refuse (`epoch < activationEpoch`) and
+// strips the rest of the current epoch of group signing and QTD sealing. The
+// injected probe simulates the miss; the candidate on disk simulates the
+// interleaved persistence.
+func TestAdoptTDilithium3ActivationCertificateFailsClosedOnMissedProbe(t *testing.T) {
+	password := []byte("DEVNET ONLY adoption missed probe password")
+	n := testAdoptionNode(t, password)
+	// The chain clock at "now" puts the current epoch at 0 — below the share's
+	// activation epoch — the early-beat shape the deferral serves.
+	_ = consensus.SetGenesisTime(time.Now().Unix())
+	n.blockProducer = &BlockProducer{node: n, qpos: &consensus.QPOS{}}
+
+	share := testThresholdStoreShare(t, 2)
+	session := testAdoptionSession(t, share)
+	sessionDigest, err := session.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, verifier, bindings := testAdoptionCertificate(t, share, sessionDigest)
+	installTestAdoptionInbox(t, n, session, share.ParticipantPosition, verifier, bindings)
+
+	// The candidate IS on disk: the interleaved persistence the probe misses.
+	if err := newThresholdShareStore(n.config.DataDir).Store(share, password); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeThresholdActivationCertificate(certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A missed probe must fail closed: no commit, no park, even though the
+	// commit below would succeed against the on-disk candidate.
+	restored := tdilithium3AdoptCandidateProbe
+	tdilithium3AdoptCandidateProbe = func(*thresholdShareStore, []byte) (uint64, []byte, uint32, uint32, error) {
+		return 0, nil, 0, 0, os.ErrNotExist
+	}
+	n.adoptTDilithium3DKGActivationCertificate(encoded)
+	tdilithium3AdoptCandidateProbe = restored
+
+	store := newThresholdShareStore(n.config.DataDir)
+	if _, err := store.LoadActive(password); err == nil {
+		t.Fatal("a missed probe still committed the future-epoch active share")
+	}
+	if pending := n.takeTDilithium3PendingActivation(); pending != nil {
+		t.Fatalf("a missed probe parked a certificate (epoch %d)", pending.activationEpoch)
+	}
+
+	// A positively confirmed probe still parks (the deferral lane): the same
+	// certificate re-fed after the dedup reset.
+	n.tdilithium3DKGActivationMu.Lock()
+	n.tdilithium3DKGAdoptedCerts = nil
+	n.tdilithium3DKGActivationMu.Unlock()
+	n.adoptTDilithium3DKGActivationCertificate(encoded)
+	pending := n.takeTDilithium3PendingActivation()
+	if pending == nil || pending.activationEpoch != share.ActivationEpoch {
+		t.Fatalf("a confirmed probe did not park for the activation epoch (pending=%v)", pending)
+	}
+	if _, err := store.LoadActive(password); err == nil {
+		t.Fatal("the parked path committed ahead of the activation epoch")
 	}
 }

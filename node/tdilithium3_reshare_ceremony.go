@@ -476,6 +476,16 @@ func (n *Node) runTDilithium3ReshareRemoveCeremony(
 	)
 	cancelActivation()
 	if exchangeErr != nil {
+		// Deferred commit (TSS-R3-B-1 lag fix): an early-beat rotation that
+		// converged before the chain reached its activation epoch parks its
+		// certificate; the produce loop's tick commits it at the boundary.
+		// The rotation is armed, not failed — the rotated key is unchanged
+		// by definition (same-key remove rotation).
+		if errors.Is(exchangeErr, errTDilithium3ActivationDeferred) {
+			nodeLog.Info("Dilithium3 v1 reshare rotation armed for epoch %d (activation deferred to the epoch boundary)",
+				config.Session.ActivationEpoch)
+			return publicKey, nil
+		}
 		return publicKey, fmt.Errorf("Dilithium3 v1 reshare activation exchange: %w", exchangeErr)
 	}
 	if err := n.registerTDilithium3SigningFinalitySigner(

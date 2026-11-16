@@ -357,6 +357,16 @@ type Node struct {
 	tdilithium3ShareCache      *dilithium3v1.LocalShare
 	tdilithium3ShareCacheEpoch uint64
 	tdilithium3ShareCacheAt    time.Time
+	// tdilithium3EarlyCeremonyMu guards the early-ceremony beat state
+	// (TSS-R3-B-1 lag fix, see tdilithium3_v1_early_ceremony.go):
+	// tdilithium3EarlyCeremonyPending parks one activation certificate whose
+	// ceremony completed before the chain reached its activation epoch, and
+	// tdilithium3EarlyCeremonyAttemptEpoch records the last activation epoch
+	// the early beat already attempted, so a failed attempt is not re-launched
+	// on every slot tick.
+	tdilithium3EarlyCeremonyMu           sync.Mutex
+	tdilithium3EarlyCeremonyPending      *tdilithium3PendingActivation
+	tdilithium3EarlyCeremonyAttemptEpoch uint64
 	// tdilithium3AnchorMu/tdilithium3AnchorObserved hold the canonical-block
 	// anchor observation of the fresh-sync bootstrap (TSS-R3-B-1 R-1 fix, see
 	// tdilithium3_v1_anchor_bootstrap.go): the last anchor a canonical import
