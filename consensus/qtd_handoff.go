@@ -17,6 +17,16 @@ package consensus
 // only when it checks out. The first establishment (empty history) is exempt:
 // that channel is the offline-ceremony/ops installation that predates this
 // observer path.
+//
+// Skipped-epoch adoption (TSS-R3-B-1, P2-4 posture-r5): when the chain itself
+// skipped epoch numbers (no boundary block — and therefore no anchor — for
+// the intermediate epochs), a rotation anchor at epoch > N+1 is adopted
+// through observeSkippedEpochRotationHandoffLocked: the observation ledger
+// proves the intermediates never anchored, and the head key's committee
+// threshold-signed the handoff for exactly the target (epoch, key). The
+// signature tuple is unchanged — the lane is selected by the observer's own
+// custody state, and the proof's verifying key must be the custody head in
+// every lane, so no proof is valid across lanes.
 
 import (
 	"encoding/binary"
@@ -97,6 +107,74 @@ func (qfs *QTDFinalityState) observeAnchoredGroupKeyHandoffLocked(epoch uint64, 
 		return fmt.Errorf("handoff: rotation anchor missing proof of handoff from epoch %d", maxKnown)
 	}
 	prevKey := prev[maxKnown]
+	if !VerifyAnchoredGroupKeyProof(prevKey, key, epoch, qfs.chainID, qtdAnchorProofCommitteeVersion, proof) {
+		return fmt.Errorf("handoff: proof does not verify under epoch-%d key", maxKnown)
+	}
+	return nil
+}
+
+// observeSkippedEpochRotationHandoffLocked is the skipped-epoch rotation lane
+// (TSS-R3-B-1, P2-4 posture-r5 observer deadlock). Called with qfs.mu already
+// HELD when a rotation anchor lands at epoch > maxKnown+1: the chain produced
+// no boundary anchor for every epoch in (maxKnown, epoch) — the experimental
+// runtime-DKG posture's clock-driven ceremonies can outpace chain time, so an
+// epoch number can pass with no block at all and strict maxKnown+1 chaining
+// would refuse this and every later anchor forever.
+//
+// Two conditions, both mandatory, let the lane adopt the next ACTUAL rotation:
+//
+//  1. DETERMINISTIC NO-INTERMEDIATE-ANCHOR EVIDENCE. The anchor-observation
+//     ledger (anchorObservedEpochs, fed by this same observe entry point for
+//     every canonical anchor this node has seen, adopted or refused) must
+//     hold no epoch in (maxKnown, epoch). Since maxKnown is by construction
+//     the largest adopted epoch, the ledger is the only place an
+//     intermediate anchor can be recorded; an observed-but-refused
+//     intermediate anchor (e.g. a proposer wrote an anchor with a bad proof)
+//     blocks the lane — "intermediate has an anchor" refuses, exactly as the
+//     chained discipline would demand the missing proof. The scan is over
+//     the ledger set (bounded by qtdAnchorObservationHorizon above the
+//     head), never a chain walk, so it is O(ledger) and hot-path safe; the
+//     caller refuses skips wider than the horizon outright.
+//
+//  2. THE CURRENT RECORDED KEY'S HANDOFF PROOF. The same handoff signature
+//     the chained lane requires — a threshold signature under
+//     groupKeyHistory[maxKnown] (the last key this observer actually trusts)
+//     over QTDHandoffMessage(chainID, epoch, key, committeeVersion). The
+//     tuple binds the target epoch and the new key, so a proof cannot be
+//     replayed across epochs, keys, or chainIDs; the verifying key is the
+//     observer's own custody head, so a proof that verifies here is one the
+//     already-trusted committee produced. The lane therefore adds no new
+//     trust root and does not weaken R19-F02: injecting a key still requires
+//     the previous committee's threshold signature, exactly as before.
+//
+// Production-side obligation (TSS-R3-B-1 Wave F channel): the boundary
+// producer signs the handoff with the last ANCHORED committee's shares only
+// when the chain skipped the intermediate epochs, so an honestly produced
+// skip proof implies the intermediates never anchored on the producer's
+// canonical chain. A Byzantine producer cannot forge the threshold
+// signature alone, and a committee that signed a handoff for an epoch whose
+// intermediates DID anchor would be violating its own protocol — the same
+// trust placement as the chained lane.
+func (qfs *QTDFinalityState) observeSkippedEpochRotationHandoffLocked(maxKnown, epoch uint64, key, proof []byte) error {
+	if len(key) != qcrypto.Dilithium3PublicKeySize {
+		return fmt.Errorf("handoff: bad key length %d", len(key))
+	}
+	if epoch <= maxKnown+1 {
+		return fmt.Errorf("handoff: skipped-epoch lane requires epoch beyond %d, got %d", maxKnown+1, epoch)
+	}
+	if epoch > maxKnown+qtdAnchorObservationHorizon {
+		return fmt.Errorf("handoff: skipped-epoch adoption wider than the %d-epoch horizon (have up to %d, got %d)",
+			qtdAnchorObservationHorizon, maxKnown, epoch)
+	}
+	for observed := range qfs.anchorObservedEpochs {
+		if observed > maxKnown && observed < epoch {
+			return fmt.Errorf("handoff: skipped-epoch adoption refused: epoch %d carries an anchor on the canonical chain", observed)
+		}
+	}
+	if len(proof) == 0 {
+		return fmt.Errorf("handoff: skipped-epoch rotation anchor missing proof of handoff from epoch %d", maxKnown)
+	}
+	prevKey := qfs.groupKeyHistory[maxKnown]
 	if !VerifyAnchoredGroupKeyProof(prevKey, key, epoch, qfs.chainID, qtdAnchorProofCommitteeVersion, proof) {
 		return fmt.Errorf("handoff: proof does not verify under epoch-%d key", maxKnown)
 	}

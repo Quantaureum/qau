@@ -120,6 +120,17 @@ type QTDFinalityState struct {
 	// signer's key, which may have rotated via DKG).
 	groupKeyHistory map[uint64][]byte
 
+	// TSS-R3-B-1 skipped-epoch adoption (P2-4 posture-r5): epochs whose
+	// boundary anchor this node OBSERVED on its canonical import path,
+	// whether the anchor was adopted or refused. The skipped-epoch adoption
+	// lane uses this to prove deterministically that the skipped intermediate
+	// epochs never carried an anchor on this node's canonical chain: an
+	// observed — even refused — intermediate anchor blocks the lane. Only
+	// entries strictly ahead of the custody head are ever queried by the
+	// lane (adopted epochs live in groupKeyHistory); the set is horizon-
+	// bounded at recording time and pruned to <= head on every adoption.
+	anchorObservedEpochs map[uint64]struct{}
+
 	// R30-IMPLEMENT (2026-07-27): P3-QTD-02 SealAnnouncer for P2P broadcast
 	// of completed QTD seals. When set, announceSeal is called after a seal
 	// is completed to propagate the QTD signature to peer nodes via the
@@ -3013,8 +3024,18 @@ func (qfs *QTDFinalityState) GroupPublicKeyForEpoch(epoch uint64) []byte {
 // sync (an observer's first establishment; its legitimacy source is the offline
 // ceremony's deployment record, which is how ceremony-only observer nodes got
 // their keys before this path existed). A skip-ahead anchor (epoch
-// E > maxKnown+1 with history present) is REFUSED, not adopted: a rotation-money-forwarding from an
-// anchoring point you never established must not teach observers a new key.
+// E > maxKnown+1 with history present) is refused unless the skipped-epoch
+// lane accepts it (qtd_handoff.go): the skipped intermediate epochs must
+// provably never have anchored on this node's canonical chain AND the
+// currently recorded (head) key's committee must have threshold-signed the
+// handoff for exactly (chainID, E, key, committeeVersion). The proof
+// requirement and its verifying key are identical to the chained lane, so the
+// anti-injection commitment (R19-F02) is unchanged — a rotation from an
+// anchoring point you never established still cannot teach observers a new
+// key without the trusted committee's signature; the lane only removes the
+// deadlock where the chain itself skipped epoch numbers (P2-4 posture-r5:
+// clock-driven ceremonies outpaced chain time, an epoch passed with no block,
+// and strict maxKnown+1 chaining refused every later anchor forever).
 // Already-known keys are cross-checked (a mismatch is reported and rejected,
 // never silently overwritten). All inputs pass the write-side length/non-zero
 // discipline. The cert-bound legitimacy chain (rotation certificates anchored
@@ -3078,26 +3099,54 @@ func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []
 		//     demanding +1 continuity would deadlock custody forever (observed
 		//     on mainnet 2026-10-11/12: one empty epoch bricked every node's
 		//     adoption for all later epochs).
-		//   - rotated key (differs from newest trusted): still strict — at most
-		//     the next epoch, plus the previous committee's handoff signature
-		//     over the handoff tuple (chainID, epoch, key, committeeVersion).
+		//   - rotated key (differs from newest trusted): still strict — exactly
+		//     the next epoch with the previous committee's handoff signature
+		//     over the handoff tuple (chainID, epoch, key, committeeVersion),
+		//     OR a skipped-epoch rotation (see the skip lane in qtd_handoff.go).
 		maxKnown := uint64(0)
 		for known := range qfs.groupKeyHistory {
 			if known > maxKnown {
 				maxKnown = known
 			}
 		}
+		// TSS-R3-B-1 skipped-epoch adoption: remember every anchor observed
+		// ahead of the custody head, adopted or refused. The skip lane reads
+		// this ledger to prove the intermediate epochs never anchored; a
+		// refused intermediate anchor must therefore block a later skip over
+		// it, which is why the recording happens BEFORE the accept/refuse
+		// decision below.
+		qfs.recordAnchorObservationLocked(maxKnown, epoch)
 		prevKey := qfs.groupKeyHistory[maxKnown]
 		if !bytes.Equal(prevKey, key) {
-			if expected := maxKnown + 1; epoch != expected {
-				qtdLogger.Warn("QTD anchored group key REFUSED (breaks chained adoption)",
-					map[string]any{"epoch": epoch, "expected": expected})
-				return false
-			}
-			if err := qfs.observeAnchoredGroupKeyHandoffLocked(epoch, key, proof); err != nil {
-				qtdLogger.Warn("QTD anchored group key refused (rotation proof)",
-					map[string]any{"epoch": epoch, "err": err.Error()})
-				return false
+			if epoch > maxKnown+1 {
+				// Skipped-epoch rotation (P2-4 posture-r5): the chain produced
+				// no boundary anchor for every epoch in (maxKnown, epoch) —
+				// e.g. the experimental runtime-DKG posture's clock-driven
+				// ceremonies outpaced chain time and an epoch passed without a
+				// single block. Strict maxKnown+1 chaining would refuse this
+				// and every later anchor forever (the observer deadlock). The
+				// skip lane adopts the next ACTUAL rotation when the
+				// intermediate epochs provably never anchored AND the current
+				// recorded key's committee threshold-signed the handoff for
+				// exactly this (epoch, key). The anti-injection commitment is
+				// unchanged: the proof requirement and its verifying key (the
+				// already-trusted head key) are identical to the chained lane.
+				if err := qfs.observeSkippedEpochRotationHandoffLocked(maxKnown, epoch, key, proof); err != nil {
+					qtdLogger.Warn("QTD anchored group key refused (skipped-epoch rotation proof)",
+						map[string]any{"epoch": epoch, "maxKnown": maxKnown, "err": err.Error()})
+					return false
+				}
+			} else {
+				if expected := maxKnown + 1; epoch != expected {
+					qtdLogger.Warn("QTD anchored group key REFUSED (breaks chained adoption)",
+						map[string]any{"epoch": epoch, "expected": expected})
+					return false
+				}
+				if err := qfs.observeAnchoredGroupKeyHandoffLocked(epoch, key, proof); err != nil {
+					qtdLogger.Warn("QTD anchored group key refused (rotation proof)",
+						map[string]any{"epoch": epoch, "err": err.Error()})
+					return false
+				}
 			}
 		} else if epoch <= maxKnown {
 			// Same key at an already-known-or-older epoch: idempotent anyway —
@@ -3109,9 +3158,49 @@ func (qfs *QTDFinalityState) ObserveAnchoredGroupKey(epoch uint64, key, proof []
 		}
 	}
 	qfs.groupKeyHistory[epoch] = append([]byte(nil), key...)
+	// The head advanced: observations at or below it can never again sit in a
+	// skipped range (maxKnown, epoch), so drop them to keep the ledger bounded.
+	qfs.pruneAnchorObservationsLocked(epoch)
 	qtdLogger.Info("QTD anchored group key adopted for epoch",
 		map[string]any{"epoch": epoch, "keyPrefix": key[:8]})
 	return true
+}
+
+// qtdAnchorObservationHorizon bounds how far ahead of the custody head an
+// anchor observation is recorded, and how wide a skipped-epoch adoption may
+// be. A legitimate skip is a chain that produced no anchored boundary block
+// for the intermediate epochs — a stall of a few epochs. A skip wider than
+// the horizon is refused (fail-closed, the pre-fix behavior): the observation
+// ledger deliberately does not record observations beyond head+horizon, so a
+// wider lane could not check the intermediate epochs exhaustively. 1024
+// epochs of consecutive anchor-less boundaries is a dead chain, not a
+// rotation race; an observer in that situation is stuck either way.
+const qtdAnchorObservationHorizon = uint64(1024)
+
+// recordAnchorObservationLocked remembers that a canonical boundary anchor
+// was observed at `epoch`, ahead of the custody head `maxKnown`. Caller must
+// hold qfs.mu (write lock). Observations at or below the head are never
+// queried by the skip lane (its scan is strictly (maxKnown, epoch)), and
+// observations beyond head+horizon are not recorded — a skip that wide is
+// refused outright, so the ledger only ever needs the recorded window.
+func (qfs *QTDFinalityState) recordAnchorObservationLocked(maxKnown, epoch uint64) {
+	if epoch <= maxKnown || epoch > maxKnown+qtdAnchorObservationHorizon {
+		return
+	}
+	if qfs.anchorObservedEpochs == nil {
+		qfs.anchorObservedEpochs = make(map[uint64]struct{})
+	}
+	qfs.anchorObservedEpochs[epoch] = struct{}{}
+}
+
+// pruneAnchorObservationsLocked drops recorded observations at or below the
+// newly adopted head `epoch`. Caller must hold qfs.mu (write lock).
+func (qfs *QTDFinalityState) pruneAnchorObservationsLocked(epoch uint64) {
+	for observed := range qfs.anchorObservedEpochs {
+		if observed <= epoch {
+			delete(qfs.anchorObservedEpochs, observed)
+		}
+	}
 }
 
 // ReceiveSealAnnouncement processes a QTD seal announcement received from
