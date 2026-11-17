@@ -1,4 +1,8 @@
 // Quantaureum Node source, version 1.0.0.
+//
+// Wave E (PR 18): the executive exclusion is deterministic per target epoch;
+// this file pins the two-state (DKG-pending vs complete) election-equivalence
+// invariant and the epoch-6/9 boundary-plus-two-slot fork shape.
 package consensus
 
 import (
