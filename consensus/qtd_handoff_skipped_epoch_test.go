@@ -79,7 +79,7 @@ func TestObserveAnchoredGroupKeySkippedEpochAdoption(t *testing.T) {
 	if !qfs.ObserveAnchoredGroupKey(7, key7, proof7) {
 		t.Fatal("skipped-epoch rotation with a valid head-key handoff proof refused")
 	}
-	if got := qfs.getGroupPublicKeyForEpoch(7); !bytes.Equal(got, key7) {
+	if got := qfs.GroupPublicKeyForEpoch(7); !bytes.Equal(got, key7) {
 		t.Fatal("skipped-epoch adopted key not recorded at epoch 7")
 	}
 
@@ -93,7 +93,7 @@ func TestObserveAnchoredGroupKeySkippedEpochAdoption(t *testing.T) {
 	if !qfs.ObserveAnchoredGroupKey(8, key8, proof8) {
 		t.Fatal("chained rotation after a skipped-epoch adoption refused")
 	}
-	if got := qfs.getGroupPublicKeyForEpoch(8); !bytes.Equal(got, key8) {
+	if got := qfs.GroupPublicKeyForEpoch(8); !bytes.Equal(got, key8) {
 		t.Fatal("chained rotation key not recorded at epoch 8")
 	}
 
