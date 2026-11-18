@@ -83,6 +83,10 @@ func (p *poisonedThresholdSigner) AggregatePartialSignatures(sealers []int, part
 //     (including the poison one), and the counter resets.
 //   - Subsequent legitimate sigs can then complete the seal normally.
 func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
+	// Devnet declaration: AssignExecutive is a test/devnet-only helper and
+	// fails closed under the production gate, which would silently leave
+	// epochExecutive empty and fail the seal-authorization assertions.
+	declareDevnetForTest(t)
 	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
 	// stake), and aggregation only runs once the weight bar is reached.
 	// This test needs aggregation to fire on the SECOND signature, so the
@@ -227,6 +231,10 @@ func TestQTD_CRIT_03_PoisonedPartialSealBoundedDoS(t *testing.T) {
 // deleted the latest sig, which was wrong: insufficient weight means we need
 // MORE sigs (with more stake), not fewer.
 func TestQTD_CRIT_03_WeightInsufficientRetainsSigs(t *testing.T) {
+	// Devnet declaration: the setup helper assigns the executive chamber via
+	// the test/devnet-only AssignExecutive path, which fails closed under the
+	// production gate.
+	declareDevnetForTest(t)
 	qpos, coordinator, _ := setupFullProvinces(t)
 	qfs := qpos.GetQTDFinality()
 

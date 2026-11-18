@@ -110,6 +110,10 @@ func TestQTDFinalityRequestSeal(t *testing.T) {
 }
 
 func TestQTDFinalitySubmitPartialSeal(t *testing.T) {
+	// Devnet declaration: AssignExecutive is a test/devnet-only helper and
+	// fails closed under the production gate, which would silently leave
+	// epochExecutive empty and fail the seal-authorization assertions.
+	declareDevnetForTest(t)
 	// R47-QTD-QUORUM: the weight quorum basis is the full validator set.
 	// Use a 3-validator set so the executive members {0,1,2} cover the
 	// entire stake — 2-of-3 partial seals reach 2000 >= ceil(2/3*3000).

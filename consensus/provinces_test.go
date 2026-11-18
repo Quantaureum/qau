@@ -162,6 +162,9 @@ func TestExecutiveChamberValidation(t *testing.T) {
 }
 
 func TestThreeChambersPowerSeparation(t *testing.T) {
+	// Test isolation: this test must not lean on devnet config left behind
+	// by an earlier test in the package; declare it explicitly.
+	declareDevnetForTest(t)
 	vs := createTestValidatorSet(t, 10)
 	qpos, err := NewQPOS(vs)
 	if err != nil {

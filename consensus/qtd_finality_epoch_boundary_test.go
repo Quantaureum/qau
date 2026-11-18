@@ -100,6 +100,10 @@ func TestQTDFinality_EpochBoundaryWindowContract(t *testing.T) {
 // epoch A+1 and assert IsSlotFinalized converges to true within a bounded
 // wait. This is the production-shaped version of the contract above.
 func TestQTDFinality_BoundarySealConvergesBounded(t *testing.T) {
+	// Devnet declaration: the setup helper assigns the executive chamber via
+	// the test/devnet-only AssignExecutive path, which fails closed under the
+	// production gate.
+	declareDevnetForTest(t)
 	// R47-QTD-QUORUM: RequiredWeight is ceil(2/3 of the FULL validator set
 	// stake). Use a 3-validator set so the executive members {0,1,2} ARE
 	// the full set (total 3000, required 2000): two distinct signatures

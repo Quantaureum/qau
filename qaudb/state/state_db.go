@@ -31,7 +31,13 @@ var (
 	// committed height still sits at or above the requested fork height.
 	// Returning nil in that situation reported a successful rollback while
 	// the state actually remained on the post-fork chain.
-	ErrRollbackHistoryUnavailable = errors.New("rollback history unavailable: in-memory beforeImages lost (restart) while state is committed at or above the rollback target")
+	//
+	// Wave E wording fix: the message states the observable condition (the
+	// in-memory history is empty) and its memory-only nature instead of
+	// asserting a restart as the certain cause — an empty map is what the
+	// operator must react to, and the restart inference is left as the
+	// likely explanation rather than a hardcoded claim.
+	ErrRollbackHistoryUnavailable = errors.New("rollback history unavailable: in-memory before-image history is empty while state is committed at or above the rollback target (before-images are memory-only and do not survive a restart)")
 
 	// M4-F5: the derived Verkle index could not be updated. The account data
 	// itself is durable (the account batch was written), but no valid state
@@ -3316,7 +3322,7 @@ func (s *StateDB) RollbackToHeight(forkHeight uint64) error {
 			if forkHeight == 0 || s.lastCommittedHeight < forkHeight {
 				return nil
 			}
-			return fmt.Errorf("%w: RollbackToHeight(%d) refused: beforeImages empty (lost across restart) but lastCommittedHeight=%d is at or above the target; state cannot be rolled back in-process — re-sync or restore a snapshot",
+			return fmt.Errorf("%w: RollbackToHeight(%d) refused: in-memory beforeImages are empty (memory-only history, not persisted across restart) but lastCommittedHeight=%d is at or above the target; state cannot be rolled back in-process — re-sync or restore a snapshot",
 				ErrRollbackHistoryUnavailable, forkHeight, s.lastCommittedHeight)
 		}
 		minRetained := uint64(0)
