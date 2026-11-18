@@ -380,6 +380,10 @@ func TestQTD_H03_FloorLookup_ServesNewestEntryAtOrBeforeEpoch(t *testing.T) {
 // key-aware signer additionally proves it was the HISTORICAL key, not the
 // live (already-rotated) one, that verified the seal.
 func TestQTD_H03_SubmitCompletedSeal_BoundarySlotAfterRollover(t *testing.T) {
+	// Devnet declaration: AssignExecutive is a test/devnet-only helper and
+	// fails closed under the production gate, which would silently leave
+	// epochExecutive empty and fail the seal-authorization assertions.
+	declareDevnetForTest(t)
 	// R47-QTD-QUORUM: a 3-validator set makes the sealers {0,1,2} cover the
 	// full 3000 stake (>= 2000 required), as in the other SubmitCompletedSeal
 	// test, so the weight check passes and the test reaches signature
