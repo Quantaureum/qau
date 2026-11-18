@@ -469,3 +469,62 @@ func TestR39_P1_04_ValidateBlock_BestEffortFail_RecordsReverify(t *testing.T) {
 		t.Fatalf("R39-P1-04: best-effort FAIL path MUST append the block to pendingReverify so the post-sync sweep re-decides once the QPOS snapshot is complete — got len=%d", records)
 	}
 }
+
+// ── Test 4: cold-start NOT-READY records are not failures (R39 noise fix). ──
+
+// TestR39_P1_04_Sweep_NotReady_IsNotAFailure verifies the R39 noise fix: a
+// sweep record whose VerifyProposer returns ErrProposerScheduleNotReady (the
+// cold-start artifact — the local VRF accumulator has not replayed far enough
+// yet) must NOT bump the FAIL counter (and must not WARN); it lands in its
+// own NOT-READY bucket instead. A cold-starting node can produce thousands of
+// these; treating them as failures made the FAIL counter (and the
+// SYNC-REVERIFY-FAIL WARN) useless on exactly the nodes that cold-start most
+// often.
+func TestR39_P1_04_Sweep_NotReady_IsNotAFailure(t *testing.T) {
+	bv := r39P1_04NewDevBV(t)
+	ver := r39P1_04NewMockElectionVerifier()
+
+	// One record per bucket: NOT-READY (cold-start sentinel), FAIL (a real
+	// mismatch error), PASS (nil).
+	proposerCold := types.BytesToAddress([]byte{0x01})
+	proposerFail := types.BytesToAddress([]byte{0x02})
+	proposerPass := types.BytesToAddress([]byte{0x03})
+	ver.setExpect(200, 4, proposerCold, ErrProposerScheduleNotReady)
+	ver.setExpect(201, 4, proposerFail, errR39P1_04TestFailed)
+	ver.setExpect(202, 4, proposerPass, nil)
+
+	bv.mu.Lock()
+	bv.pendingReverify = []reverifyRecord{
+		{height: 200, slot: 200, epoch: 4, proposer: proposerCold},
+		{height: 201, slot: 201, epoch: 4, proposer: proposerFail},
+		{height: 202, slot: 202, epoch: 4, proposer: proposerPass},
+	}
+	bv.mu.Unlock()
+
+	bv.SetElectionVerifier(ver)
+	bv.SetSyncingMode(false)
+
+	// Poll: the sweep runs in a goroutine; wait up to 2s for all three
+	// buckets to land (same pattern as the PASS/FAIL test above).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if bv.SyncProposerVerificationNotReadyCount() == 1 &&
+			bv.SyncProposerVerificationFailCount() == 1 &&
+			bv.SyncProposerVerificationPassCount() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := bv.SyncProposerVerificationNotReadyCount(); got != 1 {
+		t.Fatalf("R39 noise fix: the ErrProposerScheduleNotReady record must land in the NOT-READY bucket, got %d", got)
+	}
+	if got := bv.SyncProposerVerificationFailCount(); got != 1 {
+		t.Fatalf("R39 noise fix: FAIL count must be 1 (only the real mismatch), got %d — the cold-start sentinel must not be counted as a failure", got)
+	}
+	if got := bv.SyncProposerVerificationPassCount(); got != 1 {
+		t.Fatalf("R39 noise fix: PASS count must be 1, got %d", got)
+	}
+	if got := ver.callCount(); got != 3 {
+		t.Fatalf("R39 noise fix: VerifyProposer must be called exactly once per record (3), got %d", got)
+	}
+}

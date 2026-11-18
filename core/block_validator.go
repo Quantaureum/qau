@@ -358,6 +358,12 @@ type BlockValidator struct {
 	syncProposerVerification          bool
 	syncProposerVerificationPassCount uint64 // atomic; observable
 	syncProposerVerificationFailCount uint64 // atomic; observable
+	// syncProposerVerificationNotReadyCount counts sweep records whose
+	// VerifyProposer returned ErrProposerScheduleNotReady — the cold-start
+	// artifact (local VRF accumulator not yet replayed), NOT an election
+	// failure. Kept separate so the FAIL counter (and its WARN) stays
+	// meaningful on nodes that cold-start regularly (R39 noise fix).
+	syncProposerVerificationNotReadyCount uint64 // atomic; observable
 
 	// R40-P1-07 / R40-P2-06 (2026-08-03) — lifecycle management for the
 	// post-sync re-verification sweep goroutine launched by
@@ -701,8 +707,15 @@ func (v *BlockValidator) Stop() {
 // must not block the caller. Each entry:
 //   - PASS (electionVerifier.VerifyProposer returns nil) → atomic bump
 //     syncProposerVerificationPassCount;
-//   - FAIL (returns non-nil) → atomic bump syncProposerVerificationFailCount
-//     AND a WARN log entry tagged R39-P1-04 SYNC-REVERIFY-FAIL.
+//   - FAIL (any other non-nil error) → atomic bump
+//     syncProposerVerificationFailCount AND a WARN log entry tagged
+//     R39-P1-04 SYNC-REVERIFY-FAIL;
+//   - NOT-READY (ErrProposerScheduleNotReady — the local VRF accumulator has
+//     not replayed far enough yet) → atomic bump
+//     syncProposerVerificationNotReadyCount, NO WARN. A cold-starting node
+//     can produce thousands of these; they are the expected warm-up artifact
+//     (R39 noise fix: the canonical state is already applied and the
+//     accumulator catches up via the syncer replay), not election failures.
 //
 // The sweep is read-only against the snapshot; it does not mutate
 // v.pendingReverify (already cleared in SetSyncingMode), nor any other
@@ -711,6 +724,7 @@ func (v *BlockValidator) Stop() {
 // is the operator's call after investigating the alert, not an automatic
 // side-effect of the audit sweep).
 func (v *BlockValidator) reverifySyncPeriodProposers(ctx context.Context, pending []reverifyRecord, electionVerifier ProposerElectionVerifier) {
+	var passCount, failCount, notReadyCount uint64
 	for i, rec := range pending {
 		// R40-P1-07 / R40-P2-06 (2026-08-03): respect cancellation so node
 		// shutdown / a fresh SetSyncingMode(false) stops the sweep early
@@ -723,16 +737,23 @@ func (v *BlockValidator) reverifySyncPeriodProposers(ctx context.Context, pendin
 			return
 		}
 		if err := electionVerifier.VerifyProposer(rec.proposer, rec.slot, rec.epoch); err != nil {
-			atomic.AddUint64(&v.syncProposerVerificationFailCount, 1)
-			logging.Global().Warn("R39-P1-04 SYNC-REVERIFY-FAIL: post-sync VerifyProposer says the sync-period proposer was NOT legitimately elected — investigate the sync source (state already applied, no auto-rollback)",
-				map[string]any{"height": rec.height, "slot": rec.slot, "epoch": rec.epoch,
-					"proposer": fmt.Sprintf("%x", rec.proposer[:8]), "error": err.Error()})
+			if errors.Is(err, ErrProposerScheduleNotReady) {
+				atomic.AddUint64(&v.syncProposerVerificationNotReadyCount, 1)
+				notReadyCount++
+			} else {
+				atomic.AddUint64(&v.syncProposerVerificationFailCount, 1)
+				failCount++
+				logging.Global().Warn("R39-P1-04 SYNC-REVERIFY-FAIL: post-sync VerifyProposer says the sync-period proposer was NOT legitimately elected — investigate the sync source (state already applied, no auto-rollback)",
+					map[string]any{"height": rec.height, "slot": rec.slot, "epoch": rec.epoch,
+						"proposer": fmt.Sprintf("%x", rec.proposer[:8]), "error": err.Error()})
+			}
 		} else {
 			atomic.AddUint64(&v.syncProposerVerificationPassCount, 1)
+			passCount++
 		}
 	}
 	logging.Global().Info("R39-P1-04: post-sync re-verification sweep complete",
-		map[string]any{"records": len(pending)})
+		map[string]any{"records": len(pending), "pass": passCount, "fail": failCount, "notReady": notReadyCount})
 }
 
 // IsSyncingMode returns whether syncing mode is currently active.
@@ -797,14 +818,24 @@ func (v *BlockValidator) SyncProposerVerificationPassCount() uint64 {
 
 // SyncProposerVerificationFailCount returns the cumulative count of
 // sync-applied blocks whose best-effort VerifyProposer returned an
-// error (snapshot not yet reconstructed / proposer mismatch / etc.).
-// A non-zero value here is NOT an attack signal — it's expected during
-// early sync when the QPOS snapshot hasn't yet reached the current
-// slot. Operators should compare PASS / FAIL ratios; a high FAIL ratio
-// after sync completion may indicate an inconsistent QPOS snapshot.
-// R38-P1-08 deep-fix observability surface.
+// error other than ErrProposerScheduleNotReady (proposer mismatch /
+// snapshot inconsistency / etc.). A non-zero value here is NOT an attack
+// signal — it's expected during early sync when the QPOS snapshot hasn't
+// yet reached the current slot. Operators should compare PASS / FAIL
+// ratios; a high FAIL ratio after sync completion may indicate an
+// inconsistent QPOS snapshot. R38-P1-08 deep-fix observability surface.
 func (v *BlockValidator) SyncProposerVerificationFailCount() uint64 {
 	return atomic.LoadUint64(&v.syncProposerVerificationFailCount)
+}
+
+// SyncProposerVerificationNotReadyCount returns the cumulative count of
+// sync-applied blocks whose post-sync re-verification returned
+// ErrProposerScheduleNotReady — the cold-start artifact where the local VRF
+// accumulator has not replayed far enough yet. These are expected on
+// cold-starting nodes and are deliberately NOT counted as failures (R39
+// noise fix); a large value alongside a zero FAIL count is benign.
+func (v *BlockValidator) SyncProposerVerificationNotReadyCount() uint64 {
+	return atomic.LoadUint64(&v.syncProposerVerificationNotReadyCount)
 }
 
 // SetVRFEnforced enables or disables VRF proof/value existence checks and
