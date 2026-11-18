@@ -262,8 +262,21 @@ func (q *QPOS) epochSeedLocked(epoch uint64) (types.Hash, bool) {
 					logging.Error("VDF seed unavailable after consensus hardening activation — standing down from proposer election for this epoch (QR-21)",
 						map[string]any{"srcEpoch": srcEpoch, "shuffleEpoch": epoch})
 				}
-				logging.Warn("VDF seed unavailable for accumulator epoch — proposer shuffle falling back to the unhardened seed; known divergence risk (QR-21)",
-					map[string]any{"srcEpoch": srcEpoch})
+				// Log-noise discipline (R39 companion fix): when the VDF
+				// hardening feature is not configured for this epoch, the
+				// unhardened fallback is the steady-state posture on EVERY
+				// node — uniform, so it carries no divergence risk and must
+				// not spam WARN (a mainnet node logged 54k+ of these in a
+				// week). The WARN is reserved for the genuinely dangerous
+				// case: hardening IS configured but the seed is unavailable,
+				// where per-node availability asymmetry can fork the election.
+				if q.HardeningActive(epoch) {
+					logging.Warn("VDF seed unavailable for accumulator epoch — proposer shuffle falling back to the unhardened seed; known divergence risk (QR-21)",
+						map[string]any{"srcEpoch": srcEpoch})
+				} else {
+					logging.Debug("VDF seed hardening not configured for this epoch — proposer shuffle uses the unhardened seed (steady state)",
+						map[string]any{"srcEpoch": srcEpoch})
+				}
 			}
 		} else {
 			coldStart = true
