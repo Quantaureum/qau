@@ -131,16 +131,37 @@ qauctl validator info ./my-validator.key
 ### 4.2 Stake 32 QAU
 
 ```bash
-# Import the account to the node
-qauctl account-remote import ./my-validator.key http://YOUR_NODE_IP:8545 --password "your_password"
+# Build the staking signer (in the repository root)
+go build -o stakevalidator ./cmd/stakevalidator
 
-# Unlock the account
-qauctl account-remote unlock 0xyour_address http://YOUR_NODE_IP:8545 --password "your_password"
+# Sign the staking authorization with your validator key
+#   amount in wei: 32 QAU = 32000000000000000000
+#   chainID: 1669 (testnet) / 1668 (mainnet); commission 100 = 1%
+stakevalidator ./my-validator.key 32000000000000000000 1669 100
+```
 
-# Stake 32 QAU
+The tool signs the canonical staking authorization (ComputeStakeAuthorizationHash)
+with your Dilithium3 key and prints the payload for the `qau_stake` RPC:
+
+```json
+{
+  "address": "0x...",
+  "amount": "32000000000000000000",
+  "commission": 100,
+  "nonce": "1764000000",
+  "signature": "<hex>",
+  "publicKey": "<hex>",
+  "authHash": "<hex>"
+}
+```
+
+Submit it via `qau_stake` (the last three params are the signature fields):
+
+```bash
 curl -X POST http://YOUR_NODE_IP:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"qau_stake","params":["0xyour_address","0x1BC16D674EC80000"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"qau_stake","id":1,
+       "params":["0xyour_address","32000000000000000000",100,"<nonce>","<signature>","<publicKey>"]}'
 ```
 
 ### 4.3 Deploy the Validator Node
@@ -271,48 +292,51 @@ gpg --symmetric --cipher-algo AES256 ./my-validator.key
 
 ### 5.3 Staking Operations
 
-#### Import the Account to the Node
-
-```bash
-# Import the key to the remote node (the private key is read from the file and not shown in the output)
-qauctl account-remote import "./my-validator.key" http://YOUR_NODE_IP:8545 --password "your_password"
-
-# Can also be imported directly via RPC
-curl -X POST http://YOUR_NODE_IP:8545 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"personal_importRawKey","params":["dilithium3:your_hex_key","your_password"],"id":1}'
-```
-
-> **Note**: the key format for `personal_importRawKey` is `dilithium3:private_key_hex+public_key_hex`; do not omit the `dilithium3:` prefix.
-
-#### Unlock the Account
-
-```bash
-# Unlock using qauctl
-qauctl account-remote unlock 0xyour_address http://YOUR_NODE_IP:8545 --password "your_password"
-
-# Unlock via RPC (unlock for 3600 seconds)
-curl -X POST http://YOUR_NODE_IP:8545 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"personal_unlockAccount","params":["0xyour_address","your_password",3600],"id":1}'
-```
-
-> **Important**: the import password and unlock password must match! A mismatch will cause the unlock to fail.
+> **No account import/unlock is needed for staking.** Staking operations are
+> authorized by a Dilithium3 signature over the canonical staking
+> authorization (see `cmd/stakevalidator`), not by an unlocked node account.
+> The `personal_importRawKey` / `personal_unlockAccount` RPCs referenced by
+> older guides are admin-only (not reachable over public HTTP) and are not
+> part of the staking flow.
 
 #### Stake via qau_stake
 
+State-mutating staking operations require a Dilithium3 signature over the
+canonical staking authorization (they will be rejected with
+`missing authentication` otherwise). Build the signer, sign with your key,
+then submit:
+
 ```bash
-# Stake 32 QAU
-# 32 QAU = 32 * 10^18 = 0x1BC16D674EC80000 (in wei)
+# Build the staking signer (in the repository root)
+go build -o stakevalidator ./cmd/stakevalidator
+
+# Sign: <keyfile> <amount_wei> <chainID> [commission]
+# 32 QAU = 32000000000000000000 wei; commission 100 = 1%
+stakevalidator ./my-validator.key 32000000000000000000 1669 100
+```
+
+Submit the signed payload via `qau_stake` — params are
+`[address, amount, commission, nonce, signature, publicKey]`:
+
+```bash
 curl -X POST http://YOUR_NODE_IP:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
     "method": "qau_stake",
-    "params": ["0xyour_address", "0x1BC16D674EC80000"],
+    "params": ["0xyour_address", "32000000000000000000", 100,
+               "<nonce>", "<signature>", "<publicKey>"],
     "id": 1
   }'
 ```
+
+> The `stakevalidator` tool (cmd/stakevalidator) signs the canonical
+> ComputeStakeAuthorizationHash bound to chainID, the staking contract, the
+> amount, the commission and the nonce — cross-chain replay and commission
+> tampering are rejected by the node. Related tools: `cmd/stakeall` (same
+> signing for encrypted JSON keystores, amount in QAU) and `cmd/sign_stake`
+> (`sign_stake <key_file> <password_file> <address> <amount_wei> unstake 1668`
+> produces the signature for `qau_unstake`, which carries no commission).
 
 #### Verify the Stake
 
