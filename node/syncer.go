@@ -3006,7 +3006,7 @@ func (s *Syncer) clearForkAcceptedBelow(height uint64) {
 // node — the in-memory before-image history is empty, so committed state at
 // or above the fork height cannot be undone in-process).
 //
-// SNAP-SKELETON-DEFECT (2026-11-19, mainnet RPC node S8): with the state
+// SNAP-SKELETON-DEFECT (2026-11-19, a mainnet RPC node's fresh snap sync): with the state
 // rollback unavailable, each acceptance truncated the store, re-requested the
 // same peer blocks, re-stored them (each re-store advances currentHeight and
 // refreshes lastSyncProgress, so the stall detectors never fire), re-detected
