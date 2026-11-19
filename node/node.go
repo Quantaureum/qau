@@ -4233,7 +4233,28 @@ func (n *Node) initSyncer() error {
 				return n.stateDB.RollbackToHeight(forkHeight)
 			})
 			if err != nil {
-				nodeLog.Error("OnForkRollback: failed to roll back stateDB to height %d: %v", forkHeight, err)
+				// SNAP-SKELETON-DEFECT FIX (2026-11-19): a fresh (or freshly
+				// restarted) node has NO in-memory before-images, so M4-F3
+				// refuses to roll back committed state (ErrRollbackHistory-
+				// Unavailable). This is the deterministic-recovery case, not a
+				// hard-failure case: the syncer has already truncated the
+				// abandoned store segment and cleared its buffers, so the peer
+				// chain is authoritative from forkHeight onward. Record the
+				// failed rollback so ProcessBlock stops repeating the
+				// destructive acceptance dance at this height (the mainnet
+				// 42-cycle OOM loop), and keep following the peer chain —
+				// rebuildState replays from the state baseline at sync
+				// completion. Production stays disabled via the state-trust
+				// break below: a node that cannot rewind its state must not
+				// propose from it.
+				if errors.Is(err, state.ErrRollbackHistoryUnavailable) {
+					attempts := n.syncer.noteForkStateRollbackUnavailable(forkHeight)
+					nodeLog.Warn("OnForkRollback: state rollback to %d unavailable (no in-memory before-images — fresh node or post-restart, attempt %d). "+
+						"Deterministic recovery: the peer chain is authoritative from height %d; sync continues from the truncated tip and state is rebuilt from the baseline at sync completion.",
+						forkHeight, attempts, forkHeight)
+				} else {
+					nodeLog.Error("OnForkRollback: failed to roll back stateDB to height %d: %v", forkHeight, err)
+				}
 				n.markStateTrustBroken(fmt.Sprintf(
 					"fork rollback to height %d failed: %v — chain history was already "+
 						"truncated, so local account state belongs to the abandoned branch",

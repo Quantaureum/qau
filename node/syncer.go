@@ -329,6 +329,17 @@ type Syncer struct {
 	// refusal for every child block of that fork.
 	forkRefusedFinality map[uint64]bool
 
+	// SNAP-SKELETON-DEFECT FIX (2026-11-19): fork heights whose node-level
+	// state rollback failed with state.ErrRollbackHistoryUnavailable (M4-F3:
+	// fresh node or post-restart — before-images are memory-only). Each
+	// entry counts how many times the fork-acceptance dance ran for that
+	// height while the state could not be rolled back. Past
+	// maxForkRollbackNoStateAttempts the dance is a destructive no-op loop
+	// (delete store segment -> re-request -> re-store -> re-fork, each
+	// re-store resetting the stall timers), so further attempts are refused
+	// and the node just follows the peer chain. Guarded by s.mu.
+	forkRollbackNoState map[uint64]int
+
 	// R101-FINALITY-RESUME: epoch of the last epoch-block-root backfill pass.
 	// checkSync re-derives and injects completed-epoch boundary roots from the
 	// canonical store at most once per epoch (restarting nodes lose the whole
@@ -487,6 +498,7 @@ func NewSyncer(host *p2p.Host, blockStore *block.BlockStore, stateDB *state.Stat
 		forkAccepted:         make(map[uint64]bool),
 		forkAbandonedHash:    make(map[uint64]types.Hash),
 		forkRefusedFinality:  make(map[uint64]bool),
+		forkRollbackNoState:  make(map[uint64]int),
 		// R38-P1-08: initialize the in-memory unvalidated-blocks marker.
 		unvalidatedBlocks:    make(map[types.Hash]uint64),
 		lastSyncProgress:     time.Now(),
@@ -1110,6 +1122,23 @@ func (s *Syncer) ProcessBlock(blk *encoding.Block) error {
 				rollbackHeight := s.findForkRollbackPoint(forkPoint)
 				if rollbackHeight < forkPoint {
 					forkPoint = rollbackHeight
+				}
+
+				// SNAP-SKELETON-DEFECT FIX (2026-11-19): the node-level state
+				// rollback at this (finalized) fork height already failed twice
+				// with ErrRollbackHistoryUnavailable (fresh node / post-restart
+				// — no in-memory before-images). Re-running the acceptance dance
+				// cannot converge: it deletes the re-synced segment, re-requests
+				// the same peer blocks, re-stores them (refreshing the stall
+				// timers every cycle) and forks again — the mainnet 42-cycle
+				// OOM loop. Drop the fork block and keep following the peer
+				// chain; checkSync's stall re-request keeps polling for a
+				// resolvable state without further destructive rollbacks. The
+				// check uses the FINALIZED fork point — the same key the
+				// OnForkRollback callback records — so the counter and the
+				// guard always agree.
+				if s.forkRollbackExhausted(forkPoint) {
+					return ErrForkDetected
 				}
 
 				if attempts+1 >= peerCount {
@@ -2546,6 +2575,14 @@ func (s *Syncer) checkSync() {
 	// deadlocked without this.
 	s.maybeBackfillEpochRootsLocked()
 
+	// SNAP-SKELETON-DEFECT FIX (2026-11-19): bound the skeleton header map.
+	// Header-first download legitimately holds headers far above the block
+	// tip, but once the block tip advances the entries below it are dead
+	// weight (mainnet-scale runs held 150k+ headers). Prune them on every
+	// sync tick so the map tracks the live window instead of growing
+	// monotonically.
+	s.pruneSkeletonHeadersLocked()
+
 	// ETHEREUM-PARITY SYNC (2026-08-13): header-first skeleton download for
 	// large gaps and receipts download near the tip. Both are no-ops unless
 	// their preconditions hold; they run alongside the existing block sync.
@@ -2960,6 +2997,58 @@ func (s *Syncer) clearForkAcceptedBelow(height uint64) {
 			delete(s.forkAbandonedHash, k)
 		}
 	}
+}
+
+// maxForkRollbackNoStateAttempts bounds how many times the fork-acceptance
+// dance (DeleteBlocksFromHeight + OnForkRollback + re-request) may run for
+// the SAME fork height while the node-level state rollback keeps failing
+// with state.ErrRollbackHistoryUnavailable (M4-F3: fresh node or post-restart
+// node — the in-memory before-image history is empty, so committed state at
+// or above the fork height cannot be undone in-process).
+//
+// SNAP-SKELETON-DEFECT (2026-11-19, a mainnet RPC node's fresh snap sync): with the state
+// rollback unavailable, each acceptance truncated the store, re-requested the
+// same peer blocks, re-stored them (each re-store advances currentHeight and
+// refreshes lastSyncProgress, so the stall detectors never fire), re-detected
+// the same fork, and rolled back again — 42 cycles in 30 minutes with
+// unbounded buffer churn, ending in an OOM kill. Two complete cycles are
+// enough to distinguish a transient condition from a deterministic one;
+// past that the node keeps following the peer chain passively (blocks are
+// still requested and validated against the truncated tip) instead of
+// repeating the destructive dance.
+const maxForkRollbackNoStateAttempts = 2
+
+// noteForkStateRollbackUnavailable records that the node-level fork rollback
+// at forkPoint could not run because the local state has no rollable history
+// (M4-F3). Returns the number of times this fork height has been reported.
+// When the count reaches maxForkRollbackNoStateAttempts, a warning is logged:
+// from that point on the fork-acceptance dance is refused for this height.
+func (s *Syncer) noteForkStateRollbackUnavailable(forkPoint uint64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.forkRollbackNoState == nil {
+		s.forkRollbackNoState = make(map[uint64]int)
+	}
+	s.forkRollbackNoState[forkPoint]++
+	count := s.forkRollbackNoState[forkPoint]
+	if count == maxForkRollbackNoStateAttempts {
+		syncLog.Warn("FORK at height %d: state rollback unavailable (no in-memory before-images) and %d recovery cycles already ran — "+
+			"refusing further destructive rollbacks at this height; the node follows the peer chain from the truncated tip (SNAP-SKELETON-DEFECT)",
+			forkPoint, count)
+	}
+	return count
+}
+
+// forkRollbackExhausted reports whether the fork-acceptance dance at
+// forkPoint has already run maxForkRollbackNoStateAttempts times while the
+// state rollback kept failing. Past that point repeating the dance cannot
+// converge (the deterministic blocker is the missing rollback history, not
+// the block supply), so callers must drop the fork block and keep following
+// the peer chain instead.
+func (s *Syncer) forkRollbackExhausted(forkPoint uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.forkRollbackNoState[forkPoint] >= maxForkRollbackNoStateAttempts
 }
 
 // requestMissingBlocks requests blocks we're missing
@@ -4229,15 +4318,32 @@ func (s *Syncer) completeSnapSync() {
 	// that becomes necessary. For now the sealer keeps following the head
 	// from pivot+1 forward, which is the only thing a producing sealer
 	// needs to verify the chain head.
+	//
+	// SNAP-SKELETON-DEFECT FIX (2026-11-19): PutBlock treats a same-hash
+	// re-store as a "legitimate re-index" and REWRITES the stored block
+	// data. When the real pivot block was already persisted by the
+	// concurrent block-sync path, installing the header-only pivot here
+	// STRIPPED the stored block's transaction bodies, leaving a body-less
+	// canonical block behind (observed as store pollution on a mainnet
+	// RPC node's fresh snap sync). The pivot's only job is to anchor the
+	// chain tip so pivot+1's ParentHash lookup succeeds — skip the write
+	// when the canonical block is already present and just advance.
 	if s.snapTargetHeader != nil && s.currentHeight < s.snapTargetBlock {
 		syncLog.Info("R62-SNAP-ADVANCE: entry conditions met (snapTargetHeader set, currentH=%d < snapTarget=%d), installing pivot block",
 			s.currentHeight, s.snapTargetBlock)
-		pivotBlock := &encoding.Block{Header: s.snapTargetHeader, Transactions: nil}
-		if err := s.blockStore.PutBlockWithIndex(pivotBlock); err != nil {
-			syncLog.Warn("R62-SNAP-ADVANCE: failed to install pivot header block at %d: %v (will retry on next checkSync)", s.snapTargetBlock, err)
-		} else {
+		pivotHash := block.ComputeBlockHash(s.snapTargetHeader)
+		pivotExists, _ := s.blockStore.HasBlock(pivotHash)
+		if pivotExists {
 			s.currentHeight = s.snapTargetBlock
-			syncLog.Info("R62-SNAP-ADVANCE: advanced currentHeight to snap pivot %d (fake pivot block installed, state already at pivot root)", s.snapTargetBlock)
+			syncLog.Info("R62-SNAP-ADVANCE: advanced currentHeight to snap pivot %d (canonical pivot block already stored, no header-only rewrite)", s.snapTargetBlock)
+		} else {
+			pivotBlock := &encoding.Block{Header: s.snapTargetHeader, Transactions: nil}
+			if err := s.blockStore.PutBlockWithIndex(pivotBlock); err != nil {
+				syncLog.Warn("R62-SNAP-ADVANCE: failed to install pivot header block at %d: %v (will retry on next checkSync)", s.snapTargetBlock, err)
+			} else {
+				s.currentHeight = s.snapTargetBlock
+				syncLog.Info("R62-SNAP-ADVANCE: advanced currentHeight to snap pivot %d (fake pivot block installed, state already at pivot root)", s.snapTargetBlock)
+			}
 		}
 	} else {
 		syncLog.Info("R62-SNAP-ADVANCE: entry conditions NOT met (snapTargetHeader nil? %v, currentH=%d, snapTarget=%d)",
@@ -4516,6 +4622,24 @@ func (s *Syncer) HandleHeaderResponse(resp *p2p.HeaderResponse) {
 	}
 	if imported > 0 {
 		syncLog.Info("HandleHeaderResponse: imported %d skeleton headers (tip=%d, reqID=%d)", imported, prevHeight, resp.RequestID)
+	}
+}
+
+// pruneSkeletonHeadersLocked drops skeleton headers at heights below the
+// block tip. Callers MUST hold s.mu. Entries below currentHeight can no
+// longer serve any consumer: the pivot-header lookup only ever reads at or
+// above the snap target (which is above the tip when snap is active), and
+// the canonical store holds the full blocks. See the SNAP-SKELETON-DEFECT
+// note in checkSync.
+func (s *Syncer) pruneSkeletonHeadersLocked() {
+	if len(s.skeletonHeaders) == 0 {
+		return
+	}
+	floor := s.currentHeight
+	for h := range s.skeletonHeaders {
+		if h < floor {
+			delete(s.skeletonHeaders, h)
+		}
 	}
 }
 
@@ -5012,7 +5136,12 @@ func (s *Syncer) syncHealthLoop() {
 						// R87-M4-ROOTCAUSE: see noteStateRolledBackTo.
 						s.noteStateRolledBackTo(curH)
 
-						if s.onForkRollback != nil {
+						// SNAP-SKELETON-DEFECT FIX (2026-11-19): skip the
+						// callback once its state rollback is known to be
+						// unavailable at this height — re-running it every
+						// stall interval only repeats the failing M4-F3
+						// attempt without changing any state.
+						if s.onForkRollback != nil && !s.forkRollbackExhausted(curH) {
 							s.onForkRollback(curH)
 						}
 						s.requestMissingBlocks()
