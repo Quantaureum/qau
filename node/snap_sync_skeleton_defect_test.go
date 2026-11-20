@@ -302,3 +302,140 @@ func TestSnapSkeletonDefect_SkeletonHeadersPrunedBelowTip(t *testing.T) {
 		t.Fatal("skeleton header at the tip was incorrectly pruned")
 	}
 }
+
+// snapDefect_newBufferedNode builds a minimal Node whose sync buffer is
+// wired to the given syncer/block store, mirroring the field setup
+// blockProcessingLoop/blockInsertLoop rely on. takeNextBlock only touches
+// the sync-buffer accounting fields, the syncer and the block store, so a
+// zero-value Node with those set is a faithful harness.
+func snapDefect_newBufferedNode(s *Syncer, bs *block.BlockStore) *Node {
+	n := &Node{
+		syncer:          s,
+		blockStore:      bs,
+		syncBuf:         make([]*encoding.Block, 0, 8),
+		syncBufSet:      make(map[string]struct{}),
+		syncBufByHeight: make(map[uint64][]int),
+		maxSyncBufBytes: 256 << 20,
+	}
+	return n
+}
+
+// snapDefect_enqueue adds a block to the node's sync buffer exactly the way
+// blockProcessingLoop does (append + dedup set + height index + byte count).
+func snapDefect_enqueue(t *testing.T, n *Node, blk *encoding.Block) {
+	t.Helper()
+	n.syncBufMu.Lock()
+	defer n.syncBufMu.Unlock()
+	h := block.ComputeBlockHash(blk.Header)
+	n.syncBuf = append(n.syncBuf, blk)
+	n.syncBufSet[string(h[:])] = struct{}{}
+	n.syncBufByHeight[blk.Header.Height] = append(n.syncBufByHeight[blk.Header.Height], len(n.syncBuf)-1)
+	n.syncBufBytes += int64(encoding.ApproxBlockBytes(blk))
+}
+
+// snapDefect_forkBlock builds a block at parent.Height+1 whose ParentHash
+// deliberately does NOT match the stored parent — the fork-acceptance
+// fallback's trigger shape.
+func snapDefect_forkBlock(parent *encoding.BlockHeader) *encoding.Block {
+	hdr := r38p1_08_makeValidChildHeader(parent)
+	hdr.ParentHash = types.Hash{0xEE}
+	hdr.Signature = make([]byte, 3293)
+	hdr.StateRoot = types.Hash{0xAA}
+	hdr.ReceiptRoot = types.Hash{0xBB}
+	return &encoding.Block{Header: hdr, Transactions: nil}
+}
+
+// TestSnapSyncWaitForPivot_TakeNextBlockHoldsForkFallback pins the residual
+// mainnet-wedge fix: while a snap sync is waiting for its pivot install, the
+// buffered far-ahead blocks must NOT be fed through the fork-acceptance
+// fallback. Every acceptance on a fresh node hits the M4-F3 no-rollback
+// refusal and the next delivery wave re-arms the counters at a new height —
+// an unbounded loop. takeNextBlock must return nil (wait for the pivot) and
+// leave the buffer and the store untouched; after the pivot (snapSyncing
+// cleared) the previous behavior resumes.
+func TestSnapSyncWaitForPivot_TakeNextBlockHoldsForkFallback(t *testing.T) {
+	s, bs, _ := r38p1_08_newSyncerWithStore(t)
+	blocks := snapDefect_chainWithTx(t, s, bs, 5)
+
+	s.mu.Lock()
+	s.currentHeight = 5
+	s.snapSyncing = true // snap session waiting for its pivot
+	s.mu.Unlock()
+
+	n := snapDefect_newBufferedNode(s, bs)
+	// A fork block at the tip+1 (mismatched parent) and a far-ahead child of
+	// it — neither chains onto the store, exactly the wedge's buffer shape.
+	snapDefect_enqueue(t, n, snapDefect_forkBlock(blocks[4].Header))
+	farHdr := r38p1_08_makeValidChildHeader(snapDefect_forkBlock(blocks[4].Header).Header)
+	farHdr.Signature = make([]byte, 3293)
+	farHdr.StateRoot = types.Hash{0xAA}
+	farHdr.ReceiptRoot = types.Hash{0xBB}
+	snapDefect_enqueue(t, n, &encoding.Block{Header: farHdr, Transactions: nil})
+
+	// Drain repeatedly, as blockInsertLoop would across delivery waves: the
+	// processor must never enter the fork-acceptance path while waiting for
+	// the pivot (this is the mainnet wedge: every wave re-armed the dance at
+	// a new fork height).
+	rollbackCalls := 0
+	s.SetOnForkRollback(func(forkHeight uint64) { rollbackCalls++ })
+	for i := 0; i < 50; i++ {
+		if got := n.takeNextBlock(); got != nil {
+			t.Fatalf("drain %d: takeNextBlock returned a block while snap-syncing — the fork-acceptance fallback must be held until the pivot installs (got height %d)", i+1, got.Header.Height)
+		}
+	}
+	if rollbackCalls != 0 {
+		t.Fatalf("OnForkRollback fired %d times during the snap wait — fork-acceptance must not run while waiting for the pivot", rollbackCalls)
+	}
+	n.syncBufMu.Lock()
+	buffered := len(n.syncBuf)
+	n.syncBufMu.Unlock()
+	if buffered != 2 {
+		t.Fatalf("syncBuf length = %d after takeNextBlock, want 2 — the anti-deadlock clear must not run while waiting for the pivot", buffered)
+	}
+	if blk, err := bs.GetBlockByHeight(5); err != nil || blk == nil {
+		t.Fatalf("canonical block 5 missing after takeNextBlock: %v — the wait path must not truncate the store", err)
+	}
+
+	// Pivot installed (or session failed closed): snapSyncing clears and the
+	// previous behavior resumes — the fallback hands out the fork block so
+	// the normal fork-resolution machinery can act on it.
+	s.mu.Lock()
+	s.snapSyncing = false
+	s.mu.Unlock()
+	got := n.takeNextBlock()
+	if got == nil {
+		t.Fatal("takeNextBlock returned nil after snapSyncing cleared — the fallback must resume")
+	}
+	if got.Header.Height != 6 {
+		t.Fatalf("takeNextBlock returned height %d, want 6 (the fork block at currentH+1)", got.Header.Height)
+	}
+}
+
+// TestSnapSyncWaitForPivot_FastPathStillProgresses proves the wait guard does
+// not hold back verifiably chained blocks: a buffered block at currentH+1
+// whose parent IS in the store is still handed out during the snap wait (the
+// fast path runs before the guard), so ordinary catch-up progress is kept.
+func TestSnapSyncWaitForPivot_FastPathStillProgresses(t *testing.T) {
+	s, bs, _ := r38p1_08_newSyncerWithStore(t)
+	blocks := snapDefect_chainWithTx(t, s, bs, 5)
+
+	s.mu.Lock()
+	s.currentHeight = 5
+	s.snapSyncing = true
+	s.mu.Unlock()
+
+	n := snapDefect_newBufferedNode(s, bs)
+	real6 := r38p1_08_makeValidChildHeader(blocks[4].Header)
+	real6.Signature = make([]byte, 3293)
+	real6.StateRoot = types.Hash{0xAA}
+	real6.ReceiptRoot = types.Hash{0xBB}
+	snapDefect_enqueue(t, n, &encoding.Block{Header: real6, Transactions: nil})
+
+	got := n.takeNextBlock()
+	if got == nil {
+		t.Fatal("takeNextBlock returned nil for a block that chains onto the stored tip — the fast path must run before the snap-wait guard")
+	}
+	if got.Header.Height != 6 {
+		t.Fatalf("takeNextBlock returned height %d, want 6", got.Header.Height)
+	}
+}
