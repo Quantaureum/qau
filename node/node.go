@@ -7725,6 +7725,15 @@ func (n *Node) startServices() error {
 	// A verify-only node follows the armed ceremony's key from its operator
 	// (tssV1TrustedGroupKey); a quiet no-op on share holders.
 	n.applyTDilithium3TrustedGroupKey()
+	// Cold-start custody recovery for the Dilithium3 v1 era: a node restored
+	// from a snapshot (or one whose threshold store was lost while its
+	// canonical chain data survived) boots with an empty anchor custody and
+	// would reject every group-signed header of the era. Seed the custody from
+	// the most recent epoch-boundary anchor carrier on the local canonical
+	// chain (same trust root as fresh sync), then warn loudly when no key
+	// source remains. Both are quiet no-ops on healthy nodes.
+	n.rebuildTDilithium3V1CustodyFromLocalChain()
+	n.warnTDilithium3V1CustodyUnrecoverable()
 
 	// Enable syncing mode if the node is starting from genesis or a very low
 	// height. This skips election verification until sync completes, because
