@@ -8619,6 +8619,25 @@ func (n *Node) takeNextBlock() *encoding.Block {
 		}
 	}
 
+	// SNAP-SKELETON-DEFECT FIX (2026-11-20, residual wedge at mainnet scale):
+	// while a snap sync is waiting for its pivot installation the peer chain
+	// is authoritative, and the buffered blocks sit far above the local tip —
+	// the pivot is about to supersede them. Running the parent scan here lets
+	// the fork-acceptance fallback below pick currentH+1 and drive
+	// ProcessBlock's fork detection against blocks the pivot will replace.
+	// On a fresh node every acceptance then hits the M4-F3
+	// no-rollback-history refusal, and each new delivery wave re-arms the
+	// attempt counters at a new fork height, so the destructive
+	// delete/re-request/re-store cycle repeats without bound (observed as an
+	// OOM on a mainnet rebuild). Wait for the pivot instead: snapSyncing
+	// clears when the pivot is installed (or the session fails closed to
+	// full sync), and normal processing resumes automatically. The fast path
+	// above still runs first, so a block that verifiably chains onto the
+	// local tip is never held back.
+	if n.syncer != nil && n.syncer.IsSnapSyncing() {
+		return nil
+	}
+
 	var bestIdx int = -1
 	parentCheckCount := 0
 	parentFoundCount := 0
