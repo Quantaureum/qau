@@ -3013,6 +3013,42 @@ func (qfs *QTDFinalityState) GroupPublicKeyForEpoch(epoch uint64) []byte {
 	return qfs.getGroupPublicKeyForEpochLocked(epoch, currentEpoch)
 }
 
+// HasGroupKeyCustodyAtOrAfter reports whether the anchor custody table holds
+// a validated group public key for any epoch at or after `epoch`. It is a
+// read-only probe for the node's cold-start custody recovery: a false answer
+// means the custody predates the given epoch (or is empty) and must be seeded
+// from a trust root before the era's group signatures can verify. The table is
+// never modified.
+func (qfs *QTDFinalityState) HasGroupKeyCustodyAtOrAfter(epoch uint64) bool {
+	if qfs == nil {
+		return false
+	}
+	qfs.mu.RLock()
+	defer qfs.mu.RUnlock()
+	for known := range qfs.groupKeyHistory {
+		if known >= epoch {
+			return true
+		}
+	}
+	return false
+}
+
+// GroupKeyCustodySnapshot returns a defensive copy of the anchor custody
+// table (epoch -> group public key). Read-only view for diagnostics and
+// tests; mutating the returned map never reaches the live table.
+func (qfs *QTDFinalityState) GroupKeyCustodySnapshot() map[uint64][]byte {
+	if qfs == nil {
+		return nil
+	}
+	qfs.mu.RLock()
+	defer qfs.mu.RUnlock()
+	out := make(map[uint64][]byte, len(qfs.groupKeyHistory))
+	for epoch, key := range qfs.groupKeyHistory {
+		out[epoch] = append([]byte(nil), key...)
+	}
+	return out
+}
+
 // ObserveAnchoredGroupKey consumes the optional QTDGroupKey header field that
 // armed networks anchor on an epoch's first block. It is the observer (e.g.
 // verify-only validator) learning channel for the epoch's group key.
