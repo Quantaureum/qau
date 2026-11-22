@@ -4202,6 +4202,9 @@ func (n *Node) initSyncer() error {
 	})
 	// M4-F6: apply the operator-configured retry budget (0 keeps the default).
 	n.syncer.SetStateRootRetryLimit(n.config.StateRootMismatchRetryLimit)
+	// M4 hardening: above this height a block whose header stateRoot disagrees
+	// with the node's own re-execution is rejected (0 = disabled).
+	n.syncer.SetStateRootEnforcementHeight(n.config.StateRootEnforcementActivationHeight)
 	n.syncer.SetOnForkRollback(func(forkHeight uint64) {
 		n.syncBufMu.Lock()
 		// During cascade: only evict blocks at or above forkHeight.

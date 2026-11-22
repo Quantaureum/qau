@@ -409,6 +409,11 @@ type Syncer struct {
 	// blocks. A mismatch now causes applyBlock to reject the block.
 	strictStateRoot     bool
 	stateRootMismatches uint64 // atomic-incremented counter; observable via metrics
+	// stateRootEnforcementHeight is the activation height above which a block
+	// whose header stateRoot disagrees with the locally derived root is
+	// REJECTED (0 = disabled, the historical lenient behavior). See
+	// enforceStateRoot.
+	stateRootEnforcementHeight uint64
 	// r63CanonicalTrustCount counts how many times the R63-STATE-ROOT-TRUST
 	// fail-safe accepted a canonical header root the local derivation could
 	// not reproduce. With the M4 derivation fix active (canonical epoch-reward
@@ -1902,6 +1907,41 @@ func (s *Syncer) StateRootMismatches() uint64 {
 	return atomic.LoadUint64(&s.stateRootMismatches)
 }
 
+// SetStateRootEnforcementHeight wires the activation height above which a
+// block whose header stateRoot disagrees with the locally derived root is
+// rejected. 0 (the default) keeps the historical lenient behavior. It must be
+// set identically on every node and activated at a future height, so the
+// network switches to enforced stateRoot validation in a coordinated way.
+func (s *Syncer) SetStateRootEnforcementHeight(height uint64) {
+	atomic.StoreUint64(&s.stateRootEnforcementHeight, height)
+}
+
+// stateRootEnforcementActive reports whether header-stateRoot enforcement is
+// active for the given block height.
+func (s *Syncer) stateRootEnforcementActive(height uint64) bool {
+	h := atomic.LoadUint64(&s.stateRootEnforcementHeight)
+	return h != 0 && height >= h
+}
+
+// enforceStateRoot rejects the block when stateRoot enforcement is active and
+// the locally derived root does not match the header.
+//
+// This runs REGARDLESS of skipStateRootValidation: once the network activates
+// enforcement, a block whose stateRoot disagrees with the deterministic
+// re-execution of its contents is invalid and must never enter the chain. The
+// M4 fleet incident was caused by exactly such blocks (producers with a
+// divergent local state stamping their own root) being accepted.
+func (s *Syncer) enforceStateRoot(blk *encoding.Block, stateRoot types.Hash) error {
+	if !s.stateRootEnforcementActive(blk.Header.Height) {
+		return nil
+	}
+	if stateRoot == blk.Header.StateRoot {
+		return nil
+	}
+	return fmt.Errorf("block %d stateRoot enforcement: header=%x computed=%x — rejecting (stateRoot enforcement active)",
+		blk.Header.Height, blk.Header.StateRoot[:8], stateRoot[:8])
+}
+
 // R63CanonicalTrustCount returns how many times the R63-STATE-ROOT-TRUST
 // fail-safe had to accept a canonical header root that the local derivation
 // could not reproduce. It is a recurrence alarm for the M4 state-derivation
@@ -2182,6 +2222,13 @@ func (s *Syncer) applyBlockInternal(blk *encoding.Block, skipStateRootValidation
 			if !skipStateRootValidation {
 				return fmt.Errorf("block %d %w: %v", blk.Header.Height, ErrStateRootMismatch, err)
 			}
+			// M4 hardening: once stateRoot enforcement is activated, a block
+			// whose header stateRoot disagrees with the deterministic
+			// re-execution of its contents is INVALID and must never enter the
+			// chain — the rebuild/skip bypass does not apply.
+			if err := s.enforceStateRoot(blk, stateRoot); err != nil {
+				return err
+			}
 			syncLog.Error("State root validation SKIPPED for empty block %d: %s",
 				blk.Header.Height, skippedStateRootReason(s.isRebuilding()))
 		} else {
@@ -2327,6 +2374,13 @@ func (s *Syncer) applyBlockInternal(blk *encoding.Block, skipStateRootValidation
 		syncLog.Warn("Block %d state root mismatch: computed=%x header=%x", blk.Header.Height, stateRoot[:8], blk.Header.StateRoot[:8])
 		if !skipStateRootValidation {
 			return fmt.Errorf("block %d %w: %v", blk.Header.Height, ErrStateRootMismatch, err)
+		}
+		// M4 hardening: once stateRoot enforcement is activated, a block whose
+		// header stateRoot disagrees with the deterministic re-execution of its
+		// contents is INVALID and must never enter the chain — the
+		// rebuild/skip bypass does not apply.
+		if err := s.enforceStateRoot(blk, stateRoot); err != nil {
+			return err
 		}
 		// R12-NODE-005 FIX: Log at Error level when strictStateRoot is disabled
 		// so operators are alerted to the M4 root-derivation discrepancy.
