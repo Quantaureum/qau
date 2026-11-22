@@ -5597,7 +5597,23 @@ func (n *Node) initSharding() error {
 // its state to disk (see replayBlocksToRestoreState). Checkpointing bounds the
 // replay's in-memory dirty state so a full-chain restoration completes on
 // production-sized chains instead of stalling under GC pressure.
-const replayCommitInterval = 10_000
+const replayCommitInterval = 1_000
+
+// m4ReplayCheckpoint commits the boot replay's state at height (a checkpoint)
+// and logs the committed root against the canonical header so a bisecting
+// operator can bound the first divergent block.
+func (n *Node) m4ReplayCheckpoint(height uint64, blk *encoding.Block) error {
+	if height%replayCommitInterval != 0 {
+		return nil
+	}
+	if _, err := n.stateDB.CommitWithBlock(height); err != nil {
+		return fmt.Errorf("failed to commit replayed state at checkpoint height %d: %w", height, err)
+	}
+	ckptRoot := n.stateDB.Root()
+	nodeLog.Info("Replay checkpoint: state committed at height %d computed=%x header=%x match=%v",
+		height, ckptRoot[:8], blk.Header.StateRoot[:8], ckptRoot == blk.Header.StateRoot)
+	return nil
+}
 
 func (n *Node) replayBlocksToRestoreState() error {
 	if n.blockStore == nil || n.stateDB == nil {
@@ -5720,7 +5736,14 @@ func (n *Node) replayBlocksToRestoreState() error {
 			ApplyEpochRewards(replayQPOS, n.stateDB, blk)
 		}
 
+		// M4 follow-up: empty blocks must reach the checkpoint too — they are
+		// the overwhelming majority on this chain, and skipping them here is
+		// exactly why the checkpoint (and its bounded-memory commit) almost
+		// never fired.
 		if len(blk.Transactions) == 0 {
+			if err := n.m4ReplayCheckpoint(height, blk); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -5808,11 +5831,8 @@ func (n *Node) replayBlocksToRestoreState() error {
 		// that height; a crash mid-replay simply resumes from the last
 		// checkpoint on the next boot, and R10-01 still verifies the final
 		// root against the tip header, so a partial replay is never trusted.
-		if height%replayCommitInterval == 0 {
-			if _, err := n.stateDB.CommitWithBlock(height); err != nil {
-				return fmt.Errorf("failed to commit replayed state at checkpoint height %d: %w", height, err)
-			}
-			nodeLog.Info("Replay checkpoint: state committed at height %d", height)
+		if err := n.m4ReplayCheckpoint(height, blk); err != nil {
+			return err
 		}
 
 		// Log progress every 1000 blocks
