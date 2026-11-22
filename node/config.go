@@ -221,6 +221,15 @@ type Config struct {
 	// address receives rewards[idx], so a divergent value forks the chain at
 	// the activation epoch. See node/epoch_reward_order.go.
 	EpochRewardsCanonicalOrderActivationEpoch uint64 `json:"epochRewardsCanonicalOrderActivationEpoch,omitempty"`
+	// StateRootEnforcementActivationHeight is the first block height at which
+	// a block whose header stateRoot does not match the node's own
+	// deterministic re-execution of its contents is REJECTED instead of
+	// accepted with a warning (M4 hardening). 0 / unset = disabled: the
+	// historical lenient behavior runs byte-for-byte as before. Set it to a
+	// FUTURE height (above the current tip) and use the SAME value on every
+	// node — a divergent value changes which blocks are accepted and forks the
+	// chain at the activation height. See Syncer.enforceStateRoot.
+	StateRootEnforcementActivationHeight uint64 `json:"stateRootEnforcementActivationHeight,omitempty"`
 	// StateRootMismatchRetryLimit bounds how many consecutive state-root
 	// mismatches a single block height may accumulate before the syncer stops
 	// retrying that height (M4-F6). 0 / unset = the built-in default of 8.

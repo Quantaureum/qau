@@ -4202,6 +4202,9 @@ func (n *Node) initSyncer() error {
 	})
 	// M4-F6: apply the operator-configured retry budget (0 keeps the default).
 	n.syncer.SetStateRootRetryLimit(n.config.StateRootMismatchRetryLimit)
+	// M4 hardening: above this height a block whose header stateRoot disagrees
+	// with the node's own re-execution is rejected (0 = disabled).
+	n.syncer.SetStateRootEnforcementHeight(n.config.StateRootEnforcementActivationHeight)
 	n.syncer.SetOnForkRollback(func(forkHeight uint64) {
 		n.syncBufMu.Lock()
 		// During cascade: only evict blocks at or above forkHeight.
@@ -5593,6 +5596,28 @@ func (n *Node) initSharding() error {
 
 // replayBlocksToRestoreState replays all historical blocks to restore state
 // This is called on node startup to rebuild the state from genesis
+// replayCommitInterval is how often the boot-time state replay checkpoints
+// its state to disk (see replayBlocksToRestoreState). Checkpointing bounds the
+// replay's in-memory dirty state so a full-chain restoration completes on
+// production-sized chains instead of stalling under GC pressure.
+const replayCommitInterval = 1
+
+// m4ReplayCheckpoint commits the boot replay's state at height (a checkpoint)
+// and logs the committed root against the canonical header so a bisecting
+// operator can bound the first divergent block.
+func (n *Node) m4ReplayCheckpoint(height uint64, blk *encoding.Block) error {
+	if height%replayCommitInterval != 0 {
+		return nil
+	}
+	if _, err := n.stateDB.CommitWithBlock(height); err != nil {
+		return fmt.Errorf("failed to commit replayed state at checkpoint height %d: %w", height, err)
+	}
+	ckptRoot := n.stateDB.Root()
+	nodeLog.Info("Replay checkpoint: state committed at height %d computed=%x header=%x match=%v",
+		height, ckptRoot[:8], blk.Header.StateRoot[:8], ckptRoot == blk.Header.StateRoot)
+	return nil
+}
+
 func (n *Node) replayBlocksToRestoreState() error {
 	if n.blockStore == nil || n.stateDB == nil {
 		nodeLog.Info("Skipping state replay: blockStore=%v, stateDB=%v", n.blockStore != nil, n.stateDB != nil)
@@ -5714,7 +5739,14 @@ func (n *Node) replayBlocksToRestoreState() error {
 			ApplyEpochRewards(replayQPOS, n.stateDB, blk)
 		}
 
+		// M4 follow-up: empty blocks must reach the checkpoint too — they are
+		// the overwhelming majority on this chain, and skipping them here is
+		// exactly why the checkpoint (and its bounded-memory commit) almost
+		// never fired.
 		if len(blk.Transactions) == 0 {
+			if err := n.m4ReplayCheckpoint(height, blk); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -5733,6 +5765,17 @@ func (n *Node) replayBlocksToRestoreState() error {
 			Timestamp:   blk.Header.Timestamp,
 			Coinbase:    blk.Header.ProposerAddr,
 			GasLimit:    n.config.MaxGasLimit,
+			// M4 follow-up (R4-ECON-01 parity): the boot-time state replay must
+			// price transactions EXACTLY like the producer and the sync
+			// validator path (syncer.applyBlockInternal). Without the header's
+			// base fee the executor falls back to effectiveGasPrice =
+			// tx.GasPrice — no EIP-1559 burn and the full amount to the
+			// coinbase — so every tx-carrying block restores sender/coinbase
+			// balances that differ from the canonical chain. That is a
+			// deterministic state-root divergence on the replay path: the
+			// restored state can never match the canonical header root, which
+			// is precisely the M4 "rebuild keeps mismatching" shape.
+			BaseFee:     blk.Header.BaseFee,
 			BlockHashes: blockHashes,
 		}
 
@@ -5781,14 +5824,30 @@ func (n *Node) replayBlocksToRestoreState() error {
 			}
 		}
 
+		// M4 follow-up: commit periodically so the replay's in-memory dirty
+		// state (accounts, Verkle tree, caches) stays bounded on long chains.
+		// The replay used to hold EVERY block's mutations in memory with a
+		// single end-of-replay commit, which does not scale: on a 400k+-block
+		// chain the replay crawls to a halt well before the tip (GC pressure
+		// over an ever-growing uncommitted heap), leaving the node wedged
+		// mid-restoration. A checkpoint commit persists a consistent state at
+		// that height; a crash mid-replay simply resumes from the last
+		// checkpoint on the next boot, and R10-01 still verifies the final
+		// root against the tip header, so a partial replay is never trusted.
+		if err := n.m4ReplayCheckpoint(height, blk); err != nil {
+			return err
+		}
+
 		// Log progress every 1000 blocks
 		if height%1000 == 0 {
 			nodeLog.Info("Replayed %d/%d blocks...", height, latestHeight)
 		}
 	}
 
-	// Commit final state
-	if _, err := n.stateDB.Commit(); err != nil {
+	// Commit final state. CommitWithBlock (not the heightless Commit) records
+	// the restored height as the state's committed height, so the restart
+	// baseline logic sees the replay actually reached the tip.
+	if _, err := n.stateDB.CommitWithBlock(latestHeight); err != nil {
 		return fmt.Errorf("failed to commit replayed state: %w", err)
 	}
 
