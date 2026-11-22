@@ -1148,6 +1148,11 @@ func (a *chainInfoAdapter) GetQPOSStatus() map[string]any {
 	}
 	if a.node.syncer != nil {
 		result["stateRootMismatchTotal"] = a.node.syncer.StateRootMismatches()
+		// M4 recurrence alarm: nonzero means the R63-STATE-ROOT-TRUST fail-safe
+		// accepted a canonical header root the local derivation could not
+		// reproduce (legacy-order range, misconfigured activation epoch, or a
+		// new derivation bug). Healthy canonical-order nodes stay at 0.
+		result["r63CanonicalTrustTotal"] = a.node.syncer.R63CanonicalTrustCount()
 	}
 
 	if a.node.blockProducer == nil || a.node.blockProducer.QPOS() == nil {
