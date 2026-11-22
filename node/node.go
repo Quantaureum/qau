@@ -5593,6 +5593,12 @@ func (n *Node) initSharding() error {
 
 // replayBlocksToRestoreState replays all historical blocks to restore state
 // This is called on node startup to rebuild the state from genesis
+// replayCommitInterval is how often the boot-time state replay checkpoints
+// its state to disk (see replayBlocksToRestoreState). Checkpointing bounds the
+// replay's in-memory dirty state so a full-chain restoration completes on
+// production-sized chains instead of stalling under GC pressure.
+const replayCommitInterval = 10_000
+
 func (n *Node) replayBlocksToRestoreState() error {
 	if n.blockStore == nil || n.stateDB == nil {
 		nodeLog.Info("Skipping state replay: blockStore=%v, stateDB=%v", n.blockStore != nil, n.stateDB != nil)
@@ -5792,14 +5798,33 @@ func (n *Node) replayBlocksToRestoreState() error {
 			}
 		}
 
+		// M4 follow-up: commit periodically so the replay's in-memory dirty
+		// state (accounts, Verkle tree, caches) stays bounded on long chains.
+		// The replay used to hold EVERY block's mutations in memory with a
+		// single end-of-replay commit, which does not scale: on a 400k+-block
+		// chain the replay crawls to a halt well before the tip (GC pressure
+		// over an ever-growing uncommitted heap), leaving the node wedged
+		// mid-restoration. A checkpoint commit persists a consistent state at
+		// that height; a crash mid-replay simply resumes from the last
+		// checkpoint on the next boot, and R10-01 still verifies the final
+		// root against the tip header, so a partial replay is never trusted.
+		if height%replayCommitInterval == 0 {
+			if _, err := n.stateDB.CommitWithBlock(height); err != nil {
+				return fmt.Errorf("failed to commit replayed state at checkpoint height %d: %w", height, err)
+			}
+			nodeLog.Info("Replay checkpoint: state committed at height %d", height)
+		}
+
 		// Log progress every 1000 blocks
 		if height%1000 == 0 {
 			nodeLog.Info("Replayed %d/%d blocks...", height, latestHeight)
 		}
 	}
 
-	// Commit final state
-	if _, err := n.stateDB.Commit(); err != nil {
+	// Commit final state. CommitWithBlock (not the heightless Commit) records
+	// the restored height as the state's committed height, so the restart
+	// baseline logic sees the replay actually reached the tip.
+	if _, err := n.stateDB.CommitWithBlock(latestHeight); err != nil {
 		return fmt.Errorf("failed to commit replayed state: %w", err)
 	}
 
