@@ -5733,6 +5733,17 @@ func (n *Node) replayBlocksToRestoreState() error {
 			Timestamp:   blk.Header.Timestamp,
 			Coinbase:    blk.Header.ProposerAddr,
 			GasLimit:    n.config.MaxGasLimit,
+			// M4 follow-up (R4-ECON-01 parity): the boot-time state replay must
+			// price transactions EXACTLY like the producer and the sync
+			// validator path (syncer.applyBlockInternal). Without the header's
+			// base fee the executor falls back to effectiveGasPrice =
+			// tx.GasPrice — no EIP-1559 burn and the full amount to the
+			// coinbase — so every tx-carrying block restores sender/coinbase
+			// balances that differ from the canonical chain. That is a
+			// deterministic state-root divergence on the replay path: the
+			// restored state can never match the canonical header root, which
+			// is precisely the M4 "rebuild keeps mismatching" shape.
+			BaseFee:     blk.Header.BaseFee,
 			BlockHashes: blockHashes,
 		}
 
