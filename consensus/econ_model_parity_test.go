@@ -134,7 +134,9 @@ func TestEconModelParityWithConsensus(t *testing.T) {
 
 			for i, v := range validators {
 				wantPublic := qpos.CalculateBaseReward(i)
-				wantInternal := qpos.calculateBaseRewardUnlocked(i)
+				// nil slice = read the QPOS's own validator slice, exactly like
+				// the pre-M4-F4 internal path (legacy order, no canonical copy).
+				wantInternal := qpos.calculateBaseRewardUnlocked(i, nil)
 				got := model.BaseRewardWei(v.Stake, total, p)
 
 				if wantPublic.Cmp(wantInternal) != 0 {
@@ -166,7 +168,7 @@ func TestEconModelParityEpochIssuance(t *testing.T) {
 	// EM-2 total issuance == sum of base rewards. No per-slot term.
 	expected := big.NewInt(0)
 	for i := range validators {
-		expected.Add(expected, qpos.calculateBaseRewardUnlocked(i))
+		expected.Add(expected, qpos.calculateBaseRewardUnlocked(i, nil))
 	}
 
 	iss, err := model.EpochIssuance(model.UniformStakes(n, stakeEach), model.MainnetParams())
@@ -217,7 +219,7 @@ func TestEconModelParityAttribution(t *testing.T) {
 		pool := big.NewInt(0)
 
 		for i := range validators {
-			base := qpos.calculateBaseRewardUnlocked(i)
+			base := qpos.calculateBaseRewardUnlocked(i, nil)
 			share := new(big.Int).Mul(base, big.NewInt(WeightDenominator-ProposerWeight))
 			share.Div(share, big.NewInt(WeightDenominator))
 			contrib := new(big.Int).Mul(base, big.NewInt(ProposerWeight))

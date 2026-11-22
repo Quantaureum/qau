@@ -61,6 +61,15 @@ func (q *QPOS) computeEpochRewardsUnlocked(epoch uint64, attSource func(slot uin
 	}
 
 	validators := q.validators.Validators()
+	// M4-F4: resolve every census index against the canonical (address-sorted)
+	// validator order for this epoch. The census indices are positions in a
+	// validator slice; resolving them through the live insertion order makes
+	// both the reward AMOUNT (stake at that position) and the RECIPIENT depend
+	// on the node's insertion history — the M4 state-root divergence. The
+	// canonical order is a pure function of the membership, so every node
+	// derives identical rewards from the same census. Legacy epochs (before
+	// the activation) keep the live slice unchanged.
+	validators = CanonicalRewardValidators(epoch, validators)
 	startSlot := EpochStartSlot(epoch)
 	endSlot := startSlot + SlotsPerEpoch - 1
 
@@ -146,7 +155,7 @@ func (q *QPOS) computeEpochRewardsUnlocked(epoch uint64, attSource func(slot uin
 			// proposer separately received one full base reward per proposed slot,
 			// which coupled total issuance to the validator count and handed
 			// proposers 32/(N+32) of everything (84.2% at N=6).
-			baseReward := q.calculateBaseRewardUnlocked(att.ValidatorIndex)
+			baseReward := q.calculateBaseRewardUnlocked(att.ValidatorIndex, validators)
 			attesterShare := new(big.Int).Mul(baseReward, big.NewInt(WeightDenominator-ProposerWeight))
 			attesterShare.Div(attesterShare, big.NewInt(WeightDenominator))
 			proposerContribution := new(big.Int).Mul(baseReward, big.NewInt(ProposerWeight))
@@ -193,7 +202,7 @@ func (q *QPOS) computeEpochRewardsUnlocked(epoch uint64, attSource func(slot uin
 			// gently; only sustained downtime (≥ threshold blocks) escalates
 			// to a consensus slash. See SLASH-H2 test for the penalty-tier
 			// invariant (DowntimePenalty=10x InactivityPenalty).
-			baseReward := q.calculateBaseRewardUnlocked(i)
+			baseReward := q.calculateBaseRewardUnlocked(i, validators)
 			penalty := new(big.Int).Mul(baseReward, big.NewInt(2)) // 2x base reward as penalty
 
 			rewards.Penalties[i] = penalty

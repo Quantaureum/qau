@@ -409,6 +409,12 @@ type Syncer struct {
 	// blocks. A mismatch now causes applyBlock to reject the block.
 	strictStateRoot     bool
 	stateRootMismatches uint64 // atomic-incremented counter; observable via metrics
+	// r63CanonicalTrustCount counts how many times the R63-STATE-ROOT-TRUST
+	// fail-safe accepted a canonical header root the local derivation could
+	// not reproduce. With the M4 derivation fix active (canonical epoch-reward
+	// order) this must stay 0 on a healthy node; any increment is a visible
+	// recurrence signal (log + RPC/metrics reader).
+	r63CanonicalTrustCount uint64
 
 	// highestKnownDecay: anti-deadlock mechanism for ghost heights.
 	// When a peer advertises a height but never delivers the blocks, other
@@ -1894,6 +1900,17 @@ func (s *Syncer) reportStateRoot(height uint64, matched bool) {
 // whose state root derivation is diverging from the network.
 func (s *Syncer) StateRootMismatches() uint64 {
 	return atomic.LoadUint64(&s.stateRootMismatches)
+}
+
+// R63CanonicalTrustCount returns how many times the R63-STATE-ROOT-TRUST
+// fail-safe had to accept a canonical header root that the local derivation
+// could not reproduce. It is a recurrence alarm for the M4 state-derivation
+// discrepancy: after the canonical epoch-reward order fix, a healthy node on
+// a canonical-order network never increments this. Any nonzero value means
+// the local derivation diverged again (legacy-order range, misconfigured
+// activation epoch, or a new derivation bug) and must be investigated.
+func (s *Syncer) R63CanonicalTrustCount() uint64 {
+	return atomic.LoadUint64(&s.r63CanonicalTrustCount)
 }
 
 // SetQPOS links the QPOS consensus engine so applyBlockInternal can replicate
@@ -5578,10 +5595,15 @@ func (s *Syncer) rebuildRange(fromHeight, toHeight uint64) bool {
 		// blockStore (not stateDB.Root()). This is the same posture
 		// geth's EL takes with CL-asserted payloads: sanity check/log, do
 		// not block consensus.
+		// M4 recurrence alarm: count every canonical-trust acceptance so a
+		// re-appearing derivation divergence is visible without grepping logs.
+		// On a healthy node with the canonical epoch-reward order active this
+		// counter never moves (see R63CanonicalTrustCount).
+		r63Count := atomic.AddUint64(&s.r63CanonicalTrustCount, 1)
 		syncLog.Warn("R63-STATE-ROOT-TRUST: post-rebuild state root mismatch continued (M4 discrepancy) — "+
-			"trusting canonical header root to keep sync advancing (computed=%x header=%x block=%d). "+
+			"trusting canonical header root to keep sync advancing (computed=%x header=%x block=%d trustCount=%d). "+
 			"Local state derivation bug still tracked under M4; sealer will NOT block sync on this.",
-			computedRoot[:8], finalBlk.Header.StateRoot[:8], toHeight)
+			computedRoot[:8], finalBlk.Header.StateRoot[:8], toHeight, r63Count)
 		// R63-STATE-TRUST (2026-11-13): trusting the canonical root keeps SYNC
 		// alive, but this node's derivation is now KNOWN to disagree with the
 		// chain it follows. Letting it propose would stamp the divergent local

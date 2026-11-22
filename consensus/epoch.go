@@ -504,13 +504,22 @@ func (q *QPOS) ProcessEpochRewards(epoch uint64) *EpochRewards {
 	return rewards
 }
 
-// calculateBaseRewardUnlocked calculates base reward without locking (internal use)
-func (q *QPOS) calculateBaseRewardUnlocked(validatorIndex int) *big.Int {
-	if q.validators == nil || validatorIndex < 0 || validatorIndex >= q.validators.Size() {
+// calculateBaseRewardUnlocked calculates base reward without locking (internal use).
+// validators is the slice the caller is iterating — the canonical
+// (address-sorted) slice on the M4-F4 reward path, so that the stake looked
+// up at validatorIndex is the stake of the validator the census index actually
+// refers to, independent of the node's insertion order.
+func (q *QPOS) calculateBaseRewardUnlocked(validatorIndex int, validators []*Validator) *big.Int {
+	if q.validators == nil || validatorIndex < 0 {
+		return big.NewInt(0)
+	}
+	if validators == nil {
+		validators = q.validators.Validators()
+	}
+	if validatorIndex >= len(validators) {
 		return big.NewInt(0)
 	}
 
-	validators := q.validators.Validators()
 	validator := validators[validatorIndex]
 
 	// FIX: exclude slashed validators from the total balance used to
