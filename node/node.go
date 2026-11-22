@@ -683,6 +683,16 @@ type Node struct {
 	appliedStakingOrder    []types.Hash
 	appliedStakingBlocksMu sync.Mutex
 
+	// R86-STAKING-SCAN-CHECKPOINT: serializes the cold-start staking scan and
+	// the periodic checkpoint advance, both of which read the block store and
+	// rewrite the scan checkpoint file. Held across the whole scan so the
+	// periodic advancer (TryLock) skips ticks while a full scan is running.
+	stakingScanMu sync.Mutex
+	// stakingScanBlocksRead counts every block body the staking scan has read
+	// since the Node was created; restarts diff it to prove the incremental
+	// resume only touched the blocks above the checkpoint.
+	stakingScanBlocksRead atomic.Uint64
+
 	// R80-COLDSTART-DEADLOCK (2026-08-28): epoch of block 1, cached. Used to
 	// decide whether the epoch-2 VRF accumulator the QPOS proposer schedule
 	// needs could possibly exist on this chain yet. A chain whose genesis
@@ -1023,6 +1033,10 @@ func (n *Node) Start() error {
 
 	// Start periodic staking data persistence (every 30s)
 	n.startStakingPersistence(stakingFile)
+
+	// R86: keep the staking scan checkpoint near the chain tip so later
+	// restarts resume incrementally instead of rescanning from genesis.
+	n.startStakingScanCheckpointing()
 
 	// R4-RES: push the node height to the governance manager so that the
 	// cleanupLoop's auto-expire branch (R14-LOW) actually runs. Without
@@ -5812,7 +5826,15 @@ func (n *Node) replayBlocksToRestoreState() error {
 	return nil
 }
 
-// syncStakingFromChain syncs staking data from on-chain transactions
+// syncStakingFromChain syncs staking data from on-chain transactions.
+//
+// R86-STAKING-SCAN-CHECKPOINT: when a trustworthy scan checkpoint exists (the
+// chain still hashes to its anchor), only the blocks above it are read and its
+// transactions are replayed together with the freshly collected ones through
+// the same phased pipeline a full scan uses — so the rebuilt staking state is
+// identical to a full scan of the same tip while touching a fraction of the
+// blocks. A missing, corrupt, or non-matching checkpoint falls back to the
+// full genesis scan.
 func (n *Node) syncStakingFromChain() error {
 	if n.blockStore == nil || n.stakingManager == nil {
 		nodeLog.Info("Skipping staking sync: blockStore=%v, stakingManager=%v", n.blockStore != nil, n.stakingManager != nil)
@@ -5827,7 +5849,6 @@ func (n *Node) syncStakingFromChain() error {
 		nodeLog.Info("No blocks to sync staking from")
 		return nil
 	}
-	nodeLog.Info("Scanning %d blocks for staking transactions...", latestHeight)
 
 	// Contract addresses
 	stakingContract := economics.StakingContractAddress
@@ -5838,99 +5859,80 @@ func (n *Node) syncStakingFromChain() error {
 	nodeLog.Info("Unstake contract: %x", unstakeContract[:])
 	nodeLog.Info("Rewards contract: %x", rewardsContract[:])
 
-	// Collect all transactions to staking contracts
-	var stakingTxs []economics.ChainTransaction
-	var unstakeTxs []economics.ChainTransaction
-	var rewardTxs []economics.ChainTransaction
+	// R86: one scan at a time — the periodic checkpoint advancer skips while
+	// this scan runs, and a concurrent resync cannot interleave with it.
+	n.stakingScanMu.Lock()
+	defer n.stakingScanMu.Unlock()
 
-	// Scan blocks for staking transactions
-	for height := uint64(1); height <= latestHeight; height++ {
-		block, err := n.blockStore.GetBlockByHeight(height)
-		if err != nil {
-			continue
+	// Resume from the checkpoint when the chain still confirms it; otherwise
+	// scan the whole chain (fresh node, corrupt/stale checkpoint, rewound or
+	// reorged chain).
+	var base *stakingScanCheckpoint
+	var stakes, unstakes, rewards []stakingScanRecord
+	scanFrom := uint64(1)
+	if cp := n.loadValidatedStakingScanCheckpoint(latestHeight); cp != nil {
+		base = cp
+		stakes = append(stakes, cp.Stakes...)
+		unstakes = append(unstakes, cp.Unstakes...)
+		rewards = append(rewards, cp.Rewards...)
+		scanFrom = cp.LastHeight + 1
+		if scanFrom > latestHeight {
+			nodeLog.Info("Staking scan checkpoint covers the chain tip at height %d (%d stake, %d unstake, %d reward txs); no blocks to rescan",
+				cp.LastHeight, len(stakes), len(unstakes), len(rewards))
+		} else {
+			nodeLog.Info("Staking scan checkpoint trusted at height %d (%d stake, %d unstake, %d reward txs); scanning %d blocks [%d..%d]",
+				cp.LastHeight, len(stakes), len(unstakes), len(rewards), latestHeight-scanFrom+1, scanFrom, latestHeight)
 		}
-
-		for _, tx := range block.Transactions {
-			// Determine if this is a staking/unstaking/reward transaction.
-			// Two detection methods:
-			//   1. tx.To matches the system contract address (preferred)
-			//   2. tx.Type indicates the operation (fallback for legacy txs
-			//      where To was not set to the system contract address)
-			isStake := (tx.To != nil && *tx.To == stakingContract) ||
-				(tx.Type == encoding.TxTypeStake)
-			isUnstake := (tx.To != nil && *tx.To == unstakeContract) ||
-				(tx.Type == encoding.TxTypeUnstake)
-			isReward := tx.To != nil && *tx.To == rewardsContract
-
-			if !isStake && !isUnstake && !isReward {
-				continue
-			}
-
-			// Fix up To address for legacy staking transactions where To was nil.
-			// SyncFromChain requires To == StakingContractAddress, so we set it here.
-			txTo := tx.To
-			if txTo == nil && isStake {
-				stakingAddr := stakingContract
-				txTo = &stakingAddr
-			} else if txTo == nil && isUnstake {
-				unstakeAddr := unstakeContract
-				txTo = &unstakeAddr
-			}
-
-			chainTx := economics.ChainTransaction{
-				From:        tx.From,
-				To:          txTo,
-				Value:       tx.Value,
-				BlockHeight: height,
-			}
-
-			// Categorize by operation type
-			if isStake && tx.Value != nil && tx.Value.Sign() > 0 {
-				nodeLog.Info("Found stake tx at block %d: from=%x, value=%s",
-					height, tx.From[:8], tx.Value.String())
-				stakingTxs = append(stakingTxs, chainTx)
-
-				// Also register validator in ValidatorManager if not already registered
-				// This ensures BlockValidator can verify blocks produced by this validator
-				if n.validatorManager != nil && !n.validatorManager.IsValidator(tx.From) && len(tx.PublicKey) > 0 {
-					pubKey, pkErr := crypto.PublicKeyFromBytes(tx.PublicKey)
-					if pkErr != nil {
-						nodeLog.Warn("Failed to parse validator public key from stake tx at block %d: addr=%x, err=%v",
-							height, tx.From[:8], pkErr)
-					} else {
-						commission := uint32(100) // 1% default
-						if vmErr := n.validatorManager.AddValidator(tx.From, tx.From, pubKey, tx.Value, commission, height); vmErr != nil {
-							nodeLog.Warn("Failed to add validator to ValidatorManager at block %d: addr=%x, err=%v",
-								height, tx.From[:8], vmErr)
-						} else {
-							nodeLog.Info("🔐 Validator registered in ValidatorManager from chain sync: addr=%x, stake=%s, height=%d",
-								tx.From[:8], tx.Value.String(), height)
-							if saErr := n.validatorManager.SetActive(tx.From, tx.From, true); saErr != nil {
-								nodeLog.Warn("Failed to activate validator from chain sync: addr=%x, err=%v",
-									tx.From[:8], saErr)
-							}
-						}
-					}
-				}
-			} else if isUnstake {
-				nodeLog.Info("Found unstake tx at block %d: from=%x",
-					height, tx.From[:8])
-				unstakeTxs = append(unstakeTxs, chainTx)
-			} else if isReward {
-				nodeLog.Info("Found reward claim tx at block %d: from=%x",
-					height, tx.From[:8])
-				rewardTxs = append(rewardTxs, chainTx)
-			}
-		}
+	} else {
+		nodeLog.Info("No usable staking scan checkpoint; scanning %d blocks for staking transactions...", latestHeight)
 	}
 
-	nodeLog.Info("Found %d stake, %d unstake, %d reward transactions",
-		len(stakingTxs), len(unstakeTxs), len(rewardTxs))
+	scan := n.scanStakingTransactions(scanFrom, latestHeight)
+	stakes = append(stakes, scan.stakes...)
+	unstakes = append(unstakes, scan.unstakes...)
+	rewards = append(rewards, scan.rewards...)
+
+	nodeLog.Info("Found %d stake, %d unstake, %d reward transactions (read %d blocks in [%d..%d])",
+		len(stakes), len(unstakes), len(rewards), scan.blocksRead, scanFrom, latestHeight)
 
 	// Process in order: stakes first, then unstakes, then rewards
 	// This ensures correct state calculation
+	if err := n.applyStakingScanResults(stakes, unstakes, rewards); err != nil {
+		return err
+	}
+
+	// R86: persist the checkpoint only after the pipeline succeeded, so a
+	// checkpoint never advertises a range the node has not fully applied.
+	n.maybeSaveStakingScanCheckpoint(base, scan)
+
+	nodeLog.Info("Synced staking data, total staked: %s, contract balance: %s",
+		n.stakingManager.GetTotalStaked().String(),
+		n.stakingManager.GetContractBalance().String())
+
+	return nil
+}
+
+// applyStakingScanResults replays the collected staking transactions through
+// the staking manager: validator registration, the stake sync (which resets
+// and rebuilds the manager's stake state), the genesis re-add, unstakes, and
+// reward claims — in that order, exactly as the original single-pass full scan
+// did. Both the full scan and the checkpoint resume path go through here, so
+// their results are identical for the same transaction set.
+func (n *Node) applyStakingScanResults(stakes, unstakes, rewards []stakingScanRecord) error {
+	// Register validators from stake transactions (in block order) so
+	// BlockValidator can verify blocks produced by them. This mirrors the
+	// inline registration the original scan performed while collecting.
+	if n.validatorManager != nil {
+		for _, rec := range stakes {
+			n.registerStakingValidatorFromRecord(rec)
+		}
+	}
 
 	// 1. Sync stakes
+	stakingTxs := make([]economics.ChainTransaction, 0, len(stakes))
+	for _, rec := range stakes {
+		stakingTxs = append(stakingTxs, rec.chainTransaction())
+	}
 	if err := n.stakingManager.SyncFromChain(stakingTxs); err != nil {
 		return err
 	}
@@ -5960,7 +5962,8 @@ func (n *Node) syncStakingFromChain() error {
 	}
 
 	// 2. Process unstakes
-	for _, tx := range unstakeTxs {
+	for _, rec := range unstakes {
+		tx := rec.chainTransaction()
 		unstakeAmount := tx.Value
 		if unstakeAmount == nil {
 			unstakeAmount = big.NewInt(0)
@@ -5971,17 +5974,50 @@ func (n *Node) syncStakingFromChain() error {
 	}
 
 	// 3. Process reward claims (just resets stake height for reward calculation)
-	for _, tx := range rewardTxs {
+	for _, rec := range rewards {
+		tx := rec.chainTransaction()
 		if _, err := n.stakingManager.ProcessRewardClaimFromTx(tx.From, tx.BlockHeight); err != nil {
 			nodeLog.Warn("failed to process reward claim tx: %v", err)
 		}
 	}
 
-	nodeLog.Info("Synced staking data, total staked: %s, contract balance: %s",
-		n.stakingManager.GetTotalStaked().String(),
-		n.stakingManager.GetContractBalance().String())
-
 	return nil
+}
+
+// registerStakingValidatorFromRecord mirrors the original scan's inline
+// ValidatorManager registration for one stake transaction.
+func (n *Node) registerStakingValidatorFromRecord(rec stakingScanRecord) {
+	from, err := types.ParseHexAddress(rec.From)
+	if err != nil {
+		return
+	}
+	// Ensures BlockValidator can verify blocks produced by this validator
+	if n.validatorManager == nil || n.validatorManager.IsValidator(from) || len(rec.PublicKey) == 0 {
+		return
+	}
+	pubKey, pkErr := crypto.PublicKeyFromBytes(rec.PublicKey)
+	if pkErr != nil {
+		nodeLog.Warn("Failed to parse validator public key from stake tx at block %d: addr=%x, err=%v",
+			rec.BlockHeight, from[:8], pkErr)
+		return
+	}
+	value := rec.bigIntValue()
+	commission := uint32(100) // 1% default
+	if vmErr := n.validatorManager.AddValidator(from, from, pubKey, value, commission, rec.BlockHeight); vmErr != nil {
+		nodeLog.Warn("Failed to add validator to ValidatorManager at block %d: addr=%x, err=%v",
+			rec.BlockHeight, from[:8], vmErr)
+		return
+	}
+	stakeStr := "0"
+	if value != nil {
+		stakeStr = value.String()
+	}
+	nodeLog.Info("🔐 Validator registered in ValidatorManager from chain sync: addr=%x, stake=%s, height=%d",
+		from[:8], stakeStr, rec.BlockHeight)
+	if saErr := n.validatorManager.SetActive(from, from, true); saErr != nil {
+		nodeLog.Warn("Failed to activate validator from chain sync: addr=%x, err=%v",
+			from[:8], saErr)
+	}
 }
 
 // startStakingPersistence periodically saves the staking state to a JSON file
