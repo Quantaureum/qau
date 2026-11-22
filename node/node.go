@@ -5597,7 +5597,7 @@ func (n *Node) initSharding() error {
 // its state to disk (see replayBlocksToRestoreState). Checkpointing bounds the
 // replay's in-memory dirty state so a full-chain restoration completes on
 // production-sized chains instead of stalling under GC pressure.
-const replayCommitInterval = 1_000
+const replayCommitInterval = 1
 
 // m4ReplayCheckpoint commits the boot replay's state at height (a checkpoint)
 // and logs the committed root against the canonical header so a bisecting
