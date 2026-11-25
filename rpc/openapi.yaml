@@ -566,7 +566,10 @@ x-methods:
       returns: string
 
     qau_verifyQuantumTransaction:
-      description: Verify post-quantum transaction signature
+      description: |
+        NOT IMPLEMENTED (fail-closed). Registered but refuses with error code
+        -32004: no wallet-synced contract exists for which bytes a submitted
+        transaction signs. Use client-side Dilithium3 verification.
       params:
         - name: signedTx
           type: string
@@ -575,7 +578,10 @@ x-methods:
 
   privacy:
     qau_sendPrivacyTransaction:
-      description: Send privacy transaction (stealth address)
+      description: |
+        NOT IMPLEMENTED (fail-closed). Registered but refuses with error code
+        -32004: privacy transactions are not accepted into the mempool or
+        included in blocks.
       params:
         - name: tx
           type: object
@@ -583,7 +589,9 @@ x-methods:
       returns: string
 
     qau_scanPrivacy:
-      description: Scan for privacy transactions
+      description: |
+        NOT IMPLEMENTED (fail-closed). Registered but refuses with error code
+        -32004: no chain-integrated stealth-announcement index exists.
       params:
         - name: address
           type: string
@@ -591,7 +599,10 @@ x-methods:
       returns: array
 
     qau_getPrivacyBalance:
-      description: Get privacy balance
+      description: |
+        NOT IMPLEMENTED (fail-closed). Registered but refuses with error code
+        -32004: privacy output amounts are receiver-encrypted and cannot be
+        summed server-side.
       params:
         - name: address
           type: string
@@ -599,7 +610,11 @@ x-methods:
       returns: string
 
     qau_generateStealthAddress:
-      description: Generate stealth address (Kyber KEM)
+      description: |
+        NOT IMPLEMENTED (fail-closed). Registered but refuses with error code
+        -32004: valid stealth announcements require the sender's private
+        signing key, which this RPC must not solicit. Generate stealth
+        addresses client-side.
       params: []
       returns: object
 

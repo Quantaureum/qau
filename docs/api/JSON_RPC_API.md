@@ -15,6 +15,23 @@ core and light-client subsets: see [openapi.yaml](./openapi.yaml). Specialized
 namespaces have their own documents: [bridge-rpc-api.md](./bridge-rpc-api.md),
 [shard-rpc-api.md](./shard-rpc-api.md), [rollup-rpc-api.md](./rollup-rpc-api.md).
 
+## Not implemented (fail-closed)
+
+The following methods are registered (so they answer with a precise error
+instead of method-not-found) but their backing capability is intentionally not
+wired on this node. Each call fails closed with error code `-32004`
+(`ErrCodeNotImplemented`) and a reason string; see `rpc/api_stub_methods.go`:
+
+- `qau_verifyQuantumTransaction` — no wallet-synced contract for which bytes a
+  submitted transaction signs; use client-side Dilithium3 verification.
+- `qau_sendPrivacyTransaction` — privacy transactions are not accepted into
+  the mempool or included in blocks.
+- `qau_scanPrivacy` — no chain-integrated stealth-announcement index exists.
+- `qau_getPrivacyBalance` — privacy output amounts are receiver-encrypted and
+  cannot be summed server-side.
+- `qau_generateStealthAddress` — valid stealth announcements require the
+  sender's private signing key, which this RPC must not solicit.
+
 ## Authentication and rate limiting
 
 Public methods need no credentials. The methods marked **Admin** below are on the

@@ -22,8 +22,11 @@ func TestCheckMemoryL1AnchorPolicy(t *testing.T) {
 		{name: "testnet without opt-in", networkID: TestnetNetworkID, allowEnv: "", wantErr: true, errContains: "QAU_ALLOW_MEMORY_L1_ANCHOR=1"},
 		{name: "testnet with zero opt-in", networkID: TestnetNetworkID, allowEnv: "0", wantErr: true, errContains: "memory L1 anchor"},
 		{name: "testnet with opt-in", networkID: TestnetNetworkID, allowEnv: "1"},
-		{name: "mainnet without opt-in", networkID: MainnetNetworkID, allowEnv: "", wantErr: true, errContains: "memory L1 anchor"},
-		{name: "mainnet with opt-in", networkID: MainnetNetworkID, allowEnv: "1"},
+		// Audit H-01: mainnet refuses the in-memory anchor outright — no
+		// operator flag can enable it there.
+		{name: "mainnet without opt-in", networkID: MainnetNetworkID, allowEnv: "", wantErr: true, errContains: "FORBIDDEN on mainnet"},
+		{name: "mainnet with opt-in", networkID: MainnetNetworkID, allowEnv: "1", wantErr: true, errContains: "FORBIDDEN on mainnet"},
+		{name: "mainnet with zero opt-in", networkID: MainnetNetworkID, allowEnv: "0", wantErr: true, errContains: "FORBIDDEN on mainnet"},
 		{name: "unknown network without opt-in", networkID: 424242, allowEnv: "", wantErr: true, errContains: "424242"},
 	}
 

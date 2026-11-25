@@ -88,6 +88,12 @@ const (
 	ErrCodeInsufficientFunds = -32002
 	ErrCodeUnauthorized      = -32003
 
+	// ErrCodeNotImplemented reports a method that is registered (so callers
+	// get a precise refusal instead of method-not-found) but whose backing
+	// capability is intentionally NOT wired on this node. The node fails
+	// closed rather than returning a partial or misleading result. Audit M-07.
+	ErrCodeNotImplemented = -32004
+
 	// ErrCodeExecutionReverted is the JSON-RPC error code for a reverted
 	// execution; the revert payload is carried in Error.Data so callers can
 	// decode the reason (Ethereum semantics, as used by geth).
