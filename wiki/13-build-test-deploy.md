@@ -43,6 +43,31 @@ make rust-pq
 
 > The top-level [Makefile](../Makefile) is authoritative: specific targets are subject to `make help`.
 
+### 13.2.1 Test tiers (audit M-08)
+
+The suite is layered so the default gate stays fast and deterministic:
+
+1. **Default gate** — `make test` = `go test ./... -count=1 -short -timeout 10m`.
+   `-short` skips the heavy scale tests (200K validators/nodes). This is the
+   commit gate and must be green.
+2. **Scale tier (opt-in)** — `make test-scale` = `QAU_SCALE_TESTS=1 go test
+   -v -count=1 -timeout 30m ./simulation/ ./consensus/ -run
+   'TestSim_|TestScale_|TestLargeScale_'`. Run ONLY on a >=32 GB machine that
+   is otherwise idle. The wall-clock latency guards
+   (`TestLargeScale_CommitteeAllocationLatency`,
+   `TestLargeScale_ProposerSelectionLatency`) assert per-slot/per-call budgets
+   measured on an idle box; under concurrent package load the same code
+   measures 14-136x slower, so these two tests skip unless
+   `QAU_SCALE_TESTS=1`.
+3. **Full non-short run** — `go test ./... -count=1 -timeout 30m` on an idle
+   machine. Running all packages in parallel starves the latency guards and
+   can time out the heavy packages (`node`, `p2p`, `privacy`,
+   `privacy/confidential` need more than 10m each under load; CI runs them
+   with 20-30m per-package budgets). Prefer the per-package form:
+   `go test -count=1 -timeout 30m ./consensus/ ./node/ ./p2p/ ./privacy/...`.
+4. **Race** — requires CGO + gcc (on Windows: msys2 mingw64 on PATH):
+   `CGO_ENABLED=1 CC=gcc go test -race -count=1 -short -timeout 30m ./...`.
+
 ## 13.3 Run Modes
 
 ### 13.3.1 In-Memory Private Chain (fastest)

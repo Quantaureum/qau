@@ -4,8 +4,10 @@
 // Stub methods for API handlers referenced in api.go RegisterHandlers.
 // SignQuantumTransaction is disabled in production (use client-side signing);
 // in dev mode it performs Dilithium3 signing for testing.
-// The remaining methods return "not implemented" until full implementations
-// are provided.
+// The remaining methods are intentionally NOT IMPLEMENTED and fail closed
+// with ErrCodeNotImplemented (audit M-07): each carries a per-method comment
+// documenting the evaluated gap that blocks a safe wiring. They stay
+// registered so callers get a precise refusal instead of method-not-found.
 package rpc
 
 import (
@@ -201,27 +203,78 @@ func (api *API) SignQuantumTransaction(ctx context.Context, params json.RawMessa
 	return "0x" + hex.EncodeToString(rawBytes), nil
 }
 
-// VerifyQuantumTransaction verifies a quantum signature.
+// errNotImplemented builds the fail-closed error for a registered RPC method
+// whose backing capability is intentionally not wired on this node (audit
+// M-07). The message names the method and the concrete gap so callers get an
+// actionable refusal instead of a generic internal error.
+func errNotImplemented(method, reason string) *Error {
+	return NewError(ErrCodeNotImplemented, method+" is not implemented on this node: "+reason)
+}
+
+// VerifyQuantumTransaction is NOT IMPLEMENTED (audit M-07, fail-closed).
+//
+// Evaluation: the raw crypto exists (crypto.Verify over Dilithium3), but there
+// is no agreed contract for WHICH bytes a submitted transaction signs — the
+// wallet signs the |QUANTUM|-envelope payload client-side (see
+// quantum_signature_parser.go) and no canonical server-side signing-hash
+// convention exists for arbitrary submitted transactions. Wiring a guess would
+// expose a verification oracle that disagrees with the wallet. Wiring this
+// requires a documented (tx, publicKey, signature) verification contract
+// synced with the wallet plus round-trip tests; until then the method stays
+// registered and refuses.
 func (api *API) VerifyQuantumTransaction(ctx context.Context, params json.RawMessage) (any, *Error) {
-	return nil, NewError(ErrCodeInternal, "not implemented")
+	return nil, errNotImplemented("qau_verifyQuantumTransaction",
+		"no wallet-synced contract for which bytes a submitted transaction signs; use client-side Dilithium3 verification")
 }
 
-// SendPrivacyTransaction sends a privacy transaction.
+// SendPrivacyTransaction is NOT IMPLEMENTED (audit M-07, fail-closed).
+//
+// Evaluation: the privacy package can BUILD a privacy transaction
+// (privacy.PrivacyManager.SendPrivacyTransaction), but nothing broadcasts or
+// includes privacy transactions in blocks: the API-local manager is
+// disconnected from chain state and no privacy-tx mempool/gossip/execution
+// path exists. A wired handler would report success for a transaction that can
+// never land on-chain. Wiring this requires end-to-end privacy-transaction
+// inclusion (mempool, block execution, persistence) first.
 func (api *API) SendPrivacyTransaction(ctx context.Context, params json.RawMessage) (any, *Error) {
-	return nil, NewError(ErrCodeInternal, "not implemented")
+	return nil, errNotImplemented("qau_sendPrivacyTransaction",
+		"privacy transactions are not accepted into the mempool or included in blocks; a node-side build-only path would silently lose funds' visibility")
 }
 
-// ScanPrivacy scans for privacy transactions.
+// ScanPrivacy is NOT IMPLEMENTED (audit M-07, fail-closed).
+//
+// Evaluation: privacy.PrivacyManager.ScanPrivacyTransactions exists, but it
+// only sees announcements cached in the API-local in-memory manager, which
+// receives no chain traffic; results would be misleadingly empty or
+// incomplete. Wiring this requires chain-integrated stealth-announcement
+// indexing addressable by the caller's (kemPrivKey, spendPubKey).
 func (api *API) ScanPrivacy(ctx context.Context, params json.RawMessage) (any, *Error) {
-	return nil, NewError(ErrCodeInternal, "not implemented")
+	return nil, errNotImplemented("qau_scanPrivacy",
+		"no chain-integrated stealth-announcement index exists; scanning would only see this node's in-memory cache and miss on-chain outputs")
 }
 
-// GetPrivacyBalance returns the privacy balance for an address.
+// GetPrivacyBalance is NOT IMPLEMENTED (audit M-07, fail-closed).
+//
+// Evaluation: the underlying privacy.PrivacyManager.GetPrivacyBalance returns
+// a COUNT of unspent notes, NOT a QAU amount — output amounts are
+// KEM-encrypted to the receiver and cannot be summed server-side (see the
+// deprecation comment on privacy.PrivacyManager.GetPrivacyBalance). Wiring it
+// as a "balance" would be a resource-accounting error. A real balance RPC
+// needs a receiver-side decryption protocol that never transmits private keys.
 func (api *API) GetPrivacyBalance(ctx context.Context, params json.RawMessage) (any, *Error) {
-	return nil, NewError(ErrCodeInternal, "not implemented")
+	return nil, errNotImplemented("qau_getPrivacyBalance",
+		"privacy output amounts are receiver-encrypted and cannot be summed server-side; a count of unspent notes would be misleading as a balance")
 }
 
-// GenerateStealthAddress generates a stealth address.
+// GenerateStealthAddress is NOT IMPLEMENTED (audit M-07, fail-closed).
+//
+// Evaluation: privacy/stealth can derive a one-time stealth address, but only
+// with the SENDER's Dilithium3 private key passed in, because the announcement
+// must carry the sender signature to be valid downstream. Accepting raw
+// signing keys over a public RPC for a capability with no chain integration is
+// not a safe wiring. Wiring this requires an agreed key-handling contract
+// (client-side generation, or an authenticated session-bound key source).
 func (api *API) GenerateStealthAddress(ctx context.Context, params json.RawMessage) (any, *Error) {
-	return nil, NewError(ErrCodeInternal, "not implemented")
+	return nil, errNotImplemented("qau_generateStealthAddress",
+		"valid stealth announcements require the sender's private signing key, which this RPC must not solicit; generate stealth addresses client-side")
 }

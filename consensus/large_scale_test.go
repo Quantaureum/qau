@@ -4,6 +4,7 @@ package consensus
 import (
 	"fmt"
 	"math/big"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -699,6 +700,14 @@ func TestLargeScale_CommitteeAllocationLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("wall-clock latency budgets are not meaningful under the race detector (5-20x slowdown)")
 	}
+	// Audit M-08: these wall-clock latency budgets assume an otherwise idle
+	// machine. Measured on the same 24-vCPU box: 7.7ms/slot standalone vs
+	// 108ms/slot with the rest of `go test ./...` running concurrently — the
+	// assertion is load-sensitive, so run this scale tier only when explicitly
+	// requested (see make test-scale / wiki 13-build-test-deploy).
+	if os.Getenv("QAU_SCALE_TESTS") != "1" {
+		t.Skip("skipping load-sensitive scale latency test: set QAU_SCALE_TESTS=1 to run it against an idle machine")
+	}
 
 	setupGenesisForBenchmark()
 
@@ -712,6 +721,11 @@ func TestLargeScale_CommitteeAllocationLatency(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewQPOS failed: %v", err)
 			}
+			// OBS-R24-1 / audit M-08: stop the QPOS background loop; the
+			// subtests each build a fresh validator set and leaking the
+			// drainEvidenceQueueLoop goroutine pins all four sets for the
+			// lifetime of the process.
+			defer qpos.Stop()
 
 			start := time.Now()
 			for slot := uint64(0); slot < SlotsPerEpoch; slot++ {
@@ -740,6 +754,12 @@ func TestLargeScale_ProposerSelectionLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("wall-clock latency budgets are not meaningful under the race detector (5-20x slowdown)")
 	}
+	// Audit M-08: load-sensitive wall-clock budgets — see the committee
+	// allocation twin above. Run only under QAU_SCALE_TESTS=1 on an idle
+	// machine.
+	if os.Getenv("QAU_SCALE_TESTS") != "1" {
+		t.Skip("skipping load-sensitive scale latency test: set QAU_SCALE_TESTS=1 to run it against an idle machine")
+	}
 
 	setupGenesisForBenchmark()
 
@@ -753,6 +773,8 @@ func TestLargeScale_ProposerSelectionLatency(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewQPOS failed: %v", err)
 			}
+			// OBS-R24-1 / audit M-08: stop the background loop (see above).
+			defer qpos.Stop()
 
 			iterations := 100
 			start := time.Now()

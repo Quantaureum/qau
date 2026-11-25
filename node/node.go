@@ -1436,6 +1436,16 @@ func (n *Node) Stop() error {
 		if err := n.rollupEngine.Stop(); err != nil {
 			nodeLog.Warn("rollupEngine stop failed: %v", err)
 		}
+		// Audit H-01: release the anchor commitment journal handle, if the
+		// degraded in-memory anchor mode wired one. Writes are unbuffered
+		// appends, so this is hygiene rather than durability-critical.
+		if anchor := n.rollupEngine.GetL1Anchor(); anchor != nil {
+			if closer, ok := anchor.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					nodeLog.Warn("rollup anchor journal close failed: %v", err)
+				}
+			}
+		}
 	}
 	if n.keyRotationMgr != nil {
 		if err := n.keyRotationMgr.Close(); err != nil {
@@ -5137,15 +5147,21 @@ func parseChainURLPairs(pairs string, base map[bridge.ChainID]string) map[bridge
 	return result
 }
 
-// checkMemoryL1AnchorPolicy enforces F-18: the node only ships an in-memory
-// L1Anchor implementation, which does not commit batch data to L1. On a
-// non-devnet network that silently invalidates the fraud-proof challenge
-// window, so the rollup must not start unless the operator explicitly
-// accepts the degraded mode via QAU_ALLOW_MEMORY_L1_ANCHOR=1. Devnet keeps
-// the permissive behavior so local development needs no extra flags.
+// checkMemoryL1AnchorPolicy enforces F-18 and audit H-01: the node only ships
+// an in-memory L1Anchor implementation, which does not commit batch data to
+// L1. On mainnet the in-memory anchor is forbidden outright — the fraud-proof
+// challenge window would have no on-chain commitment and no L1 finality
+// guarantee, and no operator flag can accept that on the value chain. On other
+// non-devnet networks the rollup must not start unless the operator explicitly
+// accepts the degraded mode via QAU_ALLOW_MEMORY_L1_ANCHOR=1 (in that mode the
+// commitments are journaled to disk so they survive process restarts). Devnet
+// keeps the permissive behavior so local development needs no extra flags.
 func checkMemoryL1AnchorPolicy(networkID uint64, allowMemoryAnchorEnv string) error {
 	if networkID == DevnetNetworkID {
 		return nil
+	}
+	if networkID == MainnetNetworkID {
+		return fmt.Errorf("rollup: memory L1 anchor is FORBIDDEN on mainnet (network %d): anchors would not be committed to L1, leaving the challenge window without an on-chain commitment or L1 finality guarantee; wire a real rollup.L1Anchor implementation before enabling rollup on mainnet (F-18, audit H-01)", networkID)
 	}
 	if allowMemoryAnchorEnv == "1" {
 		return nil
@@ -5288,18 +5304,35 @@ func (n *Node) initRollup() error {
 	// (~20 minutes at 12s block time). Production should replace this with a
 	// real L1 contract submission implementation (see rollup/l1_anchor.go
 	// L1Anchor interface).
-	// F-18: checkMemoryL1AnchorPolicy above guarantees that on a non-devnet
-	// network we only reach this point when the operator explicitly opted in
-	// via QAU_ALLOW_MEMORY_L1_ANCHOR=1.
+	// F-18 / audit H-01: checkMemoryL1AnchorPolicy above guarantees that on a
+	// non-devnet network we only reach this point when the operator explicitly
+	// opted in via QAU_ALLOW_MEMORY_L1_ANCHOR=1 (mainnet is refused outright).
+	// In that degraded mode every commitment is journaled to a checksummed
+	// JSONL file so a process restart replays the challenge-window evidence
+	// instead of losing it.
 	// The L1 current height is synced from the blockchain on each new block.
 	const defaultChallengeBlocks = 100
-	l1Anchor := rollup.NewMemoryL1Anchor(defaultChallengeBlocks)
+	var l1Anchor rollup.L1Anchor
+	if n.config.NetworkID != DevnetNetworkID {
+		journalPath := filepath.Join(n.config.DataDir, "rollup", "anchor_commitments.jsonl")
+		anchor, jErr := rollup.NewMemoryL1AnchorWithJournal(defaultChallengeBlocks, journalPath)
+		if jErr != nil {
+			return fmt.Errorf("rollup: refusing to start with an unusable anchor commitment journal: %w", jErr)
+		}
+		l1Anchor = anchor
+		// Audit H-01: make the degraded mode impossible to miss. There is NO
+		// L1 finality guarantee in this mode: batch data is not committed to
+		// L1, so the fraud-proof challenge window is backed only by this
+		// node's local journal.
+		nodeLog.Warn("DEGRADED MODE: rollup L1 anchor is IN-MEMORY on non-devnet network %d — anchors are NOT committed to L1, "+
+			"so the challenge window has NO on-chain commitment and NO L1 finality guarantee "+
+			"(explicitly allowed via QAU_ALLOW_MEMORY_L1_ANCHOR=1, F-18). Commitments are journaled to %s for restart recovery; "+
+			"wire a real rollup.L1Anchor for production.", n.config.NetworkID, journalPath)
+	} else {
+		l1Anchor = rollup.NewMemoryL1Anchor(defaultChallengeBlocks)
+	}
 	engine.SetL1Anchor(l1Anchor)
 	engine.GetBatchManager().SetL1ChallengeBlocks(defaultChallengeBlocks)
-	if n.config.NetworkID != DevnetNetworkID {
-		nodeLog.Warn("Rollup L1 anchor is IN-MEMORY on non-devnet network %d: anchors are NOT committed to L1 "+
-			"(explicitly allowed via QAU_ALLOW_MEMORY_L1_ANCHOR=1, F-18)", n.config.NetworkID)
-	}
 	nodeLog.Info("Rollup L1 anchor enabled (challengeBlocks=%d)", defaultChallengeBlocks)
 
 	// W-P1-6 FIX (2026-07-13), Phase 3 (2026-07-14): Wire the L1↔L2 bridge.

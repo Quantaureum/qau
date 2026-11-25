@@ -69,6 +69,13 @@ type memoryL1Anchor struct {
 	anchors         map[types.Hash]*AnchorRecord
 	currentHeight   uint64
 	challengeBlocks uint64
+	// journal (audit H-01, 2026-11): optional on-disk JSONL log of every
+	// anchor commitment. When set, AnchorBatch persists the commitment
+	// (height/hashes/timestamp, checksummed) BEFORE updating the in-memory
+	// state, so a process restart replays the journal instead of losing the
+	// challenge-window evidence. Used only by the explicitly-allowed degraded
+	// mode on non-devnet networks; see NewMemoryL1AnchorWithJournal.
+	journal *AnchorJournal
 	// R43-ROLLUP-ANCHOR-01 (2026-08-03): used to log the prod-misconfiguration
 	// warning at most once per engine lifetime when this in-memory anchor
 	// is used on a non-devnet chain.
@@ -82,6 +89,50 @@ func NewMemoryL1Anchor(challengeBlocks uint64) L1Anchor {
 		anchors:         make(map[types.Hash]*AnchorRecord),
 		challengeBlocks: challengeBlocks,
 	}
+}
+
+// NewMemoryL1AnchorWithJournal creates an in-memory L1Anchor whose commitments
+// are appended to a checksummed JSONL journal at journalPath. Commitments
+// found in an existing journal are replayed into the anchor so the challenge
+// window survives process restarts (audit H-01). A journal that fails
+// integrity verification is a hard error: the caller must not anchor on top of
+// a commitment log of doubtful integrity.
+func NewMemoryL1AnchorWithJournal(challengeBlocks uint64, journalPath string) (L1Anchor, error) {
+	journal, recovered, err := OpenAnchorJournal(journalPath)
+	if err != nil {
+		return nil, err
+	}
+	a := &memoryL1Anchor{
+		anchors:         make(map[types.Hash]*AnchorRecord, len(recovered)),
+		challengeBlocks: challengeBlocks,
+		journal:         journal,
+	}
+	for _, rec := range recovered {
+		a.anchors[rec.BatchHash] = &AnchorRecord{
+			BatchHash:       rec.BatchHash,
+			PostStateRoot:   rec.PostStateRoot,
+			TxDataHash:      rec.TxDataHash,
+			SubmitHeight:    rec.SubmitHeight,
+			ChallengeBlocks: rec.ChallengeBlocks,
+		}
+		if rec.SubmitHeight > a.currentHeight {
+			a.currentHeight = rec.SubmitHeight
+		}
+	}
+	if len(recovered) > 0 {
+		log.Printf("[rollup] recovered %d L1 anchor commitment(s) from journal %s (anchor height=%d)",
+			len(recovered), journalPath, a.currentHeight)
+	}
+	return a, nil
+}
+
+// Close releases the optional journal handle. It is a no-op for a plain
+// in-memory anchor. Safe to call on a nil receiver for convenience.
+func (a *memoryL1Anchor) Close() error {
+	if a == nil || a.journal == nil {
+		return nil
+	}
+	return a.journal.Close()
 }
 
 // SetHeight updates the current L1 block height (for testing/simulation).
@@ -100,7 +151,27 @@ func (a *memoryL1Anchor) AnchorBatch(batchHash types.Hash, postStateRoot types.H
 	var txDataHash types.Hash
 	copy(txDataHash[:], txHash[:])
 
-	a.currentHeight++
+	// Audit H-01: persist the commitment to the journal BEFORE mutating the
+	// in-memory state, so a crash between the two steps leaves a replayable
+	// record rather than a lost commitment. A journal failure is surfaced to
+	// the engine, which marks the batch AnchorFailed (fail-closed) instead of
+	// pretending the commitment is durable.
+	submitHeight := a.currentHeight + 1
+	if a.journal != nil {
+		err := a.journal.Append(anchorJournalRecord{
+			BatchHash:       batchHash,
+			PostStateRoot:   postStateRoot,
+			TxDataHash:      txDataHash,
+			SubmitHeight:    submitHeight,
+			ChallengeBlocks: a.challengeBlocks,
+			AnchoredAtUnix:  time.Now().UTC().Unix(),
+		})
+		if err != nil {
+			return 0, fmt.Errorf("persist anchor commitment: %w", err)
+		}
+	}
+
+	a.currentHeight = submitHeight
 	record := &AnchorRecord{
 		BatchHash:       batchHash,
 		PostStateRoot:   postStateRoot,

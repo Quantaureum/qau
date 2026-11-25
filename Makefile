@@ -50,18 +50,21 @@ dist: cross-compile
 	@echo "Distribution archives created in $(BUILD_DIR)/"
 
 # R123-SCALE-GATE (2026-09-05): always -short. Heavy simulations
-# (TestSim_200KNodes etc., ~108 GB commit charge on 2026-09-05, OOM-rebooted
-# a 64 GB dev machine) are opt-in via QAU_SCALE_TESTS=1 only.
+# (TestSim_200KNodes etc., ~108 GB commit charge observed)
+# are opt-in via QAU_SCALE_TESTS=1 only.
 test:
 	$(GO) test ./... -count=1 -short -timeout 10m
 
 test-race:
 	$(GO) test -race ./... -count=1 -short -timeout 10m
 
-# Full-fat scale simulations: 200K nodes / 192K validators in memory.
+# Full-fat scale simulations: 200K nodes / 192K validators in memory, plus the
+# load-sensitive 200K-validator latency guards (audit M-08: their wall-clock
+# budgets assume an idle machine, so they are skipped unless QAU_SCALE_TESTS=1
+# is set — see wiki/13-build-test-deploy for the full-tier runbook).
 # Run ONLY on a >=32 GB machine that can afford to be pegged.
 test-scale:
-	QAU_SCALE_TESTS=1 $(GO) test -v -count=1 -timeout 30m ./simulation/ ./consensus/ -run 'TestSim_|TestScale_|Test200K'
+	QAU_SCALE_TESTS=1 $(GO) test -v -count=1 -timeout 30m ./simulation/ ./consensus/ -run 'TestSim_|TestScale_|TestLargeScale_'
 
 integration-test:
 	$(GO) test -tags integration -v -count=1 -timeout 180s ./node/... ./consensus/...

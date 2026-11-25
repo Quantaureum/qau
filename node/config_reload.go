@@ -33,6 +33,7 @@ import (
 	"os/signal"
 	"reflect"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -146,6 +147,11 @@ func (n *Node) ReloadConfig() error {
 	n.config.RateLimitViolationsBeforeBan = newCfg.RateLimitViolationsBeforeBan
 	n.config.RateLimitBanDurationSeconds = newCfg.RateLimitBanDurationSeconds
 	n.config.RateLimitExemptIPs = newCfg.RateLimitExemptIPs
+	// Audit M-01: carry the trusted-proxy list into the live config so a later
+	// reload compares against what the config file actually says, instead of
+	// silently ignoring edits to rpcTrustedProxies. The live RPC listeners keep
+	// the startup policy until restart — warnRestartRequired below flags that.
+	n.config.RPCTrustedProxies = newCfg.RPCTrustedProxies
 	n.config.MaxConcurrentRequests = newCfg.MaxConcurrentRequests
 	n.config.RequestTimeout = newCfg.RequestTimeout
 	n.config.MetricsEnabled = newCfg.MetricsEnabled
@@ -155,8 +161,35 @@ func (n *Node) ReloadConfig() error {
 	// Warn about restart-required fields that changed.
 	n.warnRestartRequired(old, newCfg)
 
+	// Audit M-01: always surface the effective trusted-proxy policy after a
+	// reload, so an operator editing rpcTrustedProxies can see exactly which
+	// list the config now carries (and that a restart is needed to apply it
+	// to the live RPC listeners).
+	n.logEffectiveRPCTrustedProxies()
+
 	nodeLog.Info("Configuration reload complete")
 	return nil
+}
+
+// logEffectiveRPCTrustedProxies logs the trusted-proxy list that is currently
+// in force for the RPC layer: the env override wins over the config file, the
+// same resolution used at startup (R90-PROXY-IP). A malformed list is logged
+// as a warning rather than fatal here — startup already failed fast on it,
+// and a reload must not crash the running node over a bad edit.
+func (n *Node) logEffectiveRPCTrustedProxies() {
+	n.mu.RLock()
+	configured := n.config.RPCTrustedProxies
+	n.mu.RUnlock()
+	resolved, err := resolveRPCTrustedProxies(configured, os.Getenv(rpcTrustedProxiesEnv))
+	if err != nil {
+		nodeLog.Warn("Hot-reload: configured RPC trusted proxies are invalid (%v) — the running listeners keep the startup policy; fix the config and restart", err)
+		return
+	}
+	if len(resolved) == 0 {
+		nodeLog.Info("Hot-reload: effective RPC trusted proxies: none (client-IP attribution uses the direct peer address)")
+		return
+	}
+	nodeLog.Info("Hot-reload: effective RPC trusted proxies (%d): %s", len(resolved), strings.Join(resolved, ","))
 }
 
 // reloadRPCRateLimits applies the RPC rate-limit settings from newCfg to the
@@ -379,6 +412,14 @@ func (n *Node) warnRestartRequired(old, newCfg *Config) {
 		// once in initSharding. Runtime changes need a restart to take effect.
 		{"sharding.slotResolverMode", old.Sharding.SlotResolverMode != newCfg.Sharding.SlotResolverMode,
 			old.Sharding.SlotResolverMode, newCfg.Sharding.SlotResolverMode},
+		// Audit M-01: the trusted-proxy list is consumed once at RPC listener
+		// startup (auth manager + rate limiter + GraphQL handler). A changed
+		// list is committed to the live config above (so status/display and
+		// the next reload diff see it), but the running listeners keep the
+		// startup policy until restart — this check makes that visible instead
+		// of silently ignoring the edit.
+		{"rpcTrustedProxies", !equalStringSlices(old.RPCTrustedProxies, newCfg.RPCTrustedProxies),
+			old.RPCTrustedProxies, newCfg.RPCTrustedProxies},
 	}
 	for _, c := range checks {
 		if c.changed {
